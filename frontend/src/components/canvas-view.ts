@@ -59,11 +59,16 @@ export class CanvasView {
   tipTimer = 0;
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
+  dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null = null;
   _rafId = 0;
 
   txHandles: TxHandle[] = [];
   _txBox: TxBox | null = null;
   _txWorld: TxWorld | null = null;
+
+  // Offscreen canvas used as render texture for the glow screen-pass
+  private _glowCanvas: HTMLCanvasElement | null = null;
+  private _glowCtx: CanvasRenderingContext2D | null = null;
 
   constructor(model: Model) {
     this.model = model;
@@ -182,6 +187,7 @@ export class CanvasView {
     }
 
     this._drawGrid(w, h);
+    this._drawDragGhosts();
     this._drawScatter(tracks);
     this._drawFolderGlow(tracks);
     this._drawTransformBox();
@@ -373,21 +379,84 @@ export class CanvasView {
     return f === prefix || f.startsWith(prefix + "/");
   }
 
+  /**
+   * Lazily creates / resizes the offscreen glow render-texture so it always
+   * matches the main canvas in physical pixels and shares the same DPR
+   * coordinate transform.
+   */
+  private _ensureGlowCanvas(w: number, h: number): void {
+    const dpr = devicePixelRatio || 1;
+    const pw = Math.round(w * dpr);
+    const ph = Math.round(h * dpr);
+    if (!this._glowCanvas) {
+      this._glowCanvas = document.createElement("canvas");
+      this._glowCtx = this._glowCanvas.getContext("2d")!;
+    }
+    if (this._glowCanvas.width !== pw || this._glowCanvas.height !== ph) {
+      this._glowCanvas.width = pw;
+      this._glowCanvas.height = ph;
+      // Setting canvas dimensions resets the context transform
+      this._glowCtx!.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+  }
+
+  /**
+   * Renders the folder-hover glow as a single screen-pass blur instead of
+   * N individual ctx.shadowBlur draws.
+   *
+   * All glowing dots are painted (without shadow) onto an offscreen render
+   * texture, then the texture is blitted to the main canvas with a single
+   * ctx.filter = 'blur()' — one GPU compositing pass for all dots.
+   */
   private _drawFolderGlow(tracks: Track[]): void {
     if (this.hoveredFolderPrefix === null) return;
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.shadowBlur = 14;
-    ctx.lineWidth = 2;
+
+    const w = this.$canvas.clientWidth;
+    const h = this.$canvas.clientHeight;
+    this._ensureGlowCanvas(w, h);
+    const gc = this._glowCtx!;
+
+    // Render all halo circles to the offscreen texture (no shadow)
+    gc.clearRect(0, 0, w, h);
+    gc.globalAlpha = 0.85;
     for (const pos of this.positions) {
       const track = tracks[pos.idx];
       if (!this._inHoveredFolder(track)) continue;
-      const color = dirColor(track.folder ?? "");
+      gc.beginPath();
+      gc.arc(pos.sx, pos.sy, DOT_R + 6, 0, Math.PI * 2);
+      gc.fillStyle = dirColor(track.folder ?? "");
+      gc.fill();
+    }
+    gc.globalAlpha = 1;
+
+    // Single screen-pass blur: blit render texture with one filter operation
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.filter = "blur(14px)";
+    ctx.globalAlpha = 0.75;
+    ctx.drawImage(this._glowCanvas!, 0, 0, w, h);
+    ctx.restore();
+  }
+
+  /* ── Drag ghosts (original positions while dragging) ────── */
+
+  private _drawDragGhosts(): void {
+    const ghosts = this.dragGhosts;
+    if (!ghosts || !ghosts.size) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.setLineDash([2, 3]);
+    ctx.lineWidth = 1.5;
+    for (const { wx, wy, folder } of ghosts.values()) {
+      const [sx, sy] = this.w2s(wx, wy);
+      const color = dirColor(folder);
       ctx.beginPath();
-      ctx.arc(pos.sx, pos.sy, DOT_R + 5, 0, Math.PI * 2);
+      ctx.arc(sx, sy, DOT_R, 0, Math.PI * 2);
+      ctx.globalAlpha = 0.2;
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.globalAlpha = 0.6;
       ctx.strokeStyle = color;
-      ctx.shadowColor = color;
-      ctx.globalAlpha = 0.75;
       ctx.stroke();
     }
     ctx.restore();

@@ -258,6 +258,8 @@ def api_move_tracks():
             errors.append(f"Not found: {rel}")
             continue
         dst = os.path.join(dest_abs, os.path.basename(src))
+        if src == dst:
+            continue  # already in this folder — skip silently
         if os.path.exists(dst):
             errors.append(f"Already exists: {os.path.basename(src)}")
             continue

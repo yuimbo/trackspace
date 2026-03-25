@@ -194,6 +194,22 @@ export class Model extends EventBus {
     this._dirty();
   }
 
+  /** Update in-memory paths after a successful move (before library reload completes). */
+  applyTracksMoved(oldPaths: string[], destFolder: string): void {
+    const normDest =
+      !destFolder || destFolder === "." ? "" : destFolder;
+    for (const p of oldPaths) {
+      const t = this.trackByPath(p);
+      if (!t) continue;
+      const fn = t.filename;
+      t.folder = normDest;
+      t.path = normDest ? `${normDest}/${fn}` : fn;
+    }
+    this.selected.clear();
+    this._dirty();
+    this.emit("change");
+  }
+
   /* ── Persistence ──────────────────────────────────────────── */
 
   saveLS(): void {

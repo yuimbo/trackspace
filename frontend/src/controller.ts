@@ -108,6 +108,10 @@ interface MouseState {
   lx: number;
   ly: number;
   hitIdx: number;
+  /** Was the hit track already in the selection when mousedown fired? */
+  hitWasSelected: boolean;
+  /** Did mousedown land inside the selection bounding box (but not on a dot)? */
+  hitInSelectionBox: boolean;
   snap: Map<string, DragSnap> | null;
   draggingOutside: boolean;
   highlightedFolder: HTMLElement | null;
@@ -161,6 +165,8 @@ export class Controller {
       lx: 0,
       ly: 0,
       hitIdx: -1,
+      hitWasSelected: false,
+      hitInSelectionBox: false,
       snap: null,
       draggingOutside: false,
       highlightedFolder: null,
@@ -515,6 +521,8 @@ export class Controller {
     mouse.sy = sy;
     mouse.lx = sx;
     mouse.ly = sy;
+    mouse.hitWasSelected = false;
+    mouse.hitInSelectionBox = false;
 
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
       mouse.mode = "pan";
@@ -523,12 +531,7 @@ export class Controller {
     }
     if (e.button !== 0) return;
 
-    if (e.shiftKey) {
-      mouse.mode = "lasso";
-      cv.lassoPoints = [[sx, sy]];
-      return;
-    }
-
+    // Resize handles always take priority.
     const txh =
       m.selected.size > 0 ? cv.hitTestTransform(sx, sy) : null;
     if (txh && txh.type !== "move") {
@@ -540,27 +543,32 @@ export class Controller {
     const hit = cv.hitTest(sx, sy);
     mouse.hitIdx = hit;
 
+    // Shift on empty space (no dot, not inside selection box) → lasso.
+    if (e.shiftKey && hit < 0 && !(txh?.type === "move")) {
+      mouse.mode = "lasso";
+      cv.lassoPoints = [[sx, sy]];
+      return;
+    }
+
+    const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+
     if (hit >= 0) {
+      // Clicked on a track dot.
       const hitPath = tracks[hit].path;
-      if (!m.selected.has(hitPath)) {
-        if (!(e.ctrlKey || e.metaKey)) m.selected.clear();
+      mouse.hitWasSelected = m.selected.has(hitPath);
+      if (!mouse.hitWasSelected) {
+        if (!additive) m.selected.clear();
         m.selected.add(hitPath);
       }
       mouse.mode = "pending";
-      mouse.snap = new Map();
-      for (const path of m.selected) {
-        const t = m.trackByPath(path);
-        if (t)
-          mouse.snap.set(path, {
-            track: t,
-            x: m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5,
-            y: m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5,
-          });
-      }
-    } else if (txh && txh.type === "move") {
-      this._startTxform("move", sx, sy);
-      return;
+      this._fillDragSnapFromSelection();
+    } else if (txh?.type === "move") {
+      // Clicked inside the selection bounding box — same drag path as track drag.
+      mouse.hitInSelectionBox = true;
+      mouse.mode = "pending";
+      this._fillDragSnapFromSelection();
     } else {
+      // Clicked on empty background → box selection.
       mouse.mode = "boxsel";
       cv.boxSel = { x0: sx, y0: sy, x1: sx, y1: sy };
     }
@@ -569,6 +577,43 @@ export class Controller {
     this.status.update(m);
     this.props.render();
     this.batch.render();
+  }
+
+  /** Tag-drag snapshot for the current selection; used for canvas drag and folder-drop drag. */
+  private _fillDragSnapFromSelection(): void {
+    const m = this.model;
+    const mouse = this.mouse;
+    mouse.snap = new Map();
+    for (const path of m.selected) {
+      const t = m.trackByPath(path);
+      if (t)
+        mouse.snap.set(path, {
+          track: t,
+          x: m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5,
+          y: m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5,
+        });
+    }
+  }
+
+  /** Shared path: tag drag on canvas + drop on folder tree (from track pending or box-select). */
+  private _startDocDragFromSelection(): void {
+    const m = this.model;
+    const cv = this.canvas;
+    const mouse = this.mouse;
+    this._fillDragSnapFromSelection();
+    mouse.mode = "drag";
+    cv.$canvas.style.cursor = "move";
+    const ghosts = new Map<string, { wx: number; wy: number; folder: string }>();
+    for (const [path, snap] of mouse.snap!) {
+      ghosts.set(path, {
+        wx: snap.x,
+        wy: snap.y,
+        folder: snap.track.folder ?? "",
+      });
+    }
+    cv.dragGhosts = ghosts;
+    document.addEventListener("mousemove", this._onDocDragMove);
+    document.addEventListener("mouseup", this._onDocDragUp);
   }
 
   private _startTxform(
@@ -693,21 +738,16 @@ export class Controller {
     if (mouse.mode === "txform") {
       const [wx, wy] = cv.s2w(sx, sy);
       this._applyTxform(wx, wy);
-      m.emit("tags-dirty");
       cv.scheduleDraw();
       return;
     }
 
     if (mouse.mode === "pending") {
-      if (Math.hypot(sx - mouse.sx, sy - mouse.sy) > DRAG_THRESH) {
-        if (m.axisX || m.axisY) {
-          mouse.mode = "drag";
-          cv.$canvas.style.cursor = "move";
-          document.addEventListener("mousemove", this._onDocDragMove);
-          document.addEventListener("mouseup", this._onDocDragUp);
-        } else {
-          mouse.mode = "idle";
-        }
+      if (
+        Math.hypot(sx - mouse.sx, sy - mouse.sy) > DRAG_THRESH &&
+        m.selected.size > 0
+      ) {
+        this._startDocDragFromSelection();
       }
       return;
     }
@@ -721,7 +761,6 @@ export class Controller {
         if (m.axisX) snap.track.tags[m.axisX] = clamp(snap.x + dx);
         if (m.axisY) snap.track.tags[m.axisY] = clamp(snap.y + dy);
       }
-      m.emit("tags-dirty");
       cv.scheduleDraw();
       return;
     }
@@ -814,7 +853,8 @@ export class Controller {
     }
 
     if (mouse.mode === "lasso") {
-      if (!(e.ctrlKey || e.metaKey)) m.selected.clear();
+      // Shift starts lasso, so treat shift as additive too.
+      if (!(e.ctrlKey || e.metaKey || e.shiftKey)) m.selected.clear();
       for (const p of cv.positions)
         if (pointInPoly(p.sx, p.sy, cv.lassoPoints))
           m.selected.add(tracks[p.idx].path);
@@ -824,10 +864,18 @@ export class Controller {
     if (mouse.mode === "pending") {
       const hitPath =
         mouse.hitIdx >= 0 ? tracks[mouse.hitIdx]?.path : null;
-      if (e.ctrlKey || e.metaKey) {
-        if (hitPath && m.selected.has(hitPath)) m.selected.delete(hitPath);
-        else if (hitPath) m.selected.add(hitPath);
+      const additive = e.ctrlKey || e.metaKey || e.shiftKey;
+
+      if (mouse.hitInSelectionBox) {
+        // Released inside the selection box without dragging: keep selection unchanged.
+      } else if (additive) {
+        if (hitPath && mouse.hitWasSelected) {
+          // Toggle off a track that was already selected.
+          m.selected.delete(hitPath);
+        }
+        // If !hitWasSelected the track was already added in _onDown, keep it.
       } else {
+        // Plain click: narrow down to just this track (or clear if none).
         m.selected.clear();
         if (hitPath) m.selected.add(hitPath);
       }
@@ -944,21 +992,28 @@ export class Controller {
     this._cleanupDocDrag();
 
     if (folderEl) {
-      const dest =
-        folderEl.dataset.path === "." ? "" : folderEl.dataset.path!;
-      await this._moveSelectedToFolder(dest);
+      this._revertDragSnapToBaseline();
     } else {
       this._commitDrag();
     }
 
+    // Reset interaction state immediately so that any canvas mousemove events
+    // fired during the async network call below are ignored.
     this.mouse.mode = "idle";
     this.mouse.snap = null;
+    this.canvas.dragGhosts = null;
     this.canvas.$canvas.style.cursor = "";
     this.canvas.scheduleDraw();
     this.status.update(this.model);
     this.props.render();
     this.batch.render();
     this.tagPanel.render();
+
+    if (folderEl) {
+      const dest =
+        folderEl.dataset.path === "." ? "" : folderEl.dataset.path!;
+      await this._moveSelectedToFolder(dest);
+    }
   };
 
   private async _moveSelectedToFolder(destPath: string): Promise<void> {
@@ -977,14 +1032,34 @@ export class Controller {
           `Moved ${res.moved} track${res.moved > 1 ? "s" : ""} to /${destPath || "(root)"}`,
           "ok",
         );
-      m.selected.clear();
-      await Promise.all([this._loadLibrary(), this._refreshFolderTreeHtmx()]);
+      if (res.moved > 0 && !res.errors?.length) {
+        // Patch in-memory state only — no _loadLibrary() here.
+        // Calling _loadLibrary() would replace all track objects while the
+        // user may already have started a new interaction (drag, boxsel, …),
+        // leaving snap/txSnap holding stale references and resetting positions.
+        m.applyTracksMoved(paths, destPath);
+        await this._refreshFolderTreeHtmx();
+      } else {
+        // Partial success or full failure: server state is uncertain — reload.
+        m.selected.clear();
+        await Promise.all([this._loadLibrary(), this._refreshFolderTreeHtmx()]);
+      }
     } catch {
       /* already toasted */
     }
   }
 
   /* ── Debounced tag writes ───────────────────────────────── */
+
+  /** Undo in-viewport tag offsets when the drag ends with a folder drop instead of a canvas commit. */
+  private _revertDragSnapToBaseline(): void {
+    const m = this.model;
+    for (const [, snap] of this.mouse.snap ?? []) {
+      if (m.axisX) snap.track.tags[m.axisX] = snap.x;
+      if (m.axisY) snap.track.tags[m.axisY] = snap.y;
+    }
+    m.emit("tags-dirty");
+  }
 
   private _commitDrag(): void {
     const m = this.model;
@@ -1193,7 +1268,33 @@ export class Controller {
         e.preventDefault();
         m.selectAll();
       }
-      if (e.key === "Escape") m.clearSelection();
+      if (e.key === "Escape") {
+        const cv = this.canvas;
+        const mouse = this.mouse;
+        if (mouse.mode === "drag") {
+          e.preventDefault();
+          this._revertDragSnapToBaseline();
+          this._cleanupDocDrag();
+          mouse.mode = "idle";
+          mouse.snap = null;
+          cv.dragGhosts = null;
+          cv.$canvas.style.cursor = "";
+          cv.scheduleDraw();
+          this.status.update(m);
+          this.props.render();
+          this.batch.render();
+        } else if (mouse.mode === "boxsel") {
+          cv.boxSel = null;
+          mouse.mode = "idle";
+          cv.scheduleDraw();
+        } else if (mouse.mode === "lasso") {
+          cv.lassoPoints = [];
+          mouse.mode = "idle";
+          cv.scheduleDraw();
+        } else {
+          m.clearSelection();
+        }
+      }
     });
   }
 
