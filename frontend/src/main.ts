@@ -1,21 +1,26 @@
 import "./trackspace.css";
 
+import Alpine from "alpinejs";
+import htmx from "htmx.org";
+
 import { Model } from "./model";
 import {
   CanvasView,
-  TreeView,
   TagPanelView,
   PropertiesView,
   BatchView,
   StatusView,
-} from "./views";
+} from "./components";
 import { Controller } from "./controller";
+
+window.htmx = htmx;
+
+Alpine.start();
 
 const model = new Model();
 model.loadLS();
 
 const canvas = new CanvasView(model);
-const tree = new TreeView(model, document.getElementById("folder-tree")!);
 const tagPanel = new TagPanelView(model, document.getElementById("tag-list")!);
 const props = new PropertiesView(
   model,
@@ -24,5 +29,5 @@ const props = new PropertiesView(
 const batch = new BatchView(model, document.getElementById("batch-list")!);
 const status = new StatusView();
 
-const ctrl = new Controller(model, canvas, tree, tagPanel, props, batch, status);
-ctrl.init();
+const ctrl = new Controller(model, canvas, tagPanel, props, batch, status);
+void ctrl.init();

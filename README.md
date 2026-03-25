@@ -16,6 +16,8 @@ pip install -r requirements.txt
 cd frontend && npm install && cd ..
 ```
 
+The UI is **Vite + TypeScript** with **Alpine.js** (e.g. shortcuts modal) and **HTMX** (folder tree HTML from Flask `GET /partials/folder-tree`).
+
 ## Dev mode (hot-reload)
 
 ```bash
@@ -23,7 +25,7 @@ cd frontend
 ROOT=/path/to/music npm run dev:all
 ```
 
-Opens Vite at [http://localhost:5173](http://localhost:5173). API calls are proxied to Flask on port 5111.
+Opens Vite at [http://localhost:5173](http://localhost:5173). `/api` and `/partials` are proxied to Flask on port 5111.
 
 ## Production
 

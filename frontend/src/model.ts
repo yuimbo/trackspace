@@ -7,12 +7,6 @@ export interface Track {
   title: string;
 }
 
-export interface FolderNode {
-  name: string;
-  path: string;
-  children: FolderNode[];
-}
-
 export interface Viewport {
   ox: number;
   oy: number;
@@ -44,7 +38,6 @@ class EventBus {
 // ─── Model ───────────────────────────────────────────────────
 export class Model extends EventBus {
   allTracks: Track[] = [];
-  folderTree: FolderNode | null = null;
   folder = "";
   recursive = true;
   axisX: string | null = null;
@@ -125,11 +118,6 @@ export class Model extends EventBus {
     this._dirty();
     this.selected.clear();
     this.emit("change");
-  }
-
-  setFolderTree(tree: FolderNode): void {
-    this.folderTree = tree;
-    this.emit("tree");
   }
 
   setFolder(f: string): void {

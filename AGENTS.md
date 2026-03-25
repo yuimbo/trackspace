@@ -7,30 +7,35 @@ Read it before making changes so that new work stays coherent with existing deci
 
 ## Frontend stack
 
-The frontend uses **Vite + TypeScript**. Source lives in `frontend/src/`.
+The frontend uses **Vite + TypeScript**, **Alpine.js**, and **HTMX**.
 
+- **UI modules:** `frontend/src/components/` — one file per view (`canvas-view.ts`, `tag-panel-view.ts`, …).
+  Shared DOM helpers (toast, loading overlay, `dirColor`) live in `frontend/src/lib/toast.ts`.
+- **Alpine.js:** Declarative islands in `frontend/index.html` (e.g. shortcuts modal `x-data`, `x-cloak`).
+  Heavier logic stays in TypeScript (`Controller`, canvas).
+- **HTMX:** The folder sidebar list is HTML from Flask (`GET /partials/folder-tree`) loaded via
+  `htmx.ajax()` in `Controller._refreshFolderTreeHtmx()`. Jinja template:
+  `templates/partials/folder_tree.html`. In dev, Vite proxies `/partials` to Flask (port 5111).
 - **Dev mode:** From `frontend/`, run `ROOT=/path/to/music npm run dev:all`.
-  This uses `concurrently` to start both Flask and Vite in one terminal, with `[backend]`
-  and `[frontend]` log prefixes. API requests are proxied to Flask on port 5111 via `vite.config.ts`.
-- **Production build:** `npm run build` in `frontend/` compiles to `frontend/dist/`.
-  Flask serves the built assets automatically when `dist/` exists.
+  `concurrently` runs Flask + Vite with `[backend]` / `[frontend]` log prefixes.
+- **Production:** `npm run build` → `frontend/dist/`; Flask serves static assets and keeps serving
+  `/partials/...` for any future HTMX fragments.
 
 ---
 
 ## Architecture: three-layer MVC
 
 ```
-model.ts      – single source of truth, owns all state, extends EventBus
-views.ts      – pure presentation: CanvasView, TreeView, TagPanelView, etc.
-controller.ts – wires model events to view renders; owns all user-input logic
+model.ts                    – single source of truth, extends EventBus
+components/*-view.ts        – imperative views (canvas, tags, properties, batch, status)
+controller.ts               – wires events, HTMX folder refresh, API calls
 ```
 
 **Views never mutate the model directly.** They expose named callbacks
 (`onPickFolder`, `onHoverTrack`, …) that the controller implements.
-This keeps views reusable and testable in isolation.
 
-**The controller is the only place that reads DOM events and calls API endpoints.**
-Business logic lives in the controller; rendering logic lives in views.
+**The controller is the only place that reads DOM events and calls API endpoints**
+(except Alpine handling for purely local UI like the F1 shortcuts modal).
 
 ---
 
@@ -104,3 +109,12 @@ means the track sits directly at the root.
 4. If it only mutates in-memory tag values → call `m.emit("tags-dirty")`.
 5. If it's purely visual (e.g. hover highlight) → update a field on `CanvasView` and call
    `canvas.scheduleDraw()` — no model event needed.
+
+---
+
+## Folder tree (HTMX + Flask)
+
+- HTML must keep CSS class names expected by `trackspace.css` and by `Controller` delegation
+  (`.folder-row`, `.folder-label`, `.folder-children`, `data-folder-toggle`, etc.).
+- Query params: `active` = current `model.folder` (see `Controller._refreshFolderTreeHtmx`);
+  `pending_rename` = optional relative path for auto-opening rename after create.

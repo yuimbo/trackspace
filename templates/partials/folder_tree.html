@@ -1,0 +1,26 @@
+{# Recursive folder list – consumed by HTMX; classes must match trackspace.css #}
+{% macro branch(node, depth, active_folder, pending_rename) -%}
+  {%- set norm_path = '' if node.path == '.' else node.path -%}
+  {%- set is_active = (not active_folder and node.path == '.') or (active_folder and active_folder == node.path) -%}
+  {%- set has_kids = node.children and node.children | length > 0 -%}
+  {%- set expanded = depth < 2 -%}
+  {%- set parent_for_create = '' if node.path == '.' else node.path -%}
+<div class="folder-row" style="padding-left: {{ depth * 14 }}px" data-folder-path="{{ node.path }}">
+  <span class="folder-arrow"{% if has_kids %} data-folder-toggle="1" style="cursor:pointer"{% endif %}>{% if has_kids %}{% if expanded %}▾{% else %}▸{% endif %}{% else %}&#x2003;{% endif %}</span>
+  <span class="folder-swatch" style="background: {{ dir_color(norm_path) }}"></span>
+  <span class="folder-label{% if is_active %} active{% endif %}" data-path="{{ node.path }}"{% if pending_rename == node.path %} data-start-rename="1"{% endif %}>{{ node.name | e }}</span>
+  <span class="folder-sel-btn" title="Select all tracks in this folder" data-path="{{ node.path }}">◉</span>
+  <span class="folder-add-btn" title="Create subfolder here" data-parent="{{ parent_for_create }}">+</span>
+  {%- if node.path != '.' %}
+  <span class="folder-rename-btn" title="Rename folder" data-path="{{ node.path }}" data-folder-name="{{ node.name | e }}">✎</span>
+  {%- endif %}
+</div>
+{%- if has_kids %}
+<div class="folder-children" style="display: {% if expanded %}block{% else %}none{% endif %}">
+  {%- for child in node.children %}
+  {{ branch(child, depth + 1, active_folder, pending_rename) }}
+  {%- endfor %}
+</div>
+{%- endif %}
+{%- endmacro %}
+{{ branch(tree, 0, active_folder, pending_rename) }}

@@ -7,20 +7,19 @@
 </head>
 <body>
 
-<!-- ───────────────────────── Left Sidebar ───────────────────────── -->
+<!-- component: sidebar -->
 <aside id="sidebar">
-
-  <section id="folder-section">
+  <!-- component: folder-panel (folder list fragment from GET /partials/folder-tree via HTMX) -->
+  <section id="folder-section" x-data>
     <h2>Folders</h2>
     <div id="folder-controls">
-      <button id="btn-add-folder" title="Create subfolder in current folder">+ Folder</button>
+      <button id="btn-add-folder" type="button" title="Create subfolder in current folder">+ Folder</button>
     </div>
     <div id="folder-tree"></div>
   </section>
-
 </aside>
 
-<!-- ──────────────────────── Main area ──────────────────────── -->
+<!-- component: main-viewport -->
 <main id="main">
   <canvas id="viewport"></canvas>
 
@@ -30,36 +29,42 @@
   </footer>
 </main>
 
-<!-- ───────────────────────── Right Panel ───────────────────────── -->
+<!-- component: right-panel -->
 <aside id="right-panel">
-
-  <section id="properties-section">
+  <section id="properties-section" x-data>
     <h2>Properties</h2>
     <div id="properties-list"></div>
   </section>
 
-  <section id="batch-section">
+  <section id="batch-section" x-data>
     <h2>Batch Edit</h2>
     <div id="batch-list"></div>
   </section>
 
-  <section id="options-section">
+  <section id="options-section" x-data>
     <h2>Options</h2>
     <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
   </section>
 
-  <section id="tag-section">
+  <section id="tag-section" x-data>
     <div id="tag-controls">
       <h2>Tags</h2>
-      <button id="btn-add-tag" title="New tag">+ Tag</button>
+      <button id="btn-add-tag" type="button" title="New tag">+ Tag</button>
     </div>
     <ul id="tag-list"></ul>
   </section>
-
 </aside>
 
-<!-- ─────────────────────── Overlays ───────────────────────── -->
-<div id="shortcuts-modal" class="hidden">
+<!-- component: shortcuts-modal (Alpine) -->
+<div
+  id="shortcuts-modal"
+  x-data="{ open: false }"
+  x-cloak
+  @keydown.window="if ($event.key === 'F1') { $event.preventDefault(); open = true }"
+  @keyup.window="if ($event.key === 'F1') open = false"
+  @click.self="open = false"
+  :class="open ? '' : 'hidden'"
+>
   <div id="shortcuts-content">
     <h2>Shortcuts</h2>
     <div class="shortcut-list">
@@ -76,6 +81,7 @@
     </div>
   </div>
 </div>
+
 <div id="tooltip" class="tooltip hidden"></div>
 <div id="toast-container"></div>
 <div id="loading-overlay" class="hidden">

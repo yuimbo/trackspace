@@ -1,6 +1,8 @@
 /* ── Reset & base ──────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+[x-cloak] { display: none !important; }
+
 :root {
   --bg:        #1a1a2e;
   --bg-side:   #16213e;
@@ -662,8 +664,9 @@ kbd {
 /* ── Toasts ───────────────────────────────────────────────── */
 #toast-container {
   position: fixed;
-  bottom: 32px;
-  right: 16px;
+  top: 32px;
+  left: 50%;
+  transform: translateX(-50%);
   display: flex;
   flex-direction: column-reverse;
   gap: 6px;

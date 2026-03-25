@@ -1,14 +1,14 @@
 import type { Model, Track } from "./model";
 import type {
   CanvasView,
-  TreeView,
   TagPanelView,
   PropertiesView,
   BatchView,
   StatusView,
   TxHandle,
-} from "./views";
-import { toast, showLoad, hideLoad } from "./views";
+} from "./components";
+import { toast, showLoad, hideLoad } from "./lib/toast";
+import htmx from "htmx.org";
 
 // ─── Constants ───────────────────────────────────────────────
 const DRAG_THRESH = 4;
@@ -123,11 +123,15 @@ interface MouseState {
 export class Controller {
   private model: Model;
   private canvas: CanvasView;
-  private tree: TreeView;
+  private $folderTree: HTMLElement;
   private tagPanel: TagPanelView;
   private props: PropertiesView;
   private batch: BatchView;
   private status: StatusView;
+
+  /** Passed to `/partials/folder-tree` on next HTMX refresh; cleared after swap. */
+  pendingRenameForTree: string | null = null;
+  private _folderClickTimer = 0;
 
   private mouse: MouseState;
   private previewPath: string | null = null;
@@ -137,7 +141,6 @@ export class Controller {
   constructor(
     model: Model,
     canvasView: CanvasView,
-    treeView: TreeView,
     tagPanelView: TagPanelView,
     propsView: PropertiesView,
     batchView: BatchView,
@@ -145,7 +148,7 @@ export class Controller {
   ) {
     this.model = model;
     this.canvas = canvasView;
-    this.tree = treeView;
+    this.$folderTree = document.getElementById("folder-tree")!;
     this.tagPanel = tagPanelView;
     this.props = propsView;
     this.batch = batchView;
@@ -171,6 +174,7 @@ export class Controller {
 
     this._wireModel();
     this._wireViewCallbacks();
+    this._bindFolderTree();
     this._bindCanvas();
     this._bindSidebar();
     this._bindKeyboard();
@@ -188,53 +192,12 @@ export class Controller {
       this.tagPanel.render();
     });
     this.model.on("tags-dirty", () => this.batch.renderDirty());
-    this.model.on("tree", () => this.tree.render());
   }
 
   /* ── View callbacks ─────────────────────────────────────── */
 
   private _wireViewCallbacks(): void {
     const m = this.model;
-
-    this.tree.onPickFolder = (rel) => {
-      m.setFolder(rel);
-      setTimeout(() => this.tagPanel.render(), 0);
-      m.saveLS();
-    };
-
-    this.tree.onSelectFolder = (path) => m.selectInFolder(path);
-    this.tree.onCreateSubfolder = (parent) => this._createSubfolder(parent);
-
-    this.tree.onHoverFolder = (path) => {
-      this.canvas.hoveredFolderPrefix = path === "." ? "" : path;
-      this.canvas.scheduleDraw();
-    };
-    this.tree.onHoverFolderEnd = () => {
-      this.canvas.hoveredFolderPrefix = null;
-      this.canvas.scheduleDraw();
-    };
-
-    this.tree.onRenameFolder = async (node, newName) => {
-      try {
-        const res = await postJSON<{
-          ok: boolean;
-          path: string;
-          error?: string;
-        }>("/api/folders/rename", { path: node.path, name: newName });
-        if (!res.ok) {
-          toast(res.error || "Rename failed", "error");
-          return false;
-        }
-        const oldRel = node.path === "." ? "" : node.path;
-        m.applyFolderRename(oldRel, res.path);
-        await this._loadTree();
-        m.saveLS();
-        m.emit("change");
-        return true;
-      } catch {
-        return false;
-      }
-    };
 
     this.tagPanel.onAxisChange = (which, tag) => {
       m.toggleAxis(which as "axisX" | "axisY", tag);
@@ -286,12 +249,197 @@ export class Controller {
     };
   }
 
-  /* ── Data loading ───────────────────────────────────────── */
+  /* ── Folder tree (HTMX + server partial) ────────────────── */
 
-  private async _loadTree(): Promise<void> {
-    const tree = await api<import("./model").FolderNode>("/api/folders");
-    this.model.setFolderTree(tree);
+  private _bindFolderTree(): void {
+    this.$folderTree.addEventListener("dblclick", (e) => {
+      const label = (e.target as HTMLElement).closest(".folder-label");
+      if (!label) return;
+      e.preventDefault();
+      e.stopPropagation();
+      clearTimeout(this._folderClickTimer);
+      this._beginFolderLabelRename(label as HTMLElement);
+    });
+    this.$folderTree.addEventListener("click", (e) =>
+      this._onFolderTreeClick(e),
+    );
+    this.$folderTree.addEventListener("mouseleave", () => {
+      const fromDrag =
+        this.mouse.mode === "drag" || this.mouse.mode === "txform";
+      if (fromDrag) return;
+      this.canvas.hoveredFolderPrefix = null;
+      this.canvas.scheduleDraw();
+    });
   }
+
+  private _afterFolderTreeSwap(): void {
+    for (const row of this.$folderTree.querySelectorAll(".folder-row")) {
+      row.addEventListener("mouseenter", () => {
+        const path = row.getAttribute("data-folder-path");
+        if (path == null) return;
+        this.canvas.hoveredFolderPrefix = path === "." ? "" : path;
+        this.canvas.scheduleDraw();
+      });
+      row.addEventListener("mouseleave", () => {
+        const fromDrag =
+          this.mouse.mode === "drag" || this.mouse.mode === "txform";
+        if (fromDrag) return;
+        this.canvas.hoveredFolderPrefix = null;
+        this.canvas.scheduleDraw();
+      });
+    }
+
+    const start = this.$folderTree.querySelector("[data-start-rename]");
+    if (start) {
+      start.removeAttribute("data-start-rename");
+      this._beginFolderLabelRename(start as HTMLElement);
+    }
+  }
+
+  private _onFolderTreeClick(e: MouseEvent): void {
+    const t = e.target as HTMLElement;
+    const toggle = t.closest("[data-folder-toggle]");
+    if (toggle) {
+      e.stopPropagation();
+      const row = toggle.closest(".folder-row");
+      const sib = row?.nextElementSibling;
+      if (sib?.classList.contains("folder-children")) {
+        const open = sib instanceof HTMLElement && sib.style.display !== "none";
+        (sib as HTMLElement).style.display = open ? "none" : "block";
+        toggle.textContent = open ? "▸" : "▾";
+      }
+      return;
+    }
+
+    if (t.closest(".folder-sel-btn")) {
+      e.stopPropagation();
+      const btn = t.closest(".folder-sel-btn") as HTMLElement;
+      const path = btn.dataset.path ?? ".";
+      this.model.selectInFolder(path);
+      return;
+    }
+
+    if (t.closest(".folder-add-btn")) {
+      e.stopPropagation();
+      const btn = t.closest(".folder-add-btn") as HTMLElement;
+      const parent = btn.dataset.parent ?? "";
+      void this._createSubfolder(parent);
+      return;
+    }
+
+    if (t.closest(".folder-rename-btn")) {
+      e.stopPropagation();
+      const row = t.closest(".folder-row") as HTMLElement;
+      const label = row.querySelector(".folder-label") as HTMLElement | null;
+      if (label) this._beginFolderLabelRename(label);
+      return;
+    }
+
+    const label = t.closest(".folder-label") as HTMLElement | null;
+    if (!label) return;
+    e.stopPropagation();
+    const path = label.dataset.path ?? ".";
+
+    clearTimeout(this._folderClickTimer);
+    this._folderClickTimer = setTimeout(() => {
+      this.$folderTree
+        .querySelectorAll(".folder-label.active")
+        .forEach((el) => el.classList.remove("active"));
+      label.classList.add("active");
+      const rel = path === "." ? "" : path;
+      this.model.setFolder(rel);
+      setTimeout(() => this.tagPanel.render(), 0);
+      this.model.saveLS();
+    }, 240) as unknown as number;
+  }
+
+  private async _commitFolderRename(path: string, newName: string): Promise<boolean> {
+    const m = this.model;
+    try {
+      const res = await postJSON<{
+        ok: boolean;
+        path: string;
+        error?: string;
+      }>("/api/folders/rename", { path, name: newName });
+      if (!res.ok) {
+        toast(res.error || "Rename failed", "error");
+        return false;
+      }
+      const oldRel = path === "." ? "" : path;
+      m.applyFolderRename(oldRel, res.path);
+      await this._refreshFolderTreeHtmx();
+      m.saveLS();
+      m.emit("change");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private _beginFolderLabelRename(labelEl: HTMLElement): void {
+    const path = labelEl.dataset.path ?? ".";
+    const oldName = labelEl.textContent ?? "";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "folder-rename-input";
+    input.value = oldName;
+
+    let done = false;
+    labelEl.replaceWith(input);
+    input.select();
+    input.focus();
+
+    const commit = async () => {
+      if (done) return;
+      done = true;
+      const newName = input.value.trim();
+      if (!newName || newName === oldName) {
+        input.replaceWith(labelEl);
+        return;
+      }
+      const ok = await this._commitFolderRename(path, newName);
+      if (!ok) {
+        done = false;
+        input.replaceWith(labelEl);
+      }
+    };
+    const cancel = () => {
+      if (done) return;
+      done = true;
+      input.replaceWith(labelEl);
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        void commit();
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        cancel();
+      }
+    });
+    input.addEventListener("blur", () => void commit());
+  }
+
+  private async _refreshFolderTreeHtmx(): Promise<void> {
+    const pr = this.pendingRenameForTree ?? "";
+    this.pendingRenameForTree = null;
+    const params = new URLSearchParams({
+      active: this.model.folder,
+      pending_rename: pr,
+    });
+    try {
+      await htmx.ajax("get", `/partials/folder-tree?${params}`, {
+        target: "#folder-tree",
+        swap: "innerHTML",
+      });
+    } catch {
+      /* network / server error */
+    }
+    this._afterFolderTreeSwap();
+  }
+
+  /* ── Data loading ───────────────────────────────────────── */
 
   private async _loadLibrary(): Promise<void> {
     const tracks = await api<Track[]>("/api/tracks?folder=&recursive=1");
@@ -301,7 +449,7 @@ export class Controller {
   async init(): Promise<void> {
     showLoad();
     try {
-      await Promise.all([this._loadTree(), this._loadLibrary()]);
+      await Promise.all([this._refreshFolderTreeHtmx(), this._loadLibrary()]);
     } finally {
       hideLoad();
     }
@@ -326,8 +474,8 @@ export class Controller {
           error?: string;
         }>("/api/folders/create", { parent: parentPath, name });
         if (res.ok) {
-          this.tree.pendingRename = res.path;
-          await this._loadTree();
+          this.pendingRenameForTree = res.path;
+          await this._refreshFolderTreeHtmx();
           return;
         }
         if (res.error === "Already exists") {
@@ -830,7 +978,7 @@ export class Controller {
           "ok",
         );
       m.selected.clear();
-      await Promise.all([this._loadLibrary(), this._loadTree()]);
+      await Promise.all([this._loadLibrary(), this._refreshFolderTreeHtmx()]);
     } catch {
       /* already toasted */
     }
@@ -979,17 +1127,11 @@ export class Controller {
 
   private _bindKeyboard(): void {
     const m = this.model;
-    const $mod = document.getElementById("shortcuts-modal")!;
     const $hov = document.getElementById(
       "hover-preview-toggle",
     ) as HTMLInputElement;
 
     document.addEventListener("keydown", (e) => {
-      if (e.key === "F1") {
-        e.preventDefault();
-        $mod.classList.remove("hidden");
-        return;
-      }
       if (
         (e.target as HTMLElement).tagName === "INPUT" ||
         (e.target as HTMLElement).tagName === "TEXTAREA"
@@ -1053,16 +1195,12 @@ export class Controller {
       }
       if (e.key === "Escape") m.clearSelection();
     });
-
-    document.addEventListener("keyup", (e) => {
-      if (e.key === "F1") $mod.classList.add("hidden");
-    });
   }
 
   /* ── Tree folder highlight helper ───────────────────────── */
 
   private _treeActivateFolder(folder: string): void {
-    const $tree = this.tree.$el;
+    const $tree = this.$folderTree;
     $tree
       .querySelectorAll(".folder-label.active")
       .forEach((el) => el.classList.remove("active"));

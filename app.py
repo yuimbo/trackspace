@@ -10,14 +10,16 @@ from flask import (
     jsonify,
     send_file,
     send_from_directory,
+    render_template,
     abort,
 )
 
 from tags import write_tag, delete_tag, rename_tag, batch_read, collect_tag_names, read_metadata
 
-DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DIST_DIR = os.path.join(BASE_DIR, "frontend", "dist")
 
-app = Flask(__name__, static_folder=None)
+app = Flask(__name__, static_folder=None, template_folder=os.path.join(BASE_DIR, "templates"))
 
 MUSIC_ROOT: str = ""  # set via CLI
 
@@ -66,6 +68,35 @@ def _folder_tree(root: str) -> dict:
     except PermissionError:
         pass
     return {"name": name, "path": os.path.relpath(root, MUSIC_ROOT), "children": children}
+
+
+def _dir_color(folder_path: str) -> str:
+    """Deterministic folder swatch colour (matches frontend dirColor())."""
+    if not folder_path:
+        return "hsl(350,60%,55%)"
+    h = 0
+    for ch in folder_path:
+        h = (h * 31 + ord(ch)) & 0x3FFFF
+    return f"hsl({h % 360},65%,60%)"
+
+
+# ---------------------------------------------------------------------------
+# HTMX partials
+# ---------------------------------------------------------------------------
+
+@app.route("/partials/folder-tree")
+def partial_folder_tree():
+    """HTML fragment for the folder sidebar (HTMX)."""
+    active = request.args.get("active", "")
+    pending_rename = request.args.get("pending_rename", "")
+    tree = _folder_tree(MUSIC_ROOT)
+    return render_template(
+        "partials/folder_tree.html",
+        tree=tree,
+        active_folder=active,
+        pending_rename=pending_rename,
+        dir_color=_dir_color,
+    )
 
 
 # ---------------------------------------------------------------------------
