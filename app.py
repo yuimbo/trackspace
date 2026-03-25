@@ -6,16 +6,18 @@ import argparse
 
 from flask import (
     Flask,
-    render_template,
     request,
     jsonify,
     send_file,
+    send_from_directory,
     abort,
 )
 
 from tags import write_tag, delete_tag, rename_tag, batch_read, collect_tag_names, read_metadata
 
-app = Flask(__name__)
+DIST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "frontend", "dist")
+
+app = Flask(__name__, static_folder=None)
 
 MUSIC_ROOT: str = ""  # set via CLI
 
@@ -67,12 +69,22 @@ def _folder_tree(root: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Page
+# Page – serve Vite build (production)
 # ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    if os.path.isdir(DIST_DIR):
+        return send_from_directory(DIST_DIR, "index.html")
+    return (
+        "Frontend not built. Run <code>npm run build</code> in <code>frontend/</code>, "
+        "or use the Vite dev server (<code>npm run dev</code>) for development."
+    ), 404
+
+
+@app.route("/assets/<path:filename>")
+def serve_assets(filename):
+    return send_from_directory(os.path.join(DIST_DIR, "assets"), filename)
 
 
 # ---------------------------------------------------------------------------

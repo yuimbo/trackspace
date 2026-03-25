@@ -5,21 +5,24 @@ Read it before making changes so that new work stays coherent with existing deci
 
 ---
 
-## Core philosophy
+## Frontend stack
 
-Trackspace is intentionally **frameworkless** — no build step, no bundler, no transpilation.
-The browser sees the same ES-module source files that sit on disk.
-Resist the temptation to introduce a framework; the current surface area is small enough that
-vanilla JS with good structure is cleaner and faster to iterate on.
+The frontend uses **Vite + TypeScript**. Source lives in `frontend/src/`.
+
+- **Dev mode:** From `frontend/`, run `ROOT=/path/to/music npm run dev:all`.
+  This uses `concurrently` to start both Flask and Vite in one terminal, with `[backend]`
+  and `[frontend]` log prefixes. API requests are proxied to Flask on port 5111 via `vite.config.ts`.
+- **Production build:** `npm run build` in `frontend/` compiles to `frontend/dist/`.
+  Flask serves the built assets automatically when `dist/` exists.
 
 ---
 
 ## Architecture: three-layer MVC
 
 ```
-model.js      – single source of truth, owns all state, extends EventBus
-views.js      – pure presentation: CanvasView, TreeView, TagPanelView, etc.
-controller.js – wires model events to view renders; owns all user-input logic
+model.ts      – single source of truth, owns all state, extends EventBus
+views.ts      – pure presentation: CanvasView, TreeView, TagPanelView, etc.
+controller.ts – wires model events to view renders; owns all user-input logic
 ```
 
 **Views never mutate the model directly.** They expose named callbacks
@@ -86,7 +89,7 @@ This is what makes "scale/translate the whole selection" possible.
 
 ## Selection model
 
-`model.selected` is a `Set<trackPath>` (strings, not objects).
+`model.selected` is a `Set<string>` (track paths, not objects).
 Always use `model.trackByPath(path)` to resolve paths back to track objects.
 The path is `folder/filename.mp3` relative to `MUSIC_ROOT`; an empty-string folder
 means the track sits directly at the root.
@@ -95,7 +98,7 @@ means the track sits directly at the root.
 
 ## Adding new interaction surfaces
 
-1. Add a callback slot to the relevant View (`this.onFoo = null`).
+1. Add a callback slot to the relevant View (`onFoo: ((…) => void) | null = null`).
 2. Implement it in `Controller._wireViewCallbacks`.
 3. If it changes model state structurally → call `m.emit("change")`.
 4. If it only mutates in-memory tag values → call `m.emit("tags-dirty")`.

@@ -6,14 +6,32 @@ Organise music in a 2D tag space. Tags are stored as private ID3 frames (`TXXX:t
 
 ```bash
 cd tools/trackspace
+
+# Python deps
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Frontend deps
+cd frontend && npm install && cd ..
 ```
 
-## Launch
+## Dev mode (hot-reload)
 
 ```bash
+cd frontend
+ROOT=/path/to/music npm run dev:all
+```
+
+Opens Vite at [http://localhost:5173](http://localhost:5173). API calls are proxied to Flask on port 5111.
+
+## Production
+
+```bash
+# Build frontend
+cd frontend && npm run build && cd ..
+
+# Run server
 source .venv/bin/activate
 python app.py /path/to/music
 ```

@@ -1,16 +1,51 @@
-"use strict";
+import type { Model, Track, FolderNode } from "./model";
+
+// ─── Types ───────────────────────────────────────────────────
+export interface DotPosition {
+  idx: number;
+  sx: number;
+  sy: number;
+}
+
+export interface TxHandle {
+  type: string;
+  sx: number;
+  sy: number;
+  cursor: string;
+}
+
+export interface BoxSel {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+interface TxBox {
+  sl: number;
+  sr: number;
+  st: number;
+  sb: number;
+}
+
+interface TxWorld {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+}
 
 // ─── Constants ───────────────────────────────────────────────
-const PAD          = 40;
-const DOT_R        = 4;
-const DOT_R_SEL    = 6;
-const HIT_RADIUS   = 10;
+const PAD = 40;
+const DOT_R = 4;
+const DOT_R_SEL = 6;
+const HIT_RADIUS = 10;
 const CLUSTER_CELL = 16;
-const TX_PAD       = 14;   // screen padding around selection bounding box
-const TX_KNOB_HIT  = 9;    // hit radius for transform handles
+const TX_PAD = 14;
+const TX_KNOB_HIT = 9;
 
 // ─── Dir coloring ────────────────────────────────────────────
-export function dirColor(folderPath) {
+export function dirColor(folderPath: string): string {
   if (!folderPath) return "hsl(350,60%,55%)";
   let h = 0;
   for (let i = 0; i < folderPath.length; i++)
@@ -19,96 +54,115 @@ export function dirColor(folderPath) {
 }
 
 // ─── Toasts ──────────────────────────────────────────────────
-let _$toasts;
-export function toast(msg, type = "info") {
+let _$toasts: HTMLElement | null = null;
+export function toast(msg: string, type: "info" | "ok" | "error" = "info"): void {
   _$toasts ??= document.getElementById("toast-container");
   const el = document.createElement("div");
   el.className = `toast toast-${type}`;
   el.textContent = msg;
-  _$toasts.appendChild(el);
-  setTimeout(() => { el.classList.add("out"); setTimeout(() => el.remove(), 400); }, 3200);
+  _$toasts!.appendChild(el);
+  setTimeout(() => {
+    el.classList.add("out");
+    setTimeout(() => el.remove(), 400);
+  }, 3200);
 }
 
 // ─── Loading overlay ─────────────────────────────────────────
-let _lc = 0, _$loading;
-export function showLoad() {
+let _lc = 0;
+let _$loading: HTMLElement | null = null;
+
+export function showLoad(): void {
   _$loading ??= document.getElementById("loading-overlay");
   _lc++;
-  _$loading.classList.remove("hidden");
+  _$loading!.classList.remove("hidden");
 }
-export function hideLoad() {
+
+export function hideLoad(): void {
   _$loading ??= document.getElementById("loading-overlay");
-  if (--_lc <= 0) { _lc = 0; _$loading.classList.add("hidden"); }
+  if (--_lc <= 0) {
+    _lc = 0;
+    _$loading!.classList.add("hidden");
+  }
 }
 
 // ═════════════════════════════════════════════════════════════
 //  CanvasView
 // ═════════════════════════════════════════════════════════════
 export class CanvasView {
-  constructor(model) {
-    this.model   = model;
-    this.$canvas = document.getElementById("viewport");
-    this.ctx     = this.$canvas.getContext("2d");
-    this.$tip    = document.getElementById("tooltip");
+  model: Model;
+  $canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  $tip: HTMLElement;
 
-    this.positions          = [];      // [{idx, sx, sy}]  rebuilt every draw
-    this.hoveredIdx         = -1;
-    this.hoveredFolderPrefix = null;  // null | "" (root) | "rel/path" – set by TreeView hover
-    this.tipReady    = false;
-    this.tipTimer    = null;
-    this.lassoPoints = [];
-    this.boxSel      = null;   // {x0,y0,x1,y1} in screen coords while box-selecting
-    this._rafId      = 0;
+  positions: DotPosition[] = [];
+  hoveredIdx = -1;
+  hoveredFolderPrefix: string | null = null;
+  tipReady = false;
+  tipTimer = 0;
+  lassoPoints: [number, number][] = [];
+  boxSel: BoxSel | null = null;
+  _rafId = 0;
 
-    // Transform box state (rebuilt each draw)
-    this.txHandles = [];         // [{type, sx, sy, cursor}]
-    this._txBox    = null;       // {sl, sr, st, sb} in screen coords
-    this._txWorld  = null;       // {minX, maxX, minY, maxY} in world coords
+  txHandles: TxHandle[] = [];
+  _txBox: TxBox | null = null;
+  _txWorld: TxWorld | null = null;
+
+  constructor(model: Model) {
+    this.model = model;
+    this.$canvas = document.getElementById("viewport") as HTMLCanvasElement;
+    this.ctx = this.$canvas.getContext("2d")!;
+    this.$tip = document.getElementById("tooltip")!;
   }
 
   /* ── Coordinate transforms ──────────────────────────────── */
 
-  w2s(wx, wy) {
-    const w = this.$canvas.clientWidth, h = this.$canvas.clientHeight;
-    const iw = w - 2 * PAD, ih = h - 2 * PAD, vp = this.model.vp;
+  w2s(wx: number, wy: number): [number, number] {
+    const w = this.$canvas.clientWidth,
+      h = this.$canvas.clientHeight;
+    const iw = w - 2 * PAD,
+      ih = h - 2 * PAD,
+      vp = this.model.vp;
     return [
       PAD + (wx - vp.ox) * vp.zoom * iw,
-      (h - PAD) - (wy - vp.oy) * vp.zoom * ih,
+      h - PAD - (wy - vp.oy) * vp.zoom * ih,
     ];
   }
 
-  s2w(sx, sy) {
-    const w = this.$canvas.clientWidth, h = this.$canvas.clientHeight;
-    const iw = w - 2 * PAD, ih = h - 2 * PAD, vp = this.model.vp;
+  s2w(sx: number, sy: number): [number, number] {
+    const w = this.$canvas.clientWidth,
+      h = this.$canvas.clientHeight;
+    const iw = w - 2 * PAD,
+      ih = h - 2 * PAD,
+      vp = this.model.vp;
     return [
       (sx - PAD) / (vp.zoom * iw) + vp.ox,
-      ((h - PAD) - sy) / (vp.zoom * ih) + vp.oy,
+      (h - PAD - sy) / (vp.zoom * ih) + vp.oy,
     ];
   }
 
   /* ── Sizing ─────────────────────────────────────────────── */
 
-  resize() {
+  resize(): void {
     const dpr = devicePixelRatio || 1;
-    this.$canvas.width  = this.$canvas.clientWidth  * dpr;
+    this.$canvas.width = this.$canvas.clientWidth * dpr;
     this.$canvas.height = this.$canvas.clientHeight * dpr;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  scheduleDraw() {
+  scheduleDraw(): void {
     cancelAnimationFrame(this._rafId);
     this._rafId = requestAnimationFrame(() => this.draw());
   }
 
   /* ── Viewport pan clamping ──────────────────────────────── */
 
-  _clampVP() {
+  private _clampVP(): void {
     const vp = this.model.vp;
-    const w  = this.$canvas.clientWidth, h = this.$canvas.clientHeight;
-    const iw = w - 2 * PAD, ih = h - 2 * PAD;
+    const w = this.$canvas.clientWidth,
+      h = this.$canvas.clientHeight;
+    const iw = w - 2 * PAD,
+      ih = h - 2 * PAD;
     if (iw <= 0 || ih <= 0) return;
-    // Keep the screen centre inside [0, 1] in world space.
-    // s2w(w/2, h/2) = [(w/2-PAD)/(zoom*iw) + ox, (h/2-PAD)/(zoom*ih) + oy]
     const cxOff = (w / 2 - PAD) / (vp.zoom * iw);
     const cyOff = (h / 2 - PAD) / (vp.zoom * ih);
     vp.ox = Math.max(-cxOff, Math.min(1 - cxOff, vp.ox));
@@ -117,22 +171,27 @@ export class CanvasView {
 
   /* ── Hit testing ────────────────────────────────────────── */
 
-  hitTest(sx, sy) {
-    let best = -1, bestD = HIT_RADIUS;
+  hitTest(sx: number, sy: number): number {
+    let best = -1,
+      bestD = HIT_RADIUS;
     for (const p of this.positions) {
       const d = Math.hypot(p.sx - sx, p.sy - sy);
-      if (d < bestD) { bestD = d; best = p.idx; }
+      if (d < bestD) {
+        bestD = d;
+        best = p.idx;
+      }
     }
     return best;
   }
 
-  hitTestTransform(sx, sy) {
-    // Corner / edge handles take priority
+  hitTestTransform(sx: number, sy: number): TxHandle | { type: "move"; cursor: "move" } | null {
     for (const h of this.txHandles) {
-      if (Math.abs(sx - h.sx) < TX_KNOB_HIT && Math.abs(sy - h.sy) < TX_KNOB_HIT)
+      if (
+        Math.abs(sx - h.sx) < TX_KNOB_HIT &&
+        Math.abs(sy - h.sy) < TX_KNOB_HIT
+      )
         return h;
     }
-    // Interior = move
     const b = this._txBox;
     if (b && sx > b.sl && sx < b.sr && sy > b.st && sy < b.sb)
       return { type: "move", cursor: "move" };
@@ -141,17 +200,18 @@ export class CanvasView {
 
   /* ── Main draw ──────────────────────────────────────────── */
 
-  draw() {
+  draw(): void {
     this._clampVP();
-    const m      = this.model;
+    const m = this.model;
     const tracks = m.tracks;
-    const w = this.$canvas.clientWidth, h = this.$canvas.clientHeight;
+    const w = this.$canvas.clientWidth,
+      h = this.$canvas.clientHeight;
     const ctx = this.ctx;
     ctx.clearRect(0, 0, w, h);
-    this.positions  = [];
-    this.txHandles  = [];
-    this._txBox     = null;
-    this._txWorld   = null;
+    this.positions = [];
+    this.txHandles = [];
+    this._txBox = null;
+    this._txWorld = null;
 
     if (tracks.length === 0) {
       ctx.fillStyle = "#444";
@@ -164,7 +224,6 @@ export class CanvasView {
     }
 
     this._drawGrid(w, h);
-    this._drawAxes(w, h);
     this._drawScatter(tracks);
     this._drawFolderGlow(tracks);
     this._drawTransformBox();
@@ -176,38 +235,35 @@ export class CanvasView {
 
   /* ── Grid + tick labels (adaptive to zoom) ──────────────── */
 
-  _drawGrid(w, h) {
+  private _drawGrid(w: number, h: number): void {
     const ctx = this.ctx;
-    const m   = this.model;
+    const m = this.model;
 
-    // Visible world range
     const [wxMin] = this.s2w(0, 0);
     const [wxMax] = this.s2w(w, 0);
     const [, wyMin] = this.s2w(0, h);
     const [, wyMax] = this.s2w(0, 0);
 
-    // Screen coords of the [0,1]×[0,1] world boundary
-    const [sLeft]      = this.w2s(0, 0);
-    const [sRight]     = this.w2s(1, 0);
-    const [, sBottom]  = this.w2s(0, 0);   // world y=0 → large screen y
-    const [, sTop]     = this.w2s(0, 1);   // world y=1 → small screen y
+    const [sLeft] = this.w2s(0, 0);
+    const [sRight] = this.w2s(1, 0);
+    const [, sBottom] = this.w2s(0, 0);
+    const [, sTop] = this.w2s(0, 1);
 
     ctx.save();
 
-    // ── Dark overlay outside [0,1] bounds ────────────────────
+    // Dark overlay outside [0,1] bounds
     ctx.fillStyle = "rgba(0,0,0,0.55)";
-    if (sLeft   > 0) ctx.fillRect(0,      0, sLeft,          h);
-    if (sRight  < w) ctx.fillRect(sRight, 0, w - sRight,     h);
-    if (sBottom < h) ctx.fillRect(sLeft,  sBottom, sRight - sLeft, h - sBottom);
-    if (sTop    > 0) ctx.fillRect(sLeft,  0,       sRight - sLeft, sTop);
+    if (sLeft > 0) ctx.fillRect(0, 0, sLeft, h);
+    if (sRight < w) ctx.fillRect(sRight, 0, w - sRight, h);
+    if (sBottom < h)
+      ctx.fillRect(sLeft, sBottom, sRight - sLeft, h - sBottom);
+    if (sTop > 0) ctx.fillRect(sLeft, 0, sRight - sLeft, sTop);
 
-    // Thin border around the [0,1] area
     ctx.strokeStyle = "rgba(255,255,255,0.12)";
     ctx.lineWidth = 1;
     ctx.strokeRect(sLeft, sTop, sRight - sLeft, sBottom - sTop);
 
-    // Choose tick spacing: target ~60px between ticks
-    const pickStep = (worldRange, pxRange) => {
+    const pickStep = (worldRange: number, pxRange: number): number => {
       const ideal = (worldRange / pxRange) * 60;
       const steps = [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1];
       for (const s of steps) if (s >= ideal) return s;
@@ -220,23 +276,29 @@ export class CanvasView {
     const startY = Math.floor(wyMin / stepY) * stepY;
 
     const EPS = 1e-9;
-    const inRange = v => v > -EPS && v < 1 + EPS;
+    const inRange = (v: number) => v > -EPS && v < 1 + EPS;
 
-    // Adaptive grid lines — confined to [0, 1]
+    // Adaptive grid lines
     ctx.strokeStyle = "rgba(255,255,255,0.04)";
     ctx.lineWidth = 1;
     for (let v = startX; v <= wxMax + stepX * 0.5; v += stepX) {
       if (!inRange(v)) continue;
       const [sx] = this.w2s(v, 0);
-      ctx.beginPath(); ctx.moveTo(sx, sTop); ctx.lineTo(sx, sBottom); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sx, sTop);
+      ctx.lineTo(sx, sBottom);
+      ctx.stroke();
     }
     for (let v = startY; v <= wyMax + stepY * 0.5; v += stepY) {
       if (!inRange(v)) continue;
       const [, sy] = this.w2s(0, v);
-      ctx.beginPath(); ctx.moveTo(sLeft, sy); ctx.lineTo(sRight, sy); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sLeft, sy);
+      ctx.lineTo(sRight, sy);
+      ctx.stroke();
     }
 
-    // 0.1-step reference lines — always slightly thicker, confined to [0, 1]
+    // 0.1-step reference lines
     ctx.strokeStyle = "rgba(255,255,255,0.10)";
     ctx.lineWidth = 1.5;
     const REF = 0.1;
@@ -245,23 +307,35 @@ export class CanvasView {
     for (let v = startXRef; v <= Math.min(wxMax, 1) + REF * 0.5; v += REF) {
       if (!inRange(v)) continue;
       const [sx] = this.w2s(v, 0);
-      ctx.beginPath(); ctx.moveTo(sx, sTop); ctx.lineTo(sx, sBottom); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sx, sTop);
+      ctx.lineTo(sx, sBottom);
+      ctx.stroke();
     }
     for (let v = startYRef; v <= Math.min(wyMax, 1) + REF * 0.5; v += REF) {
       if (!inRange(v)) continue;
       const [, sy] = this.w2s(0, v);
-      ctx.beginPath(); ctx.moveTo(sLeft, sy); ctx.lineTo(sRight, sy); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(sLeft, sy);
+      ctx.lineTo(sRight, sy);
+      ctx.stroke();
     }
 
-    // 0.5 origin lines — absolute centre reference, always drawn across the full [0,1] area
+    // 0.5 origin lines
     ctx.strokeStyle = "rgba(255,255,255,0.22)";
     ctx.lineWidth = 1.5;
     const [sx05] = this.w2s(0.5, 0);
-    ctx.beginPath(); ctx.moveTo(sx05, sTop); ctx.lineTo(sx05, sBottom); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(sx05, sTop);
+    ctx.lineTo(sx05, sBottom);
+    ctx.stroke();
     const [, sy05] = this.w2s(0, 0.5);
-    ctx.beginPath(); ctx.moveTo(sLeft, sy05); ctx.lineTo(sRight, sy05); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(sLeft, sy05);
+    ctx.lineTo(sRight, sy05);
+    ctx.stroke();
 
-    // Tick labels along bottom edge (X axis) — only within [0, 1]
+    // Tick labels along bottom edge
     ctx.fillStyle = "rgba(255,255,255,0.3)";
     ctx.font = "9px monospace";
     ctx.textAlign = "center";
@@ -273,7 +347,7 @@ export class CanvasView {
       ctx.fillText(v.toFixed(stepX < 0.1 ? 2 : 1), sx, h - 14);
     }
 
-    // Tick labels along left edge (Y axis) — only within [0, 1]
+    // Tick labels along left edge
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
     for (let v = startY; v <= wyMax + stepY * 0.5; v += stepY) {
@@ -300,16 +374,18 @@ export class CanvasView {
     ctx.restore();
   }
 
-  _drawAxes() { /* merged into _drawGrid */ }
-
   /* ── Scatter plot (filter-aware) ────────────────────────── */
 
-  _drawScatter(tracks) {
+  private _drawScatter(tracks: Track[]): void {
     const m = this.model;
-    const tx = m.axisX, ty = m.axisY;
+    const tx = m.axisX,
+      ty = m.axisY;
     let anyFiltered = false;
     tracks.forEach((t, i) => {
-      if (!m.passesFilter(t)) { anyFiltered = true; return; }
+      if (!m.passesFilter(t)) {
+        anyFiltered = true;
+        return;
+      }
       const wx = tx ? (t.tags[tx] ?? 0.5) : 0.5;
       const wy = ty ? (t.tags[ty] ?? 0.5) : 0.5;
       const [sx, sy] = this.w2s(wx, wy);
@@ -318,7 +394,8 @@ export class CanvasView {
     });
     if (anyFiltered) {
       const ctx = this.ctx;
-      const w = this.$canvas.clientWidth, h = this.$canvas.clientHeight;
+      const w = this.$canvas.clientWidth,
+        h = this.$canvas.clientHeight;
       ctx.save();
       ctx.fillStyle = "rgba(255,170,50,0.55)";
       ctx.font = "10px monospace";
@@ -330,29 +407,29 @@ export class CanvasView {
 
   /* ── Folder-hover glow pass ────────────────────────────── */
 
-  _inHoveredFolder(track) {
+  private _inHoveredFolder(track: Track): boolean {
     const prefix = this.hoveredFolderPrefix;
     if (prefix === null) return false;
     const f = track.folder ?? "";
-    if (prefix === "") return true;   // root node → all tracks
+    if (prefix === "") return true;
     return f === prefix || f.startsWith(prefix + "/");
   }
 
-  _drawFolderGlow(tracks) {
+  private _drawFolderGlow(tracks: Track[]): void {
     if (this.hoveredFolderPrefix === null) return;
     const ctx = this.ctx;
     ctx.save();
     ctx.shadowBlur = 14;
-    ctx.lineWidth  = 2;
+    ctx.lineWidth = 2;
     for (const pos of this.positions) {
       const track = tracks[pos.idx];
       if (!this._inHoveredFolder(track)) continue;
       const color = dirColor(track.folder ?? "");
       ctx.beginPath();
       ctx.arc(pos.sx, pos.sy, DOT_R + 5, 0, Math.PI * 2);
-      ctx.strokeStyle  = color;
-      ctx.shadowColor  = color;
-      ctx.globalAlpha  = 0.75;
+      ctx.strokeStyle = color;
+      ctx.shadowColor = color;
+      ctx.globalAlpha = 0.75;
       ctx.stroke();
     }
     ctx.restore();
@@ -360,16 +437,16 @@ export class CanvasView {
 
   /* ── Single dot ─────────────────────────────────────────── */
 
-  _dot(sx, sy, track, idx) {
+  private _dot(sx: number, sy: number, track: Track, idx: number): void {
     const sel = this.model.selected.has(track.path);
     const hov = this.hoveredIdx === idx;
-    const r   = sel ? DOT_R_SEL : hov ? DOT_R + 1.5 : DOT_R;
+    const r = sel ? DOT_R_SEL : hov ? DOT_R + 1.5 : DOT_R;
     const ctx = this.ctx;
 
-    let color;
-    if (sel)      color = "#ffdd57";
+    let color: string;
+    if (sel) color = "#ffdd57";
     else if (hov) color = "#ff7eb3";
-    else          color = dirColor(track.folder ?? "");
+    else color = dirColor(track.folder ?? "");
 
     ctx.beginPath();
     ctx.arc(sx, sy, r, 0, Math.PI * 2);
@@ -385,38 +462,41 @@ export class CanvasView {
 
   /* ── Transform bounding box ─────────────────────────────── */
 
-  _drawTransformBox() {
+  private _drawTransformBox(): void {
     const m = this.model;
     if (!m.selected.size) return;
     if (!m.axisX && !m.axisY) return;
 
-    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    let minX = Infinity,
+      maxX = -Infinity,
+      minY = Infinity,
+      maxY = -Infinity;
     for (const path of m.selected) {
       const t = m.trackByPath(path);
       if (!t || !m.passesFilter(t)) continue;
       const wx = m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5;
       const wy = m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5;
-      if (wx < minX) minX = wx; if (wx > maxX) maxX = wx;
-      if (wy < minY) minY = wy; if (wy > maxY) maxY = wy;
+      if (wx < minX) minX = wx;
+      if (wx > maxX) maxX = wx;
+      if (wy < minY) minY = wy;
+      if (wy > maxY) maxY = wy;
     }
     if (!isFinite(minX)) return;
 
     this._txWorld = { minX, maxX, minY, maxY };
 
-    // Screen coords of world corners
-    // w2s: high world-Y → small screen-Y (top), low world-Y → large screen-Y (bottom)
     const [sx0] = this.w2s(minX, 0);
     const [sx1] = this.w2s(maxX, 0);
-    const [, sy0] = this.w2s(0, minY);  // screen bottom (large sy)
-    const [, sy1] = this.w2s(0, maxY);  // screen top   (small sy)
+    const [, sy0] = this.w2s(0, minY);
+    const [, sy1] = this.w2s(0, maxY);
 
     const sl = sx0 - TX_PAD;
     const sr = sx1 + TX_PAD;
     const st = sy1 - TX_PAD;
     const sb = sy0 + TX_PAD;
 
-    // Enforce minimum box size
-    const cx = (sl + sr) / 2, cy = (st + sb) / 2;
+    const cx = (sl + sr) / 2,
+      cy = (st + sb) / 2;
     const bsl = cx - Math.max((sr - sl) / 2, 16);
     const bsr = cx + Math.max((sr - sl) / 2, 16);
     const bst = cy - Math.max((sb - st) / 2, 16);
@@ -432,8 +512,9 @@ export class CanvasView {
     ctx.strokeRect(bsl, bst, bsr - bsl, bsb - bst);
     ctx.setLineDash([]);
 
-    const hasRange = (maxX - minX) >= 0.005 || (maxY - minY) >= 0.005;
-    const mx = (bsl + bsr) / 2, my = (bst + bsb) / 2;
+    const hasRange = maxX - minX >= 0.005 || maxY - minY >= 0.005;
+    const mx = (bsl + bsr) / 2,
+      my = (bst + bsb) / 2;
 
     this.txHandles = [];
     if (hasRange) {
@@ -457,7 +538,6 @@ export class CanvasView {
         );
     }
 
-    // Draw handle squares
     for (const h of this.txHandles) {
       ctx.fillStyle = "rgba(255,221,87,0.9)";
       ctx.fillRect(h.sx - 4, h.sy - 4, 8, 8);
@@ -470,13 +550,13 @@ export class CanvasView {
 
   /* ── Cluster badges ─────────────────────────────────────── */
 
-  _drawClusters() {
+  private _drawClusters(): void {
     if (this.positions.length < 2) return;
-    const grid = new Map();
+    const grid = new Map<string, DotPosition[]>();
     for (const p of this.positions) {
       const key = `${Math.round(p.sx / CLUSTER_CELL)},${Math.round(p.sy / CLUSTER_CELL)}`;
       if (!grid.has(key)) grid.set(key, []);
-      grid.get(key).push(p);
+      grid.get(key)!.push(p);
     }
 
     const ctx = this.ctx;
@@ -487,7 +567,7 @@ export class CanvasView {
       if (cluster.length < 2) continue;
       const cx = cluster.reduce((s, p) => s + p.sx, 0) / cluster.length;
       const cy = cluster.reduce((s, p) => s + p.sy, 0) / cluster.length;
-      const n  = cluster.length;
+      const n = cluster.length;
       const br = n > 9 ? 9 : 7;
       const bx = cx + DOT_R + 1;
       const by = cy - DOT_R - 1;
@@ -511,7 +591,7 @@ export class CanvasView {
 
   /* ── Box selection overlay ──────────────────────────────── */
 
-  _drawBoxSel() {
+  private _drawBoxSel(): void {
     const bs = this.boxSel;
     if (!bs) return;
     const x = Math.min(bs.x0, bs.x1);
@@ -533,7 +613,7 @@ export class CanvasView {
 
   /* ── Lasso overlay ──────────────────────────────────────── */
 
-  _drawLasso() {
+  private _drawLasso(): void {
     const pts = this.lassoPoints;
     if (pts.length < 2) return;
     const ctx = this.ctx;
@@ -552,31 +632,37 @@ export class CanvasView {
 
   /* ── Tooltip ────────────────────────────────────────────── */
 
-  _updateTooltip(tracks) {
+  private _updateTooltip(tracks: Track[]): void {
     if (this.hoveredIdx < 0 || !this.tipReady) {
       this.$tip.classList.add("hidden");
       return;
     }
     const track = tracks[this.hoveredIdx];
-    const pos   = this.positions.find(p => p.idx === this.hoveredIdx);
-    if (!track || !pos) { this.$tip.classList.add("hidden"); return; }
+    const pos = this.positions.find((p) => p.idx === this.hoveredIdx);
+    if (!track || !pos) {
+      this.$tip.classList.add("hidden");
+      return;
+    }
 
-    const tags   = Object.entries(track.tags).map(([k, v]) => `${k}: ${v.toFixed(2)}`).join("  ");
+    const tags = Object.entries(track.tags)
+      .map(([k, v]) => `${k}: ${v.toFixed(2)}`)
+      .join("  ");
     const folder = track.folder ? `[${track.folder}]  ` : "";
-    this.$tip.textContent = folder + track.filename + (tags ? "  ·  " + tags : "");
+    this.$tip.textContent =
+      folder + track.filename + (tags ? "  ·  " + tags : "");
     this.$tip.classList.remove("hidden");
 
-    const r  = this.$canvas.getBoundingClientRect();
-    let tx   = r.left + pos.sx + 14;
-    let ty   = r.top  + pos.sy - 10;
+    const r = this.$canvas.getBoundingClientRect();
+    let tx = r.left + pos.sx + 14;
+    const ty = r.top + pos.sy - 10;
     if (tx + 280 > window.innerWidth) tx = r.left + pos.sx - 280;
     this.$tip.style.left = tx + "px";
-    this.$tip.style.top  = ty + "px";
+    this.$tip.style.top = ty + "px";
   }
 
-  clearHover() {
+  clearHover(): void {
     clearTimeout(this.tipTimer);
-    this.tipReady   = false;
+    this.tipReady = false;
     this.hoveredIdx = -1;
     this.$tip.classList.add("hidden");
   }
@@ -586,34 +672,45 @@ export class CanvasView {
 //  TreeView
 // ═════════════════════════════════════════════════════════════
 export class TreeView {
-  constructor(model, container) {
-    this.model = model;
-    this.$el   = container;
-    this.pendingRename = null;
-    this._clickTimer   = null;
+  model: Model;
+  $el: HTMLElement;
+  pendingRename: string | null = null;
+  private _clickTimer = 0;
 
-    this.onPickFolder      = null;
-    this.onSelectFolder    = null;
-    this.onCreateSubfolder = null;
-    this.onRenameFolder    = null;
-    this.onHoverFolder     = null;
-    this.onHoverFolderEnd  = null;
+  onPickFolder: ((rel: string) => void) | null = null;
+  onSelectFolder: ((path: string) => void) | null = null;
+  onCreateSubfolder: ((parent: string) => void) | null = null;
+  onRenameFolder:
+    | ((node: FolderNode, newName: string) => Promise<boolean>)
+    | null = null;
+  onHoverFolder: ((path: string) => void) | null = null;
+  onHoverFolderEnd: (() => void) | null = null;
+
+  constructor(model: Model, container: HTMLElement) {
+    this.model = model;
+    this.$el = container;
   }
 
-  render() {
+  render(): void {
     this.$el.innerHTML = "";
     if (this.model.folderTree)
       this._buildNode(this.model.folderTree, this.$el, 0);
   }
 
-  _buildNode(node, parent, depth) {
+  private _buildNode(
+    node: FolderNode,
+    parent: HTMLElement,
+    depth: number,
+  ): void {
     const hasKids = node.children?.length > 0;
-    let expanded  = depth < 2;
+    let expanded = depth < 2;
 
     const row = document.createElement("div");
     row.className = "folder-row";
     row.style.paddingLeft = depth * 14 + "px";
-    row.addEventListener("mouseenter", () => this.onHoverFolder?.(node.path));
+    row.addEventListener("mouseenter", () =>
+      this.onHoverFolder?.(node.path),
+    );
     row.addEventListener("mouseleave", () => this.onHoverFolderEnd?.());
 
     const arrow = document.createElement("span");
@@ -623,7 +720,9 @@ export class TreeView {
 
     const swatch = document.createElement("span");
     swatch.className = "folder-swatch";
-    swatch.style.background = dirColor(node.path === "." ? "" : node.path);
+    swatch.style.background = dirColor(
+      node.path === "." ? "" : node.path,
+    );
     row.appendChild(swatch);
 
     const label = document.createElement("span");
@@ -636,7 +735,7 @@ export class TreeView {
     selBtn.className = "folder-sel-btn";
     selBtn.title = "Select all tracks in this folder";
     selBtn.textContent = "◉";
-    selBtn.addEventListener("click", e => {
+    selBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.onSelectFolder?.(node.path);
     });
@@ -646,7 +745,7 @@ export class TreeView {
     addBtn.className = "folder-add-btn";
     addBtn.title = "Create subfolder here";
     addBtn.textContent = "+";
-    addBtn.addEventListener("click", e => {
+    addBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       this.onCreateSubfolder?.(node.path === "." ? "" : node.path);
     });
@@ -657,7 +756,7 @@ export class TreeView {
       renBtn.className = "folder-rename-btn";
       renBtn.title = "Rename folder";
       renBtn.textContent = "✎";
-      renBtn.addEventListener("click", e => {
+      renBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         this._startRename(row, label, node);
       });
@@ -666,26 +765,28 @@ export class TreeView {
 
     parent.appendChild(row);
 
-    let box = null;
+    let box: HTMLDivElement | null = null;
     if (hasKids) {
       box = document.createElement("div");
       box.style.display = expanded ? "" : "none";
       parent.appendChild(box);
-      node.children.forEach(c => this._buildNode(c, box, depth + 1));
+      node.children.forEach((c) => this._buildNode(c, box!, depth + 1));
     }
 
-    label.addEventListener("click", e => {
+    label.addEventListener("click", (e) => {
       e.stopPropagation();
       clearTimeout(this._clickTimer);
       this._clickTimer = setTimeout(() => {
-        this.$el.querySelectorAll(".folder-label.active").forEach(el => el.classList.remove("active"));
+        this.$el
+          .querySelectorAll(".folder-label.active")
+          .forEach((el) => el.classList.remove("active"));
         label.classList.add("active");
         this.onPickFolder?.(node.path === "." ? "" : node.path);
-      }, 240);
+      }, 240) as unknown as number;
     });
 
     if (node.path !== ".") {
-      label.addEventListener("dblclick", e => {
+      label.addEventListener("dblclick", (e) => {
         e.stopPropagation();
         clearTimeout(this._clickTimer);
         this._startRename(row, label, node);
@@ -694,11 +795,11 @@ export class TreeView {
 
     if (hasKids) {
       arrow.style.cursor = "pointer";
-      arrow.addEventListener("click", e => {
+      arrow.addEventListener("click", (e) => {
         e.stopPropagation();
         expanded = !expanded;
         arrow.textContent = expanded ? "▾" : "▸";
-        box.style.display = expanded ? "" : "none";
+        box!.style.display = expanded ? "" : "none";
       });
     }
 
@@ -708,7 +809,11 @@ export class TreeView {
     }
   }
 
-  _startRename(row, labelEl, node) {
+  private _startRename(
+    _row: HTMLElement,
+    labelEl: HTMLElement,
+    node: FolderNode,
+  ): void {
     const input = document.createElement("input");
     input.type = "text";
     input.className = "folder-rename-input";
@@ -723,18 +828,30 @@ export class TreeView {
       if (done) return;
       done = true;
       const newName = input.value.trim();
-      if (!newName || newName === node.name) { input.replaceWith(labelEl); return; }
+      if (!newName || newName === node.name) {
+        input.replaceWith(labelEl);
+        return;
+      }
       const ok = await this.onRenameFolder?.(node, newName);
-      if (!ok) { done = false; input.replaceWith(labelEl); }
+      if (!ok) {
+        done = false;
+        input.replaceWith(labelEl);
+      }
     };
     const cancel = () => {
       if (done) return;
       done = true;
       input.replaceWith(labelEl);
     };
-    input.addEventListener("keydown", e => {
-      if (e.key === "Enter")  { e.preventDefault(); commit(); }
-      if (e.key === "Escape") { e.preventDefault(); cancel(); }
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        commit();
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        cancel();
+      }
     });
     input.addEventListener("blur", commit);
   }
@@ -744,15 +861,19 @@ export class TreeView {
 //  TagPanelView
 // ═════════════════════════════════════════════════════════════
 export class TagPanelView {
-  constructor(model, container) {
-    this.model = model;
-    this.$el   = container;
+  model: Model;
+  $el: HTMLElement;
 
-    this.onAxisChange   = null;
-    this.onFilterChange = null;
+  onAxisChange: ((which: string, tag: string) => void) | null = null;
+  onFilterChange: ((tag: string, range: [number, number]) => void) | null =
+    null;
+
+  constructor(model: Model, container: HTMLElement) {
+    this.model = model;
+    this.$el = container;
   }
 
-  render() {
+  render(): void {
     this.$el.innerHTML = "";
     const m = this.model;
     for (const tag of m.tags) {
@@ -762,7 +883,7 @@ export class TagPanelView {
     }
   }
 
-  _buildTagRow(li, tag) {
+  private _buildTagRow(li: HTMLLIElement, tag: string): void {
     const m = this.model;
     if (!m.tagHasValuesInView(tag)) li.classList.add("tag-no-values");
 
@@ -771,7 +892,12 @@ export class TagPanelView {
     name.textContent = tag;
     li.appendChild(name);
 
-    [["X", "axisX"], ["Y", "axisY"]].forEach(([lbl, key]) => {
+    (
+      [
+        ["X", "axisX"],
+        ["Y", "axisY"],
+      ] as const
+    ).forEach(([lbl, key]) => {
       const btn = document.createElement("button");
       btn.className = "axis-btn" + (m[key] === tag ? " active" : "");
       btn.textContent = lbl;
@@ -781,15 +907,21 @@ export class TagPanelView {
 
     const rng = m.filterRanges[tag] || [0, 1];
     const { slider, resetBtn } = this._makeDualRangeSlider(
-      rng[0], rng[1],
+      rng[0],
+      rng[1],
       (range) => this.onFilterChange?.(tag, range),
-      ()      => this.onFilterChange?.(tag, [0, 1])
+      () => this.onFilterChange?.(tag, [0, 1]),
     );
     li.appendChild(slider);
     li.appendChild(resetBtn);
   }
 
-  _makeDualRangeSlider(lo, hi, onChange, onReset) {
+  private _makeDualRangeSlider(
+    lo: number,
+    hi: number,
+    onChange: (range: [number, number]) => void,
+    onReset: () => void,
+  ): { slider: HTMLDivElement; resetBtn: HTMLButtonElement } {
     const wrap = document.createElement("div");
     wrap.className = "range-slider";
 
@@ -801,8 +933,8 @@ export class TagPanelView {
     fill.className = "range-fill";
     track.appendChild(fill);
 
-    const sLo = document.createElement("input");
-    const sHi = document.createElement("input");
+    const sLo = document.createElement("input") as HTMLInputElement;
+    const sHi = document.createElement("input") as HTMLInputElement;
     for (const s of [sLo, sHi]) {
       Object.assign(s, { type: "range", min: "0", max: "1", step: "0.01" });
       s.className = "range-thumb";
@@ -814,27 +946,36 @@ export class TagPanelView {
     const sync = () => {
       const a = Math.min(+sLo.value, +sHi.value);
       const b = Math.max(+sLo.value, +sHi.value);
-      fill.style.left  = (a * 100) + "%";
-      fill.style.width = ((b - a) * 100) + "%";
+      fill.style.left = a * 100 + "%";
+      fill.style.width = (b - a) * 100 + "%";
       sLo.style.zIndex = +sLo.value > +sHi.value ? "3" : "2";
     };
     sync();
 
-    const fire = () => onChange([
-      Math.min(+sLo.value, +sHi.value),
-      Math.max(+sLo.value, +sHi.value),
-    ]);
-    sLo.addEventListener("input", () => { sync(); fire(); });
-    sHi.addEventListener("input", () => { sync(); fire(); });
+    const fire = () =>
+      onChange([
+        Math.min(+sLo.value, +sHi.value),
+        Math.max(+sLo.value, +sHi.value),
+      ]);
+    sLo.addEventListener("input", () => {
+      sync();
+      fire();
+    });
+    sHi.addEventListener("input", () => {
+      sync();
+      fire();
+    });
 
     const resetBtn = document.createElement("button");
     resetBtn.className = "range-reset-btn";
     resetBtn.textContent = "↺";
     resetBtn.title = "Reset filter range";
-    resetBtn.addEventListener("click", e => {
+    resetBtn.addEventListener("click", (e) => {
       e.stopPropagation();
-      sLo.value = "0"; sHi.value = "1";
-      sync(); onReset();
+      sLo.value = "0";
+      sHi.value = "1";
+      sync();
+      onReset();
     });
 
     return { slider: wrap, resetBtn };
@@ -845,50 +986,54 @@ export class TagPanelView {
 //  PropertiesView  – selection list with ghost-deselect
 // ═════════════════════════════════════════════════════════════
 export class PropertiesView {
-  constructor(model, container) {
-    this.model = model;
-    this.$el   = container;
-    // path → {timerId, track}
-    this._pendingRestore = new Map();
-    this._rangeAnchor    = null;   // path used as shift-select range start
-    this._sortedPaths    = [];     // sorted order used for range calc
-    this._listSel        = new Set(); // sub-selection within the list
-    this._selHash        = "";
+  model: Model;
+  $el: HTMLElement;
+  private _pendingRestore = new Map<
+    string,
+    { timerId: number; track: Track | undefined }
+  >();
+  private _rangeAnchor: string | null = null;
+  private _sortedPaths: string[] = [];
+  private _listSel = new Set<string>();
+  private _selHash = "";
 
-    this.onDeselect    = null;  // (path) =>
-    this.onRestore     = null;  // (path) =>
-    this.onFocusRange  = null;  // (Set<path>) => keep only these selected
-    this.onHoverTrack  = null;  // (path) =>
-    this.onHoverEnd    = null;  // () =>
+  onDeselect: ((path: string) => void) | null = null;
+  onRestore: ((path: string) => void) | null = null;
+  onFocusRange: ((paths: Set<string>) => void) | null = null;
+  onHoverTrack: ((path: string) => void) | null = null;
+  onHoverEnd: (() => void) | null = null;
+
+  constructor(model: Model, container: HTMLElement) {
+    this.model = model;
+    this.$el = container;
   }
 
   /* ── Sort helpers ───────────────────────────────────────── */
 
-  _sortKey(t) {
+  private _sortKey(t: Track | undefined): string {
     if (!t) return "\x7f";
-    const a  = (t.artist  || "").toLowerCase().trim();
-    const ti = (t.title   || t.filename || "").toLowerCase().trim();
+    const a = (t.artist || "").toLowerCase().trim();
+    const ti = (t.title || t.filename || "").toLowerCase().trim();
     return a ? `${a}\x00${ti}` : `\x7f${ti}`;
   }
 
-  _sortedSelected() {
+  private _sortedSelected(): string[] {
     const m = this.model;
     return [...m.selected]
-      .map(p => m.trackByPath(p))
-      .filter(Boolean)
-      .sort((a, b) => this._sortKey(a) < this._sortKey(b) ? -1 : 1)
-      .map(t => t.path);
+      .map((p) => m.trackByPath(p))
+      .filter((t): t is Track => Boolean(t))
+      .sort((a, b) => (this._sortKey(a) < this._sortKey(b) ? -1 : 1))
+      .map((t) => t.path);
   }
 
   /* ── Render ─────────────────────────────────────────────── */
 
-  render() {
+  render(): void {
     this.$el.innerHTML = "";
-    const m      = this.model;
+    const m = this.model;
     const sorted = this._sortedSelected();
     this._sortedPaths = sorted;
 
-    // Reset list sub-selection when the viewport selection changes
     const hash = [...m.selected].sort().join("|");
     if (hash !== this._selHash) {
       this._selHash = hash;
@@ -896,7 +1041,9 @@ export class PropertiesView {
       this._rangeAnchor = null;
     }
 
-    const ghosts = [...this._pendingRestore.entries()].filter(([p]) => !m.selected.has(p));
+    const ghosts = [...this._pendingRestore.entries()].filter(
+      ([p]) => !m.selected.has(p),
+    );
 
     if (sorted.length === 0 && ghosts.length === 0) {
       const empty = document.createElement("div");
@@ -908,12 +1055,12 @@ export class PropertiesView {
 
     // ── Active selection ────────────────────────────────────
     for (const path of sorted) {
-      const track    = m.trackByPath(path);
+      const track = m.trackByPath(path);
       const isListSel = this._listSel.has(path);
-      const row      = document.createElement("div");
-      row.className  = "props-track-row" + (isListSel ? " list-sel" : "");
+      const row = document.createElement("div");
+      row.className =
+        "props-track-row" + (isListSel ? " list-sel" : "");
 
-      // ── Info area (click/shift-click for list sub-selection) ──
       const info = document.createElement("div");
       info.className = "props-track-info";
       info.title = path;
@@ -930,24 +1077,28 @@ export class PropertiesView {
         info.appendChild(secondary);
       }
 
-      info.addEventListener("mouseenter", () => this.onHoverTrack?.(path));
+      info.addEventListener("mouseenter", () =>
+        this.onHoverTrack?.(path),
+      );
       info.addEventListener("mouseleave", () => this.onHoverEnd?.());
 
-      info.addEventListener("click", e => {
+      info.addEventListener("click", (e) => {
         if (e.shiftKey && this._rangeAnchor && this._sortedPaths.length) {
-          // Extend list sub-selection range — does NOT change m.selected
           const ai = this._sortedPaths.indexOf(this._rangeAnchor);
           const bi = this._sortedPaths.indexOf(path);
           if (ai >= 0 && bi >= 0) {
-            const lo = Math.min(ai, bi), hi = Math.max(ai, bi);
-            for (const p of this._sortedPaths.slice(lo, hi + 1)) this._listSel.add(p);
+            const lo = Math.min(ai, bi),
+              hi = Math.max(ai, bi);
+            for (const p of this._sortedPaths.slice(lo, hi + 1))
+              this._listSel.add(p);
           }
         } else if (e.ctrlKey || e.metaKey) {
-          // Toggle individual item in list sub-selection
           if (this._listSel.has(path)) this._listSel.delete(path);
-          else { this._listSel.add(path); this._rangeAnchor = path; }
+          else {
+            this._listSel.add(path);
+            this._rangeAnchor = path;
+          }
         } else {
-          // Single click: select only this item
           this._listSel.clear();
           this._listSel.add(path);
           this._rangeAnchor = path;
@@ -958,31 +1109,33 @@ export class PropertiesView {
 
       row.appendChild(info);
 
-      // ── Focus-select button (⊙) ──
       const focusBtn = document.createElement("button");
       focusBtn.className = "props-focus-btn";
       focusBtn.textContent = "⊙";
-      focusBtn.title = "Focus select — keep only list-selected (or this track)";
-      focusBtn.addEventListener("click", e => {
+      focusBtn.title =
+        "Focus select — keep only list-selected (or this track)";
+      focusBtn.addEventListener("click", (e) => {
         e.stopPropagation();
-        const targets = this._listSel.size > 0 ? new Set(this._listSel) : new Set([path]);
+        const targets =
+          this._listSel.size > 0
+            ? new Set(this._listSel)
+            : new Set([path]);
         this._rangeAnchor = path;
         this.onFocusRange?.(targets);
       });
       row.appendChild(focusBtn);
 
-      // ── Deselect button (×) ──
       const delBtn = document.createElement("button");
       delBtn.className = "props-deselect-btn";
       delBtn.textContent = "×";
       delBtn.title = "Deselect (click ↩ ghost to restore)";
-      delBtn.addEventListener("click", e => {
+      delBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         const t = m.trackByPath(path);
         const timerId = setTimeout(() => {
           this._pendingRestore.delete(path);
           this.render();
-        }, 3000);
+        }, 3000) as unknown as number;
         this._pendingRestore.set(path, { timerId, track: t });
         if (this._rangeAnchor === path) this._rangeAnchor = null;
         this._listSel.delete(path);
@@ -993,7 +1146,7 @@ export class PropertiesView {
       this.$el.appendChild(row);
     }
 
-    // ── Ghost entries (recently deselected, re-selectable) ──
+    // ── Ghost entries ────────────────────────────────────────
     if (ghosts.length > 0) {
       const sep = document.createElement("div");
       sep.className = "props-sep";
@@ -1027,7 +1180,10 @@ export class PropertiesView {
         row.appendChild(info);
         row.addEventListener("click", () => {
           const entry = this._pendingRestore.get(path);
-          if (entry) { clearTimeout(entry.timerId); this._pendingRestore.delete(path); }
+          if (entry) {
+            clearTimeout(entry.timerId);
+            this._pendingRestore.delete(path);
+          }
           this.onRestore?.(path);
         });
         this.$el.appendChild(row);
@@ -1040,29 +1196,31 @@ export class PropertiesView {
 //  BatchView  – transform (scale/translate) sliders per tag
 // ═════════════════════════════════════════════════════════════
 export class BatchView {
-  constructor(model, container) {
-    this.model     = model;
-    this.$el       = container;
-    this._snapshots = new Map();   // tag → Map<path, origValue>
-    this._selHash   = "";
-    this._dragging  = false;
+  model: Model;
+  $el: HTMLElement;
+  private _snapshots = new Map<string, Map<string, number>>();
+  private _selHash = "";
+  private _dragging = false;
 
-    this.onApply    = null;  // (tag, Map<path, newValue>) =>
-    this.onDragEnd  = null;  // () =>
+  onApply: ((tag: string, updates: Map<string, number>) => void) | null =
+    null;
+  onDragEnd: (() => void) | null = null;
+
+  constructor(model: Model, container: HTMLElement) {
+    this.model = model;
+    this.$el = container;
   }
 
-  // Called on "tags-dirty" (in-flight viewport drag / txform): drop stale snapshots
-  // so the sliders rebuild from the current in-memory tag values, then re-render.
-  renderDirty() {
+  renderDirty(): void {
     if (this._dragging) return;
     this._snapshots.clear();
     this.render();
   }
 
-  render() {
+  render(): void {
     if (this._dragging) return;
 
-    const m    = this.model;
+    const m = this.model;
     const hash = [...m.selected].sort().join("|");
 
     if (hash !== this._selHash) {
@@ -1073,23 +1231,25 @@ export class BatchView {
     this.$el.innerHTML = "";
 
     if (!m.selected.size) return;
-
     if (!m.tags.length) return;
 
     const grid = document.createElement("div");
     grid.className = "batch-tag-grid";
 
     for (const tag of m.tags) {
-      const snap    = this._getOrCreateSnapshot(tag);
-      const vals    = [...snap.values()];
+      const snap = this._getOrCreateSnapshot(tag);
+      const vals = [...snap.values()];
       const hasVals = vals.length > 0;
-      const origLo  = hasVals ? Math.min(...vals) : 0.5;
-      const origHi  = hasVals ? Math.max(...vals) : 0.5;
-      const origAvg = hasVals ? vals.reduce((a, b) => a + b, 0) / vals.length : 0.5;
-      const narrow  = !hasVals || (origHi - origLo) < 0.05;
+      const origLo = hasVals ? Math.min(...vals) : 0.5;
+      const origHi = hasVals ? Math.max(...vals) : 0.5;
+      const origAvg = hasVals
+        ? vals.reduce((a, b) => a + b, 0) / vals.length
+        : 0.5;
+      const narrow = !hasVals || origHi - origLo < 0.05;
 
       const label = document.createElement("span");
-      label.className = "batch-tag-label" + (hasVals ? "" : " batch-tag-label--unset");
+      label.className =
+        "batch-tag-label" + (hasVals ? "" : " batch-tag-label--unset");
       label.textContent = tag;
       label.title = hasVals ? tag : tag + " (unset)";
 
@@ -1106,24 +1266,30 @@ export class BatchView {
 
   /* ── Snapshot helpers ───────────────────────────────────── */
 
-  _getOrCreateSnapshot(tag) {
+  private _getOrCreateSnapshot(tag: string): Map<string, number> {
     if (!this._snapshots.has(tag)) {
       const m = this.model;
-      const snap = new Map();
+      const snap = new Map<string, number>();
       for (const path of m.selected) {
         const t = m.trackByPath(path);
         if (t && t.tags[tag] !== undefined) snap.set(path, t.tags[tag]);
       }
       this._snapshots.set(tag, snap);
     }
-    return this._snapshots.get(tag);
+    return this._snapshots.get(tag)!;
   }
 
-  _clearSnapshot(tag) { this._snapshots.delete(tag); }
+  private _clearSnapshot(tag: string): void {
+    this._snapshots.delete(tag);
+  }
 
   /* ── Single translate slider (narrow / uniform range) ───── */
 
-  _makeSingleSlider(tag, initVal, isUnset = false) {
+  private _makeSingleSlider(
+    tag: string,
+    initVal: number,
+    isUnset = false,
+  ): HTMLDivElement {
     const outer = document.createElement("div");
     outer.className = "txslider";
 
@@ -1145,39 +1311,39 @@ export class BatchView {
     update();
 
     const fireTransform = () => {
-      const snap    = this._getOrCreateSnapshot(tag);
-      const updates = new Map();
+      const snap = this._getOrCreateSnapshot(tag);
+      const updates = new Map<string, number>();
       if (!snap.size) {
-        // Tag unset on all selected tracks – assign val to every selected track
         for (const path of this.model.selected) updates.set(path, val);
       } else {
-        const snapAvg = [...snap.values()].reduce((a, b) => a + b, 0) / snap.size;
-        const delta   = val - snapAvg;
+        const snapAvg =
+          [...snap.values()].reduce((a, b) => a + b, 0) / snap.size;
+        const delta = val - snapAvg;
         for (const [path, origVal] of snap)
           updates.set(path, Math.max(0, Math.min(1, origVal + delta)));
       }
       this.onApply?.(tag, updates);
     };
 
-    knob.addEventListener("pointerdown", e => {
+    knob.addEventListener("pointerdown", (e) => {
       if (e.button !== 0) return;
       e.stopPropagation();
       e.preventDefault();
       knob.setPointerCapture(e.pointerId);
       this._dragging = true;
 
-      const startX   = e.clientX;
+      const startX = e.clientX;
       const startVal = val;
-      const W        = outer.getBoundingClientRect().width || 100;
+      const W = outer.getBoundingClientRect().width || 100;
 
-      knob.onpointermove = e => {
+      knob.onpointermove = (e) => {
         val = Math.max(0, Math.min(1, startVal + (e.clientX - startX) / W));
         update();
         fireTransform();
       };
       knob.onpointerup = () => {
         knob.onpointermove = null;
-        knob.onpointerup   = null;
+        knob.onpointerup = null;
         this._dragging = false;
         this._clearSnapshot(tag);
         this.onDragEnd?.();
@@ -1189,7 +1355,11 @@ export class BatchView {
 
   /* ── Transform slider (dual-knob scale/translate) ───────── */
 
-  _makeTransformSlider(tag, origLo, origHi) {
+  private _makeTransformSlider(
+    tag: string,
+    origLo: number,
+    origHi: number,
+  ): HTMLDivElement {
     const outer = document.createElement("div");
     outer.className = "txslider";
 
@@ -1208,16 +1378,15 @@ export class BatchView {
     outer.appendChild(loKnob);
     outer.appendChild(hiKnob);
 
-    // Slider always represents the full 0–1 range.
-    // lo/hi knobs start at the actual data min/max of the selection.
-    let lo = origLo, hi = origHi;
+    let lo = origLo,
+      hi = origHi;
 
     const update = () => {
       lo = Math.max(0, Math.min(1, lo));
       hi = Math.max(0, Math.min(1, hi));
       if (hi < lo) hi = lo;
-      fill.style.left   = (lo * 100) + "%";
-      fill.style.right  = ((1 - hi) * 100) + "%";
+      fill.style.left = lo * 100 + "%";
+      fill.style.right = (1 - hi) * 100 + "%";
       loKnob.style.left = `calc(${lo * 100}% - 6px)`;
       hiKnob.style.left = `calc(${hi * 100}% - 6px)`;
     };
@@ -1225,37 +1394,43 @@ export class BatchView {
 
     const fireTransform = () => {
       const snap = this._getOrCreateSnapshot(tag);
-      const vals  = [...snap.values()];
+      const vals = [...snap.values()];
       if (!vals.length) return;
       const sLo = Math.min(...vals);
       const sHi = Math.max(...vals);
       const range = sHi - sLo;
       const targetRange = hi - lo;
 
-      const updates = new Map();
+      const updates = new Map<string, number>();
       for (const [path, origVal] of snap) {
-        let nv = range < 0.0001
-          ? (lo + hi) / 2
-          : lo + (origVal - sLo) / range * targetRange;
+        const nv =
+          range < 0.0001
+            ? (lo + hi) / 2
+            : lo + ((origVal - sLo) / range) * targetRange;
         updates.set(path, Math.max(0, Math.min(1, nv)));
       }
       this.onApply?.(tag, updates);
     };
 
-    const startDrag = (el, isKnob, isLo) => {
-      el.addEventListener("pointerdown", e => {
+    const startDrag = (
+      el: HTMLElement,
+      isKnob: boolean,
+      isLo: boolean | null,
+    ) => {
+      el.addEventListener("pointerdown", (e) => {
         if (e.button !== 0) return;
         e.stopPropagation();
         e.preventDefault();
         el.setPointerCapture(e.pointerId);
         this._dragging = true;
 
-        const startX   = e.clientX;
-        const startLo  = lo, startHi = hi;
-        const span     = hi - lo;
-        let   W        = outer.getBoundingClientRect().width || 100;
+        const startX = e.clientX;
+        const startLo = lo,
+          startHi = hi;
+        const span = hi - lo;
+        const W = outer.getBoundingClientRect().width || 100;
 
-        el.onpointermove = e => {
+        el.onpointermove = (e) => {
           const delta = (e.clientX - startX) / W;
           if (!isKnob) {
             lo = Math.max(0, Math.min(1 - span, startLo + delta));
@@ -1271,7 +1446,7 @@ export class BatchView {
 
         el.onpointerup = () => {
           el.onpointermove = null;
-          el.onpointerup   = null;
+          el.onpointerup = null;
           this._dragging = false;
           this._clearSnapshot(tag);
           this.onDragEnd?.();
@@ -1280,9 +1455,9 @@ export class BatchView {
     };
 
     fill.style.cursor = "ew-resize";
-    startDrag(fill,   false, null);
-    startDrag(loKnob, true,  true);
-    startDrag(hiKnob, true,  false);
+    startDrag(fill, false, null);
+    startDrag(loKnob, true, true);
+    startDrag(hiKnob, true, false);
 
     return outer;
   }
@@ -1292,11 +1467,13 @@ export class BatchView {
 //  StatusView
 // ═════════════════════════════════════════════════════════════
 export class StatusView {
+  $el: HTMLElement;
+
   constructor() {
-    this.$el = document.getElementById("status-text");
+    this.$el = document.getElementById("status-text")!;
   }
 
-  update(model) {
+  update(model: Model): void {
     if (model.selected.size)
       this.$el.textContent = `${model.selected.size} selected  ·  ${model.tracks.length} tracks`;
     else
