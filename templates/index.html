@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trackspace</title>
+  <link rel="stylesheet" href="/static/trackspace.css" />
+</head>
+<body>
+
+<!-- ───────────────────────── Left Sidebar ───────────────────────── -->
+<aside id="sidebar">
+
+  <section id="folder-section">
+    <h2>Folders</h2>
+    <div id="folder-controls">
+      <button id="btn-add-folder" title="Create subfolder in current folder">+ Folder</button>
+    </div>
+    <div id="folder-tree"></div>
+  </section>
+
+</aside>
+
+<!-- ──────────────────────── Main area ──────────────────────── -->
+<main id="main">
+  <canvas id="viewport"></canvas>
+
+  <footer id="statusbar">
+    <span id="status-text">Select a folder to begin</span>
+    <span id="shortcuts-hint"><kbd>F1</kbd> shortcuts</span>
+  </footer>
+</main>
+
+<!-- ───────────────────────── Right Panel ───────────────────────── -->
+<aside id="right-panel">
+
+  <section id="properties-section">
+    <h2>Properties</h2>
+    <div id="properties-list"></div>
+  </section>
+
+  <section id="batch-section">
+    <h2>Batch Edit</h2>
+    <div id="batch-list"></div>
+  </section>
+
+  <section id="options-section">
+    <h2>Options</h2>
+    <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
+  </section>
+
+  <section id="tag-section">
+    <div id="tag-controls">
+      <h2>Tags</h2>
+      <button id="btn-add-tag" title="New tag">+ Tag</button>
+    </div>
+    <ul id="tag-list"></ul>
+  </section>
+
+</aside>
+
+<!-- ─────────────────────── Overlays ───────────────────────── -->
+<div id="shortcuts-modal" class="hidden">
+  <div id="shortcuts-content">
+    <h2>Shortcuts</h2>
+    <div class="shortcut-list">
+      <span><kbd>M</kbd> toggle preview</span>
+      <span><kbd>H</kbd> fit view to tracks</span>
+      <span><kbd>I</kbd> enter folder</span>
+      <span><kbd>U</kbd> up to parent</span>
+      <span><kbd>Esc</kbd> deselect all</span>
+      <span><kbd>⌘A</kbd> select all</span>
+      <span><kbd>Shift</kbd>+drag lasso</span>
+      <span><kbd>Alt</kbd>+drag pan</span>
+      <span>drag to folder → move files</span>
+      <span>◉ select folder's tracks</span>
+    </div>
+  </div>
+</div>
+<div id="tooltip" class="tooltip hidden"></div>
+<div id="toast-container"></div>
+<div id="loading-overlay" class="hidden">
+  <div class="spinner"></div>
+</div>
+
+<audio id="preview-audio" preload="none"></audio>
+
+<script type="module" src="/static/trackspace.js"></script>
+</body>
+</html>
