@@ -3,6 +3,7 @@
 
 import os
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from flask import (
     Flask,
@@ -14,9 +15,16 @@ from flask import (
     abort,
 )
 
-from tags import write_tag, delete_tag, rename_tag, batch_read, collect_tag_names, read_metadata
+from tags import write_tag, delete_tag, rename_tag, read_all
+from cache import TrackCache
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+_THREAD_POOL = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 4))
+_DATA_DIR = os.path.join(BASE_DIR, "data")
+os.makedirs(_DATA_DIR, exist_ok=True)
+_CACHE = TrackCache(os.path.join(_DATA_DIR, "track_cache.db"))
+
 DIST_DIR = os.path.join(BASE_DIR, "frontend", "dist")
 
 app = Flask(__name__, static_folder=None, template_folder=os.path.join(BASE_DIR, "templates"))
@@ -68,6 +76,26 @@ def _folder_tree(root: str) -> dict:
     except PermissionError:
         pass
     return {"name": name, "path": os.path.relpath(root, MUSIC_ROOT), "children": children}
+
+
+def _cached_read_all(path: str) -> dict:
+    """Read ID3 tags + metadata for *path*, consulting the two-layer cache first.
+
+    Cache key is (path, mtime).  Any write to the file changes mtime, so stale
+    entries are never returned — no explicit invalidation is needed.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return read_all(path)
+
+    cached = _CACHE.get(path, mtime)
+    if cached is not None:
+        return cached
+
+    data = read_all(path)
+    _CACHE.put(path, mtime, data)
+    return data
 
 
 def _dir_color(folder_path: str) -> str:
@@ -147,22 +175,28 @@ def api_tracks():
     folder = _resolve(rel)
 
     paths = _list_mp3s(folder, recursive)
-    tag_data = batch_read(paths)
+
+    # Read each file's ID3 header once (tags + metadata) in parallel threads.
+    # _cached_read_all checks the in-memory LRU then SQLite before hitting disk.
+    results: dict[str, dict] = {}
+    futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
+    for fut in as_completed(futures):
+        results[futures[fut]] = fut.result()
 
     tracks = []
     for p in paths:
-        rel = os.path.relpath(p, MUSIC_ROOT)
-        folder = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
-        if folder == ".":
-            folder = ""
-        meta = read_metadata(p)
+        rel_path = os.path.relpath(p, MUSIC_ROOT)
+        folder_rel = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
+        if folder_rel == ".":
+            folder_rel = ""
+        info = results.get(p, {})
         tracks.append({
-            "path": rel,
+            "path": rel_path,
             "filename": os.path.basename(p),
-            "folder": folder,
-            "tags": tag_data.get(p, {}),
-            "artist": meta.get("artist", ""),
-            "title": meta.get("title", ""),
+            "folder": folder_rel,
+            "tags": info.get("tags", {}),
+            "artist": info.get("artist", ""),
+            "title": info.get("title", ""),
         })
     return jsonify(tracks)
 
@@ -178,7 +212,12 @@ def api_tags():
     recursive = request.args.get("recursive", "1") == "1"
     folder = _resolve(rel)
     paths = _list_mp3s(folder, recursive)
-    return jsonify(collect_tag_names(paths))
+    # Use the same cached reads as api_tracks to avoid redundant disk I/O.
+    futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
+    names: set[str] = set()
+    for fut in as_completed(futures):
+        names.update(fut.result().get("tags", {}).keys())
+    return jsonify(sorted(names))
 
 
 @app.route("/api/tracks/tags", methods=["POST"])
@@ -325,6 +364,9 @@ def main():
     global MUSIC_ROOT
     MUSIC_ROOT = os.path.abspath(args.root)
     print(f"Trackspace serving: {MUSIC_ROOT}")
+    pruned = _CACHE.prune_missing()
+    if pruned:
+        print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
     app.run(host=args.host, port=args.port, debug=True)
 
 

@@ -111,14 +111,53 @@ def read_metadata(path: str) -> dict[str, str]:
     return meta
 
 
+def read_all(path: str) -> dict:
+    """Open *path* once and return both custom tags and standard metadata.
+
+    Returns ``{"tags": {name: value, …}, "artist": str, "title": str}``.
+    Opening the ID3 file is the expensive operation, so combining the two
+    reads cuts disk I/O in half compared to calling read_tags + read_metadata
+    separately.
+    """
+    try:
+        id3 = ID3(path)
+    except Exception:
+        return {"tags": {}, "artist": "", "title": ""}
+
+    tags: dict[str, float] = {}
+    for key, frame in id3.items():
+        if isinstance(frame, TXXX) and frame.desc.startswith(TAG_PREFIX):
+            tagname = frame.desc[len(TAG_PREFIX):]
+            try:
+                tags[tagname] = float(frame.text[0])
+            except (IndexError, ValueError):
+                pass
+
+    artist = ""
+    title = ""
+    if "TIT2" in id3:
+        v = str(id3["TIT2"].text[0]).strip()
+        if v:
+            title = v
+    if "TPE1" in id3:
+        v = str(id3["TPE1"].text[0]).strip()
+        if v:
+            artist = v
+
+    return {"tags": tags, "artist": artist, "title": title}
+
+
 def batch_read(paths: list[str]) -> dict[str, dict[str, float]]:
     """Return ``{path: {tagname: value, …}, …}`` for every path."""
     return {p: read_tags(p) for p in paths}
 
 
 def collect_tag_names(paths: list[str]) -> list[str]:
-    """Return sorted unique tag names across all *paths*."""
+    """Return sorted unique tag names across all *paths*.
+
+    Reuses read_all so each file is opened only once (tags + metadata in one pass).
+    """
     names: set[str] = set()
     for p in paths:
-        names.update(read_tags(p).keys())
+        names.update(read_all(p)["tags"].keys())
     return sorted(names)
