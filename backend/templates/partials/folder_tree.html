@@ -3,7 +3,7 @@
   {%- set norm_path = '' if node.path == '.' else node.path -%}
   {%- set is_active = (not active_folder and node.path == '.') or (active_folder and active_folder == node.path) -%}
   {%- set has_kids = node.children and node.children | length > 0 -%}
-  {%- set expanded = depth < 2 -%}
+  {%- set expanded = depth < 1 -%}
   {%- set parent_for_create = '' if node.path == '.' else node.path -%}
 <div class="folder-row" style="padding-left: {{ depth * 14 }}px" data-folder-path="{{ node.path }}">
   <span class="folder-arrow"{% if has_kids %} data-folder-toggle="1" style="cursor:pointer"{% endif %}>{% if has_kids %}{% if expanded %}▾{% else %}▸{% endif %}{% else %}&#x2003;{% endif %}</span>

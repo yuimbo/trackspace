@@ -151,6 +151,11 @@ export class Controller {
   private cmdMgr: CommandManager;
   readonly hotkeyMgr = new HotkeyManager();
 
+  /** Folders the user explicitly toggled open (never auto-closed). */
+  private _manuallyOpenedFolders = new Set<string>();
+  /** Folders opened automatically because they contain selected tracks. */
+  private _autoOpenedFolders = new Set<string>();
+
   constructor(
     model: Model,
     canvasView: CanvasView,
@@ -219,6 +224,7 @@ export class Controller {
       this.batch.render();
       this.tagPanel.render();
       this._syncModeVisuals();
+      this._updateFolderHighlights();
     });
     this.model.on("tags-dirty", () => this.batch.renderDirty());
   }
@@ -345,6 +351,14 @@ export class Controller {
       start.removeAttribute("data-start-rename");
       this._beginFolderLabelRename(start as HTMLElement);
     }
+
+    // Restore manually-opened folders after the DOM was replaced.
+    for (const folderPath of this._manuallyOpenedFolders) {
+      this._setFolderOpen(folderPath, true);
+    }
+    // Auto-opened state must be recomputed from scratch after a swap.
+    this._autoOpenedFolders.clear();
+    this._updateFolderHighlights();
   }
 
   private _onFolderTreeClick(e: MouseEvent): void {
@@ -352,12 +366,20 @@ export class Controller {
     const toggle = t.closest("[data-folder-toggle]");
     if (toggle) {
       e.stopPropagation();
-      const row = toggle.closest(".folder-row");
+      const row = toggle.closest(".folder-row") as HTMLElement | null;
+      const folderPath = row?.dataset.folderPath ?? "";
       const sib = row?.nextElementSibling;
       if (sib?.classList.contains("folder-children")) {
         const open = sib instanceof HTMLElement && sib.style.display !== "none";
         (sib as HTMLElement).style.display = open ? "none" : "block";
         toggle.textContent = open ? "▸" : "▾";
+        if (open) {
+          this._manuallyOpenedFolders.delete(folderPath);
+          this._autoOpenedFolders.delete(folderPath);
+        } else {
+          this._manuallyOpenedFolders.add(folderPath);
+          this._autoOpenedFolders.delete(folderPath);
+        }
       }
       return;
     }
@@ -480,9 +502,73 @@ export class Controller {
 
   /* ── Data loading ───────────────────────────────────────── */
 
-  private async _loadLibrary(): Promise<void> {
-    const tracks = await api<Track[]>("/api/tracks?folder=&recursive=1");
-    this.model.setAllTracks(tracks);
+  // ── Background library loading state ──────────────────────
+  private _libFlushTimer = 0;
+  private _libPending: Track[] = [];
+
+  private _loadLibrary(): Promise<void> {
+    const $progress = document.getElementById("loading-progress");
+    const m = this.model;
+
+    return new Promise((resolve) => {
+      let firstFlushDone = false;
+      let streamDone = false;
+
+      const flush = (final = false) => {
+        if (this._libPending.length) {
+          const batch = this._libPending.splice(0);
+          m.appendTracks(batch);
+          this.canvas.scheduleDraw();
+          this.status.update(m);
+        }
+
+        if (!firstFlushDone && (m.allTracks.length > 0 || final)) {
+          firstFlushDone = true;
+          if ($progress) $progress.textContent = "";
+          resolve();
+        }
+
+        if (final) {
+          clearInterval(this._libFlushTimer);
+          this._libFlushTimer = 0;
+          m.libraryLoadProgress = null;
+          m.emit("change");
+        }
+      };
+
+      // Flush buffered tracks to the canvas every 150 ms while stream is open.
+      this._libFlushTimer = setInterval(() => {
+        if (!streamDone) flush();
+      }, 150) as unknown as number;
+
+      const es = new EventSource("/api/library/stream?folder=&recursive=1");
+
+      es.addEventListener("progress", ((e: MessageEvent) => {
+        const data = JSON.parse(e.data) as {
+          done: number;
+          total: number;
+          track: Track;
+        };
+        this._libPending.push(data.track);
+        m.libraryLoadProgress = { done: data.done, total: data.total };
+        if ($progress) {
+          $progress.textContent = `Loading library… ${data.done} / ${data.total}`;
+        }
+      }) as EventListener);
+
+      es.addEventListener("done", (() => {
+        es.close();
+        streamDone = true;
+        flush(true);
+      }) as EventListener);
+
+      es.onerror = () => {
+        es.close();
+        streamDone = true;
+        if ($progress) $progress.textContent = "";
+        flush(true);
+      };
+    });
   }
 
   async init(): Promise<void> {
@@ -1321,6 +1407,7 @@ export class Controller {
         }, 150) as unknown as number;
       cv.scheduleDraw();
       this._handlePreview();
+      this._updateFolderHighlights();
     }
   }
 
@@ -1360,8 +1447,7 @@ export class Controller {
           }
         }
       }
-      mouse.mode = "idle";
-      m.emit("change");
+      this._finalizeSelection();
       return;
     }
 
@@ -1435,14 +1521,17 @@ export class Controller {
     }
 
     if (mouse.mode !== "drag") {
-      mouse.mode = "idle";
-      mouse.snap = null;
-      cv.$canvas.style.cursor = "";
-      cv.scheduleDraw();
-      this.status.update(m);
-      this.props.render();
-      this.batch.render();
+      this._finalizeSelection();
     }
+  }
+
+  /** Shared post-selection cleanup: resets interaction state and emits
+   *  "change" so all views (including folder highlights) update together. */
+  private _finalizeSelection(): void {
+    this.mouse.mode = "idle";
+    this.mouse.snap = null;
+    this.canvas.$canvas.style.cursor = "";
+    this.model.emit("change");
   }
 
   private _onLeave(): void {
@@ -1465,6 +1554,7 @@ export class Controller {
     cv.$canvas.style.cursor = "";
     this._stopPreview();
     cv.scheduleDraw();
+    this._updateFolderHighlights();
   }
 
   private _onWheel(e: WheelEvent): void {
@@ -1907,6 +1997,93 @@ export class Controller {
       `.folder-label[data-path="${CSS.escape(dataPath)}"]`,
     );
     if (label) label.classList.add("active");
+  }
+
+  /* ── Folder open/close helpers ──────────────────────────── */
+
+  private _setFolderOpen(folderPath: string, open: boolean): void {
+    const $tree = this.$folderTree;
+    const row = $tree.querySelector<HTMLElement>(
+      `.folder-row[data-folder-path="${CSS.escape(folderPath)}"]`,
+    );
+    const sib = row?.nextElementSibling;
+    if (!sib?.classList.contains("folder-children")) return;
+    (sib as HTMLElement).style.display = open ? "block" : "none";
+    const arrow = row?.querySelector<HTMLElement>(
+      "[data-folder-toggle]",
+    );
+    if (arrow) arrow.textContent = open ? "▾" : "▸";
+  }
+
+  /** Returns the set of data-folder-path values (including ancestors) that
+   *  contain at least one selected or hovered track. Root is represented
+   *  as ".". */
+  private _getFoldersWithSelection(): Set<string> {
+    const m = this.model;
+    const cv = this.canvas;
+    const folders = new Set<string>();
+
+    const addFolderAndAncestors = (folder: string) => {
+      folders.add(".");
+      if (folder) {
+        const parts = folder.split("/");
+        for (let i = 1; i <= parts.length; i++) {
+          folders.add(parts.slice(0, i).join("/"));
+        }
+      }
+    };
+
+    for (const path of m.selected) {
+      const t = m.trackByPath(path);
+      if (t) addFolderAndAncestors(t.folder ?? "");
+    }
+
+    if (cv.hoveredIdx >= 0) {
+      const t = m.tracks[cv.hoveredIdx];
+      if (t) addFolderAndAncestors(t.folder ?? "");
+    }
+
+    return folders;
+  }
+
+  /** Apply glow class and auto-open / auto-close folder rows based on the
+   *  current selection.  Called after every "change" event and after HTMX
+   *  tree swaps. */
+  private _updateFolderHighlights(): void {
+    const $tree = this.$folderTree;
+    const foldersWithSel = this._getFoldersWithSelection();
+
+    // Update glow class on every folder row.
+    for (const row of $tree.querySelectorAll<HTMLElement>(".folder-row")) {
+      const path = row.dataset.folderPath ?? ".";
+      row.classList.toggle("folder-sel", foldersWithSel.has(path));
+    }
+
+    // Close auto-opened folders that no longer contain selected tracks.
+    for (const folderPath of [...this._autoOpenedFolders]) {
+      if (!foldersWithSel.has(folderPath)) {
+        this._setFolderOpen(folderPath, false);
+        this._autoOpenedFolders.delete(folderPath);
+      }
+    }
+
+    // Open folders that have selected tracks, haven't been manually opened,
+    // and are currently closed.
+    for (const folderPath of foldersWithSel) {
+      if (folderPath === ".") continue; // root is always visible
+      if (this._manuallyOpenedFolders.has(folderPath)) continue;
+      if (this._autoOpenedFolders.has(folderPath)) continue;
+      const row = $tree.querySelector<HTMLElement>(
+        `.folder-row[data-folder-path="${CSS.escape(folderPath)}"]`,
+      );
+      const sib = row?.nextElementSibling;
+      if (!sib?.classList.contains("folder-children")) continue;
+      const isOpen = (sib as HTMLElement).style.display !== "none";
+      if (!isOpen) {
+        this._setFolderOpen(folderPath, true);
+        this._autoOpenedFolders.add(folderPath);
+      }
+    }
   }
 
   /* ── Window resize ──────────────────────────────────────── */

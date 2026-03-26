@@ -15,6 +15,10 @@ export class StatusView {
     } else {
       parts.push(`${model.tracks.length} tracks in /${model.folder}`);
     }
+    if (model.libraryLoadProgress) {
+      const { done, total } = model.libraryLoadProgress;
+      parts.push(`loading ${done}/${total}`);
+    }
     if (model.viewMode === "embeddings") {
       parts.push(`Embedding Space (${model.projectionMethod.toUpperCase()})`);
       if (model.embeddingsGenerating && model.embeddingProgress) {

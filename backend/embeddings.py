@@ -147,70 +147,157 @@ def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
         return None
 
 
-def _build_weighted_context(
-    tag_names: list[str],
-    folder_paths: list[str],
+def _build_folder_directions(
+    mat: np.ndarray,
+    paths: list[str],
+    context_folders: list[str],
     boost: float = 3.0,
-    depth_decay: float = 0.25,
-) -> list[tuple[str, float]]:
-    """Combine tag names and folder path segments into (text, weight) pairs.
+    depth_boost: float = 1.5,
+    min_tracks: int = 2,
+) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, float]]]:
+    """Compute hierarchical contrast directions from actual track embeddings.
 
-    - Tags receive full *boost*.
-    - Folder paths are split into segments.  A segment at depth *d* (1-based)
-      receives ``boost * depth_decay ** (d - 1)``.  If the same segment name
-      appears at multiple depths, the shallowest (highest weight) wins.
+    For each folder node the direction is
+    ``centroid(all tracks under node) − centroid(all tracks under parent)``.
+    Shared directions among siblings are naturally absorbed by the parent;
+    each child retains only its unique contrast.  Deeper levels receive
+    *increasing* boost (``boost × depth_boost^(depth−1)``) to amplify the
+    subtle microgenre distinctions that dimensionality reduction tends to
+    collapse.
+
+    Returns *(directions, weights, text_fallbacks)* where *directions* is an
+    ``(K, D)`` normalised array (or *None*), *weights* is ``(K,)``
+    (or *None*), and *text_fallbacks* is a list of ``(leaf_name, weight)``
+    pairs for folders with fewer than *min_tracks* embedded tracks that
+    should fall back to CLAP text embedding.
     """
-    items: dict[str, float] = {}
+    if not context_folders:
+        return None, None, []
 
-    for tag in tag_names:
-        items[tag] = max(items.get(tag, 0.0), boost)
+    # Build hierarchy: every folder node including inferred parents.
+    all_nodes: set[str] = {""}
+    for f in context_folders:
+        parts = [p for p in f.split("/") if p]
+        for depth in range(1, len(parts) + 1):
+            all_nodes.add("/".join(parts[:depth]))
 
-    for fpath in folder_paths:
-        parts = [p for p in fpath.split("/") if p]
-        for depth_idx, segment in enumerate(parts):
-            w = boost * (depth_decay ** depth_idx)
-            items[segment] = max(items.get(segment, 0.0), w)
+    # Map each embedding row to its direct folder.
+    track_folders: list[str] = []
+    for p in paths:
+        sep = p.rfind("/")
+        track_folders.append(p[:sep] if sep >= 0 else "")
 
-    return [(text, weight) for text, weight in items.items() if weight > 1e-6]
+    # Accumulate track indices per node (includes all descendants).
+    node_indices: dict[str, list[int]] = {n: [] for n in all_nodes}
+    for i, tf in enumerate(track_folders):
+        node_indices[""].append(i)
+        parts = [p for p in tf.split("/") if p]
+        for depth in range(1, len(parts) + 1):
+            ancestor = "/".join(parts[:depth])
+            if ancestor in node_indices:
+                node_indices[ancestor].append(i)
+
+    # Centroid per node.
+    centroids: dict[str, np.ndarray | None] = {}
+    for n, idx_list in node_indices.items():
+        centroids[n] = mat[idx_list].mean(axis=0) if idx_list else None
+
+    # Contrast directions.
+    dirs: list[np.ndarray] = []
+    wts: list[float] = []
+    fallbacks: list[tuple[str, float]] = []
+
+    for node in sorted(all_nodes - {""}):
+        parts = node.split("/")
+        parent = "/".join(parts[:-1])
+        depth = len(parts)
+        w = boost * (depth_boost ** (depth - 1))
+
+        c = centroids.get(node)
+        pc = centroids.get(parent)
+        if c is None or pc is None:
+            continue
+
+        if len(node_indices[node]) < min_tracks:
+            fallbacks.append((parts[-1], w))
+            continue
+
+        d = c - pc
+        norm = np.linalg.norm(d)
+        if norm < 1e-9:
+            continue
+
+        dirs.append(d / norm)
+        wts.append(w)
+
+    if dirs:
+        log.debug(
+            "folder directions: %d data-driven, %d text-fallback",
+            len(dirs), len(fallbacks),
+        )
+        return np.stack(dirs), np.array(wts, dtype=np.float32), fallbacks
+    return None, None, fallbacks
 
 
 def _apply_semantic_weighting(
     mat: np.ndarray,
+    paths: list[str],
     context_tags: list[str] | None = None,
     context_folders: list[str] | None = None,
     boost: float = 3.0,
 ) -> np.ndarray:
-    """Re-scale embedding space to emphasise directions aligned with user context.
+    """Re-weight embedding space using data-driven folder directions and text
+    tag directions.
 
-    Uses CLAP's text encoder to embed tag names / folder names, then linearly
-    boosts the component of each audio embedding along those semantic directions.
+    Folders use *hierarchical centroid decomposition*: each folder's direction
+    is its centroid minus its parent's centroid, capturing only the contrast
+    unique to that hierarchy level.  Deeper levels receive increasing boost so
+    that subtle microgenre differences are amplified rather than collapsed.
+    Folders with fewer than 2 embedded tracks fall back to CLAP text embedding
+    of the folder name.
 
-    Each context item *i* has its own weight *w_i*:
+    Tags always use CLAP text embedding (they are labels, not track collections).
 
-        W = I + T_n^T  diag(w)  T_n
-
-    Tag names receive full *boost*.  Folder segments are depth-scaled: each
-    subsequent subfolder level multiplies the weight by 0.25 (configurable via
-    ``depth_decay`` in ``_build_weighted_context``).
+    The weighting matrix is ``W = I + T_n^T diag(w) T_n`` where ``T_n``
+    collects all normalised direction vectors and ``w`` their weights.
     """
-    items = _build_weighted_context(
-        context_tags or [], context_folders or [], boost=boost,
-    )
-    if not items:
+    all_dirs: list[np.ndarray] = []
+    all_weights: list[np.ndarray] = []
+
+    # --- Data-driven folder directions (hierarchical centroid contrast) ---
+    if context_folders:
+        fd, fw, fallbacks = _build_folder_directions(
+            mat, paths, context_folders, boost=boost,
+        )
+        if fd is not None and fw is not None:
+            all_dirs.append(fd)
+            all_weights.append(fw)
+
+        if fallbacks:
+            texts = [t for t, _ in fallbacks]
+            fb_w = np.array([w for _, w in fallbacks], dtype=np.float32)
+            text_vecs = generate_text_embeddings(texts)
+            if text_vecs is not None and text_vecs.shape[0] > 0:
+                norms = np.linalg.norm(text_vecs, axis=1, keepdims=True)
+                norms[norms < 1e-9] = 1.0
+                all_dirs.append(text_vecs / norms)
+                all_weights.append(fb_w)
+
+    # --- Text-based tag directions ---
+    if context_tags:
+        tag_vecs = generate_text_embeddings(context_tags)
+        if tag_vecs is not None and tag_vecs.shape[0] > 0:
+            norms = np.linalg.norm(tag_vecs, axis=1, keepdims=True)
+            norms[norms < 1e-9] = 1.0
+            all_dirs.append(tag_vecs / norms)
+            all_weights.append(np.full(len(context_tags), boost, dtype=np.float32))
+
+    if not all_dirs:
         return mat
 
-    texts = [t for t, _ in items]
-    weights = np.array([w for _, w in items], dtype=np.float32)
+    T_n = np.concatenate(all_dirs, axis=0)   # (K, D)
+    weights = np.concatenate(all_weights)     # (K,)
 
-    text_vecs = generate_text_embeddings(texts)
-    if text_vecs is None or text_vecs.shape[0] == 0:
-        return mat
-
-    norms = np.linalg.norm(text_vecs, axis=1, keepdims=True)
-    norms[norms < 1e-9] = 1.0
-    T_n = text_vecs / norms  # (K, D)
-
-    # W = I + T_n^T @ diag(weights) @ T_n   (D×D)
     W = np.eye(mat.shape[1], dtype=np.float32) + T_n.T @ (weights[:, None] * T_n)
     return (mat @ W).astype(np.float32)
 
@@ -386,9 +473,9 @@ def compute_projection(
     *method* is ``"umap"`` (default), ``"tsne"``, or ``"pca"`` (instant,
     good enough for live intermediate updates during generation).
 
-    *context_tags* / *context_folders* — when provided the embedding space is
-    re-weighted via CLAP text embeddings.  Tag names get full boost; folder
-    segments are depth-scaled (each subfolder level × 0.25).
+    *context_tags* / *context_folders* — when provided the embedding space
+    is re-weighted before projection.  Folders use hierarchical centroid
+    decomposition (data-driven); tags use CLAP text embedding.
 
     Returns ``[{"path": rel, "x": float, "y": float}, ...]`` where x/y
     are in [0, 1].  Tracks without embeddings are omitted.
@@ -401,7 +488,7 @@ def compute_projection(
     mat = np.stack(vecs)
 
     if (context_tags or context_folders) and _loaded:
-        mat = _apply_semantic_weighting(mat, context_tags, context_folders)
+        mat = _apply_semantic_weighting(mat, paths, context_tags, context_folders)
 
     if method == "pca":
         coords = _project_pca(mat, paths)

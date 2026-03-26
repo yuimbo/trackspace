@@ -341,6 +341,11 @@ def api_tracks():
     for fut in as_completed(futures):
         results[futures[fut]] = fut.result()
 
+    return jsonify(_build_track_list(paths, results))
+
+
+def _build_track_list(paths: list[str], results: dict[str, dict]) -> list[dict]:
+    """Convert path→data mapping into the track dicts the frontend expects."""
     tracks = []
     for p in paths:
         rel_path = os.path.relpath(p, MUSIC_ROOT)
@@ -357,7 +362,76 @@ def api_tracks():
             "title": info.get("title", ""),
             "fingerprint": info.get("fingerprint"),
         })
-    return jsonify(tracks)
+    return tracks
+
+
+@app.route("/api/library/stream")
+def api_library_stream():
+    """SSE endpoint — streams library scan progress then delivers the full track list.
+
+    Query params:
+        folder    – relative path (default: root)
+        recursive – "1" to include subfolders
+
+    Event types:
+      ``progress`` — ``{"done": N, "total": N, "path": "rel/file.mp3"}``
+      ``done``     — ``{"tracks": [...]}`` — full track list, same shape as /api/tracks
+    """
+    rel = request.args.get("folder", "")
+    recursive = request.args.get("recursive", "0") == "1"
+    folder = _resolve(rel)
+    paths = _list_mp3s(folder, recursive)
+    total = len(paths)
+
+    # Each SSE client gets its own queue; the scan thread fills it.
+    q: queue.Queue[dict] = queue.Queue(maxsize=total + 100)
+
+    def _scan() -> None:
+        futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
+        done = 0
+        for fut in as_completed(futures):
+            p = futures[fut]
+            info = fut.result()
+            done += 1
+            rel_path = os.path.relpath(p, MUSIC_ROOT)
+            folder_rel = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
+            if folder_rel == ".":
+                folder_rel = ""
+            q.put_nowait({
+                "type": "progress",
+                "done": done,
+                "total": total,
+                "track": {
+                    "path": rel_path,
+                    "filename": os.path.basename(p),
+                    "folder": folder_rel,
+                    "tags": info.get("tags", {}),
+                    "artist": info.get("artist", ""),
+                    "title": info.get("title", ""),
+                    "fingerprint": info.get("fingerprint"),
+                },
+            })
+        q.put_nowait({"type": "done"})
+
+    threading.Thread(target=_scan, daemon=True).start()
+
+    def generate():
+        while True:
+            try:
+                event = q.get(timeout=60)
+            except queue.Empty:
+                yield ": keepalive\n\n"
+                continue
+            etype = event.get("type", "progress")
+            yield f"event: {etype}\ndata: {_json.dumps(event)}\n\n"
+            if etype == "done":
+                break
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ---------------------------------------------------------------------------

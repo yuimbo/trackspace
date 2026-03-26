@@ -289,22 +289,48 @@ projections while embeddings are being generated.
 
 ### Semantic weighting (context-aware projection)
 
-Before projection, the embedding space can be **re-weighted** so directions matching
-the user's tag names and folder names receive higher contrast.
+Before projection, the embedding space can be **re-weighted** so directions
+reflecting the user's folder organisation and tag names receive higher contrast.
+
+**Two strategies — data-driven folders, text-based tags:**
+
+| Source | Method | Rationale |
+|--------|--------|-----------|
+| Folders | Hierarchical centroid decomposition from actual track embeddings | Folders are manual curation — their tracks ARE the ground truth |
+| Tags | CLAP text embedding of tag names | Tags are labels, not track collections |
+
+**Hierarchical centroid decomposition** (`_build_folder_directions`):
+
+For each folder node the direction is
+`centroid(all tracks under node) − centroid(all tracks under parent)`.
+The parent centroid *is* the weighted mean of its children's centroids, so
+subtracting it naturally strips the shared component among siblings — each
+child retains only its unique contrast.  This decomposes the embedding space
+hierarchically: broad genre distinctions live at shallow levels, subtle
+microgenre differences at deeper levels.
+
+**Depth-increasing boost:**  Deeper levels receive *more* weight
+(`boost × depth_boost^(depth−1)`, default `depth_boost = 1.5`) because broad
+genre axes are already well-separated in CLAP space — it is the fine sibling
+distinctions that dimensionality reduction tends to collapse and that benefit
+most from amplification.
+
+**Fallback:** Folders with fewer than 2 embedded tracks cannot produce a
+reliable centroid; these fall back to CLAP text embedding of the folder's
+leaf name.
 
 **Flow:**
 1. The frontend collects `model.contextTags` (tag names) and `model.contextFolders`
    (unique full folder paths from all tracks).
 2. These are sent as `context_tags` and `context_folders` query params on
    `GET /api/embeddings/umap`.
-3. `_build_weighted_context()` splits folder paths into segments and assigns
-   depth-scaled weights: depth 1 = full `boost` (3.0), depth 2 = `boost × 0.25`,
-   depth 3 = `boost × 0.0625`, etc.  Tag names always get full boost.  If a segment
-   name appears at multiple depths the shallowest (highest weight) wins.
-4. `_apply_semantic_weighting()` embeds all context strings via CLAP's text encoder,
-   then applies `X_out = X @ (I + T_n^T diag(w) T_n)` where `w` is the per-item
-   weight vector.  This amplifies embedding components aligned with high-weight
-   semantic directions, making UMAP/t-SNE spread tracks more along those axes.
+3. `_build_folder_directions()` infers the folder hierarchy from the leaf paths,
+   computes centroids per node (including all descendants), and derives one
+   normalised contrast direction per node.  Intermediate parent nodes that were
+   not in the original folder set are inferred automatically.
+4. `_apply_semantic_weighting()` combines data-driven folder directions, text
+   fallbacks, and tag text directions into a single matrix `T_n` with weights
+   `w`, then applies `X_out = X @ (I + T_n^T diag(w) T_n)`.
 
 Weighting is transparent — when no context is provided, raw embeddings are
 projected unmodified.

@@ -61,6 +61,7 @@ export class Model extends EventBus {
   embeddingsGenerating = false;
   embeddingProgress: { done: number; total: number } | null = null;
   projectionPending = false;
+  libraryLoadProgress: { done: number; total: number } | null = null;
 
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
@@ -147,6 +148,12 @@ export class Model extends EventBus {
     this._dirty();
     this.selected.clear();
     this.emit("change");
+  }
+
+  /** Append tracks without emitting "change" — caller controls when to redraw. */
+  appendTracks(tracks: Track[]): void {
+    for (const t of tracks) this.allTracks.push(t);
+    this._dirty();
   }
 
   setFolder(f: string): void {
