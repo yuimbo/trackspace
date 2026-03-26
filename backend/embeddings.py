@@ -853,6 +853,25 @@ def _mlx_tsne_pca_dim(n_features: int) -> int | None:
     return min(50, n_features - 1)
 
 
+def _mlx_tsne_max_points() -> int:
+    """Row count above which mlx-vis t-SNE is skipped in favour of scikit-learn.
+
+    Profiled on Apple Silicon: **openTSNE** (FIt-SNE-style FFT and Barnes–Hut) is
+    CPU-only (no MPS) and was slower than both mlx-vis and sklearn for *n* from
+    hundreds through ~12k with typical embedding widths. **mlx-vis** beat sklearn
+    up to roughly 10k points then sklearn's Barnes–Hut overtook; this cap avoids
+    that regression while keeping Metal for normal library sizes.
+
+    Set ``TRACKSPACE_MLX_TSNE_MAX_POINTS=0`` to always try mlx-vis (previous behaviour).
+    """
+    raw = os.environ.get("TRACKSPACE_MLX_TSNE_MAX_POINTS", "10000").strip()
+    try:
+        v = int(raw)
+    except ValueError:
+        return 10_000
+    return v
+
+
 def _project_umap(mat: np.ndarray) -> np.ndarray:
     """Full UMAP 2D projection. Higher quality but slower."""
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
@@ -901,7 +920,12 @@ def _project_umap(mat: np.ndarray) -> np.ndarray:
 
 
 def _project_tsne(mat: np.ndarray) -> np.ndarray:
-    """t-SNE 2D projection.  Better at preserving local cluster structure."""
+    """t-SNE 2D projection.  Better at preserving local cluster structure.
+
+    CUDA: RAPIDS cuML ``method="fft"`` when available.  Apple Silicon: mlx-vis
+    on Metal up to :func:`_mlx_tsne_max_points`, then scikit-learn (see env var
+    documented there).  Otherwise scikit-learn.
+    """
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     if _use_cuml_projection():
         try:
@@ -924,7 +948,8 @@ def _project_tsne(mat: np.ndarray) -> np.ndarray:
         except Exception as e:
             log.warning("cuML t-SNE failed; using scikit-learn: %s", e)
             _cuml_projection_enabled = False
-    if _use_mlx_vis_projection():
+    cap = _mlx_tsne_max_points()
+    if _use_mlx_vis_projection() and (cap <= 0 or len(mat) <= cap):
         pca_dim = _mlx_tsne_pca_dim(int(np.asarray(mat).shape[1]))
         if pca_dim is not None:
             try:
