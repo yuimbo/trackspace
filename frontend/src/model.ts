@@ -6,6 +6,9 @@ export interface Track {
   artist: string;
   title: string;
   fingerprint?: string | null;
+  /** From cached librosa features when available (after embedding/analysis pass). */
+  bpm?: number | null;
+  musical_key?: string | null;
 }
 
 export type ViewMode = "tags" | "embeddings";
@@ -42,12 +45,12 @@ class EventBus {
 // ─── Model ───────────────────────────────────────────────────
 export class Model extends EventBus {
   allTracks: Track[] = [];
-  folder = "";
   /**
-   * Normalised folder paths ("" = library root). Union of roots for the folder sidebar
-   * selection; each root uses ``recursive`` for subtree inclusion.
+   * Sidebar focus: highlighted tree row and default parent for “+ Folder”.
+   * Does **not** filter the canvas — the full loaded library is always in scope
+   * (only per-session hides apply). Persisted as ``folder`` in localStorage.
    */
-  viewFolderPaths = new Set<string>([""]);
+  folder = "";
   recursive = true;
   axisX: string | null = null;
   axisY: string | null = null;
@@ -92,20 +95,9 @@ export class Model extends EventBus {
 
   /* ── Computed ──────────────────────────────────────────────── */
 
-  /** True if a track lies under ``root`` using the current ``recursive`` rule. */
-  trackUnderViewRoot(tf: string, root: string): boolean {
-    if (!this.recursive) return tf === root;
-    if (root === "") return true;
-    return tf === root || tf.startsWith(root + "/");
-  }
-
-  /** Track matches at least one selected folder root (ignores hide rules). */
-  trackInViewUnion(t: Track): boolean {
-    const tf = t.folder ?? "";
-    for (const root of this.viewFolderPaths) {
-      if (this.trackUnderViewRoot(tf, root)) return true;
-    }
-    return false;
+  /** True if the track is part of the main library list before hide rules (always yes). */
+  trackInViewUnion(_t: Track): boolean {
+    return true;
   }
 
   isTrackHidden(t: Track): boolean {
@@ -229,41 +221,6 @@ export class Model extends EventBus {
   appendTracks(tracks: Track[]): void {
     for (const t of tracks) this.allTracks.push(t);
     this._dirty();
-  }
-
-  setFolder(f: string): void {
-    this.folder = f;
-    this.viewFolderPaths = new Set([f]);
-    this._cache = null;
-    this.selected.clear();
-    this.emit("change");
-  }
-
-  /** Replace the multi-folder sidebar selection; ``primary`` is stored in ``folder``. */
-  setViewFolderUnion(paths: Iterable<string>, primary: string): void {
-    const next = new Set(paths);
-    if (next.size === 0) next.add(primary);
-    this.viewFolderPaths = next;
-    this.folder = primary;
-    this._cache = null;
-    this.selected.clear();
-    this.emit("change");
-  }
-
-  /** Cmd/Ctrl-click toggle for folder multi-select. Cannot deselect the last root. */
-  toggleViewFolder(rootNorm: string): void {
-    if (this.viewFolderPaths.has(rootNorm)) {
-      if (this.viewFolderPaths.size <= 1) return;
-      this.viewFolderPaths.delete(rootNorm);
-      if (this.folder === rootNorm)
-        this.folder = [...this.viewFolderPaths][0] ?? "";
-    } else {
-      this.viewFolderPaths.add(rootNorm);
-      this.folder = rootNorm;
-    }
-    this._cache = null;
-    this.selected.clear();
-    this.emit("change");
   }
 
   setRecursive(r: boolean): void {
@@ -529,6 +486,27 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
+  /**
+   * Add every visible track under *any* of the folder roots (recursive) in one update.
+   */
+  addTracksUnderFolderPrefixes(paths: Iterable<string>): void {
+    const norms = new Set<string>();
+    for (const raw of paths) {
+      norms.add(!raw || raw === "." ? "" : raw);
+    }
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      const tf = t.folder ?? "";
+      for (const norm of norms) {
+        if (norm === "" || tf === norm || tf.startsWith(norm + "/")) {
+          this.selected.add(t.path);
+          break;
+        }
+      }
+    }
+    this.emit("change");
+  }
+
   /** Replace selection with every visible track in this folder (and subfolders). */
   selectOnlyInFolder(folderPath: string): void {
     const norm = !folderPath || folderPath === "." ? "" : folderPath;
@@ -597,9 +575,6 @@ export class Model extends EventBus {
     ) {
       this.folder = upd(this.folder);
     }
-    this.viewFolderPaths = new Set(
-      [...this.viewFolderPaths].map((p) => upd(p)),
-    );
     this.hiddenFolderPrefixes = new Set(
       [...this.hiddenFolderPrefixes].map((p) => upd(p)),
     );
@@ -643,7 +618,6 @@ export class Model extends EventBus {
       LS_KEY,
       JSON.stringify({
         folder: this.folder,
-        viewFolders: [...this.viewFolderPaths].sort(),
         recursive: this.recursive,
         axisX: this.axisX,
         axisY: this.axisY,
@@ -672,13 +646,10 @@ export class Model extends EventBus {
     try {
       const d = JSON.parse(localStorage.getItem(LS_KEY) ?? "null");
       if (d) {
-        this.folder = d.folder ?? "";
-        const vf = (d as { viewFolders?: string[] }).viewFolders;
-        this.viewFolderPaths = new Set(
-          Array.isArray(vf) && vf.length ? vf : [this.folder],
-        );
-        if (!this.viewFolderPaths.has(this.folder))
-          this.folder = [...this.viewFolderPaths][0] ?? "";
+        // Ignore legacy ``folder`` / ``viewFolders`` “library scope” — it only
+        // hid tracks and is easy to get stuck via cached localStorage. Sidebar
+        // focus resets to root until you click a folder label.
+        this.folder = "";
         this.recursive = true;
         this.axisX = d.axisX ?? null;
         this.axisY = d.axisY ?? null;

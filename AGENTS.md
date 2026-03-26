@@ -163,7 +163,7 @@ means the track sits directly at the root.
 
 - HTML must keep CSS class names expected by `trackspace.css` and by `Controller` delegation
   (`.folder-row`, `.folder-label`, `.folder-children`, `data-folder-toggle`, etc.).
-- Query params: `active` = current `model.folder` (see `Controller._refreshFolderTreeHtmx`);
+- Query params: `active` and `active_folders` = current `model.folder` (see `Controller._refreshFolderTreeHtmx`);
   `pending_rename` = optional relative path for auto-opening rename after create.
 
 ---

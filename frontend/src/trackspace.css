@@ -772,11 +772,12 @@ kbd {
   backdrop-filter: blur(6px);
   color: var(--fg);
   font-size: 11px;
-  padding: 4px 8px;
+  padding: 6px 10px;
   border-radius: 4px;
   pointer-events: none;
-  white-space: nowrap;
-  max-width: 360px;
+  white-space: pre-line;
+  line-height: 1.35;
+  max-width: 420px;
   overflow: hidden;
   text-overflow: ellipsis;
   z-index: 100;

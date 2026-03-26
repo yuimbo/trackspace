@@ -105,6 +105,122 @@ def _three_segments_from_samples(
     return out
 
 
+def _mono_full_short_metadata_decode(
+    path: str,
+    *,
+    sr: int,
+    meta_dur: float,
+    meta_short_max: float,
+) -> tuple[bool, np.ndarray | None, int | None, str | None]:
+    """If *meta_dur* is within the short-track budget, decode the whole file.
+
+    Returns ``(False, None, None, None)`` when *meta_dur* > *meta_short_max* (caller
+    should use long-track logic). Otherwise ``(True, audio, sr, warn)`` with
+    *audio* ``None`` only when decode yielded no samples.
+    """
+    if meta_dur > meta_short_max:
+        return False, None, None, None
+    audio, sr_a = librosa_load(path, sr=sr, mono=True)
+    if audio.size == 0:
+        return True, None, None, None
+    dec = float(audio.shape[0]) / float(sr_a)
+    warn = None
+    if meta_dur >= 2.0 and dec < meta_dur * 0.25:
+        warn = decode_reliability_user_message(meta_dur, dec)
+    return True, audio, sr_a, warn
+
+
+def _probe_long_track_decode(
+    path: str,
+    *,
+    sr: int,
+    meta_dur: float,
+    segment_seconds: float,
+) -> tuple[str, np.ndarray | None, int | None, str | None]:
+    """Opening probe for files longer than the short-track cutoff.
+
+    Returns a tag and payload:
+
+    * ``"empty"`` — probe could not read audio.
+    * ``"full"`` — metadata is unreliable vs probe; *audio* is a full decode.
+    * ``"seek"`` — timed seeks are likely safe; other fields unused.
+    """
+    probe_len = min(segment_seconds, meta_dur)
+    probe, sr_a = librosa_load(
+        path, sr=sr, mono=True, offset=0.0, duration=probe_len,
+    )
+    if probe.size == 0:
+        return "empty", None, None, None
+    probe_dur = float(probe.shape[0]) / float(sr_a)
+    if (
+        probe_len >= 1.0
+        and probe_dur < max(float(segment_seconds), probe_len) * 0.2
+    ):
+        audio, sr_a = librosa_load(path, sr=sr, mono=True)
+        if audio.size == 0:
+            return "empty", None, None, None
+        tot_dur = float(audio.shape[0]) / float(sr_a)
+        warn = decode_reliability_user_message(meta_dur, tot_dur)
+        return "full", audio, sr_a, warn
+    return "seek", None, None, None
+
+
+def _try_librosa_seek_mono(
+    path: str,
+    *,
+    sr: int,
+    offset: float,
+    read_dur: float,
+) -> np.ndarray:
+    """Partial decode; empty array on failure (librosa may raise on bad seeks)."""
+    try:
+        audio, _ = librosa_load(
+            path, sr=sr, mono=True, offset=offset, duration=read_dur,
+        )
+        return audio
+    except Exception:
+        return np.array([], dtype=np.float32)
+
+
+def _mono_centered_window_or_full(
+    path: str,
+    *,
+    sr: int,
+    meta_dur: float,
+    window_seconds: float,
+) -> tuple[np.ndarray | None, int | None, str | None]:
+    """One window centred using metadata duration, or full decode if seek returns nothing.
+
+    Used for lightweight feature extraction when a single excerpt is enough.
+    """
+    offset = max(0.0, (meta_dur - window_seconds) * 0.5)
+    read_dur = min(window_seconds, max(0.0, meta_dur - offset))
+    if read_dur < 0.05:
+        return None, None, None
+    try:
+        audio, sr_o = librosa_load(
+            path, sr=sr, mono=True, offset=offset, duration=read_dur,
+        )
+    except Exception:
+        audio, sr_o = librosa_load(path, sr=sr, mono=True)
+    if audio.size == 0:
+        audio, sr_o = librosa_load(path, sr=sr, mono=True)
+        if audio.size == 0:
+            return None, None, None
+        dec = float(audio.shape[0]) / float(sr_o)
+        warn = (
+            decode_reliability_user_message(meta_dur, dec)
+            if meta_dur > dec + 1.0
+            else None
+        )
+        return audio, sr_o, warn
+    dec = float(audio.shape[0]) / float(sr_o)
+    warn = None
+    if meta_dur > window_seconds * 1.25 and dec < meta_dur * 0.35:
+        warn = decode_reliability_user_message(meta_dur, dec)
+    return audio, sr_o, warn
+
+
 def load_resilient_audio_segments(
     path: str,
     *,
@@ -124,32 +240,25 @@ def load_resilient_audio_segments(
     if not math.isfinite(meta_dur) or meta_dur <= 0:
         return [], None
 
-    if meta_dur <= segment_seconds * 1.5:
-        audio, sr_a = librosa_load(path, sr=sr, mono=True)
-        if audio.size == 0:
+    done, audio, sr_a, warn = _mono_full_short_metadata_decode(
+        path,
+        sr=sr,
+        meta_dur=meta_dur,
+        meta_short_max=segment_seconds * 1.5,
+    )
+    if done:
+        if audio is None:
             return [], None
-        dec = float(audio.shape[0]) / float(sr_a)
-        warn = None
-        if meta_dur >= 2.0 and dec < meta_dur * 0.25:
-            warn = decode_reliability_user_message(meta_dur, dec)
         return [audio], warn
 
-    probe_len = min(segment_seconds, meta_dur)
-    probe, sr_a = librosa_load(
-        path, sr=sr, mono=True, offset=0.0, duration=probe_len,
+    kind, audio, sr_a, warn = _probe_long_track_decode(
+        path, sr=sr, meta_dur=meta_dur, segment_seconds=segment_seconds,
     )
-    if probe.size == 0:
+    if kind == "empty":
         return [], None
-    probe_dur = float(probe.shape[0]) / float(sr_a)
-    if (
-        probe_len >= 1.0
-        and probe_dur < max(float(segment_seconds), probe_len) * 0.2
-    ):
-        audio, sr_a = librosa_load(path, sr=sr, mono=True)
-        if audio.size == 0:
-            return [], None
+    if kind == "full":
+        assert audio is not None and sr_a is not None
         tot_dur = float(audio.shape[0]) / float(sr_a)
-        warn = decode_reliability_user_message(meta_dur, tot_dur)
         if tot_dur <= segment_seconds * 1.5:
             return [audio], warn
         return (
@@ -167,12 +276,9 @@ def load_resilient_audio_segments(
         read_dur = min(segment_seconds, max(0.0, meta_dur - offset))
         if read_dur < 0.05:
             continue
-        try:
-            audio, _ = librosa_load(
-                path, sr=sr, mono=True, offset=offset, duration=read_dur,
-            )
-        except Exception:
-            audio = np.array([], dtype=np.float32)
+        audio = _try_librosa_seek_mono(
+            path, sr=sr, offset=offset, read_dur=read_dur,
+        )
         if audio.size > 0:
             segments.append(audio)
 
@@ -491,61 +597,46 @@ def _load_feature_audio_excerpt(
     This keeps runtime predictable while preserving enough rhythmic/harmonic
     content for coarse descriptors.
 
+    Shares probe / short-track logic with :func:`load_resilient_audio_segments`;
+    centred-window loading uses :func:`_mono_centered_window_or_full`.
+
     Returns ``(audio, sr, user_warning)``.
     """
     try:
-        duration = float(librosa_get_duration(path=path))
-        if not math.isfinite(duration) or duration <= 0:
+        meta_dur = float(librosa_get_duration(path=path))
+        if not math.isfinite(meta_dur) or meta_dur <= 0:
             return None, None, None
 
-        if duration <= _FEATURE_EXCERPT_SECONDS * 1.25:
-            audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
-            if len(audio) == 0:
+        done, audio, sr, warn = _mono_full_short_metadata_decode(
+            path,
+            sr=_FEATURE_SR,
+            meta_dur=meta_dur,
+            meta_short_max=_FEATURE_EXCERPT_SECONDS * 1.25,
+        )
+        if done:
+            if audio is None:
                 return None, None, None
-            dec = float(audio.shape[0]) / float(sr)
-            warn = None
-            if duration >= 2.0 and dec < duration * 0.25:
-                warn = decode_reliability_user_message(duration, dec)
             return audio, sr, warn
 
-        probe_len = min(_FEATURE_EXCERPT_SECONDS, duration)
-        probe, sr = librosa_load(
-            path, sr=_FEATURE_SR, mono=True, offset=0.0, duration=probe_len,
+        kind, audio, sr, warn = _probe_long_track_decode(
+            path,
+            sr=_FEATURE_SR,
+            meta_dur=meta_dur,
+            segment_seconds=_FEATURE_EXCERPT_SECONDS,
         )
-        if probe.size == 0:
+        if kind == "empty":
             return None, None, None
-        probe_dur = float(probe.shape[0]) / float(sr)
-        if (
-            probe_len >= 1.0
-            and probe_dur < max(_FEATURE_EXCERPT_SECONDS, probe_len) * 0.2
-        ):
-            audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
-            if audio.size == 0:
+        if kind == "full":
+            if audio is None:
                 return None, None, None
-            dec = float(audio.shape[0]) / float(sr)
-            return audio, sr, decode_reliability_user_message(duration, dec)
+            return audio, sr, warn
 
-        offset = max(0.0, (duration - _FEATURE_EXCERPT_SECONDS) * 0.5)
-        read_dur = min(_FEATURE_EXCERPT_SECONDS, max(0.0, duration - offset))
-        if read_dur < 0.05:
-            return None, None, None
-        try:
-            audio, sr = librosa_load(
-                path,
-                sr=_FEATURE_SR,
-                mono=True,
-                offset=offset,
-                duration=read_dur,
-            )
-        except Exception:
-            audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
-        if len(audio) == 0:
-            return None, None, None
-        dec = float(audio.shape[0]) / float(sr)
-        warn = None
-        if duration > _FEATURE_EXCERPT_SECONDS * 1.25 and dec < duration * 0.35:
-            warn = decode_reliability_user_message(duration, dec)
-        return audio, sr, warn
+        return _mono_centered_window_or_full(
+            path,
+            sr=_FEATURE_SR,
+            meta_dur=meta_dur,
+            window_seconds=_FEATURE_EXCERPT_SECONDS,
+        )
     except Exception as e:
         log.warning("Audio excerpt load failed for %s: %s", path, e)
         return None, None, None
@@ -681,6 +772,29 @@ def extract_audio_features(path: str) -> np.ndarray | None:
     """
     vec, _warn = extract_audio_features_and_warning(path)
     return vec
+
+
+# Circle-of-fifths index 0..11 — same layout as ``_KEY_TO_FIFTHS`` values.
+_FIFTHS_POS_NAMES = (
+    "C", "G", "D", "A", "E", "B", "F#", "Db", "Ab", "Eb", "Bb", "F",
+)
+
+
+def audio_features_display_bpm_key(vec: np.ndarray | None) -> tuple[int | None, str | None]:
+    """Decode a cached 6-D feature vector to rounded BPM and key label (e.g. ``Am``)."""
+    if vec is None or int(vec.size) < AUDIO_FEATURE_DIM:
+        return None, None
+    tnorm = float(np.clip(float(vec[0]), 0.0, 1.0))
+    bpm_f = tnorm * (_BPM_HI - _BPM_LO) + _BPM_LO
+    bpm = int(round(bpm_f))
+    key_cos = float(vec[1])
+    key_sin = float(vec[2])
+    mode_major = float(vec[3]) >= 0.5
+    angle = math.atan2(key_sin, key_cos)
+    fifths = int(round(12.0 * angle / (2.0 * math.pi))) % 12
+    name = _FIFTHS_POS_NAMES[fifths]
+    key_label = name if mode_major else f"{name}m"
+    return bpm, key_label
 
 
 def generate_audio_features_batch(

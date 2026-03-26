@@ -55,6 +55,8 @@ export class CanvasView {
   positions: DotPosition[] = [];
   hoveredIdx = -1;
   hoveredFolderPrefix: string | null = null;
+  /** Exact folder path (``""`` = library root): glow siblings while hovering a dot. */
+  hoveredSiblingFolder: string | null = null;
   tipReady = false;
   tipTimer = 0;
   lassoPoints: [number, number][] = [];
@@ -427,6 +429,14 @@ export class CanvasView {
     return f === prefix || f.startsWith(prefix + "/");
   }
 
+  /** Tracks that get the folder-style halo: sidebar subtree or canvas sibling folder. */
+  private _inFolderGlow(track: Track): boolean {
+    if (this.hoveredFolderPrefix !== null) return this._inHoveredFolder(track);
+    const sib = this.hoveredSiblingFolder;
+    if (sib === null) return false;
+    return (track.folder ?? "") === sib;
+  }
+
   /**
    * Lazily creates / resizes the offscreen glow render-texture so it always
    * matches the main canvas in physical pixels and shares the same DPR
@@ -457,7 +467,8 @@ export class CanvasView {
    * ctx.filter = 'blur()' — one GPU compositing pass for all dots.
    */
   private _drawFolderGlow(tracks: Track[]): void {
-    if (this.hoveredFolderPrefix === null) return;
+    if (this.hoveredFolderPrefix === null && this.hoveredSiblingFolder === null)
+      return;
 
     const w = this.$canvas.clientWidth;
     const h = this.$canvas.clientHeight;
@@ -469,7 +480,7 @@ export class CanvasView {
     gc.globalAlpha = 0.85;
     for (const pos of this.positions) {
       const track = tracks[pos.idx];
-      if (!this._inHoveredFolder(track)) continue;
+      if (!this._inFolderGlow(track)) continue;
       gc.beginPath();
       gc.arc(pos.sx, pos.sy, DOT_R + 6, 0, Math.PI * 2);
       gc.fillStyle = dirColor(track.folder ?? "");
@@ -791,18 +802,32 @@ export class CanvasView {
       return;
     }
 
-    const tags = Object.entries(track.tags)
+    const folderLine = (track.folder || "").trim()
+      ? track.folder
+      : "Library root";
+    const ar = (track.artist || "").trim();
+    const ti = (track.title || "").trim();
+    const titleLine =
+      ar && ti ? `${ar} — ${ti}` : ti || ar || track.filename;
+    const audioParts: string[] = [];
+    if (track.bpm != null && Number.isFinite(track.bpm))
+      audioParts.push(`${Math.round(track.bpm)} BPM`);
+    if (track.musical_key) audioParts.push(track.musical_key);
+    const audioLine = audioParts.join(" · ");
+
+    const tagStr = Object.entries(track.tags)
       .map(([k, v]) => `${k}: ${v.toFixed(2)}`)
       .join("  ");
-    const folder = track.folder ? `[${track.folder}]  ` : "";
-    this.$tip.textContent =
-      folder + track.filename + (tags ? "  ·  " + tags : "");
+    const lines = [folderLine, titleLine];
+    if (audioLine) lines.push(audioLine);
+    if (tagStr) lines.push(tagStr);
+    this.$tip.textContent = lines.join("\n");
     this.$tip.classList.remove("hidden");
 
     const r = this.$canvas.getBoundingClientRect();
     let tx = r.left + pos.sx + 14;
     const ty = r.top + pos.sy - 10;
-    if (tx + 280 > window.innerWidth) tx = r.left + pos.sx - 280;
+    if (tx + 320 > window.innerWidth) tx = r.left + pos.sx - 320;
     this.$tip.style.left = tx + "px";
     this.$tip.style.top = ty + "px";
   }
@@ -811,6 +836,7 @@ export class CanvasView {
     clearTimeout(this.tipTimer);
     this.tipReady = false;
     this.hoveredIdx = -1;
+    this.hoveredSiblingFolder = null;
     this.$tip.classList.add("hidden");
   }
 }

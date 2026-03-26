@@ -10,11 +10,7 @@ export class StatusView {
 
   update(model: Model): void {
     const parts: string[] = [];
-    const roots = [...model.viewFolderPaths].sort();
-    const folderLabel =
-      roots.length <= 1
-        ? model.folder || "·"
-        : roots.map((r) => r || "·").join(", ");
+    const folderLabel = model.folder || "·";
     if (model.selected.size) {
       parts.push(`${model.selected.size} selected  ·  ${model.tracks.length} tracks`);
     } else {

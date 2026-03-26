@@ -185,6 +185,8 @@ export class Controller {
   private _manuallyOpenedFolders = new Set<string>();
   /** Folders opened automatically because they contain selected tracks. */
   private _autoOpenedFolders = new Set<string>();
+  /** True while the pointer is inside the viewport canvas (for hover resync). */
+  private _pointerOverCanvas = false;
 
   constructor(
     model: Model,
@@ -258,6 +260,9 @@ export class Controller {
       this._updateFolderHighlights();
       this._syncFolderTreeActiveLabels();
       this._updateClearHidesButton();
+      // ``m.tracks`` is rebuilt when hides/filters change; ``hoveredIdx`` must be
+      // re-derived from the pointer after the next paint or hotkeys see a stale index.
+      requestAnimationFrame(() => this._resyncCanvasHoverFromLastPointer());
     });
     this.model.on("tags-dirty", () => this.batch.renderDirty());
   }
@@ -409,6 +414,7 @@ export class Controller {
       row.addEventListener("mouseenter", () => {
         const path = row.getAttribute("data-folder-path");
         if (path == null) return;
+        this.canvas.hoveredSiblingFolder = null;
         this.canvas.hoveredFolderPrefix = path === "." ? "" : path;
         this.canvas.scheduleDraw();
       });
@@ -526,7 +532,7 @@ export class Controller {
   }
 
   private _syncFolderTreeActiveLabels(): void {
-    const activeNorm = new Set(this.model.viewFolderPaths);
+    const activeNorm = new Set<string>([this.model.folder]);
     for (const label of this.$folderTree.querySelectorAll<HTMLElement>(
       ".folder-label",
     )) {
@@ -555,7 +561,8 @@ export class Controller {
 
     if (e.metaKey || e.ctrlKey) {
       e.preventDefault();
-      this.model.toggleViewFolder(norm);
+      this.model.folder = norm;
+      this.model.selectInFolder(path);
       this.model.saveLS();
       this._folderShiftAnchor = norm;
       setTimeout(() => this.tagPanel.render(), 0);
@@ -567,7 +574,8 @@ export class Controller {
       const anchorData =
         anchorPath === "" ? "." : anchorPath;
       const range = this._folderPathsInRangeFromDom(anchorData, path);
-      this.model.setViewFolderUnion(range, norm);
+      this.model.folder = norm;
+      this.model.addTracksUnderFolderPrefixes(range);
       this._folderShiftAnchor = norm;
       this.model.saveLS();
       setTimeout(() => this.tagPanel.render(), 0);
@@ -575,6 +583,7 @@ export class Controller {
     }
 
     this._folderShiftAnchor = norm;
+    this.model.folder = norm;
     this.model.selectOnlyInFolder(path);
     this.model.saveLS();
   }
@@ -633,8 +642,7 @@ export class Controller {
     const m = this.model;
     const params = new URLSearchParams({ pending_rename: pr });
     params.set("active", m.folder === "" ? "." : m.folder);
-    for (const fp of m.viewFolderPaths)
-      params.append("active_folders", fp === "" ? "." : fp);
+    params.append("active_folders", m.folder === "" ? "." : m.folder);
     try {
       await htmx.ajax("get", `/partials/folder-tree?${params}`, {
         target: "#folder-tree",
@@ -1393,6 +1401,9 @@ export class Controller {
 
   private _bindCanvas(): void {
     const $c = this.canvas.$canvas;
+    $c.addEventListener("mouseenter", () => {
+      this._pointerOverCanvas = true;
+    });
     $c.addEventListener("mousedown", (e) => this._onDown(e));
     $c.addEventListener("mousemove", (e) => this._onMove(e));
     $c.addEventListener("mouseup", (e) => this._onUp(e));
@@ -1608,6 +1619,52 @@ export class Controller {
     }
   }
 
+  /**
+   * Recompute scatter hit/hover after ``tracks`` changed (indices are not stable).
+   * Runs on the frame after ``scheduleDraw`` so ``positions`` matches the new list.
+   */
+  private _resyncCanvasHoverFromLastPointer(): void {
+    if (!this._pointerOverCanvas || this.mouse.mode !== "idle") return;
+    this._updateCanvasHoverAt(this.mouse.lx, this.mouse.ly);
+  }
+
+  /** Update hovered dot + sibling glow from canvas pixel coordinates. */
+  private _updateCanvasHoverAt(sx: number, sy: number): void {
+    const m = this.model;
+    const cv = this.canvas;
+    const prevIdx = cv.hoveredIdx;
+    const prevPath =
+      prevIdx >= 0 ? (m.tracks[prevIdx]?.path ?? null) : null;
+
+    this.mouse.lx = sx;
+    this.mouse.ly = sy;
+
+    cv.hoveredIdx = cv.hitTest(sx, sy);
+    const newPath =
+      cv.hoveredIdx >= 0 ? (m.tracks[cv.hoveredIdx]?.path ?? null) : null;
+
+    if (cv.hoveredIdx >= 0) {
+      const ht = m.tracks[cv.hoveredIdx];
+      cv.hoveredSiblingFolder = ht ? (ht.folder ?? "") : null;
+    } else {
+      cv.hoveredSiblingFolder = null;
+    }
+
+    if (cv.hoveredIdx === prevIdx && newPath === prevPath) return;
+
+    clearTimeout(cv.tipTimer);
+    cv.tipReady = false;
+    cv.$tip.classList.add("hidden");
+    if (cv.hoveredIdx >= 0)
+      cv.tipTimer = setTimeout(() => {
+        cv.tipReady = true;
+        cv.scheduleDraw();
+      }, 150) as unknown as number;
+    cv.scheduleDraw();
+    this._handlePreview();
+    this._updateFolderHighlights();
+  }
+
   private _onMove(e: MouseEvent): void {
     const m = this.model;
     const cv = this.canvas;
@@ -1674,8 +1731,7 @@ export class Controller {
     }
 
     // Idle hover
-    const prev = cv.hoveredIdx;
-    cv.hoveredIdx = cv.hitTest(sx, sy);
+    this._updateCanvasHoverAt(sx, sy);
 
     const txh: TxHandle | { type: string; cursor: string } | null =
       m.selected.size > 0 ? cv.hitTestTransform(sx, sy) : null;
@@ -1683,20 +1739,6 @@ export class Controller {
       cv.$canvas.style.cursor = txh.cursor;
     } else {
       cv.$canvas.style.cursor = "";
-    }
-
-    if (cv.hoveredIdx !== prev) {
-      clearTimeout(cv.tipTimer);
-      cv.tipReady = false;
-      cv.$tip.classList.add("hidden");
-      if (cv.hoveredIdx >= 0)
-        cv.tipTimer = setTimeout(() => {
-          cv.tipReady = true;
-          cv.scheduleDraw();
-        }, 150) as unknown as number;
-      cv.scheduleDraw();
-      this._handlePreview();
-      this._updateFolderHighlights();
     }
   }
 
@@ -1839,6 +1881,7 @@ export class Controller {
       } as MouseEvent);
     cv.boxSel = null;
     cv.intersectMode = false;
+    this._pointerOverCanvas = false;
     cv.clearHover();
     cv.$canvas.style.cursor = "";
     this._stopPreview();
@@ -2065,7 +2108,7 @@ export class Controller {
     return s[idx];
   }
 
-  /** Fit viewport to an 80th-percentile disc around the centroid (folder hover + H). */
+  /** Fit viewport to an 80th-percentile disc around the centroid (folder/track folder hover + H). */
   private _fitViewToFolderPercentile(prefixNorm: string): void {
     const m = this.model;
     const subset: Track[] = [];
@@ -2371,6 +2414,20 @@ export class Controller {
     return false;
   }
 
+  /**
+   * Folder prefix for H / S hotkeys: sidebar folder-row hover wins;
+   * otherwise the hovered canvas track’s folder (Library root = ``""``).
+   */
+  private _effectiveHoveredFolderPrefix(): string | null {
+    const cv = this.canvas;
+    if (cv.hoveredFolderPrefix !== null) return cv.hoveredFolderPrefix;
+    if (cv.hoveredIdx >= 0) {
+      const t = this.model.tracks[cv.hoveredIdx];
+      if (t) return t.folder ?? "";
+    }
+    return null;
+  }
+
   private _bindKeyboard(): void {
     const m = this.model;
     const hk = this.hotkeyMgr;
@@ -2386,7 +2443,7 @@ export class Controller {
     });
 
     hk.on("fit-view", () => {
-      const hp = this.canvas.hoveredFolderPrefix;
+      const hp = this._effectiveHoveredFolderPrefix();
       if (hp !== null) {
         this._fitViewToFolderPercentile(hp);
         this.canvas.scheduleDraw();
@@ -2410,8 +2467,15 @@ export class Controller {
       m.saveLS();
     });
 
+    hk.on("focus-folder", () => {
+      const hp = this._effectiveHoveredFolderPrefix();
+      if (hp === null) return;
+      m.selectOnlyInFolder(hp);
+      m.saveLS();
+    });
+
     hk.on("exclude-selection", () => {
-      const hp = this.canvas.hoveredFolderPrefix;
+      const hp = this._effectiveHoveredFolderPrefix();
       if (hp !== null) {
         if (m.folderSubtreeFullyExcluded(hp)) {
           m.revealFolderSubtree(hp);
@@ -2428,7 +2492,7 @@ export class Controller {
     });
 
     hk.on("isolate-selection", () => {
-      const hp = this.canvas.hoveredFolderPrefix;
+      const hp = this._effectiveHoveredFolderPrefix();
       if (hp !== null) {
         if (m.folderSubtreeFullyExcluded(hp)) {
           m.revealThenFocusFolderSubtree(hp);
@@ -2453,32 +2517,6 @@ export class Controller {
     hk.on("show-all-tracks", () => {
       m.clearExclusions();
       m.saveLS();
-    });
-
-    hk.on("enter-folder", () => {
-      const cv = this.canvas;
-      if (cv.hoveredIdx >= 0) {
-        const track = m.tracks[cv.hoveredIdx];
-        const folder = track?.folder ?? "";
-        m.setFolder(folder);
-        setTimeout(() => this.tagPanel.render(), 0);
-        m.saveLS();
-      }
-    });
-
-    hk.on("parent-folder", () => {
-      const slash = m.folder.lastIndexOf("/");
-      const parent =
-        slash > 0
-          ? m.folder.slice(0, slash)
-          : m.folder !== ""
-            ? ""
-            : null;
-      if (parent !== null) {
-        m.setFolder(parent);
-        setTimeout(() => this.tagPanel.render(), 0);
-        m.saveLS();
-      }
     });
 
     hk.on("select-all", () => m.selectAll());

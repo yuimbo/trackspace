@@ -69,6 +69,21 @@ def test_mel_patching_short_audio():
     assert np.allclose(patches[0, 10:], 0.0)
 
 
+def test_feature_excerpt_falls_back_when_seek_returns_empty():
+    """Bad duration metadata can put the centered excerpt past EOF; librosa then
+    returns an empty array without raising. Full-file decode must still succeed."""
+    from unittest.mock import patch
+
+    from backend import audio_features as af
+
+    with patch.object(af, "librosa_get_duration", return_value=600.0):
+        audio, sr, warn = af._load_feature_audio_excerpt(TEST_TRACK)
+    assert audio is not None and audio.size > 0
+    assert sr == af._FEATURE_SR
+    assert warn is not None
+    assert "600" in warn
+
+
 # ── EffNet embeddings ─────────────────────────────────────────
 
 @pytest.fixture(scope="module")

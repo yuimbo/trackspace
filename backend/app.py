@@ -153,13 +153,17 @@ class _FilesystemHandler(FileSystemEventHandler):
                 ok = emb is not None
                 if ok:
                     _FEATURES.put_embedding(fp, emb, version=EMBEDDING_VERSION)
-                _broadcast_embed_event({
+                evt: dict = {
                     "type": "progress",
                     "path": rel_path,
                     "ok": ok,
                     "done": 1,
                     "total": 1,
-                })
+                }
+                if not ok:
+                    evt["failures"] = ["clap"]
+                    log.warning("Watchdog: CLAP embedding failed for %s", rel_path)
+                _broadcast_embed_event(evt)
                 log.info("Watchdog: embedding %s for %s", "ok" if ok else "failed", rel_path)
             except Exception as e:
                 log.exception("Watchdog: embedding generation failed for %s", rel_path)
@@ -420,25 +424,55 @@ def api_tracks():
     return jsonify(_build_track_list(paths, results))
 
 
+def _track_dict_from_read(
+    p: str,
+    info: dict,
+    *,
+    feat_by_fp: dict[str, object] | None = None,
+) -> dict:
+    """One API track object from a filesystem path and ``_cached_read_all`` payload."""
+    rel_path = os.path.relpath(p, MUSIC_ROOT)
+    folder_rel = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
+    if folder_rel == ".":
+        folder_rel = ""
+    fp = info.get("fingerprint")
+    bpm: int | None = None
+    musical_key: str | None = None
+    if isinstance(fp, str) and fp:
+        arr = feat_by_fp.get(fp) if feat_by_fp is not None else _FEATURES.get_audio_features(
+            fp, FEATURES_VERSION
+        )
+        if arr is not None:
+            bpm, musical_key = audio_features.audio_features_display_bpm_key(arr)
+    return {
+        "path": rel_path,
+        "filename": os.path.basename(p),
+        "folder": folder_rel,
+        "tags": info.get("tags", {}),
+        "artist": info.get("artist", ""),
+        "title": info.get("title", ""),
+        "fingerprint": info.get("fingerprint"),
+        "bpm": bpm,
+        "musical_key": musical_key,
+    }
+
+
 def _build_track_list(paths: list[str], results: dict[str, dict]) -> list[dict]:
     """Convert path→data mapping into the track dicts the frontend expects."""
-    tracks = []
+    fps_ordered: list[str] = []
+    seen: set[str] = set()
     for p in paths:
-        rel_path = os.path.relpath(p, MUSIC_ROOT)
-        folder_rel = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
-        if folder_rel == ".":
-            folder_rel = ""
-        info = results.get(p, {})
-        tracks.append({
-            "path": rel_path,
-            "filename": os.path.basename(p),
-            "folder": folder_rel,
-            "tags": info.get("tags", {}),
-            "artist": info.get("artist", ""),
-            "title": info.get("title", ""),
-            "fingerprint": info.get("fingerprint"),
-        })
-    return tracks
+        fp = results.get(p, {}).get("fingerprint")
+        if not isinstance(fp, str) or not fp or fp in seen:
+            continue
+        seen.add(fp)
+        fps_ordered.append(fp)
+    feat_map = (
+        _FEATURES.get_all_audio_features(fps_ordered, FEATURES_VERSION)
+        if fps_ordered
+        else {}
+    )
+    return [_track_dict_from_read(p, results.get(p, {}), feat_by_fp=feat_map) for p in paths]
 
 
 @app.route("/api/library/stream")
@@ -469,23 +503,11 @@ def api_library_stream():
             p = futures[fut]
             info = fut.result()
             done += 1
-            rel_path = os.path.relpath(p, MUSIC_ROOT)
-            folder_rel = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
-            if folder_rel == ".":
-                folder_rel = ""
             q.put_nowait({
                 "type": "progress",
                 "done": done,
                 "total": total,
-                "track": {
-                    "path": rel_path,
-                    "filename": os.path.basename(p),
-                    "folder": folder_rel,
-                    "tags": info.get("tags", {}),
-                    "artist": info.get("artist", ""),
-                    "title": info.get("title", ""),
-                    "fingerprint": info.get("fingerprint"),
-                },
+                "track": _track_dict_from_read(p, info),
             })
         q.put_nowait({"type": "done"})
 
@@ -981,6 +1003,7 @@ def api_embeddings_generate():
                     abs_path = os.path.join(MUSIC_ROOT, t["path"])
                     fp = t["fingerprint"]
                     ok = True
+                    failures: list[str] = []
 
                     if "clap" in needed:
                         rel = t["path"]
@@ -992,6 +1015,7 @@ def api_embeddings_generate():
                             _FEATURES.put_embedding(fp, emb, version=EMBEDDING_VERSION)
                         else:
                             ok = False
+                            failures.append("clap")
 
                     if "effnet" in needed:
                         emb = effnet_results.get(abs_path)
@@ -999,6 +1023,7 @@ def api_embeddings_generate():
                             _FEATURES.put_effnet_embedding(fp, emb, version=EFFNET_VERSION)
                         else:
                             ok = False
+                            failures.append("effnet")
 
                     if "features" in needed:
                         feat = feature_results.get(abs_path)
@@ -1006,17 +1031,26 @@ def api_embeddings_generate():
                             _FEATURES.put_audio_features(fp, feat, version=FEATURES_VERSION)
                         else:
                             ok = False
+                            failures.append("features")
 
                     done += 1
                     with _embed_lock:
                         _embed_status["done"] = done
-                    _broadcast_embed_event({
+                    prog_evt: dict = {
                         "type": "progress",
                         "path": t["path"],
                         "ok": ok,
                         "done": done,
                         "total": len(work),
-                    })
+                    }
+                    if failures:
+                        prog_evt["failures"] = failures
+                        log.warning(
+                            "Embedding incomplete for %s (%s)",
+                            t["path"],
+                            ", ".join(failures),
+                        )
+                    _broadcast_embed_event(prog_evt)
 
         except Exception as e:
             log.exception("Embedding generation failed")
@@ -1037,7 +1071,8 @@ def api_embeddings_stream():
     """SSE endpoint — streams embedding generation progress events.
 
     Event types:
-      ``progress`` — ``{"path", "ok", "done", "total"}``
+      ``progress`` — ``{"path", "ok", "done", "total", "failures"?}``
+      (*failures* lists sources that did not write cache: clap / effnet / features)
       ``decode_warning`` — ``{"path", "message"}`` metadata vs decode mismatch
       ``done``     — generation finished
       ``error``    — generation failed with message
