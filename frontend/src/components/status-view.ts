@@ -20,7 +20,10 @@ export class StatusView {
       parts.push(`loading ${done}/${total}`);
     }
     if (model.viewMode === "embeddings") {
-      parts.push(`Embedding Space (${model.projectionMethod.toUpperCase()})`);
+      const srcs = model.activeSources.map((s) =>
+        s === "clap" ? "CLAP" : s === "effnet" ? "EffNet" : "Audio",
+      ).join("+");
+      parts.push(`Embedding Space (${model.projectionMethod.toUpperCase()}) [${srcs}]`);
       if (model.embeddingsGenerating && model.embeddingProgress) {
         parts.push(`generating ${model.embeddingProgress.done}/${model.embeddingProgress.total}`);
       }

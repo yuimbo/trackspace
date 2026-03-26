@@ -56,6 +56,9 @@ export class Model extends EventBus {
   projectionMethod: ProjectionMethod = "tsne";
   scaleByTags = true;
   scaleByFolders = true;
+  useCLAP = true;
+  useEffNet = false;
+  useAudioFeatures = false;
   embeddingPositions: Map<string, { x: number; y: number }> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
@@ -189,6 +192,29 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
+  get activeSources(): string[] {
+    const s: string[] = [];
+    if (this.useCLAP) s.push("clap");
+    if (this.useEffNet) s.push("effnet");
+    if (this.useAudioFeatures) s.push("features");
+    return s;
+  }
+
+  toggleSource(source: "clap" | "effnet" | "features"): void {
+    const field =
+      source === "clap"
+        ? "useCLAP"
+        : source === "effnet"
+          ? "useEffNet"
+          : "useAudioFeatures";
+    const next = !this[field];
+    if (!next && this.activeSources.length <= 1) return;
+    (this as Record<string, unknown>)[field] = next;
+    this.embeddingsReady = false;
+    this.embeddingPositions.clear();
+    this.emit("change");
+  }
+
   setFilterRange(tag: string, r: [number, number]): void {
     this.filterRanges[tag] = r;
     this.emit("change");
@@ -303,6 +329,9 @@ export class Model extends EventBus {
         projectionMethod: this.projectionMethod,
         scaleByTags: this.scaleByTags,
         scaleByFolders: this.scaleByFolders,
+        useCLAP: this.useCLAP,
+        useEffNet: this.useEffNet,
+        useAudioFeatures: this.useAudioFeatures,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -322,6 +351,9 @@ export class Model extends EventBus {
         this.projectionMethod = d.projectionMethod ?? "tsne";
         this.scaleByTags = d.scaleByTags ?? true;
         this.scaleByFolders = d.scaleByFolders ?? true;
+        this.useCLAP = d.useCLAP ?? true;
+        this.useEffNet = d.useEffNet ?? false;
+        this.useAudioFeatures = d.useAudioFeatures ?? false;
       }
     } catch {
       /* start fresh */

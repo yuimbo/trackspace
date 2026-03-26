@@ -17,6 +17,7 @@ trackspace/
     fingerprint.py          – Chromaprint audio fingerprinting (fpcalc)
     feature_cache.py        – FeatureCache (fingerprint → CLAP embedding)
     embeddings.py           – CLAP model loading, inference, UMAP projection
+    audio_features.py       – EffNet (ONNX) + librosa audio feature extraction
     templates/partials/     – Jinja templates served by Flask (HTMX)
   frontend/                 ← Vite + TypeScript + Alpine.js + HTMX
     src/
@@ -32,6 +33,7 @@ trackspace/
     package.json
   tests/                    ← test suite
     test_embeddings.py      – smoke tests for fingerprint → CLAP pipeline
+    test_audio_features.py  – tests for EffNet + librosa audio features
     fixtures/test_track.mp3 – 5 s trimmed mp3 for tests
   data/                     – SQLite caches (gitignored, created at runtime)
   .env                      – HF_TOKEN (gitignored)
@@ -335,6 +337,65 @@ leaf name.
 Weighting is transparent — when no context is provided, raw embeddings are
 projected unmodified.
 
+### Combinable embedding sources
+
+Three sources can be independently enabled via checkboxes in the Options panel.
+The user can activate any combination (at least one must stay on):
+
+| Source | Module | Dimensions | Model |
+|--------|--------|-----------|-------|
+| CLAP | `backend/embeddings.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
+| EffNet | `backend/audio_features.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
+| Audio features | `backend/audio_features.py` | 6 | `librosa` — no ML model needed |
+
+**Audio feature vector (6D):**
+`[tempo_norm, key_cos, key_sin, mode, energy_norm, danceability]`
+
+Key is encoded on the **circle of fifths as a unit circle** in 2D:
+`key_cos = cos(2π · fifths_pos / 12)`, `key_sin = sin(2π · fifths_pos / 12)`.
+This preserves harmonic topology — keys a fifth apart are geometrically close,
+and the circular wrap is seamless.  Mode (major=1, minor=0) is a 3rd dimension.
+
+**Composite vector construction** (`_gather_composite_vecs` in `embeddings.py`):
+Each enabled source block is **L2-normalized across the batch** before
+concatenation so that 1280D EffNet does not dominate 6D audio features.
+A track is included only if it has data for every enabled source.
+
+**Semantic weighting with composite vectors:** Text-based directions (tag names,
+folder-name fallbacks) only apply to the CLAP sub-dimensions. Folder centroid
+decomposition works on the full composite vector regardless of which sources
+are active.
+
+### Independent versioning per source
+
+| Source | Version constant | Cache columns |
+|--------|-----------------|---------------|
+| CLAP | `EMBEDDING_VERSION` (embeddings.py) | `clap_embedding`, `version` |
+| EffNet | `EFFNET_VERSION` (audio_features.py) | `effnet_embedding`, `effnet_version` |
+| Audio features | `FEATURES_VERSION` (audio_features.py) | `features`, `features_version` |
+
+Bumping one source's version invalidates only that source's cached data.
+
+### EffNet model management
+
+The `discogs-effnet-bsdynamic-1.onnx` file (~18 MB) is auto-downloaded from
+`essentia.upf.edu` to `data/models/` on first use.  The `data/` directory
+is gitignored.  Loading is gated behind `--no-effnet` CLI flag (parallel
+to `--no-clap`).  If `onnxruntime` is not installed, EffNet features are
+silently unavailable.
+
+**Mel-spectrogram preprocessing** (matches Essentia's `TensorflowInputMusiCNN`):
+`librosa.feature.melspectrogram(sr=16000, n_fft=512, hop_length=256, n_mels=96)`
+followed by `np.log10(10000 * mel + 1)`.  The mel is then patched into
+128-frame windows (hop 64) and fed to the ONNX model.  Recipe confirmed
+equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
+
+**Audio feature extraction** uses librosa only (no ML model):
+- Tempo: `librosa.feature.tempo()`
+- Key: Krumhansl-Schmuckler algorithm on `librosa.feature.chroma_cqt()`
+- Energy: `librosa.feature.rms()` (log-scaled)
+- Danceability: onset strength autocorrelation regularity
+
 ### Embedding Space viewport mode
 
 - `model.viewMode` toggles between `"tags"` (default) and `"embeddings"`.
@@ -347,10 +408,10 @@ projected unmodified.
   During animation, tracks have interpolated positions; after animation completes,
   `animPositions` is cleared and the canvas falls through to embedding positions.
 - The controller auto-triggers embedding generation when switching to embedding mode
-  for the first time (`_ensureEmbeddingsAndProject`).  If the CLAP model is still
+  for the first time (`_ensureEmbeddingsAndProject`).  If required models are still
   loading in the background, the frontend polls every 3 s until ready.
 - During generation the controller opens an `EventSource` on `/api/embeddings/stream`.
   As embeddings complete, PCA is re-fetched at intervals (roughly every 10 % of the
   batch) so dots appear progressively on canvas rather than all at once.
-- Switching projection method in the toggle re-fetches positions from the backend
-  and animates the transition.
+- Switching projection method or source checkboxes re-fetches positions from the
+  backend and animates the transition.

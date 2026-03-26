@@ -389,6 +389,65 @@ def _gather_vecs(
     return paths, vecs
 
 
+def _gather_composite_vecs(
+    track_infos: list[dict],
+    feature_cache,
+    sources: tuple[str, ...] = ("clap",),
+) -> tuple[list[str], np.ndarray, int]:
+    """Collect and concatenate vectors from multiple enabled sources.
+
+    Each source block is L2-normalized across the batch before concatenation
+    so that sources with different native dimensionalities contribute equally.
+
+    Returns *(paths, matrix, clap_dim)* where *matrix* is ``(N, D_total)``
+    and *clap_dim* is the width of the CLAP sub-block (0 if CLAP is not
+    among *sources*), used for targeted semantic weighting.
+    """
+    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+
+    fps = [t.get("fingerprint") for t in track_infos]
+    fp_set = [fp for fp in fps if fp]
+
+    # Pre-fetch all requested source maps keyed by fingerprint.
+    source_maps: dict[str, dict[str, np.ndarray]] = {}
+    if "clap" in sources:
+        source_maps["clap"] = feature_cache.get_all_embeddings(fp_set, version=EMBEDDING_VERSION)
+    if "effnet" in sources:
+        source_maps["effnet"] = feature_cache.get_all_effnet_embeddings(fp_set, version=EFFNET_VERSION)
+    if "features" in sources:
+        source_maps["features"] = feature_cache.get_all_audio_features(fp_set, version=FEATURES_VERSION)
+
+    # Determine which tracks have data for ALL enabled sources.
+    paths: list[str] = []
+    fp_order: list[str] = []
+    for t in track_infos:
+        fp = t.get("fingerprint")
+        if not fp:
+            continue
+        if all(fp in source_maps.get(s, {}) for s in sources):
+            paths.append(t["path"])
+            fp_order.append(fp)
+
+    if not paths:
+        return paths, np.empty((0, 0), dtype=np.float32), 0
+
+    # Build per-source matrices, normalize, and concatenate.
+    blocks: list[np.ndarray] = []
+    clap_dim = 0
+    for s in sources:
+        smap = source_maps[s]
+        block = np.stack([smap[fp] for fp in fp_order])
+        norms = np.linalg.norm(block, axis=1, keepdims=True)
+        norms[norms < 1e-9] = 1.0
+        block = block / norms
+        if s == "clap":
+            clap_dim = block.shape[1]
+        blocks.append(block)
+
+    mat = np.concatenate(blocks, axis=1).astype(np.float32)
+    return paths, mat, clap_dim
+
+
 def _normalise_coords(coords: np.ndarray) -> np.ndarray:
     """Normalise an (N, 2) array to [0, 1] per axis."""
     mins = coords.min(axis=0)
@@ -467,28 +526,45 @@ def compute_projection(
     method: str = "umap",
     context_tags: list[str] | None = None,
     context_folders: list[str] | None = None,
+    sources: tuple[str, ...] = ("clap",),
 ) -> list[dict]:
     """Project cached embeddings to 2D positions.
 
     *method* is ``"umap"`` (default), ``"tsne"``, or ``"pca"`` (instant,
     good enough for live intermediate updates during generation).
 
+    *sources* selects which data to concatenate: any subset of
+    ``("clap", "effnet", "features")``.  Each source block is
+    L2-normalized before concatenation.
+
     *context_tags* / *context_folders* — when provided the embedding space
-    is re-weighted before projection.  Folders use hierarchical centroid
-    decomposition (data-driven); tags use CLAP text embedding.
+    is re-weighted before projection.  Text-based directions are applied
+    only to the CLAP sub-dimensions (requires CLAP in *sources*).
+    Folder centroid decomposition works on the full composite vector.
 
     Returns ``[{"path": rel, "x": float, "y": float}, ...]`` where x/y
-    are in [0, 1].  Tracks without embeddings are omitted.
+    are in [0, 1].  Tracks without data for every enabled source are omitted.
     """
-    paths, vecs = _gather_vecs(track_infos, feature_cache, version)
+    paths, mat, clap_dim = _gather_composite_vecs(
+        track_infos, feature_cache, sources=sources,
+    )
 
-    if len(vecs) < 2:
+    if len(paths) < 2:
         return [{"path": p, "x": 0.5, "y": 0.5} for p in paths]
 
-    mat = np.stack(vecs)
-
     if (context_tags or context_folders) and _loaded:
-        mat = _apply_semantic_weighting(mat, paths, context_tags, context_folders)
+        if clap_dim > 0:
+            # Semantic weighting applies only to the CLAP sub-dimensions.
+            clap_block = mat[:, :clap_dim].copy()
+            clap_block = _apply_semantic_weighting(
+                clap_block, paths, context_tags, context_folders,
+            )
+            mat = np.concatenate([clap_block, mat[:, clap_dim:]], axis=1)
+        else:
+            # No CLAP dims — only data-driven folder weighting on full matrix.
+            mat = _apply_semantic_weighting(
+                mat, paths, context_tags=None, context_folders=context_folders,
+            )
 
     if method == "pca":
         coords = _project_pca(mat, paths)

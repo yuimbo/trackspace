@@ -34,7 +34,9 @@ from backend.cache import TrackCache
 from backend.fingerprint import compute_fingerprint
 from backend.feature_cache import FeatureCache
 from backend import embeddings
+from backend import audio_features
 from backend.embeddings import EMBEDDING_VERSION
+from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -634,8 +636,10 @@ def api_embeddings_status():
     total = len(infos)
     fingerprinted = sum(1 for t in infos if t.get("fingerprint"))
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-    existing = _FEATURES.get_all_embeddings(fps, version=EMBEDDING_VERSION)
-    embedded = len(existing)
+
+    clap_existing = _FEATURES.get_all_embeddings(fps, version=EMBEDDING_VERSION)
+    effnet_existing = _FEATURES.get_all_effnet_embeddings(fps, version=EFFNET_VERSION)
+    features_existing = _FEATURES.get_all_audio_features(fps, version=FEATURES_VERSION)
 
     with _embed_lock:
         running = _embed_status["running"]
@@ -645,9 +649,14 @@ def api_embeddings_status():
     return jsonify({
         "total": total,
         "fingerprinted": fingerprinted,
-        "embedded": embedded,
-        "pending": fingerprinted - embedded,
+        "embedded": len(clap_existing),
+        "pending": fingerprinted - len(clap_existing),
         "model_ready": embeddings.is_model_ready(),
+        "effnet_embedded": len(effnet_existing),
+        "effnet_pending": fingerprinted - len(effnet_existing),
+        "effnet_model_ready": audio_features.is_effnet_ready(),
+        "features_extracted": len(features_existing),
+        "features_pending": fingerprinted - len(features_existing),
         "generating": running,
         "embedding_version": EMBEDDING_VERSION,
         "progress": {"done": progress_done, "total": progress_total} if running else None,
@@ -656,20 +665,26 @@ def api_embeddings_status():
 
 @app.route("/api/embeddings/generate", methods=["POST"])
 def api_embeddings_generate():
-    """Kick off background CLAP embedding generation for tracks missing embeddings.
+    """Kick off background generation for one or more embedding sources.
 
-    Body: {"folder": "", "recursive": true, "priority_paths": [...]}
+    Body: {"folder": "", "recursive": true, "priority_paths": [...],
+           "sources": ["clap", "effnet", "features"]}
     ``priority_paths`` is an optional list of relative track paths that should
     be generated first (e.g. tracks currently visible on screen).
+    ``sources`` defaults to ``["clap"]`` for backward compatibility.
     """
     data = request.get_json(force=True)
     rel = data.get("folder", "")
     recursive = data.get("recursive", True)
     priority_paths: list[str] = data.get("priority_paths", [])
+    sources: list[str] = data.get("sources", ["clap"])
     folder = _resolve(rel)
 
-    if not embeddings.is_model_ready():
+    # Validate that required models are ready.
+    if "clap" in sources and not embeddings.is_model_ready():
         return jsonify({"ok": False, "error": "CLAP model still loading, try again shortly"})
+    if "effnet" in sources and not audio_features.is_effnet_ready():
+        return jsonify({"ok": False, "error": "EffNet model still loading, try again shortly"})
 
     with _embed_lock:
         if _embed_status["running"]:
@@ -682,37 +697,82 @@ def api_embeddings_generate():
     def _run():
         try:
             infos = _build_track_infos(folder, recursive)
-            fps_needed: list[dict] = []
+
+            # Build a unified work list: tracks that need at least one source.
+            work: list[tuple[dict, list[str]]] = []
             for t in infos:
                 fp = t.get("fingerprint")
-                if fp and not _FEATURES.has_embedding(fp, version=EMBEDDING_VERSION):
-                    fps_needed.append(t)
+                if not fp:
+                    continue
+                needed: list[str] = []
+                if "clap" in sources and not _FEATURES.has_embedding(fp, version=EMBEDDING_VERSION):
+                    needed.append("clap")
+                if "effnet" in sources and not _FEATURES.has_effnet_embedding(fp, version=EFFNET_VERSION):
+                    needed.append("effnet")
+                if "features" in sources and not _FEATURES.has_audio_features(fp, version=FEATURES_VERSION):
+                    needed.append("features")
+                if needed:
+                    work.append((t, needed))
 
-            # Prioritise tracks the user can currently see.
             if priority_paths:
                 pset = set(priority_paths)
-                fps_needed.sort(key=lambda t: (0 if t["path"] in pset else 1, t["path"]))
+                work.sort(key=lambda w: (0 if w[0]["path"] in pset else 1, w[0]["path"]))
 
             with _embed_lock:
-                _embed_status["total"] = len(fps_needed)
+                _embed_status["total"] = len(work)
 
+            _EFFNET_CHUNK = 8
             done = 0
-            for t in fps_needed:
-                abs_path = os.path.join(MUSIC_ROOT, t["path"])
-                emb = embeddings.generate_embedding(abs_path)
-                ok = emb is not None
-                if ok:
-                    _FEATURES.put_embedding(t["fingerprint"], emb, version=EMBEDDING_VERSION)
-                done += 1
-                with _embed_lock:
-                    _embed_status["done"] = done
-                _broadcast_embed_event({
-                    "type": "progress",
-                    "path": t["path"],
-                    "ok": ok,
-                    "done": done,
-                    "total": len(fps_needed),
-                })
+            for chunk_start in range(0, max(len(work), 1), _EFFNET_CHUNK):
+                chunk = work[chunk_start:chunk_start + _EFFNET_CHUNK]
+                if not chunk:
+                    break
+
+                effnet_paths = [
+                    os.path.join(MUSIC_ROOT, t["path"])
+                    for t, needed in chunk if "effnet" in needed
+                ]
+                effnet_results = (
+                    audio_features.generate_effnet_embeddings_batch(effnet_paths)
+                    if effnet_paths else {}
+                )
+
+                for t, needed in chunk:
+                    abs_path = os.path.join(MUSIC_ROOT, t["path"])
+                    fp = t["fingerprint"]
+                    ok = True
+
+                    if "clap" in needed:
+                        emb = embeddings.generate_embedding(abs_path)
+                        if emb is not None:
+                            _FEATURES.put_embedding(fp, emb, version=EMBEDDING_VERSION)
+                        else:
+                            ok = False
+
+                    if "effnet" in needed:
+                        emb = effnet_results.get(abs_path)
+                        if emb is not None:
+                            _FEATURES.put_effnet_embedding(fp, emb, version=EFFNET_VERSION)
+                        else:
+                            ok = False
+
+                    if "features" in needed:
+                        feat = audio_features.extract_audio_features(abs_path)
+                        if feat is not None:
+                            _FEATURES.put_audio_features(fp, feat, version=FEATURES_VERSION)
+                        else:
+                            ok = False
+
+                    done += 1
+                    with _embed_lock:
+                        _embed_status["done"] = done
+                    _broadcast_embed_event({
+                        "type": "progress",
+                        "path": t["path"],
+                        "ok": ok,
+                        "done": done,
+                        "total": len(work),
+                    })
 
         except Exception as e:
             log.exception("Embedding generation failed")
@@ -781,6 +841,7 @@ def api_embeddings_umap():
         method          – "umap" (default), "tsne", or "pca" (fast, for live updates)
         context_tags    – comma-separated tag names (full boost)
         context_folders – comma-separated folder paths (depth-scaled boost)
+        sources         – comma-separated embedding sources (default: "clap")
     """
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
@@ -789,15 +850,17 @@ def api_embeddings_umap():
         method = "umap"
     raw_tags = request.args.get("context_tags", "")
     raw_folders = request.args.get("context_folders", "")
+    raw_sources = request.args.get("sources", "clap")
     tag_names = [s.strip() for s in raw_tags.split(",") if s.strip()] if raw_tags else []
     folder_paths = [s.strip() for s in raw_folders.split(",") if s.strip()] if raw_folders else []
+    sources = tuple(s.strip() for s in raw_sources.split(",") if s.strip() in ("clap", "effnet", "features"))
+    if not sources:
+        sources = ("clap",)
     folder = _resolve(rel)
     infos = _build_track_infos(folder, recursive)
 
-    # Build a cache key from the sorted set of fingerprints that currently have
-    # embeddings.  The hash changes whenever the embedded library changes, so
-    # stale results are never served.  PCA is excluded: it is fast and its
-    # Procrustes reference state changes per call.
+    # Build a cache key that includes the active sources.  PCA is excluded:
+    # it is fast and its Procrustes reference state changes per call.
     cache_key: str | None = None
     if method != "pca":
         fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
@@ -806,7 +869,8 @@ def api_embeddings_umap():
             lib_hash = hashlib.sha256(",".join(present_fps).encode()).hexdigest()[:20]
             tags_part = ",".join(sorted(tag_names))
             folders_part = ",".join(sorted(folder_paths))
-            cache_key = f"{lib_hash}|{method}|{tags_part}|{folders_part}"
+            sources_part = ",".join(sorted(sources))
+            cache_key = f"{lib_hash}|{method}|{tags_part}|{folders_part}|{sources_part}"
             if cache_key in _projection_cache:
                 _projection_cache.move_to_end(cache_key)
                 log.debug("projection cache hit: %s", cache_key)
@@ -815,6 +879,7 @@ def api_embeddings_umap():
     positions = embeddings.compute_projection(
         infos, _FEATURES, version=EMBEDDING_VERSION, method=method,
         context_tags=tag_names, context_folders=folder_paths,
+        sources=sources,
     )
 
     if cache_key is not None:
@@ -854,6 +919,8 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--no-clap", action="store_true",
                         help="Skip eager CLAP model loading at startup")
+    parser.add_argument("--no-effnet", action="store_true",
+                        help="Skip eager EffNet model loading at startup")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
@@ -880,14 +947,29 @@ def main():
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
     purged = _FEATURES.purge_old_versions(EMBEDDING_VERSION)
     if purged:
-        print(f"Embeddings: purged {purged} stale v<{EMBEDDING_VERSION} entr{'y' if purged == 1 else 'ies'}")
-    print(f"Embedding version: {EMBEDDING_VERSION}")
+        print(f"CLAP: purged {purged} stale v<{EMBEDDING_VERSION} entr{'y' if purged == 1 else 'ies'}")
+    purged_effnet = _FEATURES.purge_old_effnet_versions(EFFNET_VERSION)
+    if purged_effnet:
+        print(f"EffNet: purged {purged_effnet} stale v<{EFFNET_VERSION} entr{'y' if purged_effnet == 1 else 'ies'}")
+    purged_feat = _FEATURES.purge_old_feature_versions(FEATURES_VERSION)
+    if purged_feat:
+        print(f"Features: purged {purged_feat} stale v<{FEATURES_VERSION} entr{'y' if purged_feat == 1 else 'ies'}")
+    print(f"Versions: CLAP={EMBEDDING_VERSION} EffNet={EFFNET_VERSION} Features={FEATURES_VERSION}")
     if not args.no_clap:
-        def _bg_load():
+        def _bg_load_clap():
             print("Loading CLAP model in background (this may take a moment on first run)…")
             embeddings.load_model()
             print("CLAP model ready.")
-        threading.Thread(target=_bg_load, daemon=True).start()
+        threading.Thread(target=_bg_load_clap, daemon=True).start()
+    if not args.no_effnet:
+        def _bg_load_effnet():
+            print("Loading EffNet model in background…")
+            audio_features.load_effnet()
+            if audio_features.is_effnet_ready():
+                print("EffNet model ready.")
+            else:
+                print("EffNet model not available (essentia-tensorflow may not be installed).")
+        threading.Thread(target=_bg_load_effnet, daemon=True).start()
     app.run(host=args.host, port=args.port, debug=True)
 
 

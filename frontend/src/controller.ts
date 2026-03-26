@@ -234,6 +234,7 @@ export class Controller {
     const isEmbed = this.model.viewMode === "embeddings";
     const embedEls = [
       document.getElementById("projection-method"),
+      document.getElementById("embedding-sources"),
       document.getElementById("scale-tags-toggle")?.closest("label"),
       document.getElementById("scale-folders-toggle")?.closest("label"),
     ];
@@ -609,17 +610,39 @@ export class Controller {
         embedded: number;
         pending: number;
         model_ready: boolean;
+        effnet_embedded: number;
+        effnet_pending: number;
+        effnet_model_ready: boolean;
+        features_extracted: number;
+        features_pending: number;
         generating: boolean;
       }>("/api/embeddings/status?folder=&recursive=1");
 
-      if (!status.model_ready) {
+      // Check if required models are still loading.
+      if (m.useCLAP && !status.model_ready) {
         toast("CLAP model loading…", "ok");
         this._pollModelReady();
         return;
       }
+      if (m.useEffNet && !status.effnet_model_ready) {
+        toast("EffNet model loading…", "ok");
+        this._pollModelReady();
+        return;
+      }
 
-      if (status.pending > 0 && !status.generating) {
-        toast(`Generating embeddings for ${status.pending} tracks…`, "ok");
+      // Determine which sources need generation.
+      const sourcesNeeded: string[] = [];
+      if (m.useCLAP && status.pending > 0) sourcesNeeded.push("clap");
+      if (m.useEffNet && status.effnet_pending > 0) sourcesNeeded.push("effnet");
+      if (m.useAudioFeatures && status.features_pending > 0) sourcesNeeded.push("features");
+
+      if (sourcesNeeded.length > 0 && !status.generating) {
+        const total = Math.max(
+          m.useCLAP ? status.pending : 0,
+          m.useEffNet ? status.effnet_pending : 0,
+          m.useAudioFeatures ? status.features_pending : 0,
+        );
+        toast(`Generating embeddings for ${total} tracks…`, "ok");
         m.embeddingsGenerating = true;
 
         const priorityPaths = m.tracks
@@ -630,6 +653,7 @@ export class Controller {
           folder: "",
           recursive: true,
           priority_paths: priorityPaths,
+          sources: sourcesNeeded,
         });
         this._listenEmbeddingStream();
         return;
@@ -641,7 +665,12 @@ export class Controller {
         return;
       }
 
-      if (status.embedded > 0) {
+      // Check if at least some data exists for the active sources.
+      const hasData =
+        (m.useCLAP && status.embedded > 0) ||
+        (m.useEffNet && status.effnet_embedded > 0) ||
+        (m.useAudioFeatures && status.features_extracted > 0);
+      if (hasData) {
         await this._fetchUmapPositions();
       }
     } catch {
@@ -653,11 +682,15 @@ export class Controller {
     clearTimeout(this._embedPollTimer);
     this._embedPollTimer = setTimeout(async () => {
       try {
-        const status = await api<{ model_ready: boolean }>(
-          "/api/embeddings/status?folder=&recursive=1",
-        );
-        if (status.model_ready) {
-          toast("CLAP model ready", "ok");
+        const m = this.model;
+        const status = await api<{
+          model_ready: boolean;
+          effnet_model_ready: boolean;
+        }>("/api/embeddings/status?folder=&recursive=1");
+        const clapOk = !m.useCLAP || status.model_ready;
+        const effnetOk = !m.useEffNet || status.effnet_model_ready;
+        if (clapOk && effnetOk) {
+          toast("Models ready", "ok");
           await this._ensureEmbeddingsAndProject();
         } else {
           this._pollModelReady();
@@ -731,7 +764,8 @@ export class Controller {
   private _projectionQueryString(methodOverride?: string): string {
     const m = this.model;
     const method = methodOverride ?? m.projectionMethod;
-    let qs = `folder=&recursive=1&method=${method}`;
+    const sources = m.activeSources.join(",");
+    let qs = `folder=&recursive=1&method=${method}&sources=${encodeURIComponent(sources)}`;
     if (m.scaleByTags) {
       const tags = m.contextTags.join(",");
       if (tags) qs += `&context_tags=${encodeURIComponent(tags)}`;
@@ -1831,7 +1865,42 @@ export class Controller {
     $addF.addEventListener("click", () => this._createSubfolder(m.folder));
 
     this._initProjectionToggle();
+    this._initSourceCheckboxes();
     this._initScalingToggles();
+  }
+
+  private _initSourceCheckboxes(): void {
+    const m = this.model;
+    const ids: [string, "clap" | "effnet" | "features"][] = [
+      ["source-clap", "clap"],
+      ["source-effnet", "effnet"],
+      ["source-features", "features"],
+    ];
+    for (const [elId, source] of ids) {
+      const $cb = document.getElementById(elId) as HTMLInputElement | null;
+      if (!$cb) continue;
+      $cb.checked =
+        source === "clap"
+          ? m.useCLAP
+          : source === "effnet"
+            ? m.useEffNet
+            : m.useAudioFeatures;
+      $cb.addEventListener("change", () => {
+        m.toggleSource(source);
+        // If toggleSource was a no-op (would leave zero sources), revert checkbox.
+        const actual =
+          source === "clap"
+            ? m.useCLAP
+            : source === "effnet"
+              ? m.useEffNet
+              : m.useAudioFeatures;
+        $cb.checked = actual;
+        m.saveLS();
+        if (m.viewMode === "embeddings") {
+          void this._ensureEmbeddingsAndProject();
+        }
+      });
+    }
   }
 
   private _initScalingToggles(): void {
