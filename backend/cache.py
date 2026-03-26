@@ -106,6 +106,70 @@ class TrackCache:
         with self._lock:
             self._lru_put(key, data)
 
+    def remap(self, old_path: str, new_path: str) -> int:
+        """Re-key all cache entries from *old_path* to *new_path*.
+
+        Called after a single-file move so the entry survives under the new
+        absolute path rather than becoming a stale orphan.  Returns the number
+        of rows updated (0 or 1 in practice).
+        """
+        updated = 0
+        try:
+            with self._conn() as conn:
+                cur = conn.execute(
+                    "UPDATE track_cache SET path=? WHERE path=?",
+                    (new_path, old_path),
+                )
+                updated = cur.rowcount
+        except Exception:
+            pass
+
+        with self._lock:
+            keys = [k for k in self._mem if k[0] == old_path]
+            for key in keys:
+                data = self._mem.pop(key)
+                new_key = (new_path, key[1])
+                self._mem[new_key] = data
+                self._mem.move_to_end(new_key)
+
+        return updated
+
+    def remap_prefix(self, old_prefix: str, new_prefix: str) -> int:
+        """Re-key all cache entries whose path starts with *old_prefix*.
+
+        Used when a folder is renamed: pass the old and new absolute folder
+        paths (with a trailing separator) to bulk-update every entry inside.
+        Returns the number of rows updated.
+        """
+        updated = 0
+        try:
+            with self._conn() as conn:
+                escaped = old_prefix.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+                rows = conn.execute(
+                    "SELECT path, mtime FROM track_cache WHERE path LIKE ? ESCAPE '\\'",
+                    (escaped + "%",),
+                ).fetchall()
+                for old_path, mtime in rows:
+                    new_path = new_prefix + old_path[len(old_prefix):]
+                    conn.execute(
+                        "UPDATE track_cache SET path=? WHERE path=? AND mtime=?",
+                        (new_path, old_path, mtime),
+                    )
+                    updated += 1
+        except Exception:
+            pass
+
+        with self._lock:
+            keys = [k for k in self._mem if k[0].startswith(old_prefix)]
+            for key in keys:
+                data = self._mem.pop(key)
+                new_path = new_prefix + key[0][len(old_prefix):]
+                new_key = (new_path, key[1])
+                self._mem[new_key] = data
+                self._mem.move_to_end(new_key)
+
+        return updated
+
     def prune_missing(self) -> int:
         """Delete DB entries whose files no longer exist on disk.
 

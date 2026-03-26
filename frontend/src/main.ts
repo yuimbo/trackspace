@@ -12,6 +12,7 @@ import {
   StatusView,
 } from "./components";
 import { Controller } from "./controller";
+import { renderShortcutList } from "./hotkeys";
 
 window.htmx = htmx;
 
@@ -31,3 +32,5 @@ const status = new StatusView();
 
 const ctrl = new Controller(model, canvas, tagPanel, props, batch, status);
 void ctrl.init();
+
+renderShortcutList(document.getElementById("shortcut-list")!);

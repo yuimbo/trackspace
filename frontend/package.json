@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:all": "concurrently --names backend,frontend --prefix-colors cyan,magenta \"../.venv/bin/python ../app.py ${ROOT:-.}\" \"vite\"",
+    "dev:all": "concurrently --names backend,frontend --prefix-colors cyan,magenta \"cd .. && .venv/bin/python -m backend.app ${ROOT:-.}\" \"vite\"",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },

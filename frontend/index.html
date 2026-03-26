@@ -41,9 +41,21 @@
     <div id="batch-list"></div>
   </section>
 
+  <div class="rp-spacer"></div>
+
   <section id="options-section" x-data>
     <h2>Options</h2>
     <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
+    <label><input type="checkbox" id="view-mode-toggle" /> Embedding space <kbd>E</kbd></label>
+    <div id="projection-method" class="option-row">
+      <span class="option-label">Projection</span>
+      <div class="toggle-group" id="projection-toggle">
+        <button class="toggle-btn" data-method="tsne">t-SNE</button>
+        <button class="toggle-btn" data-method="umap">UMAP</button>
+      </div>
+    </div>
+    <label><input type="checkbox" id="scale-tags-toggle" checked /> Tag scaling</label>
+    <label><input type="checkbox" id="scale-folders-toggle" checked /> Folder name scaling</label>
   </section>
 
   <section id="tag-section" x-data>
@@ -67,18 +79,7 @@
 >
   <div id="shortcuts-content">
     <h2>Shortcuts</h2>
-    <div class="shortcut-list">
-      <span><kbd>M</kbd> toggle preview</span>
-      <span><kbd>H</kbd> fit view to tracks</span>
-      <span><kbd>I</kbd> enter folder</span>
-      <span><kbd>U</kbd> up to parent</span>
-      <span><kbd>Esc</kbd> deselect all</span>
-      <span><kbd>⌘A</kbd> select all</span>
-      <span><kbd>Shift</kbd>+drag lasso</span>
-      <span><kbd>Alt</kbd>+drag pan</span>
-      <span>drag to folder → move files</span>
-      <span>◉ select folder's tracks</span>
-    </div>
+    <div id="shortcut-list" class="shortcut-list"></div>
   </div>
 </div>
 

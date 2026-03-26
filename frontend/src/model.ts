@@ -5,7 +5,11 @@ export interface Track {
   tags: Record<string, number>;
   artist: string;
   title: string;
+  fingerprint?: string | null;
 }
+
+export type ViewMode = "tags" | "embeddings";
+export type ProjectionMethod = "umap" | "tsne";
 
 export interface Viewport {
   ox: number;
@@ -47,6 +51,17 @@ export class Model extends EventBus {
   hoverPreview = false;
   vp: Viewport = { ox: 0, oy: 0, zoom: 1 };
   _knownTags: string[] = [];
+
+  viewMode: ViewMode = "tags";
+  projectionMethod: ProjectionMethod = "tsne";
+  scaleByTags = true;
+  scaleByFolders = true;
+  embeddingPositions: Map<string, { x: number; y: number }> = new Map();
+  embeddingsReady = false;
+  embeddingsGenerating = false;
+  embeddingProgress: { done: number; total: number } | null = null;
+  projectionPending = false;
+
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
 
@@ -85,6 +100,20 @@ export class Model extends EventBus {
 
   tagHasValuesInView(tag: string): boolean {
     return this.tracks.some((t) => t.tags[tag] !== undefined);
+  }
+
+  /** Tag names for semantic weighting (all get full boost). */
+  get contextTags(): string[] {
+    return [...this.tags];
+  }
+
+  /** Unique folder paths for semantic weighting (depth determines boost). */
+  get contextFolders(): string[] {
+    const s = new Set<string>();
+    for (const t of this.allTracks) {
+      if (t.folder) s.add(t.folder);
+    }
+    return [...s];
   }
 
   trackByPath(path: string): Track | undefined {
@@ -139,6 +168,20 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
+  setViewMode(mode: ViewMode): void {
+    if (this.viewMode === mode) return;
+    this.viewMode = mode;
+    this.emit("change");
+  }
+
+  setProjectionMethod(method: ProjectionMethod): void {
+    if (this.projectionMethod === method) return;
+    this.projectionMethod = method;
+    this.embeddingsReady = false;
+    this.embeddingPositions.clear();
+    this.emit("change");
+  }
+
   setFilterRange(tag: string, r: [number, number]): void {
     this.filterRanges[tag] = r;
     this.emit("change");
@@ -174,6 +217,33 @@ export class Model extends EventBus {
       this._knownTags.push(name);
       this._knownTags.sort();
     }
+  }
+
+  renameTag(oldName: string, newName: string): void {
+    // Update tag values in every track
+    for (const t of this.allTracks) {
+      if (oldName in t.tags) {
+        t.tags[newName] = t.tags[oldName];
+        delete t.tags[oldName];
+      }
+    }
+    // Update known-tags list
+    const idx = this._knownTags.indexOf(oldName);
+    if (idx !== -1) this._knownTags[idx] = newName;
+    if (!this._knownTags.includes(newName)) this._knownTags.push(newName);
+    this._knownTags = [...new Set(this._knownTags)].sort();
+
+    // Update axis assignments
+    if (this.axisX === oldName) this.axisX = newName;
+    if (this.axisY === oldName) this.axisY = newName;
+
+    // Migrate filter range
+    if (oldName in this.filterRanges) {
+      this.filterRanges[newName] = this.filterRanges[oldName];
+      delete this.filterRanges[oldName];
+    }
+
+    this._dirty();
   }
 
   /* ── Track mutations ──────────────────────────────────────── */
@@ -222,6 +292,10 @@ export class Model extends EventBus {
         axisY: this.axisY,
         filterRanges: this.filterRanges,
         hoverPreview: this.hoverPreview,
+        viewMode: this.viewMode,
+        projectionMethod: this.projectionMethod,
+        scaleByTags: this.scaleByTags,
+        scaleByFolders: this.scaleByFolders,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -237,6 +311,10 @@ export class Model extends EventBus {
         this.axisY = d.axisY ?? null;
         this.filterRanges = d.filterRanges ?? {};
         this.hoverPreview = d.hoverPreview ?? false;
+        this.viewMode = d.viewMode ?? "tags";
+        this.projectionMethod = d.projectionMethod ?? "tsne";
+        this.scaleByTags = d.scaleByTags ?? true;
+        this.scaleByFolders = d.scaleByFolders ?? true;
       }
     } catch {
       /* start fresh */

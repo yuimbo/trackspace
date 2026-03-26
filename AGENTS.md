@@ -5,6 +5,48 @@ Read it before making changes so that new work stays coherent with existing deci
 
 ---
 
+## Project layout
+
+```
+trackspace/
+  backend/                  ← Python package (Flask server + ML pipeline)
+    __init__.py
+    app.py                  – Flask routes, CLI entry point
+    tags.py                 – ID3 tag read/write via mutagen
+    cache.py                – TrackCache (path+mtime → metadata, LRU + SQLite)
+    fingerprint.py          – Chromaprint audio fingerprinting (fpcalc)
+    feature_cache.py        – FeatureCache (fingerprint → CLAP embedding)
+    embeddings.py           – CLAP model loading, inference, UMAP projection
+    templates/partials/     – Jinja templates served by Flask (HTMX)
+  frontend/                 ← Vite + TypeScript + Alpine.js + HTMX
+    src/
+      main.ts               – entry point
+      model.ts              – Model (single source of truth, EventBus)
+      controller.ts         – Controller (events, API calls, mouse/keyboard)
+      hotkeys.ts            – HotkeyManager + key binding definitions
+      command.ts            – Command pattern (optimistic UI + undo)
+      components/           – one View per file (canvas, tags, properties, batch, status)
+      lib/toast.ts          – shared DOM helpers
+    index.html
+    vite.config.ts
+    package.json
+  tests/                    ← test suite
+    test_embeddings.py      – smoke tests for fingerprint → CLAP pipeline
+    fixtures/test_track.mp3 – 5 s trimmed mp3 for tests
+  data/                     – SQLite caches (gitignored, created at runtime)
+  .env                      – HF_TOKEN (gitignored)
+  requirements.txt
+  AGENTS.md
+```
+
+**Running the backend:**  `python -m backend.app /path/to/music`
+(The `dev:all` npm script does this automatically from `frontend/`.)
+
+**Running tests:**  `.venv/bin/python -m pytest tests/ -v`
+  or standalone:  `.venv/bin/python -m tests.test_embeddings`
+
+---
+
 ## Frontend stack
 
 The frontend uses **Vite + TypeScript**, **Alpine.js**, and **HTMX**.
@@ -15,7 +57,7 @@ The frontend uses **Vite + TypeScript**, **Alpine.js**, and **HTMX**.
   Heavier logic stays in TypeScript (`Controller`, canvas).
 - **HTMX:** The folder sidebar list is HTML from Flask (`GET /partials/folder-tree`) loaded via
   `htmx.ajax()` in `Controller._refreshFolderTreeHtmx()`. Jinja template:
-  `templates/partials/folder_tree.html`. In dev, Vite proxies `/partials` to Flask (port 5111).
+  `backend/templates/partials/folder_tree.html`. In dev, Vite proxies `/partials` to Flask (port 5111).
 - **Dev mode:** From `frontend/`, run `ROOT=/path/to/music npm run dev:all`.
   `concurrently` runs Flask + Vite with `[backend]` / `[frontend]` log prefixes.
 - **Production:** `npm run build` → `frontend/dist/`; Flask serves static assets and keeps serving
@@ -118,3 +160,171 @@ means the track sits directly at the root.
   (`.folder-row`, `.folder-label`, `.folder-children`, `data-folder-toggle`, etc.).
 - Query params: `active` = current `model.folder` (see `Controller._refreshFolderTreeHtmx`);
   `pending_rename` = optional relative path for auto-opening rename after create.
+
+---
+
+## Command pattern (optimistic UI + undo)
+
+`frontend/src/command.ts` implements a command pattern for state-mutating operations.
+
+**Flow:**  `execute()` applies to model synchronously (optimistic) → UI re-renders →
+`commit()` fires the API call in the background → on failure, `undo()` auto-reverts.
+
+**Interface:**
+- `execute(m)` / `undo(m)` — sync model mutations (inverse of each other).
+- `commit()` — async API call; throws on failure to trigger auto-rollback.
+- `undoCommit()` — optional reverse API call fired when the user hits Ctrl+Z.
+- `effect` — declares which post-apply side-effects to run (`"change"`, `"tags-dirty"`, or `"change+htmx"`).
+
+**CommandManager** lives on the Controller. The `afterEffect` callback (set up in the
+constructor) maps effects to event emission, HTMX refresh, and `saveLS()`. Undo stack is
+linear, capped at 50 entries. Undo is blocked while a `commit()` is in flight.
+
+**Concrete commands:** `RenameTagCommand`, `RenameFolderCommand`, `MoveTracksCommand`.
+
+**Not covered:** Tag value drags — the existing debounced `pending` queue + `_flushPending`
+already provides optimistic behavior for that hot path.
+
+**Adding a new command:**
+1. Implement the `Command` interface in `command.ts`.
+2. Pick the right `effect` (`"change"` for most, `"change+htmx"` if folder tree must refresh).
+3. In the controller, replace the old `postJSON` + model mutation with `this.cmdMgr.run(new YourCommand(...), m)`.
+4. Ctrl+Z undo works automatically via the stack.
+
+---
+
+## Hotkey system
+
+`frontend/src/hotkeys.ts` owns all keyboard shortcut definitions and dispatch.
+
+- **`HOTKEY_MAP`** — single array of `{ action, key, mod?, shift?, alt?, label, description }`.
+  Each entry defines a named action (e.g. `"undo"`, `"fit-view"`) with its key binding.
+- **`MOUSE_HINTS`** — non-keyboard hints (shift+drag, alt+drag) shown in the F1 modal
+  but not dispatched.
+- **`HotkeyManager`** — listens to `keydown`, matches against `HOTKEY_MAP`, and fires
+  registered handlers for the matching action. The controller calls `hk.on("action", fn)`.
+- **`renderShortcutList(container)`** — populates the F1 shortcuts modal from the maps.
+  Called once at startup in `main.ts`.
+
+**Adding a new hotkey:**
+1. Add an entry to `HOTKEY_MAP` in `hotkeys.ts`.
+2. Register a handler in `Controller._bindKeyboard` via `hk.on("your-action", () => { ... })`.
+3. The F1 modal updates automatically.
+
+---
+
+## Audio fingerprinting and embeddings
+
+Trackspace supports content-based audio similarity via **chromaprint** fingerprinting and
+**CLAP** (Contrastive Language-Audio Pre-training) embeddings.
+
+### Two-cache architecture
+
+| Cache | File | Key | Stores |
+|-------|------|-----|--------|
+| `TrackCache` | `data/track_cache.db` | `(path, mtime)` | ID3 tags, metadata, chromaprint fingerprint hash |
+| `FeatureCache` | `data/audio_features.db` | `fingerprint` (SHA-256 of chromaprint) | CLAP embedding vector (float32 blob) + version |
+
+The split means identical audio content (same recording, different filenames) shares one
+embedding entry. `TrackCache` still invalidates on mtime change; `FeatureCache` is
+content-addressed and versioned.
+
+### Embedding versioning
+
+`EMBEDDING_VERSION` (int) in `backend/embeddings.py` encodes the current embedding
+strategy. All `FeatureCache` reads filter by version, so bumping the constant
+auto-invalidates stale entries. Old-version rows are purged on server startup.
+
+| Version | Strategy |
+|---------|----------|
+| 0 | Legacy (pre-versioning) |
+| 1 | Single 30 s middle-of-track chunk |
+| 2 | Multi-segment: 3 × 15 s at 20 %/50 %/80 %, averaged |
+
+When changing how embeddings are produced (model, chunk strategy, post-processing),
+bump `EMBEDDING_VERSION` and add a row to the table above.
+
+### Fingerprinting (`backend/fingerprint.py`)
+
+- Calls `fpcalc` (chromaprint CLI) and SHA-256-hashes the raw fingerprint.
+- System dependency: `brew install chromaprint` (provides `fpcalc`).
+- `fpcalc` is resolved via `shutil.which` at import time, with a fallback to common
+  homebrew/system paths.  npm/concurrently child processes sometimes have a stripped
+  `PATH` that omits `/opt/homebrew/bin`, so bare `fpcalc` may not be found.
+- Integrated into `_cached_read_all()` — fingerprints are computed once per file and
+  stored alongside ID3 data in the track cache.
+
+**Cache poisoning guard:** `_cached_read_all` checks `cached.get("fingerprint")` (truthy),
+not just `"fingerprint" in cached`.  If a previous run stored `null` (e.g. fpcalc was
+missing), the next run with fpcalc available will retry rather than serving the stale null.
+Never cache a `None` fingerprint and treat it as a permanent result.
+
+### CLAP embeddings (`backend/embeddings.py`)
+
+- Model: `laion/larger_clap_music` loaded in a background thread at server startup
+  (does not block Flask from accepting requests).
+- Uses MPS (Apple Silicon), CUDA, or CPU — whichever is available.
+- Audio is loaded via librosa at 48 kHz.  Three 15 s segments (at 20 %/50 %/80 %
+  through the file) are embedded independently and averaged for robustness.
+  Short tracks (≤ 22.5 s) use the whole file as a single segment.
+- Generation runs in a background thread.  Progress is streamed to the frontend
+  via SSE (`/api/embeddings/stream`) so tracks appear incrementally.
+- The frontend sends `priority_paths` when kicking off generation so that tracks
+  currently visible on screen are processed first.
+
+### Projection methods
+
+`compute_projection()` projects cached embeddings to 2D. The method is chosen by
+the user via a toggle in the right-panel Options section and stored as
+`model.projectionMethod`.
+
+| Method | Backend function | Notes |
+|--------|-----------------|-------|
+| `"tsne"` (default) | `_project_tsne` (scikit-learn) | Best local cluster preservation; slower |
+| `"umap"` | `_project_umap` (umap-learn) | Good global structure; moderate speed |
+| `"pca"` | `_project_pca` (numpy SVD) | Instant; used for live incremental updates during generation |
+
+PCA is never shown in the UI toggle — it is only used internally for fast intermediate
+projections while embeddings are being generated.
+
+### Semantic weighting (context-aware projection)
+
+Before projection, the embedding space can be **re-weighted** so directions matching
+the user's tag names and folder names receive higher contrast.
+
+**Flow:**
+1. The frontend collects `model.contextTags` (tag names) and `model.contextFolders`
+   (unique full folder paths from all tracks).
+2. These are sent as `context_tags` and `context_folders` query params on
+   `GET /api/embeddings/umap`.
+3. `_build_weighted_context()` splits folder paths into segments and assigns
+   depth-scaled weights: depth 1 = full `boost` (3.0), depth 2 = `boost × 0.25`,
+   depth 3 = `boost × 0.0625`, etc.  Tag names always get full boost.  If a segment
+   name appears at multiple depths the shallowest (highest weight) wins.
+4. `_apply_semantic_weighting()` embeds all context strings via CLAP's text encoder,
+   then applies `X_out = X @ (I + T_n^T diag(w) T_n)` where `w` is the per-item
+   weight vector.  This amplifies embedding components aligned with high-weight
+   semantic directions, making UMAP/t-SNE spread tracks more along those axes.
+
+Weighting is transparent — when no context is provided, raw embeddings are
+projected unmodified.
+
+### Embedding Space viewport mode
+
+- `model.viewMode` toggles between `"tags"` (default) and `"embeddings"`.
+- Hotkey **E** switches modes.
+- In embedding mode: canvas positions come from the selected projection method,
+  grid shows "Embedding Space (TSNE)" or "(UMAP)", transform handles and tag-drag
+  are disabled.  Tracks without embedding data are **hidden**
+  (not shown at tag-space positions).
+- Mode transitions animate: positions lerp over 500 ms via `canvas.animPositions`.
+  During animation, tracks have interpolated positions; after animation completes,
+  `animPositions` is cleared and the canvas falls through to embedding positions.
+- The controller auto-triggers embedding generation when switching to embedding mode
+  for the first time (`_ensureEmbeddingsAndProject`).  If the CLAP model is still
+  loading in the background, the frontend polls every 3 s until ready.
+- During generation the controller opens an `EventSource` on `/api/embeddings/stream`.
+  As embeddings complete, PCA is re-fetched at intervals (roughly every 10 % of the
+  batch) so dots appear progressively on canvas rather than all at once.
+- Switching projection method in the toggle re-fetches positions from the backend
+  and animates the transition.

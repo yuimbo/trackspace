@@ -1,4 +1,4 @@
-import type { Model, Track } from "./model";
+import type { Model, Track, ProjectionMethod } from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -8,6 +8,13 @@ import type {
   TxHandle,
 } from "./components";
 import { toast, showLoad, hideLoad } from "./lib/toast";
+import {
+  CommandManager,
+  RenameTagCommand,
+  RenameFolderCommand,
+  MoveTracksCommand,
+} from "./command";
+import { HotkeyManager } from "./hotkeys";
 import htmx from "htmx.org";
 
 // ─── Constants ───────────────────────────────────────────────
@@ -141,6 +148,8 @@ export class Controller {
   private previewPath: string | null = null;
   private $audio: HTMLAudioElement;
   private pending = new Map<string, PendingUpdate>();
+  private cmdMgr: CommandManager;
+  readonly hotkeyMgr = new HotkeyManager();
 
   constructor(
     model: Model,
@@ -157,6 +166,18 @@ export class Controller {
     this.props = propsView;
     this.batch = batchView;
     this.status = statusView;
+
+    this.cmdMgr = new CommandManager((effect) => {
+      if (effect === "tags-dirty") {
+        model.emit("tags-dirty");
+      } else {
+        model.emit("change");
+      }
+      if (effect === "change+htmx") {
+        void this._refreshFolderTreeHtmx();
+      }
+      model.saveLS();
+    });
 
     this.mouse = {
       mode: "idle",
@@ -185,6 +206,7 @@ export class Controller {
     this._bindSidebar();
     this._bindKeyboard();
     this._bindResize();
+    this._syncModeVisuals();
   }
 
   /* ── Model events ───────────────────────────────────────── */
@@ -196,8 +218,22 @@ export class Controller {
       this.props.render();
       this.batch.render();
       this.tagPanel.render();
+      this._syncModeVisuals();
     });
     this.model.on("tags-dirty", () => this.batch.renderDirty());
+  }
+
+  /** Dim controls that belong to the inactive view mode. */
+  private _syncModeVisuals(): void {
+    const isEmbed = this.model.viewMode === "embeddings";
+    const embedEls = [
+      document.getElementById("projection-method"),
+      document.getElementById("scale-tags-toggle")?.closest("label"),
+      document.getElementById("scale-folders-toggle")?.closest("label"),
+    ];
+    for (const el of embedEls) {
+      el?.classList.toggle("mode-dimmed", !isEmbed);
+    }
   }
 
   /* ── View callbacks ─────────────────────────────────────── */
@@ -206,7 +242,12 @@ export class Controller {
     const m = this.model;
 
     this.tagPanel.onAxisChange = (which, tag) => {
-      m.toggleAxis(which as "axisX" | "axisY", tag);
+      if (m.viewMode === "tags") {
+        this._animateAxisChange(which as "axisX" | "axisY", tag);
+      } else {
+        m.toggleAxis(which as "axisX" | "axisY", tag);
+        void this._switchToMode("tags");
+      }
       this.tagPanel.render();
       m.saveLS();
     };
@@ -214,6 +255,10 @@ export class Controller {
     this.tagPanel.onFilterChange = (tag, range) => {
       m.setFilterRange(tag, range);
       m.saveLS();
+    };
+
+    this.tagPanel.onTagRename = (oldName, newName) => {
+      void this.cmdMgr.run(new RenameTagCommand(oldName, newName), m);
     };
 
     this.props.onDeselect = (path) => {
@@ -333,6 +378,14 @@ export class Controller {
       return;
     }
 
+    if (t.closest(".folder-reveal-btn")) {
+      e.stopPropagation();
+      const btn = t.closest(".folder-reveal-btn") as HTMLElement;
+      const path = btn.dataset.path ?? ".";
+      void postJSON("/api/folders/reveal", { path: path === "." ? "" : path });
+      return;
+    }
+
     if (t.closest(".folder-rename-btn")) {
       e.stopPropagation();
       const row = t.closest(".folder-row") as HTMLElement;
@@ -359,27 +412,11 @@ export class Controller {
     }, 240) as unknown as number;
   }
 
-  private async _commitFolderRename(path: string, newName: string): Promise<boolean> {
-    const m = this.model;
-    try {
-      const res = await postJSON<{
-        ok: boolean;
-        path: string;
-        error?: string;
-      }>("/api/folders/rename", { path, name: newName });
-      if (!res.ok) {
-        toast(res.error || "Rename failed", "error");
-        return false;
-      }
-      const oldRel = path === "." ? "" : path;
-      m.applyFolderRename(oldRel, res.path);
-      await this._refreshFolderTreeHtmx();
-      m.saveLS();
-      m.emit("change");
-      return true;
-    } catch {
-      return false;
-    }
+  private _commitFolderRename(path: string, newName: string): void {
+    void this.cmdMgr.run(
+      new RenameFolderCommand(path, newName),
+      this.model,
+    );
   }
 
   private _beginFolderLabelRename(labelEl: HTMLElement): void {
@@ -395,7 +432,7 @@ export class Controller {
     input.select();
     input.focus();
 
-    const commit = async () => {
+    const commit = () => {
       if (done) return;
       done = true;
       const newName = input.value.trim();
@@ -403,11 +440,7 @@ export class Controller {
         input.replaceWith(labelEl);
         return;
       }
-      const ok = await this._commitFolderRename(path, newName);
-      if (!ok) {
-        done = false;
-        input.replaceWith(labelEl);
-      }
+      this._commitFolderRename(path, newName);
     };
     const cancel = () => {
       if (done) return;
@@ -417,14 +450,14 @@ export class Controller {
     input.addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") {
         ev.preventDefault();
-        void commit();
+        commit();
       }
       if (ev.key === "Escape") {
         ev.preventDefault();
         cancel();
       }
     });
-    input.addEventListener("blur", () => void commit());
+    input.addEventListener("blur", () => commit());
   }
 
   private async _refreshFolderTreeHtmx(): Promise<void> {
@@ -465,6 +498,490 @@ export class Controller {
     this.canvas.resize();
     this.canvas.scheduleDraw();
     this.status.update(this.model);
+
+    if (this.model.viewMode === "embeddings") {
+      void this._ensureEmbeddingsAndProject();
+    }
+  }
+
+  /* ── Embedding space ───────────────────────────────────── */
+
+  /** Saved viewport state per view-mode so pan/zoom persists across toggles. */
+  private _savedVpByMode = new Map<string, { ox: number; oy: number; zoom: number }>();
+
+  private _embedPollTimer = 0;
+  private _embedEventSource: EventSource | null = null;
+  private _embedBatchCount = 0;
+  private _umapFetchPending = false;
+
+  private async _ensureEmbeddingsAndProject(): Promise<void> {
+    const m = this.model;
+    try {
+      const status = await api<{
+        total: number;
+        fingerprinted: number;
+        embedded: number;
+        pending: number;
+        model_ready: boolean;
+        generating: boolean;
+      }>("/api/embeddings/status?folder=&recursive=1");
+
+      if (!status.model_ready) {
+        toast("CLAP model loading…", "ok");
+        this._pollModelReady();
+        return;
+      }
+
+      if (status.pending > 0 && !status.generating) {
+        toast(`Generating embeddings for ${status.pending} tracks…`, "ok");
+        m.embeddingsGenerating = true;
+
+        const priorityPaths = m.tracks
+          .filter((t) => t.fingerprint && m.passesFilter(t))
+          .map((t) => t.path);
+
+        await postJSON("/api/embeddings/generate", {
+          folder: "",
+          recursive: true,
+          priority_paths: priorityPaths,
+        });
+        this._listenEmbeddingStream();
+        return;
+      }
+
+      if (status.generating) {
+        m.embeddingsGenerating = true;
+        this._listenEmbeddingStream();
+        return;
+      }
+
+      if (status.embedded > 0) {
+        await this._fetchUmapPositions();
+      }
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  private _pollModelReady(): void {
+    clearTimeout(this._embedPollTimer);
+    this._embedPollTimer = setTimeout(async () => {
+      try {
+        const status = await api<{ model_ready: boolean }>(
+          "/api/embeddings/status?folder=&recursive=1",
+        );
+        if (status.model_ready) {
+          toast("CLAP model ready", "ok");
+          await this._ensureEmbeddingsAndProject();
+        } else {
+          this._pollModelReady();
+        }
+      } catch {
+        this._pollModelReady();
+      }
+    }, 3000) as unknown as number;
+  }
+
+  /** Open an SSE connection to stream embedding generation progress. */
+  private _listenEmbeddingStream(): void {
+    this._closeEmbeddingStream();
+    this._embedBatchCount = 0;
+
+    const es = new EventSource("/api/embeddings/stream");
+    this._embedEventSource = es;
+
+    es.addEventListener("progress", ((e: MessageEvent) => {
+      const data = JSON.parse(e.data) as {
+        path: string;
+        ok: boolean;
+        done: number;
+        total: number;
+      };
+      const m = this.model;
+      m.embeddingProgress = { done: data.done, total: data.total };
+      this.status.update(m);
+
+      this._embedBatchCount++;
+      const interval = Math.max(5, Math.floor(data.total / 10));
+      if (
+        data.done >= 2 &&
+        (this._embedBatchCount >= interval || data.done === data.total) &&
+        m.viewMode === "embeddings" &&
+        !this._umapFetchPending
+      ) {
+        this._embedBatchCount = 0;
+        void this._fetchUmapIncremental();
+      }
+    }) as EventListener);
+
+    es.addEventListener("done", () => {
+      this._closeEmbeddingStream();
+      const m = this.model;
+      m.embeddingsGenerating = false;
+      m.embeddingProgress = null;
+      toast("Embeddings ready", "ok");
+      this.status.update(m);
+      if (m.viewMode === "embeddings") {
+        void this._fetchUmapPositions();
+      }
+    });
+
+    es.addEventListener("error", () => {
+      this._closeEmbeddingStream();
+      const m = this.model;
+      m.embeddingsGenerating = false;
+      m.embeddingProgress = null;
+      this.status.update(m);
+    });
+  }
+
+  private _closeEmbeddingStream(): void {
+    if (this._embedEventSource) {
+      this._embedEventSource.close();
+      this._embedEventSource = null;
+    }
+  }
+
+  private _projectionQueryString(methodOverride?: string): string {
+    const m = this.model;
+    const method = methodOverride ?? m.projectionMethod;
+    let qs = `folder=&recursive=1&method=${method}`;
+    if (m.scaleByTags) {
+      const tags = m.contextTags.join(",");
+      if (tags) qs += `&context_tags=${encodeURIComponent(tags)}`;
+    }
+    if (m.scaleByFolders) {
+      const folders = m.contextFolders.join(",");
+      if (folders) qs += `&context_folders=${encodeURIComponent(folders)}`;
+    }
+    return qs;
+  }
+
+  /** Fetch PCA positions during ongoing generation, animating the transition. */
+  private async _fetchUmapIncremental(): Promise<void> {
+    this._umapFetchPending = true;
+    const m = this.model;
+    m.projectionPending = true;
+    this.canvas.scheduleDraw();
+    try {
+      const positions = await api<{ path: string; x: number; y: number }[]>(
+        `/api/embeddings/umap?${this._projectionQueryString("pca")}`,
+      );
+      const isFirst = m.embeddingPositions.size === 0;
+
+      const newPositions = new Map<string, { x: number; y: number }>();
+      for (const p of positions) {
+        newPositions.set(p.path, { x: p.x, y: p.y });
+      }
+      m.embeddingsReady = true;
+
+      if (isFirst && m.viewMode === "embeddings") {
+        m.embeddingPositions = newPositions;
+        this._animateToEmbeddings();
+      } else {
+        this._animatePositionUpdate(newPositions);
+      }
+    } catch {
+      /* silent — generation still ongoing */
+    } finally {
+      this._umapFetchPending = false;
+      m.projectionPending = false;
+      this.canvas.scheduleDraw();
+    }
+  }
+
+  /** Smoothly lerp from current embedding positions to *newPositions*. */
+  private _animatePositionUpdate(
+    newPositions: Map<string, { x: number; y: number }>,
+  ): void {
+    const cv = this.canvas;
+    const m = this.model;
+
+    const startPos = new Map<string, { x: number; y: number }>();
+    for (const [path] of newPositions) {
+      const cur =
+        cv.animPositions?.get(path) ?? m.embeddingPositions.get(path);
+      if (cur) startPos.set(path, { ...cur });
+    }
+
+    m.embeddingPositions = newPositions;
+
+    if (startPos.size === 0) {
+      cv.animPositions = null;
+      cv.scheduleDraw();
+      return;
+    }
+
+    cv.animPositions = new Map(startPos);
+    const DURATION = 350;
+    const t0 = performance.now();
+
+    cancelAnimationFrame(this._animFrame);
+    const step = () => {
+      const elapsed = performance.now() - t0;
+      const t = Math.min(1, elapsed / DURATION);
+      const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+      for (const [path, start] of startPos) {
+        const target = m.embeddingPositions.get(path);
+        if (!target) continue;
+        cv.animPositions!.set(path, {
+          x: start.x + (target.x - start.x) * ease,
+          y: start.y + (target.y - start.y) * ease,
+        });
+      }
+      for (const [path, pos] of m.embeddingPositions) {
+        if (!startPos.has(path)) cv.animPositions!.set(path, pos);
+      }
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._animFrame = requestAnimationFrame(step);
+      } else {
+        cv.animPositions = null;
+        cv.scheduleDraw();
+      }
+    };
+    this._animFrame = requestAnimationFrame(step);
+  }
+
+  private async _fetchUmapPositions(): Promise<void> {
+    const m = this.model;
+    m.projectionPending = true;
+    this.canvas.scheduleDraw();
+    try {
+      const positions = await api<{ path: string; x: number; y: number }[]>(
+        `/api/embeddings/umap?${this._projectionQueryString()}`,
+      );
+      const newPositions = new Map<string, { x: number; y: number }>();
+      for (const p of positions) {
+        newPositions.set(p.path, { x: p.x, y: p.y });
+      }
+      m.embeddingsReady = true;
+      if (m.viewMode === "embeddings") {
+        if (m.embeddingPositions.size > 0) {
+          // Re-projection while already in embedding mode: interpolate from
+          // current positions to the new ones rather than snapping via tag space.
+          this._animatePositionUpdate(newPositions);
+        } else {
+          // First time entering embedding mode: animate from tag positions.
+          m.embeddingPositions = newPositions;
+          this._animateToEmbeddings();
+        }
+      } else {
+        m.embeddingPositions = newPositions;
+      }
+    } catch {
+      /* api() already toasted */
+    } finally {
+      m.projectionPending = false;
+      this.canvas.scheduleDraw();
+    }
+  }
+
+  private _animFrame = 0;
+
+  private _animateToEmbeddings(): void {
+    const cv = this.canvas;
+    const m = this.model;
+
+    // Capture current screen positions as starting points
+    const startPos = new Map<string, { x: number; y: number }>();
+    for (const t of m.tracks) {
+      if (m.viewMode === "embeddings" && m.embeddingPositions.has(t.path)) {
+        const existing = cv.animPositions?.get(t.path);
+        if (existing) {
+          startPos.set(t.path, { ...existing });
+        } else {
+          const wx = m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5;
+          const wy = m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5;
+          startPos.set(t.path, { x: wx, y: wy });
+        }
+      }
+    }
+
+    cv.animPositions = startPos;
+    const DURATION = 500;
+    const t0 = performance.now();
+
+    cancelAnimationFrame(this._animFrame);
+    const step = () => {
+      const elapsed = performance.now() - t0;
+      const t = Math.min(1, elapsed / DURATION);
+      const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+      for (const [path, start] of startPos) {
+        const target = m.embeddingPositions.get(path);
+        if (!target) continue;
+        cv.animPositions!.set(path, {
+          x: start.x + (target.x - start.x) * ease,
+          y: start.y + (target.y - start.y) * ease,
+        });
+      }
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._animFrame = requestAnimationFrame(step);
+      } else {
+        cv.animPositions = null;
+        cv.scheduleDraw();
+      }
+    };
+    this._animFrame = requestAnimationFrame(step);
+  }
+
+  private _animateToTags(): void {
+    const cv = this.canvas;
+    const m = this.model;
+
+    // Capture current embedding positions as starting points
+    const startPos = new Map<string, { x: number; y: number }>();
+    for (const t of m.tracks) {
+      const ep = m.embeddingPositions.get(t.path);
+      const existing = cv.animPositions?.get(t.path);
+      if (existing) {
+        startPos.set(t.path, { ...existing });
+      } else if (ep) {
+        startPos.set(t.path, { x: ep.x, y: ep.y });
+      }
+    }
+
+    cv.animPositions = startPos;
+    const DURATION = 500;
+    const t0 = performance.now();
+
+    cancelAnimationFrame(this._animFrame);
+    const step = () => {
+      const elapsed = performance.now() - t0;
+      const t = Math.min(1, elapsed / DURATION);
+      const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+      for (const track of m.tracks) {
+        const start = startPos.get(track.path);
+        if (!start) continue;
+        const tx = m.axisX ? (track.tags[m.axisX] ?? 0.5) : 0.5;
+        const ty = m.axisY ? (track.tags[m.axisY] ?? 0.5) : 0.5;
+        cv.animPositions!.set(track.path, {
+          x: start.x + (tx - start.x) * ease,
+          y: start.y + (ty - start.y) * ease,
+        });
+      }
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._animFrame = requestAnimationFrame(step);
+      } else {
+        cv.animPositions = null;
+        cv.scheduleDraw();
+      }
+    };
+    this._animFrame = requestAnimationFrame(step);
+  }
+
+  /**
+   * Animate tag-space dots from their current positions to the positions they
+   * will occupy after changing an axis.  Must only be called in "tags" mode.
+   */
+  private _animateAxisChange(which: "axisX" | "axisY", tag: string): void {
+    const cv = this.canvas;
+    const m = this.model;
+
+    // Snapshot where every track currently sits (mid-animation positions take
+    // priority, otherwise use current tag values with the old axes).
+    const startPos = new Map<string, { x: number; y: number }>();
+    for (const t of m.tracks) {
+      const existing = cv.animPositions?.get(t.path);
+      if (existing) {
+        startPos.set(t.path, { ...existing });
+      } else {
+        startPos.set(t.path, {
+          x: m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5,
+          y: m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5,
+        });
+      }
+    }
+
+    // Apply the axis change (emits "change" → scheduleDraw).
+    m.toggleAxis(which, tag);
+
+    // Override the canvas with our start snapshot so the change-event draw
+    // shows the old positions — the animation will take it from here.
+    cv.animPositions = startPos;
+
+    const DURATION = 500;
+    const t0 = performance.now();
+
+    cancelAnimationFrame(this._animFrame);
+    const step = () => {
+      const elapsed = performance.now() - t0;
+      const t = Math.min(1, elapsed / DURATION);
+      const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+      for (const [path, start] of startPos) {
+        const track = m.trackByPath(path);
+        if (!track) continue;
+        // Target is the new tag position (axes are already updated).
+        const tx = m.axisX ? (track.tags[m.axisX] ?? 0.5) : 0.5;
+        const ty = m.axisY ? (track.tags[m.axisY] ?? 0.5) : 0.5;
+        cv.animPositions!.set(path, {
+          x: start.x + (tx - start.x) * ease,
+          y: start.y + (ty - start.y) * ease,
+        });
+      }
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._animFrame = requestAnimationFrame(step);
+      } else {
+        cv.animPositions = null;
+        cv.scheduleDraw();
+      }
+    };
+    this._animFrame = requestAnimationFrame(step);
+  }
+
+  private async _toggleViewMode(): Promise<void> {
+    const m = this.model;
+    // Persist the current viewport for the mode we're leaving.
+    this._savedVpByMode.set(m.viewMode, { ...m.vp });
+
+    if (m.viewMode === "tags") {
+      m.setViewMode("embeddings");
+      // Restore a previously saved embedding viewport, or default to full [0,1] view.
+      const saved = this._savedVpByMode.get("embeddings");
+      if (saved) {
+        m.vp.ox = saved.ox;
+        m.vp.oy = saved.oy;
+        m.vp.zoom = saved.zoom;
+      } else {
+        m.vp.ox = 0;
+        m.vp.oy = 0;
+        m.vp.zoom = 1;
+      }
+      if (m.embeddingsReady) {
+        this._animateToEmbeddings();
+      } else {
+        await this._ensureEmbeddingsAndProject();
+      }
+    } else {
+      m.setViewMode("tags");
+      // Restore a previously saved tag viewport, or leave as-is (first time back).
+      const saved = this._savedVpByMode.get("tags");
+      if (saved) {
+        m.vp.ox = saved.ox;
+        m.vp.oy = saved.oy;
+        m.vp.zoom = saved.zoom;
+      }
+      this._animateToTags();
+    }
+    m.saveLS();
+    this.status.update(m);
+    const $vm = document.getElementById(
+      "view-mode-toggle",
+    ) as HTMLInputElement | null;
+    if ($vm) $vm.checked = m.viewMode === "embeddings";
+  }
+
+  /** Switch to a specific view mode (no-op if already there). */
+  private async _switchToMode(target: "tags" | "embeddings"): Promise<void> {
+    if (this.model.viewMode === target) return;
+    await this._toggleViewMode();
   }
 
   /* ── Subfolder creation ─────────────────────────────────── */
@@ -531,9 +1048,11 @@ export class Controller {
     }
     if (e.button !== 0) return;
 
-    // Resize handles always take priority.
+    // Resize handles always take priority (disabled in embedding mode).
     const txh =
-      m.selected.size > 0 ? cv.hitTestTransform(sx, sy) : null;
+      m.selected.size > 0 && m.viewMode !== "embeddings"
+        ? cv.hitTestTransform(sx, sy)
+        : null;
     if (txh && txh.type !== "move") {
       this._startTxform(txh.type, sx, sy);
       return;
@@ -547,6 +1066,7 @@ export class Controller {
     if (e.shiftKey && hit < 0 && !(txh?.type === "move")) {
       mouse.mode = "lasso";
       cv.lassoPoints = [[sx, sy]];
+      cv.intersectMode = e.ctrlKey || e.metaKey;
       return;
     }
 
@@ -560,9 +1080,13 @@ export class Controller {
         if (!additive) m.selected.clear();
         m.selected.add(hitPath);
       }
+      // In embedding mode allow pending so a threshold drag can trigger folder-drop,
+      // but skip the tag-position snap (embedding positions are used for ghosts instead).
       mouse.mode = "pending";
-      this._fillDragSnapFromSelection();
-    } else if (txh?.type === "move") {
+      if (m.viewMode !== "embeddings") {
+        this._fillDragSnapFromSelection();
+      }
+    } else if (txh?.type === "move" && m.viewMode !== "embeddings") {
       // Clicked inside the selection bounding box — same drag path as track drag.
       mouse.hitInSelectionBox = true;
       mouse.mode = "pending";
@@ -571,6 +1095,7 @@ export class Controller {
       // Clicked on empty background → box selection.
       mouse.mode = "boxsel";
       cv.boxSel = { x0: sx, y0: sy, x1: sx, y1: sy };
+      cv.intersectMode = e.ctrlKey || e.metaKey;
     }
 
     cv.scheduleDraw();
@@ -605,9 +1130,12 @@ export class Controller {
     cv.$canvas.style.cursor = "move";
     const ghosts = new Map<string, { wx: number; wy: number; folder: string }>();
     for (const [path, snap] of mouse.snap!) {
+      // In embedding mode use the embedding position for the ghost dot so it sits
+      // on top of the dot the user clicked rather than at the (invisible) tag position.
+      const ep = m.viewMode === "embeddings" ? m.embeddingPositions.get(path) : null;
       ghosts.set(path, {
-        wx: snap.x,
-        wy: snap.y,
+        wx: ep ? ep.x : snap.x,
+        wy: ep ? ep.y : snap.y,
         folder: snap.track.folder ?? "",
       });
     }
@@ -725,12 +1253,14 @@ export class Controller {
 
     if (mouse.mode === "boxsel") {
       cv.boxSel = { x0: mouse.sx, y0: mouse.sy, x1: sx, y1: sy };
+      cv.intersectMode = e.ctrlKey || e.metaKey;
       cv.scheduleDraw();
       return;
     }
 
     if (mouse.mode === "lasso") {
       cv.lassoPoints.push([sx, sy]);
+      cv.intersectMode = e.ctrlKey || e.metaKey;
       cv.scheduleDraw();
       return;
     }
@@ -753,13 +1283,16 @@ export class Controller {
     }
 
     if (mouse.mode === "drag") {
-      const [swx, swy] = cv.s2w(mouse.sx, mouse.sy);
-      const [cwx, cwy] = cv.s2w(sx, sy);
-      const dx = cwx - swx,
-        dy = cwy - swy;
-      for (const [, snap] of mouse.snap!) {
-        if (m.axisX) snap.track.tags[m.axisX] = clamp(snap.x + dx);
-        if (m.axisY) snap.track.tags[m.axisY] = clamp(snap.y + dy);
+      // In embedding mode the drag is only for folder-drop; skip tag mutations.
+      if (m.viewMode !== "embeddings") {
+        const [swx, swy] = cv.s2w(mouse.sx, mouse.sy);
+        const [cwx, cwy] = cv.s2w(sx, sy);
+        const dx = cwx - swx,
+          dy = cwy - swy;
+        for (const [, snap] of mouse.snap!) {
+          if (m.axisX) snap.track.tags[m.axisX] = clamp(snap.x + dx);
+          if (m.axisY) snap.track.tags[m.axisY] = clamp(snap.y + dy);
+        }
       }
       cv.scheduleDraw();
       return;
@@ -800,22 +1333,31 @@ export class Controller {
     if (mouse.mode === "boxsel") {
       const bs = cv.boxSel;
       cv.boxSel = null;
+      cv.intersectMode = false;
       if (bs) {
         const bL = Math.min(bs.x0, bs.x1),
           bR = Math.max(bs.x0, bs.x1);
         const bT = Math.min(bs.y0, bs.y1),
           bB = Math.max(bs.y0, bs.y1);
         const isClick = bR - bL < 4 && bB - bT < 4;
-        if (!(e.ctrlKey || e.metaKey)) m.selected.clear();
-        if (!isClick) {
-          for (const p of cv.positions)
-            if (
-              p.sx >= bL &&
-              p.sx <= bR &&
-              p.sy >= bT &&
-              p.sy <= bB
-            )
-              m.selected.add(tracks[p.idx].path);
+        if (e.ctrlKey || e.metaKey) {
+          // AND / intersect: keep only the existing selection that also falls inside the box
+          if (!isClick) {
+            const inBox = new Set<string>(
+              cv.positions
+                .filter((p) => p.sx >= bL && p.sx <= bR && p.sy >= bT && p.sy <= bB)
+                .map((p) => tracks[p.idx].path),
+            );
+            for (const path of [...m.selected])
+              if (!inBox.has(path)) m.selected.delete(path);
+          }
+        } else {
+          m.selected.clear();
+          if (!isClick) {
+            for (const p of cv.positions)
+              if (p.sx >= bL && p.sx <= bR && p.sy >= bT && p.sy <= bB)
+                m.selected.add(tracks[p.idx].path);
+          }
         }
       }
       mouse.mode = "idle";
@@ -853,12 +1395,23 @@ export class Controller {
     }
 
     if (mouse.mode === "lasso") {
-      // Shift starts lasso, so treat shift as additive too.
-      if (!(e.ctrlKey || e.metaKey || e.shiftKey)) m.selected.clear();
-      for (const p of cv.positions)
-        if (pointInPoly(p.sx, p.sy, cv.lassoPoints))
-          m.selected.add(tracks[p.idx].path);
+      const lassoPts = cv.lassoPoints;
       cv.lassoPoints = [];
+      cv.intersectMode = false;
+      const inLasso = new Set<string>(
+        cv.positions
+          .filter((p) => pointInPoly(p.sx, p.sy, lassoPts))
+          .map((p) => tracks[p.idx].path),
+      );
+      if (e.ctrlKey || e.metaKey) {
+        // AND / intersect: keep only the existing selection that also falls inside the lasso
+        for (const path of [...m.selected])
+          if (!inLasso.has(path)) m.selected.delete(path);
+      } else {
+        // Shift starts lasso, so treat shift as additive union
+        if (!e.shiftKey) m.selected.clear();
+        for (const path of inLasso) m.selected.add(path);
+      }
     }
 
     if (mouse.mode === "pending") {
@@ -907,6 +1460,7 @@ export class Controller {
         metaKey: false,
       } as MouseEvent);
     cv.boxSel = null;
+    cv.intersectMode = false;
     cv.clearHover();
     cv.$canvas.style.cursor = "";
     this._stopPreview();
@@ -929,7 +1483,8 @@ export class Controller {
     if (e.ctrlKey) {
       const factor = Math.exp(-dy * 0.005);
       const [wx, wy] = cv.s2w(sx, sy);
-      vp.zoom = clamp(vp.zoom * factor, 1, 50);
+      const zMin = cv.minZoom();
+      vp.zoom = clamp(vp.zoom * factor, zMin, 50);
       const [wx2, wy2] = cv.s2w(sx, sy);
       vp.ox += wx - wx2;
       vp.oy += wy - wy2;
@@ -944,7 +1499,7 @@ export class Controller {
       } else {
         const f = dy < 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
         const [wx, wy] = cv.s2w(sx, sy);
-        vp.zoom = clamp(vp.zoom * f, 1, 50);
+        vp.zoom = clamp(vp.zoom * f, cv.minZoom(), 50);
         const [wx2, wy2] = cv.s2w(sx, sy);
         vp.ox += wx - wx2;
         vp.oy += wy - wy2;
@@ -1012,41 +1567,15 @@ export class Controller {
     if (folderEl) {
       const dest =
         folderEl.dataset.path === "." ? "" : folderEl.dataset.path!;
-      await this._moveSelectedToFolder(dest);
+      this._moveSelectedToFolder(dest);
     }
   };
 
-  private async _moveSelectedToFolder(destPath: string): Promise<void> {
+  private _moveSelectedToFolder(destPath: string): void {
     const m = this.model;
     const paths = [...m.selected];
     if (!paths.length) return;
-    try {
-      const res = await postJSON<{
-        ok: boolean;
-        moved: number;
-        errors: string[];
-      }>("/api/tracks/move", { paths, dest: destPath });
-      if (res.errors?.length) toast(res.errors.join("; "), "error");
-      if (res.moved)
-        toast(
-          `Moved ${res.moved} track${res.moved > 1 ? "s" : ""} to /${destPath || "(root)"}`,
-          "ok",
-        );
-      if (res.moved > 0 && !res.errors?.length) {
-        // Patch in-memory state only — no _loadLibrary() here.
-        // Calling _loadLibrary() would replace all track objects while the
-        // user may already have started a new interaction (drag, boxsel, …),
-        // leaving snap/txSnap holding stale references and resetting positions.
-        m.applyTracksMoved(paths, destPath);
-        await this._refreshFolderTreeHtmx();
-      } else {
-        // Partial success or full failure: server state is uncertain — reload.
-        m.selected.clear();
-        await Promise.all([this._loadLibrary(), this._refreshFolderTreeHtmx()]);
-      }
-    } catch {
-      /* already toasted */
-    }
+    void this.cmdMgr.run(new MoveTracksCommand(paths, destPath), m);
   }
 
   /* ── Debounced tag writes ───────────────────────────────── */
@@ -1054,6 +1583,8 @@ export class Controller {
   /** Undo in-viewport tag offsets when the drag ends with a folder drop instead of a canvas commit. */
   private _revertDragSnapToBaseline(): void {
     const m = this.model;
+    // In embedding mode no tag values were mutated during the drag, nothing to revert.
+    if (m.viewMode === "embeddings") return;
     for (const [, snap] of this.mouse.snap ?? []) {
       if (m.axisX) snap.track.tags[m.axisX] = snap.x;
       if (m.axisY) snap.track.tags[m.axisY] = snap.y;
@@ -1063,6 +1594,8 @@ export class Controller {
 
   private _commitDrag(): void {
     const m = this.model;
+    // In embedding mode no tag values were changed during the drag; nothing to persist.
+    if (m.viewMode === "embeddings") return;
     for (const [path, snap] of this.mouse.snap ?? []) {
       if (m.axisX)
         this.pending.set(`${path}|${m.axisX}`, {
@@ -1096,6 +1629,11 @@ export class Controller {
 
   private _computeFitVP(): { ox: number; oy: number; zoom: number } {
     const m = this.model;
+
+    // In embedding mode positions are already normalised to [0,1], so the
+    // default viewport shows everything.
+    if (m.viewMode === "embeddings") return { ox: 0, oy: 0, zoom: 1 };
+
     const visible = m.tracks.filter((t) => m.passesFilter(t));
     if (visible.length === 0) return { ox: 0, oy: 0, zoom: 1 };
 
@@ -1121,7 +1659,7 @@ export class Controller {
       maxX - minX > 0.01 ? (1 - 2 * margin) / (maxX - minX) : 50;
     const zy =
       maxY - minY > 0.01 ? (1 - 2 * margin) / (maxY - minY) : 50;
-    const zoom = Math.max(1, Math.min(50, Math.min(zx, zy)));
+    const zoom = Math.max(this.canvas.minZoom(), Math.min(50, Math.min(zx, zy)));
     return {
       zoom,
       ox: midX - 1 / (2 * zoom),
@@ -1171,6 +1709,9 @@ export class Controller {
     const $hov = document.getElementById(
       "hover-preview-toggle",
     ) as HTMLInputElement;
+    const $vm = document.getElementById(
+      "view-mode-toggle",
+    ) as HTMLInputElement;
     const $addT = document.getElementById("btn-add-tag")!;
     const $addF = document.getElementById("btn-add-folder")!;
 
@@ -1181,119 +1722,175 @@ export class Controller {
       m.saveLS();
     });
 
+    $vm.checked = m.viewMode === "embeddings";
+    $vm.addEventListener("change", () => void this._toggleViewMode());
+
     $addT.addEventListener("click", () => {
-      const raw = prompt("New tag name:");
-      if (!raw || !raw.trim()) return;
-      const name = raw.trim().toLowerCase().replace(/\s+/g, "_");
-      if (m.tags.includes(name)) {
-        toast("Tag already exists", "error");
-        return;
+      let name = "new_tag";
+      let n = 1;
+      while (m.tags.includes(name)) {
+        n++;
+        name = `new_tag_${n}`;
       }
       m.addKnownTag(name);
-      this.tagPanel.render();
       m.saveLS();
-      toast(`Tag "${name}" created`, "ok");
+      this.tagPanel.scheduleRenameAfterRender(name);
+      this.tagPanel.render();
     });
 
     $addF.addEventListener("click", () => this._createSubfolder(m.folder));
+
+    this._initProjectionToggle();
+    this._initScalingToggles();
+  }
+
+  private _initScalingToggles(): void {
+    const m = this.model;
+    const $tags = document.getElementById("scale-tags-toggle") as HTMLInputElement;
+    const $folders = document.getElementById("scale-folders-toggle") as HTMLInputElement;
+
+    $tags.checked = m.scaleByTags;
+    $folders.checked = m.scaleByFolders;
+
+    const onToggle = () => {
+      m.scaleByTags = $tags.checked;
+      m.scaleByFolders = $folders.checked;
+      m.saveLS();
+      if (m.viewMode === "embeddings" && m.embeddingsReady) {
+        void this._fetchUmapPositions();
+      } else if (m.viewMode !== "embeddings") {
+        void this._switchToMode("embeddings");
+      }
+    };
+
+    $tags.addEventListener("change", onToggle);
+    $folders.addEventListener("change", onToggle);
+  }
+
+  private _initProjectionToggle(): void {
+    const m = this.model;
+    const $toggle = document.getElementById("projection-toggle");
+    if (!$toggle) return;
+
+    const syncActive = () => {
+      for (const btn of $toggle.querySelectorAll<HTMLElement>(".toggle-btn")) {
+        btn.classList.toggle("active", btn.dataset.method === m.projectionMethod);
+      }
+    };
+    syncActive();
+
+    $toggle.addEventListener("click", (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLElement>(".toggle-btn");
+      if (!btn || !btn.dataset.method) return;
+      const method = btn.dataset.method as ProjectionMethod;
+      if (method === m.projectionMethod) return;
+      m.setProjectionMethod(method);
+      syncActive();
+      m.saveLS();
+      if (m.viewMode === "embeddings") {
+        void this._fetchUmapPositions();
+      } else {
+        void this._switchToMode("embeddings");
+      }
+    });
   }
 
   /* ── Keyboard shortcuts ─────────────────────────────────── */
 
   private _bindKeyboard(): void {
     const m = this.model;
+    const hk = this.hotkeyMgr;
     const $hov = document.getElementById(
       "hover-preview-toggle",
     ) as HTMLInputElement;
 
-    document.addEventListener("keydown", (e) => {
-      if (
-        (e.target as HTMLElement).tagName === "INPUT" ||
-        (e.target as HTMLElement).tagName === "TEXTAREA"
-      )
-        return;
+    hk.on("toggle-preview", () => {
+      m.hoverPreview = !m.hoverPreview;
+      $hov.checked = m.hoverPreview;
+      if (!m.hoverPreview) this._stopPreview();
+      m.saveLS();
+    });
 
-      if (e.key === "m" || e.key === "M") {
-        m.hoverPreview = !m.hoverPreview;
-        $hov.checked = m.hoverPreview;
-        if (!m.hoverPreview) this._stopPreview();
-        m.saveLS();
+    hk.on("fit-view", () => {
+      const vp = m.vp;
+      const fit = this._computeFitVP();
+      const atFit =
+        Math.abs(vp.ox - fit.ox) < 0.002 &&
+        Math.abs(vp.oy - fit.oy) < 0.002 &&
+        Math.abs(vp.zoom - fit.zoom) < 0.05;
+      if (atFit) {
+        vp.ox = 0;
+        vp.oy = 0;
+        vp.zoom = 1;
+      } else {
+        this._fitViewToTracks();
       }
-      if (e.key === "h" || e.key === "H") {
-        const vp = m.vp;
-        const fit = this._computeFitVP();
-        const atFit =
-          Math.abs(vp.ox - fit.ox) < 0.002 &&
-          Math.abs(vp.oy - fit.oy) < 0.002 &&
-          Math.abs(vp.zoom - fit.zoom) < 0.05;
-        if (atFit) {
-          vp.ox = 0;
-          vp.oy = 0;
-          vp.zoom = 1;
-        } else {
-          this._fitViewToTracks();
-        }
-        this.canvas.scheduleDraw();
-        m.saveLS();
-      }
-      if (e.key === "i" || e.key === "I") {
-        const cv = this.canvas;
-        if (cv.hoveredIdx >= 0) {
-          const track = m.tracks[cv.hoveredIdx];
-          const folder = track?.folder ?? "";
-          if (folder !== m.folder) {
-            m.setFolder(folder);
-            this._treeActivateFolder(folder);
-            setTimeout(() => this.tagPanel.render(), 0);
-            m.saveLS();
-          }
-        }
-      }
-      if (e.key === "u" || e.key === "U") {
-        const slash = m.folder.lastIndexOf("/");
-        const parent =
-          slash > 0
-            ? m.folder.slice(0, slash)
-            : m.folder !== ""
-              ? ""
-              : null;
-        if (parent !== null) {
-          m.setFolder(parent);
-          this._treeActivateFolder(parent);
+      this.canvas.scheduleDraw();
+      m.saveLS();
+    });
+
+    hk.on("enter-folder", () => {
+      const cv = this.canvas;
+      if (cv.hoveredIdx >= 0) {
+        const track = m.tracks[cv.hoveredIdx];
+        const folder = track?.folder ?? "";
+        if (folder !== m.folder) {
+          m.setFolder(folder);
+          this._treeActivateFolder(folder);
           setTimeout(() => this.tagPanel.render(), 0);
           m.saveLS();
         }
       }
-      if (e.key === "a" && (e.ctrlKey || e.metaKey)) {
-        e.preventDefault();
-        m.selectAll();
+    });
+
+    hk.on("parent-folder", () => {
+      const slash = m.folder.lastIndexOf("/");
+      const parent =
+        slash > 0
+          ? m.folder.slice(0, slash)
+          : m.folder !== ""
+            ? ""
+            : null;
+      if (parent !== null) {
+        m.setFolder(parent);
+        this._treeActivateFolder(parent);
+        setTimeout(() => this.tagPanel.render(), 0);
+        m.saveLS();
       }
-      if (e.key === "Escape") {
-        const cv = this.canvas;
-        const mouse = this.mouse;
-        if (mouse.mode === "drag") {
-          e.preventDefault();
-          this._revertDragSnapToBaseline();
-          this._cleanupDocDrag();
-          mouse.mode = "idle";
-          mouse.snap = null;
-          cv.dragGhosts = null;
-          cv.$canvas.style.cursor = "";
-          cv.scheduleDraw();
-          this.status.update(m);
-          this.props.render();
-          this.batch.render();
-        } else if (mouse.mode === "boxsel") {
-          cv.boxSel = null;
-          mouse.mode = "idle";
-          cv.scheduleDraw();
-        } else if (mouse.mode === "lasso") {
-          cv.lassoPoints = [];
-          mouse.mode = "idle";
-          cv.scheduleDraw();
-        } else {
-          m.clearSelection();
-        }
+    });
+
+    hk.on("select-all", () => m.selectAll());
+
+    hk.on("undo", () => void this.cmdMgr.undo(m));
+
+    hk.on("toggle-view", () => void this._toggleViewMode());
+
+    hk.on("deselect", () => {
+      const cv = this.canvas;
+      const mouse = this.mouse;
+      if (mouse.mode === "drag") {
+        this._revertDragSnapToBaseline();
+        this._cleanupDocDrag();
+        mouse.mode = "idle";
+        mouse.snap = null;
+        cv.dragGhosts = null;
+        cv.$canvas.style.cursor = "";
+        cv.scheduleDraw();
+        this.status.update(m);
+        this.props.render();
+        this.batch.render();
+      } else if (mouse.mode === "boxsel") {
+        cv.boxSel = null;
+        cv.intersectMode = false;
+        mouse.mode = "idle";
+        cv.scheduleDraw();
+      } else if (mouse.mode === "lasso") {
+        cv.lassoPoints = [];
+        cv.intersectMode = false;
+        mouse.mode = "idle";
+        cv.scheduleDraw();
+      } else {
+        m.clearSelection();
       }
     });
   }

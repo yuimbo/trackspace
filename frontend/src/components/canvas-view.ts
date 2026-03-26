@@ -59,12 +59,17 @@ export class CanvasView {
   tipTimer = 0;
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
+  /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
+  intersectMode = false;
   dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null = null;
   _rafId = 0;
 
   txHandles: TxHandle[] = [];
   _txBox: TxBox | null = null;
   _txWorld: TxWorld | null = null;
+
+  /** Transient per-track positions used during animated mode transitions. */
+  animPositions: Map<string, { x: number; y: number }> | null = null;
 
   // Offscreen canvas used as render texture for the glow screen-pass
   private _glowCanvas: HTMLCanvasElement | null = null;
@@ -101,6 +106,13 @@ export class CanvasView {
       (sx - PAD) / (vp.zoom * iw) + vp.ox,
       (h - PAD - sy) / (vp.zoom * ih) + vp.oy,
     ];
+  }
+
+  /** Minimum zoom: let the user zoom out until the longest axis drives the limit. */
+  minZoom(): number {
+    const iw = Math.max(1, this.$canvas.clientWidth - 2 * PAD);
+    const ih = Math.max(1, this.$canvas.clientHeight - 2 * PAD);
+    return Math.min(iw, ih) / Math.max(iw, ih);
   }
 
   /* ── Sizing ─────────────────────────────────────────────── */
@@ -194,6 +206,7 @@ export class CanvasView {
     this._drawClusters();
     this._drawBoxSel();
     this._drawLasso();
+    this._drawModeBadge(w, h);
     this._updateTooltip(tracks);
   }
 
@@ -326,13 +339,17 @@ export class CanvasView {
     ctx.font = "10px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
-    if (m.axisX) ctx.fillText(m.axisX, w / 2, h - 2);
-    if (m.axisY) {
-      ctx.save();
-      ctx.translate(8, h / 2);
-      ctx.rotate(-Math.PI / 2);
-      ctx.fillText(m.axisY, 0, 0);
-      ctx.restore();
+    if (m.viewMode === "embeddings") {
+      ctx.fillText("Embedding Space", w / 2, h - 2);
+    } else {
+      if (m.axisX) ctx.fillText(m.axisX, w / 2, h - 2);
+      if (m.axisY) {
+        ctx.save();
+        ctx.translate(8, h / 2);
+        ctx.rotate(-Math.PI / 2);
+        ctx.fillText(m.axisY, 0, 0);
+        ctx.restore();
+      }
     }
 
     ctx.restore();
@@ -340,19 +357,45 @@ export class CanvasView {
 
   /* ── Scatter plot (filter-aware) ────────────────────────── */
 
+  private _tagPos(t: Track): { wx: number; wy: number } {
+    const m = this.model;
+    const tx = m.axisX, ty = m.axisY;
+    return {
+      wx: tx ? (t.tags[tx] ?? 0.5) : 0.5,
+      wy: ty ? (t.tags[ty] ?? 0.5) : 0.5,
+    };
+  }
+
+  private _resolveTrackWPos(t: Track): { wx: number; wy: number } | null {
+    const m = this.model;
+
+    // During animation, interpolated positions always take priority
+    if (this.animPositions) {
+      const ap = this.animPositions.get(t.path);
+      if (ap) return { wx: ap.x, wy: ap.y };
+    }
+
+    if (m.viewMode === "embeddings") {
+      const ep = m.embeddingPositions.get(t.path);
+      if (ep) return { wx: ep.x, wy: ep.y };
+      // No embedding → hide the track (don't fall back to tag positions)
+      return null;
+    }
+
+    return this._tagPos(t);
+  }
+
   private _drawScatter(tracks: Track[]): void {
     const m = this.model;
-    const tx = m.axisX,
-      ty = m.axisY;
     let anyFiltered = false;
     tracks.forEach((t, i) => {
-      if (!m.passesFilter(t)) {
+      if (m.viewMode === "tags" && !m.passesFilter(t)) {
         anyFiltered = true;
         return;
       }
-      const wx = tx ? (t.tags[tx] ?? 0.5) : 0.5;
-      const wy = ty ? (t.tags[ty] ?? 0.5) : 0.5;
-      const [sx, sy] = this.w2s(wx, wy);
+      const pos = this._resolveTrackWPos(t);
+      if (!pos) return;
+      const [sx, sy] = this.w2s(pos.wx, pos.wy);
       this.positions.push({ idx: i, sx, sy });
       this._dot(sx, sy, t, i);
     });
@@ -492,6 +535,7 @@ export class CanvasView {
   private _drawTransformBox(): void {
     const m = this.model;
     if (!m.selected.size) return;
+    if (m.viewMode === "embeddings") return;
     if (!m.axisX && !m.axisY) return;
 
     let minX = Infinity,
@@ -616,6 +660,59 @@ export class CanvasView {
     ctx.textBaseline = "alphabetic";
   }
 
+  /* ── Mode badge ─────────────────────────────────────────── */
+
+  private _drawModeBadge(w: number, h: number): void {
+    const m = this.model;
+    if (m.viewMode !== "embeddings") return;
+    const ctx = this.ctx;
+    ctx.save();
+
+    // Small top-right badge
+    ctx.font = "bold 10px monospace";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "top";
+    ctx.fillStyle = "rgba(120,200,255,0.6)";
+    ctx.fillText("EMBEDDING SPACE", w - 8, 8);
+    let y = 22;
+    if (m.embeddingsGenerating && m.embeddingProgress) {
+      ctx.fillStyle = "rgba(255,200,100,0.6)";
+      ctx.fillText(
+        `generating ${m.embeddingProgress.done}/${m.embeddingProgress.total}…`,
+        w - 8,
+        y,
+      );
+      y += 14;
+    }
+
+    // Large centred "clustering…" overlay
+    if (m.projectionPending) {
+      const cx = w / 2;
+      const cy = h / 2;
+      const label = "clustering…";
+      ctx.font = "bold 22px monospace";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      const metrics = ctx.measureText(label);
+      const pw = metrics.width + 28;
+      const ph = 44;
+      const rx = 8;
+      // pill background
+      ctx.beginPath();
+      ctx.roundRect(cx - pw / 2, cy - ph / 2, pw, ph, rx);
+      ctx.fillStyle = "rgba(10,14,30,0.72)";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(180,220,255,0.35)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // label
+      ctx.fillStyle = "rgba(180,220,255,0.9)";
+      ctx.fillText(label, cx, cy);
+    }
+
+    ctx.restore();
+  }
+
   /* ── Box selection overlay ──────────────────────────────── */
 
   private _drawBoxSel(): void {
@@ -627,14 +724,23 @@ export class CanvasView {
     const h = Math.abs(bs.y1 - bs.y0);
     if (w < 2 && h < 2) return;
     const ctx = this.ctx;
+    const stroke = this.intersectMode ? "rgba(80,220,255,0.75)" : "rgba(255,221,87,0.7)";
+    const fill   = this.intersectMode ? "rgba(80,220,255,0.07)" : "rgba(255,221,87,0.06)";
     ctx.save();
-    ctx.strokeStyle = "rgba(255,221,87,0.7)";
+    ctx.strokeStyle = stroke;
     ctx.lineWidth = 1.5;
     ctx.setLineDash([5, 4]);
     ctx.strokeRect(x, y, w, h);
     ctx.setLineDash([]);
-    ctx.fillStyle = "rgba(255,221,87,0.06)";
+    ctx.fillStyle = fill;
     ctx.fillRect(x, y, w, h);
+    if (this.intersectMode && (w >= 2 || h >= 2)) {
+      ctx.font = "bold 11px monospace";
+      ctx.fillStyle = "rgba(80,220,255,0.7)";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.fillText("∩ AND", x + 4, y - 3);
+    }
     ctx.restore();
   }
 
@@ -644,17 +750,26 @@ export class CanvasView {
     const pts = this.lassoPoints;
     if (pts.length < 2) return;
     const ctx = this.ctx;
+    const stroke = this.intersectMode ? "rgba(80,220,255,0.75)" : "rgba(255,221,87,0.7)";
+    const fill   = this.intersectMode ? "rgba(80,220,255,0.07)" : "rgba(255,221,87,0.06)";
     ctx.beginPath();
     ctx.moveTo(pts[0][0], pts[0][1]);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
     ctx.closePath();
-    ctx.strokeStyle = "rgba(255,221,87,0.7)";
+    ctx.strokeStyle = stroke;
     ctx.lineWidth = 1.5;
     ctx.setLineDash([5, 4]);
     ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "rgba(255,221,87,0.06)";
+    ctx.fillStyle = fill;
     ctx.fill();
+    if (this.intersectMode) {
+      ctx.font = "bold 11px monospace";
+      ctx.fillStyle = "rgba(80,220,255,0.7)";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "bottom";
+      ctx.fillText("∩ AND", pts[0][0] + 6, pts[0][1] - 4);
+    }
   }
 
   /* ── Tooltip ────────────────────────────────────────────── */

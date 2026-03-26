@@ -9,9 +9,18 @@ export class StatusView {
   }
 
   update(model: Model): void {
-    if (model.selected.size)
-      this.$el.textContent = `${model.selected.size} selected  ·  ${model.tracks.length} tracks`;
-    else
-      this.$el.textContent = `${model.tracks.length} tracks in /${model.folder}`;
+    const parts: string[] = [];
+    if (model.selected.size) {
+      parts.push(`${model.selected.size} selected  ·  ${model.tracks.length} tracks`);
+    } else {
+      parts.push(`${model.tracks.length} tracks in /${model.folder}`);
+    }
+    if (model.viewMode === "embeddings") {
+      parts.push(`Embedding Space (${model.projectionMethod.toUpperCase()})`);
+      if (model.embeddingsGenerating && model.embeddingProgress) {
+        parts.push(`generating ${model.embeddingProgress.done}/${model.embeddingProgress.total}`);
+      }
+    }
+    this.$el.textContent = parts.join("  ·  ");
   }
 }

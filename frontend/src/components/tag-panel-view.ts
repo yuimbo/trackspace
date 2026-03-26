@@ -8,6 +8,11 @@ export class TagPanelView {
   onAxisChange: ((which: string, tag: string) => void) | null = null;
   onFilterChange: ((tag: string, range: [number, number]) => void) | null =
     null;
+  onTagRename: ((oldName: string, newName: string) => void) | null = null;
+
+  /** Tag name to auto-enter rename mode after next render. */
+  private _pendingRename: string | null = null;
+  private _interacting = false;
 
   constructor(model: Model, container: HTMLElement) {
     this.model = model;
@@ -15,6 +20,7 @@ export class TagPanelView {
   }
 
   render(): void {
+    if (this._interacting) return;
     this.$el.innerHTML = "";
     const m = this.model;
     for (const tag of m.tags) {
@@ -22,6 +28,66 @@ export class TagPanelView {
       this._buildTagRow(li, tag);
       this.$el.appendChild(li);
     }
+    if (this._pendingRename) {
+      const tag = this._pendingRename;
+      this._pendingRename = null;
+      requestAnimationFrame(() => this.beginRename(tag));
+    }
+  }
+
+  beginRename(tag: string): void {
+    const nameEl = this.$el.querySelector(
+      `[data-tag="${CSS.escape(tag)}"]`,
+    ) as HTMLElement | null;
+    if (!nameEl) return;
+
+    const oldName = tag;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "tag-rename-input";
+    input.value = oldName;
+
+    let done = false;
+    nameEl.replaceWith(input);
+    input.select();
+    input.focus();
+
+    const commit = () => {
+      if (done) return;
+      done = true;
+      const raw = input.value.trim().toLowerCase().replace(/\s+/g, "_");
+      if (!raw || raw === oldName) {
+        input.replaceWith(nameEl);
+        return;
+      }
+      if (this.model.tags.includes(raw) && raw !== oldName) {
+        input.replaceWith(nameEl);
+        return;
+      }
+      this.onTagRename?.(oldName, raw);
+    };
+
+    const cancel = () => {
+      if (done) return;
+      done = true;
+      input.replaceWith(nameEl);
+    };
+
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        commit();
+      }
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        cancel();
+      }
+    });
+    input.addEventListener("blur", () => commit());
+  }
+
+  scheduleRenameAfterRender(tag: string): void {
+    this._pendingRename = tag;
   }
 
   private _buildTagRow(li: HTMLLIElement, tag: string): void {
@@ -30,7 +96,13 @@ export class TagPanelView {
 
     const name = document.createElement("span");
     name.className = "tag-name";
+    name.dataset.tag = tag;
     name.textContent = tag;
+    name.addEventListener("dblclick", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.beginRename(tag);
+    });
     li.appendChild(name);
 
     (
@@ -40,7 +112,10 @@ export class TagPanelView {
       ] as const
     ).forEach(([lbl, key]) => {
       const btn = document.createElement("button");
-      btn.className = "axis-btn" + (m[key] === tag ? " active" : "");
+      let cls = "axis-btn";
+      if (m[key] === tag) cls += " active";
+      if (m.viewMode !== "tags") cls += " mode-dimmed";
+      btn.className = cls;
       btn.textContent = lbl;
       btn.addEventListener("click", () => this.onAxisChange?.(key, tag));
       li.appendChild(btn);
@@ -98,14 +173,11 @@ export class TagPanelView {
         Math.min(+sLo.value, +sHi.value),
         Math.max(+sLo.value, +sHi.value),
       ]);
-    sLo.addEventListener("input", () => {
-      sync();
-      fire();
-    });
-    sHi.addEventListener("input", () => {
-      sync();
-      fire();
-    });
+    for (const s of [sLo, sHi]) {
+      s.addEventListener("pointerdown", () => { this._interacting = true; });
+      s.addEventListener("pointerup", () => { this._interacting = false; });
+      s.addEventListener("input", () => { sync(); fire(); });
+    }
 
     const resetBtn = document.createElement("button");
     resetBtn.className = "range-reset-btn";

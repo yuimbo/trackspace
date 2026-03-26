@@ -11,8 +11,9 @@
   <span class="folder-label{% if is_active %} active{% endif %}" data-path="{{ node.path }}"{% if pending_rename == node.path %} data-start-rename="1"{% endif %}>{{ node.name | e }}</span>
   <span class="folder-sel-btn" title="Select all tracks in this folder" data-path="{{ node.path }}">◉</span>
   <span class="folder-add-btn" title="Create subfolder here" data-parent="{{ parent_for_create }}">+</span>
+  <span class="folder-reveal-btn" title="Open in Finder" data-path="{{ node.path }}">↗</span>
   {%- if node.path != '.' %}
-  <span class="folder-rename-btn" title="Rename folder" data-path="{{ node.path }}" data-folder-name="{{ node.name | e }}">✎</span>
+  {# <span class="folder-rename-btn" title="Rename folder" data-path="{{ node.path }}" data-folder-name="{{ node.name | e }}">✎</span> #}
   {%- endif %}
 </div>
 {%- if has_kids %}
