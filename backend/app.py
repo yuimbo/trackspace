@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Trackspace – organise music in a linear tag space.  Flask backend."""
 
+import hashlib
 import os
 import sys
 import subprocess
@@ -10,7 +11,9 @@ import argparse
 import threading
 import queue
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 
 from dotenv import load_dotenv
 from flask import (
@@ -35,6 +38,14 @@ from backend import embeddings
 from backend import audio_features
 from backend.embeddings import EMBEDDING_VERSION
 from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+from backend.embedding_coverage import (
+    SourceVersions,
+    batch_fetch_maps,
+    build_generation_work,
+    coverage_payload,
+    eligible_paths_for_projection,
+)
+from backend.layout_revision import compute_layout_revision
 
 load_dotenv()
 log = logging.getLogger(__name__)
@@ -126,7 +137,13 @@ class _FilesystemHandler(FileSystemEventHandler):
 
         def _run() -> None:
             try:
-                emb = embeddings.generate_embedding(abs_path)
+                warn_seen: set[str] = set()
+                emb = embeddings.generate_embedding(
+                    abs_path,
+                    on_decode_warning=lambda m: _emit_decode_warning_once(
+                        rel_path, m, warn_seen,
+                    ),
+                )
                 ok = emb is not None
                 if ok:
                     _FEATURES.put_embedding(fp, emb, version=EMBEDDING_VERSION)
@@ -157,6 +174,54 @@ _embed_lock = threading.Lock()
 # SSE broadcast: each connected EventSource client gets its own Queue.
 _embed_subscribers: list[queue.Queue] = []
 
+# Embedding /status caches (see api_embeddings_status).
+_TRACK_INFOS_CACHE_MAX = 8
+_track_infos_lru: OrderedDict[tuple[str, bool, str], list[dict]] = OrderedDict()
+_STATUS_COVERAGE_CACHE_MAX = 48
+_status_coverage_lru: OrderedDict[tuple[str, int, str], tuple[dict, str | None]] = OrderedDict()
+_embed_status_cache_lock = threading.Lock()
+
+
+def _library_mtime_signature(folder_abs: str, recursive: bool) -> str:
+    """Cheap fingerprint of the mp3 set under *folder_abs* (path + mtime per file)."""
+    h = hashlib.sha256()
+    for p in _list_mp3s(folder_abs, recursive):
+        rel = os.path.relpath(p, MUSIC_ROOT)
+        h.update(rel.encode("utf-8", errors="replace"))
+        h.update(b"\0")
+        try:
+            h.update(str(os.path.getmtime(p)).encode("ascii", errors="ignore"))
+        except OSError:
+            h.update(b"0")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _embedding_projection_query_fingerprint(req) -> str:
+    """Stable hash of query args that affect coverage counts or layout_revision."""
+    skip = frozenset({"folder", "recursive", "models_only"})
+    parts: list[str] = []
+    for k in sorted(req.args.keys()):
+        if k in skip:
+            continue
+        parts.append(f"{k}={req.args.get(k, '')}")
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
+def _track_infos_cached(folder_abs: str, recursive: bool, lib_sig: str) -> list[dict]:
+    key = (folder_abs, recursive, lib_sig)
+    with _embed_status_cache_lock:
+        if key in _track_infos_lru:
+            _track_infos_lru.move_to_end(key)
+            return _track_infos_lru[key]
+    infos = _build_track_infos(folder_abs, recursive)
+    with _embed_status_cache_lock:
+        _track_infos_lru[key] = infos
+        _track_infos_lru.move_to_end(key)
+        while len(_track_infos_lru) > _TRACK_INFOS_CACHE_MAX:
+            _track_infos_lru.popitem(last=False)
+    return infos
+
 
 def _broadcast_embed_event(event: dict) -> None:
     with _embed_lock:
@@ -168,6 +233,18 @@ def _broadcast_embed_event(event: dict) -> None:
                 dead.append(q)
         for q in dead:
             _embed_subscribers.remove(q)
+
+
+def _emit_decode_warning_once(rel_path: str, message: str, seen_paths: set[str]) -> None:
+    """Notify SSE subscribers once per relative path per generation run."""
+    if not message or rel_path in seen_paths:
+        return
+    seen_paths.add(rel_path)
+    _broadcast_embed_event({
+        "type": "decode_warning",
+        "path": rel_path,
+        "message": message,
+    })
 
 DIST_DIR = os.path.join(_PROJECT_DIR, "frontend", "dist")
 
@@ -597,6 +674,82 @@ def api_audio(relpath):
 # API – Embeddings
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class _ProjectionParams:
+    method: str
+    tag_names: list[str]
+    explicit_folders: list[str]
+    scale_folders: bool
+    feature_mask: object  # np.ndarray after parse
+    features_blend: float
+    folder_boost: float
+    folder_depth_boost: float
+    sources: tuple[str, ...]
+
+
+def _parse_projection_params(
+    req,
+    *,
+    default_when_no_method: bool = False,
+) -> _ProjectionParams | None:
+    """Parse projection query args shared by status + projection routes.
+
+    For ``/api/embeddings/status``, *default_when_no_method* is False so a
+    minimal poll URL omits ``layout_revision``.  For the projection route,
+    pass ``default_when_no_method=True`` so ``method`` defaults to umap.
+    """
+    raw_method = req.args.get("method", "")
+    if not raw_method and not default_when_no_method:
+        return None
+    method = raw_method or "umap"
+    if method not in ("umap", "pca", "tsne"):
+        method = "umap"
+
+    raw_tags = req.args.get("context_tags", "")
+    raw_folders = req.args.get("context_folders", "")
+    raw_sources = req.args.get("sources", "clap")
+    tag_names = [s.strip() for s in raw_tags.split(",") if s.strip()] if raw_tags else []
+    explicit_folders = (
+        [s.strip() for s in raw_folders.split(",") if s.strip()] if raw_folders else []
+    )
+    scale_folders = req.args.get("scale_folders", "") == "1"
+    if not scale_folders and explicit_folders:
+        scale_folders = True
+    feature_mask = embeddings.parse_audio_feature_mask(req.args.get("feature_mask"))
+    features_blend = embeddings.parse_features_blend(req.args.get("features_blend"))
+    folder_boost = embeddings.parse_folder_boost(req.args.get("folder_boost"))
+    folder_depth_boost = embeddings.parse_folder_depth_boost(
+        req.args.get("folder_depth_boost"),
+    )
+    sources = tuple(
+        s.strip()
+        for s in raw_sources.split(",")
+        if s.strip() in ("clap", "effnet", "features")
+    )
+    if not sources:
+        sources = ("clap",)
+
+    return _ProjectionParams(
+        method=method,
+        tag_names=tag_names,
+        explicit_folders=explicit_folders,
+        scale_folders=scale_folders,
+        feature_mask=feature_mask,
+        features_blend=features_blend,
+        folder_boost=folder_boost,
+        folder_depth_boost=folder_depth_boost,
+        sources=sources,
+    )
+
+
+def _feature_mask_as_list(params: _ProjectionParams) -> list[float]:
+    import numpy as np
+
+    m = params.feature_mask
+    arr = np.asarray(m, dtype=np.float64).reshape(-1)
+    return [float(x) for x in arr]
+
+
 def _build_track_infos(folder_abs: str, recursive: bool) -> list[dict]:
     """Build lightweight track info dicts with path + fingerprint for embedding ops."""
     paths = _list_mp3s(folder_abs, recursive)
@@ -610,45 +763,117 @@ def _build_track_infos(folder_abs: str, recursive: bool) -> list[dict]:
             "path": rel_path,
             "fingerprint": info.get("fingerprint"),
         })
+    infos.sort(key=lambda t: t["path"])
     return infos
 
 
 @app.route("/api/embeddings/status")
 def api_embeddings_status():
-    """Return embedding coverage stats for a folder."""
+    """Return embedding coverage stats for a folder.
+
+    Query params:
+        models_only=1 — skip library scan; only model readiness + generation flag
+            (for lightweight polling).
+        With projection parameters (``method``, ``sources``, …) the response
+        includes ``layout_revision`` so the client can skip redundant layout fetches.
+
+    When generation is idle, coverage + layout_revision are cached by library
+    signature, feature-cache write epoch, and projection query fingerprint.
+    """
+    if request.args.get("models_only") == "1":
+        with _embed_lock:
+            running = _embed_status["running"]
+            progress_done = _embed_status["done"]
+            progress_total = _embed_status["total"]
+        return jsonify({
+            "model_ready": embeddings.is_model_ready(),
+            "effnet_model_ready": audio_features.is_effnet_ready(),
+            "generating": running,
+            "progress": {"done": progress_done, "total": progress_total} if running else None,
+        })
+
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
     folder = _resolve(rel)
-    infos = _build_track_infos(folder, recursive)
+    lib_sig = _library_mtime_signature(folder, recursive)
+    infos = _track_infos_cached(folder, recursive, lib_sig)
 
-    total = len(infos)
-    fingerprinted = sum(1 for t in infos if t.get("fingerprint"))
-    fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-
-    clap_existing = _FEATURES.get_all_embeddings(fps, version=EMBEDDING_VERSION)
-    effnet_existing = _FEATURES.get_all_effnet_embeddings(fps, version=EFFNET_VERSION)
-    features_existing = _FEATURES.get_all_audio_features(fps, version=FEATURES_VERSION)
+    versions = SourceVersions(EMBEDDING_VERSION, EFFNET_VERSION, FEATURES_VERSION)
+    write_epoch = _FEATURES.write_epoch()
+    proj_fp = _embedding_projection_query_fingerprint(request)
 
     with _embed_lock:
         running = _embed_status["running"]
         progress_done = _embed_status["done"]
         progress_total = _embed_status["total"]
 
-    return jsonify({
-        "total": total,
-        "fingerprinted": fingerprinted,
-        "embedded": len(clap_existing),
-        "pending": fingerprinted - len(clap_existing),
+    layout_revision: str | None = None
+    if running:
+        fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
+        maps = batch_fetch_maps(_FEATURES, fps, versions)
+        base = coverage_payload(infos, maps, versions)
+        proj = _parse_projection_params(request, default_when_no_method=False)
+        if proj is not None:
+            eligible = eligible_paths_for_projection(infos, maps, proj.sources)
+            layout_revision = compute_layout_revision(
+                eligible_paths=eligible,
+                method=proj.method,
+                sources=proj.sources,
+                feature_mask=_feature_mask_as_list(proj),
+                features_blend=proj.features_blend,
+                folder_boost=proj.folder_boost,
+                folder_depth_boost=proj.folder_depth_boost,
+                context_tags=proj.tag_names,
+                context_folders=proj.explicit_folders if proj.explicit_folders else None,
+                scale_folders=proj.scale_folders,
+                cache_versions=(versions.clap, versions.effnet, versions.features),
+            )
+    else:
+        cov_key = (lib_sig, write_epoch, proj_fp)
+        with _embed_status_cache_lock:
+            if cov_key in _status_coverage_lru:
+                base, layout_revision = _status_coverage_lru[cov_key]
+                _status_coverage_lru.move_to_end(cov_key)
+                base = dict(base)
+            else:
+                base = None
+        if base is None:
+            fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
+            maps = batch_fetch_maps(_FEATURES, fps, versions)
+            base = coverage_payload(infos, maps, versions)
+            proj = _parse_projection_params(request, default_when_no_method=False)
+            layout_revision = None
+            if proj is not None:
+                eligible = eligible_paths_for_projection(infos, maps, proj.sources)
+                layout_revision = compute_layout_revision(
+                    eligible_paths=eligible,
+                    method=proj.method,
+                    sources=proj.sources,
+                    feature_mask=_feature_mask_as_list(proj),
+                    features_blend=proj.features_blend,
+                    folder_boost=proj.folder_boost,
+                    folder_depth_boost=proj.folder_depth_boost,
+                    context_tags=proj.tag_names,
+                    context_folders=proj.explicit_folders if proj.explicit_folders else None,
+                    scale_folders=proj.scale_folders,
+                    cache_versions=(versions.clap, versions.effnet, versions.features),
+                )
+            with _embed_status_cache_lock:
+                _status_coverage_lru[cov_key] = (dict(base), layout_revision)
+                _status_coverage_lru.move_to_end(cov_key)
+                while len(_status_coverage_lru) > _STATUS_COVERAGE_CACHE_MAX:
+                    _status_coverage_lru.popitem(last=False)
+
+    payload = {
+        **base,
         "model_ready": embeddings.is_model_ready(),
-        "effnet_embedded": len(effnet_existing),
-        "effnet_pending": fingerprinted - len(effnet_existing),
         "effnet_model_ready": audio_features.is_effnet_ready(),
-        "features_extracted": len(features_existing),
-        "features_pending": fingerprinted - len(features_existing),
         "generating": running,
-        "embedding_version": EMBEDDING_VERSION,
         "progress": {"done": progress_done, "total": progress_total} if running else None,
-    })
+    }
+    if layout_revision is not None:
+        payload["layout_revision"] = layout_revision
+    return jsonify(payload)
 
 
 @app.route("/api/embeddings/generate", methods=["POST"])
@@ -684,27 +909,27 @@ def api_embeddings_generate():
 
     def _run():
         try:
+            decode_warn_seen: set[str] = set()
+
+            def _note_decode(rel: str, msg: str) -> None:
+                _emit_decode_warning_once(rel, msg, decode_warn_seen)
+
             infos = _build_track_infos(folder, recursive)
+            vers = SourceVersions(EMBEDDING_VERSION, EFFNET_VERSION, FEATURES_VERSION)
+            work = build_generation_work(infos, _FEATURES, sources, vers)
 
-            # Build a unified work list: tracks that need at least one source.
-            work: list[tuple[dict, list[str]]] = []
-            for t in infos:
-                fp = t.get("fingerprint")
-                if not fp:
-                    continue
-                needed: list[str] = []
-                if "clap" in sources and not _FEATURES.has_embedding(fp, version=EMBEDDING_VERSION):
-                    needed.append("clap")
-                if "effnet" in sources and not _FEATURES.has_effnet_embedding(fp, version=EFFNET_VERSION):
-                    needed.append("effnet")
-                if "features" in sources and not _FEATURES.has_audio_features(fp, version=FEATURES_VERSION):
-                    needed.append("features")
-                if needed:
-                    work.append((t, needed))
-
+            # Deterministic order; optional tier for paths the client cares about first.
+            # If every work item is "priority", the tier is a no-op vs path sort — skip
+            # the extra pass so giant priority_paths payloads are unnecessary.
             if priority_paths:
                 pset = set(priority_paths)
-                work.sort(key=lambda w: (0 if w[0]["path"] in pset else 1, w[0]["path"]))
+                deprioritized = any(w[0]["path"] not in pset for w in work)
+                if deprioritized:
+                    work.sort(key=lambda w: (0 if w[0]["path"] in pset else 1, w[0]["path"]))
+                else:
+                    work.sort(key=lambda w: w[0]["path"])
+            else:
+                work.sort(key=lambda w: w[0]["path"])
 
             with _embed_lock:
                 _embed_status["total"] = len(work)
@@ -720,18 +945,28 @@ def api_embeddings_generate():
                     os.path.join(MUSIC_ROOT, t["path"])
                     for t, needed in chunk if "effnet" in needed
                 ]
+                effnet_decode_warns: dict[str, str] = {}
                 effnet_results = (
-                    audio_features.generate_effnet_embeddings_batch(effnet_paths)
+                    audio_features.generate_effnet_embeddings_batch(
+                        effnet_paths, decode_warnings=effnet_decode_warns,
+                    )
                     if effnet_paths else {}
                 )
+                for abs_p, msg in effnet_decode_warns.items():
+                    _note_decode(os.path.relpath(abs_p, MUSIC_ROOT), msg)
                 feature_paths = [
                     os.path.join(MUSIC_ROOT, t["path"])
                     for t, needed in chunk if "features" in needed
                 ]
+                feat_decode_warns: dict[str, str] = {}
                 feature_results = (
-                    audio_features.generate_audio_features_batch(feature_paths)
+                    audio_features.generate_audio_features_batch(
+                        feature_paths, decode_warnings=feat_decode_warns,
+                    )
                     if feature_paths else {}
                 )
+                for abs_p, msg in feat_decode_warns.items():
+                    _note_decode(os.path.relpath(abs_p, MUSIC_ROOT), msg)
 
                 for t, needed in chunk:
                     abs_path = os.path.join(MUSIC_ROOT, t["path"])
@@ -739,7 +974,11 @@ def api_embeddings_generate():
                     ok = True
 
                     if "clap" in needed:
-                        emb = embeddings.generate_embedding(abs_path)
+                        rel = t["path"]
+                        emb = embeddings.generate_embedding(
+                            abs_path,
+                            on_decode_warning=lambda m, rp=rel: _note_decode(rp, m),
+                        )
                         if emb is not None:
                             _FEATURES.put_embedding(fp, emb, version=EMBEDDING_VERSION)
                         else:
@@ -790,6 +1029,7 @@ def api_embeddings_stream():
 
     Event types:
       ``progress`` — ``{"path", "ok", "done", "total"}``
+      ``decode_warning`` — ``{"path", "message"}`` metadata vs decode mismatch
       ``done``     — generation finished
       ``error``    — generation failed with message
     """
@@ -847,47 +1087,46 @@ def api_embeddings_projection():
     """
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
-    method = request.args.get("method", "umap")
-    if method not in ("umap", "pca", "tsne"):
-        method = "umap"
-    raw_tags = request.args.get("context_tags", "")
-    raw_folders = request.args.get("context_folders", "")
-    raw_sources = request.args.get("sources", "clap")
-    tag_names = [s.strip() for s in raw_tags.split(",") if s.strip()] if raw_tags else []
-    explicit_folders = (
-        [s.strip() for s in raw_folders.split(",") if s.strip()] if raw_folders else []
-    )
-    scale_folders = request.args.get("scale_folders", "") == "1"
-    if not scale_folders and explicit_folders:
-        scale_folders = True
-    feature_mask = embeddings.parse_audio_feature_mask(request.args.get("feature_mask"))
-    features_blend = embeddings.parse_features_blend(request.args.get("features_blend"))
-    folder_boost = embeddings.parse_folder_boost(request.args.get("folder_boost"))
-    folder_depth_boost = embeddings.parse_folder_depth_boost(
-        request.args.get("folder_depth_boost"),
-    )
-    sources = tuple(s.strip() for s in raw_sources.split(",") if s.strip() in ("clap", "effnet", "features"))
-    if not sources:
-        sources = ("clap",)
     folder = _resolve(rel)
     infos = _build_track_infos(folder, recursive)
+
+    proj = _parse_projection_params(request, default_when_no_method=True)
+
+    fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
+    pversions = SourceVersions(EMBEDDING_VERSION, EFFNET_VERSION, FEATURES_VERSION)
+    maps = batch_fetch_maps(_FEATURES, fps, pversions)
+    eligible = eligible_paths_for_projection(infos, maps, proj.sources)
+    revision = compute_layout_revision(
+        eligible_paths=eligible,
+        method=proj.method,
+        sources=proj.sources,
+        feature_mask=_feature_mask_as_list(proj),
+        features_blend=proj.features_blend,
+        folder_boost=proj.folder_boost,
+        folder_depth_boost=proj.folder_depth_boost,
+        context_tags=proj.tag_names,
+        context_folders=proj.explicit_folders if proj.explicit_folders else None,
+        scale_folders=proj.scale_folders,
+        cache_versions=(pversions.clap, pversions.effnet, pversions.features),
+    )
 
     positions = embeddings.compute_projection(
         infos,
         _FEATURES,
         version=EMBEDDING_VERSION,
-        method=method,
-        context_tags=tag_names,
-        context_folders=explicit_folders if explicit_folders else None,
-        scale_folders=scale_folders,
-        folder_boost=folder_boost,
-        folder_depth_boost=folder_depth_boost,
-        sources=sources,
-        feature_mask=feature_mask,
-        features_blend=features_blend,
+        method=proj.method,
+        context_tags=proj.tag_names,
+        context_folders=proj.explicit_folders if proj.explicit_folders else None,
+        scale_folders=proj.scale_folders,
+        folder_boost=proj.folder_boost,
+        folder_depth_boost=proj.folder_depth_boost,
+        sources=proj.sources,
+        feature_mask=proj.feature_mask,
+        features_blend=proj.features_blend,
+        layout_revision=revision,
     )
 
-    return jsonify(positions)
+    return jsonify({"positions": positions, "revision": revision})
 
 
 # ---------------------------------------------------------------------------

@@ -60,6 +60,142 @@ _EFFNET_BATCH_CAP = 64   # max patches per ONNX inference call
 _EFFNET_SEGMENT_SECONDS = 15
 _EFFNET_NUM_SEGMENTS = 3
 
+
+def decode_reliability_user_message(meta_seconds: float, decoded_seconds: float) -> str:
+    """Human-readable note when container metadata and decoded audio length disagree."""
+    if not math.isfinite(meta_seconds) or meta_seconds <= 0:
+        return (
+            "Audio could not be decoded to match the file metadata; "
+            "the file may be damaged — try re-encoding or replacing it."
+        )
+    return (
+        "Metadata reports ~"
+        f"{meta_seconds:.0f}s"
+        " of audio but only ~"
+        f"{decoded_seconds:.1f}s"
+        " decoded — file may be damaged or mis-tagged; re-encode for reliable analysis."
+    )
+
+
+def _three_segments_from_samples(
+    y: np.ndarray,
+    *,
+    segment_seconds: float,
+    sr: int,
+) -> list[np.ndarray]:
+    """Take 20 % / 50 % / 80 % windows from an in-memory waveform (no MP3 seek)."""
+    n = int(y.shape[0])
+    if n <= 0:
+        return []
+    w = int(round(float(segment_seconds) * float(sr)))
+    if w <= 0:
+        return [y]
+    total_dur = n / float(sr)
+    if total_dur <= segment_seconds * 1.5:
+        return [y]
+    out: list[np.ndarray] = []
+    for pos in (0.2, 0.5, 0.8):
+        centre = int(round(pos * (n - 1)))
+        start = max(0, centre - w // 2)
+        end = min(n, start + w)
+        start = max(0, end - w)
+        chunk = y[start:end]
+        if chunk.size > 0:
+            out.append(chunk)
+    return out
+
+
+def load_resilient_audio_segments(
+    path: str,
+    *,
+    sr: int,
+    segment_seconds: float,
+) -> tuple[list[np.ndarray], str | None]:
+    """Decode one or three segments; tolerate bad MP3 duration metadata and broken seeks.
+
+    ``librosa.get_duration`` can report minutes from headers while audioread only
+    yields a few hundred samples, and ``librosa.load(..., offset>0)`` may then
+    raise ``ValueError: negative dimensions are not allowed``.
+
+    Returns ``(segments, user_warning)``. *user_warning* is a short message when
+    metadata and decoded length clearly disagree (for UI / SSE).
+    """
+    meta_dur = float(librosa_get_duration(path=path))
+    if not math.isfinite(meta_dur) or meta_dur <= 0:
+        return [], None
+
+    if meta_dur <= segment_seconds * 1.5:
+        audio, sr_a = librosa_load(path, sr=sr, mono=True)
+        if audio.size == 0:
+            return [], None
+        dec = float(audio.shape[0]) / float(sr_a)
+        warn = None
+        if meta_dur >= 2.0 and dec < meta_dur * 0.25:
+            warn = decode_reliability_user_message(meta_dur, dec)
+        return [audio], warn
+
+    probe_len = min(segment_seconds, meta_dur)
+    probe, sr_a = librosa_load(
+        path, sr=sr, mono=True, offset=0.0, duration=probe_len,
+    )
+    if probe.size == 0:
+        return [], None
+    probe_dur = float(probe.shape[0]) / float(sr_a)
+    if (
+        probe_len >= 1.0
+        and probe_dur < max(float(segment_seconds), probe_len) * 0.2
+    ):
+        audio, sr_a = librosa_load(path, sr=sr, mono=True)
+        if audio.size == 0:
+            return [], None
+        tot_dur = float(audio.shape[0]) / float(sr_a)
+        warn = decode_reliability_user_message(meta_dur, tot_dur)
+        if tot_dur <= segment_seconds * 1.5:
+            return [audio], warn
+        return (
+            _three_segments_from_samples(
+                audio, segment_seconds=segment_seconds, sr=int(sr_a),
+            ),
+            warn,
+        )
+
+    segments: list[np.ndarray] = []
+    for pos in (0.2, 0.5, 0.8):
+        centre = meta_dur * pos
+        offset = max(0.0, centre - segment_seconds / 2)
+        offset = min(offset, max(0.0, meta_dur - segment_seconds))
+        read_dur = min(segment_seconds, max(0.0, meta_dur - offset))
+        if read_dur < 0.05:
+            continue
+        try:
+            audio, _ = librosa_load(
+                path, sr=sr, mono=True, offset=offset, duration=read_dur,
+            )
+        except Exception:
+            audio = np.array([], dtype=np.float32)
+        if audio.size > 0:
+            segments.append(audio)
+
+    if len(segments) >= 2:
+        return segments, None
+
+    audio, sr_a = librosa_load(path, sr=sr, mono=True)
+    if audio.size == 0:
+        return [], None
+    tot_dur = float(audio.shape[0]) / float(sr_a)
+    warn = None
+    if meta_dur > segment_seconds * 1.5 and tot_dur < meta_dur * 0.35:
+        warn = decode_reliability_user_message(meta_dur, tot_dur)
+    if tot_dur <= segment_seconds * 1.5:
+        return [audio], warn
+    return (
+        _three_segments_from_samples(
+            audio, segment_seconds=segment_seconds, sr=int(sr_a),
+        ),
+        warn,
+    )
+
+
 _EFFNET_MODEL_URL = "https://essentia.upf.edu/models/feature-extractors/discogs-effnet/discogs-effnet-bsdynamic-1.onnx"
 _EFFNET_MODEL_NAME = "discogs-effnet-bsdynamic-1.onnx"
 _EFFNET_MODEL_MIN_BYTES = 10_000_000  # ~18 MB expected; anything under 10 MB is truncated
@@ -191,37 +327,19 @@ def patch_mel_spectrogram(
     return patches
 
 
-def _load_effnet_segments(path: str) -> list[np.ndarray]:
+def _load_effnet_segments(path: str) -> tuple[list[np.ndarray], str | None]:
     """Load up to _EFFNET_NUM_SEGMENTS segments for EffNet processing.
 
     Short tracks (<=1.5x segment length) return a single whole-file segment.
     Longer tracks return segments centred at 20%, 50%, and 80%.
     """
     try:
-        duration = librosa_get_duration(path=path)
-        if duration <= 0:
-            return []
-
-        if duration <= _EFFNET_SEGMENT_SECONDS * 1.5:
-            audio, _ = librosa_load(path, sr=_EFFNET_SR, mono=True)
-            return [audio] if len(audio) > 0 else []
-
-        positions = [0.2, 0.5, 0.8]
-        segments: list[np.ndarray] = []
-        for pos in positions:
-            centre = duration * pos
-            offset = max(0.0, centre - _EFFNET_SEGMENT_SECONDS / 2)
-            offset = min(offset, max(0.0, duration - _EFFNET_SEGMENT_SECONDS))
-            audio, _ = librosa_load(
-                path, sr=_EFFNET_SR, mono=True,
-                offset=offset, duration=_EFFNET_SEGMENT_SECONDS,
-            )
-            if len(audio) > 0:
-                segments.append(audio)
-        return segments
+        return load_resilient_audio_segments(
+            path, sr=_EFFNET_SR, segment_seconds=_EFFNET_SEGMENT_SECONDS,
+        )
     except Exception as e:
         log.warning("Failed to load audio %s: %s", path, e)
-        return []
+        return [], None
 
 
 def _run_effnet_batched(patches: np.ndarray) -> np.ndarray:
@@ -239,23 +357,24 @@ def _run_effnet_batched(patches: np.ndarray) -> np.ndarray:
     return np.concatenate(results, axis=0)
 
 
-def _preprocess_effnet(path: str) -> np.ndarray | None:
+def _preprocess_effnet(path: str) -> tuple[np.ndarray | None, str | None]:
     """Load audio and compute mel patches — no ONNX inference.
 
-    Returns patches array of shape ``(N, 128, 96)`` or None on failure.
+    Returns ``(patches | None, decode_warning | None)``; patches have shape
+    ``(N, 128, 96)`` on success.
     """
     try:
-        segments = _load_effnet_segments(path)
+        segments, warn = _load_effnet_segments(path)
         if not segments:
-            return None
+            return None, warn
         all_patches: list[np.ndarray] = []
         for audio in segments:
             mel = compute_mel_spectrogram(audio)
             all_patches.append(patch_mel_spectrogram(mel))
-        return np.concatenate(all_patches, axis=0)
+        return np.concatenate(all_patches, axis=0), warn
     except Exception as e:
         log.warning("EffNet preprocessing failed for %s: %s", path, e)
-        return None
+        return None, None
 
 
 def generate_effnet_embedding(path: str) -> np.ndarray | None:
@@ -270,7 +389,7 @@ def generate_effnet_embedding(path: str) -> np.ndarray | None:
     if not _effnet_loaded or _effnet_session is None:
         return None
 
-    patches = _preprocess_effnet(path)
+    patches, _warn = _preprocess_effnet(path)
     if patches is None:
         return None
     try:
@@ -285,6 +404,7 @@ def generate_effnet_embedding(path: str) -> np.ndarray | None:
 
 def generate_effnet_embeddings_batch(
     paths: list[str],
+    decode_warnings: dict[str, str] | None = None,
 ) -> dict[str, np.ndarray | None]:
     """Generate EffNet embeddings for multiple files with combined ONNX inference.
 
@@ -292,6 +412,9 @@ def generate_effnet_embeddings_batch(
     MP3 decoder is not thread-safe and crashes under concurrent access.
     The speedup comes from concatenating patches from all tracks into fewer,
     larger ONNX inference calls.
+
+    If *decode_warnings* is provided, maps absolute *path* → user-facing warning
+    when metadata vs decoded audio disagrees (same path may appear in other stages).
     """
     if not paths:
         return {}
@@ -304,7 +427,9 @@ def generate_effnet_embeddings_batch(
     all_patches: list[np.ndarray] = []
     patch_counts: list[int] = []
     for path in paths:
-        patches = _preprocess_effnet(path)
+        patches, dwarn = _preprocess_effnet(path)
+        if dwarn and decode_warnings is not None:
+            decode_warnings[path] = dwarn
         if patches is not None and len(patches) > 0:
             valid_paths.append(path)
             all_patches.append(patches)
@@ -357,34 +482,73 @@ _FEATURE_EXCERPT_SECONDS = 20.0
 _FEATURE_HOP = 1024
 
 
-def _load_feature_audio_excerpt(path: str) -> tuple[np.ndarray, int] | tuple[None, None]:
+def _load_feature_audio_excerpt(
+    path: str,
+) -> tuple[np.ndarray | None, int | None, str | None]:
     """Load a bounded excerpt for lightweight feature extraction.
 
     For long tracks, decode a centered excerpt to avoid full-file decode cost.
     This keeps runtime predictable while preserving enough rhythmic/harmonic
     content for coarse descriptors.
+
+    Returns ``(audio, sr, user_warning)``.
     """
     try:
-        duration = librosa_get_duration(path=path)
-        if duration <= 0:
-            return None, None
+        duration = float(librosa_get_duration(path=path))
+        if not math.isfinite(duration) or duration <= 0:
+            return None, None, None
 
         if duration <= _FEATURE_EXCERPT_SECONDS * 1.25:
             audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
-            return (audio, sr) if len(audio) > 0 else (None, None)
+            if len(audio) == 0:
+                return None, None, None
+            dec = float(audio.shape[0]) / float(sr)
+            warn = None
+            if duration >= 2.0 and dec < duration * 0.25:
+                warn = decode_reliability_user_message(duration, dec)
+            return audio, sr, warn
+
+        probe_len = min(_FEATURE_EXCERPT_SECONDS, duration)
+        probe, sr = librosa_load(
+            path, sr=_FEATURE_SR, mono=True, offset=0.0, duration=probe_len,
+        )
+        if probe.size == 0:
+            return None, None, None
+        probe_dur = float(probe.shape[0]) / float(sr)
+        if (
+            probe_len >= 1.0
+            and probe_dur < max(_FEATURE_EXCERPT_SECONDS, probe_len) * 0.2
+        ):
+            audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
+            if audio.size == 0:
+                return None, None, None
+            dec = float(audio.shape[0]) / float(sr)
+            return audio, sr, decode_reliability_user_message(duration, dec)
 
         offset = max(0.0, (duration - _FEATURE_EXCERPT_SECONDS) * 0.5)
-        audio, sr = librosa_load(
-            path,
-            sr=_FEATURE_SR,
-            mono=True,
-            offset=offset,
-            duration=_FEATURE_EXCERPT_SECONDS,
-        )
-        return (audio, sr) if len(audio) > 0 else (None, None)
+        read_dur = min(_FEATURE_EXCERPT_SECONDS, max(0.0, duration - offset))
+        if read_dur < 0.05:
+            return None, None, None
+        try:
+            audio, sr = librosa_load(
+                path,
+                sr=_FEATURE_SR,
+                mono=True,
+                offset=offset,
+                duration=read_dur,
+            )
+        except Exception:
+            audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
+        if len(audio) == 0:
+            return None, None, None
+        dec = float(audio.shape[0]) / float(sr)
+        warn = None
+        if duration > _FEATURE_EXCERPT_SECONDS * 1.25 and dec < duration * 0.35:
+            warn = decode_reliability_user_message(duration, dec)
+        return audio, sr, warn
     except Exception as e:
         log.warning("Audio excerpt load failed for %s: %s", path, e)
-        return None, None
+        return None, None, None
 
 
 def detect_key(audio: np.ndarray, sr: int = 44100) -> tuple[str, str]:
@@ -462,17 +626,14 @@ def _compute_danceability(
     return float(np.clip(peak, 0.0, 1.0))
 
 
-def extract_audio_features(path: str) -> np.ndarray | None:
-    """Extract a compact feature vector from an audio file.
-
-    Returns float32 array of shape (6,):
-        [tempo_norm, key_cos, key_sin, mode, energy_norm, danceability]
-    or None on failure.
-    """
+def extract_audio_features_and_warning(
+    path: str,
+) -> tuple[np.ndarray | None, str | None]:
+    """Like :func:`extract_audio_features` but also returns a user-facing decode note."""
     try:
-        audio, sr = _load_feature_audio_excerpt(path)
+        audio, sr, warn = _load_feature_audio_excerpt(path)
         if audio is None or sr is None or len(audio) == 0:
-            return None
+            return None, warn
 
         # Tempo
         onset_env = librosa.onset.onset_strength(y=audio, sr=sr, hop_length=_FEATURE_HOP)
@@ -499,30 +660,50 @@ def extract_audio_features(path: str) -> np.ndarray | None:
             audio, sr, onset_env=onset_env, tempo_bpm=tempo, hop_length=_FEATURE_HOP
         )
 
-        return np.array(
-            [tempo_norm, key_cos, key_sin, mode, energy_norm, danceability],
-            dtype=np.float32,
+        return (
+            np.array(
+                [tempo_norm, key_cos, key_sin, mode, energy_norm, danceability],
+                dtype=np.float32,
+            ),
+            warn,
         )
     except Exception as e:
         log.warning("Audio feature extraction failed for %s: %s", path, e)
-        return None
+        return None, None
+
+
+def extract_audio_features(path: str) -> np.ndarray | None:
+    """Extract a compact feature vector from an audio file.
+
+    Returns float32 array of shape (6,):
+        [tempo_norm, key_cos, key_sin, mode, energy_norm, danceability]
+    or None on failure.
+    """
+    vec, _warn = extract_audio_features_and_warning(path)
+    return vec
 
 
 def generate_audio_features_batch(
     paths: list[str],
+    decode_warnings: dict[str, str] | None = None,
 ) -> dict[str, np.ndarray | None]:
     """Extract audio features for multiple paths.
 
     IMPORTANT: MP3 decode in the librosa/audioread stack is not reliably
     thread-safe in this app's mixed workload, so preprocessing must remain
     sequential to avoid intermittent native crashes.
+
+    If *decode_warnings* is provided, fills ``abs_path -> message`` for unreliable decodes.
     """
     if not paths:
         return {}
 
     results: dict[str, np.ndarray | None] = {p: None for p in paths}
     for p in paths:
-        results[p] = extract_audio_features(p)
+        vec, w = extract_audio_features_and_warning(p)
+        results[p] = vec
+        if w and decode_warnings is not None:
+            decode_warnings[p] = w
 
     return results
 

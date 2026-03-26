@@ -29,7 +29,7 @@ def test_fingerprint():
 def test_audio_segment_loading():
     from backend.embeddings import _load_audio_segments, CLAP_SR
 
-    segments = _load_audio_segments(TEST_TRACK)
+    segments, _warn = _load_audio_segments(TEST_TRACK)
     print(f"Segments: count={len(segments)}")
     assert len(segments) >= 1, "_load_audio_segments returned empty"
     for i, seg in enumerate(segments):

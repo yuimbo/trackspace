@@ -16,12 +16,13 @@ import platform
 import sys
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 
 import numpy as np
 import torch
 from transformers import ClapModel, ClapProcessor
 
-from backend.decode_stderr import librosa_get_duration, librosa_load
+from backend.audio_features import load_resilient_audio_segments
 
 log = logging.getLogger(__name__)
 
@@ -38,14 +39,14 @@ EMBEDDING_VERSION = 2
 # PCA bypasses layout cache (fast; global Procrustes reference is per-process).
 _COMPOSITE_CACHE_MAX = 10
 _SEMANTIC_BASIS_CACHE_MAX = 10
-_LAYOUT_CACHE_MAX = 16
+_REVISION_LAYOUT_CACHE_MAX = 16
 _composite_cache: OrderedDict[str, tuple[list[str], np.ndarray, int, int]] = (
     OrderedDict()
 )
 _semantic_basis_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
     OrderedDict()
 )
-_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
+_revision_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
 
 # Prepared per-source row vectors (L2-normalised CLAP/EffNet; masked+norm+blend features).
 # Lets us switch source *combinations* without re-running per-row normalisation or
@@ -221,37 +222,21 @@ def load_model() -> None:
         log.info("CLAP model loaded.")
 
 
-def _load_audio_segments(path: str) -> list[np.ndarray]:
+def _load_audio_segments(path: str) -> tuple[list[np.ndarray], str | None]:
     """Load up to NUM_SEGMENTS segments from different parts of the track.
 
     Short tracks (≤ 1.5× SEGMENT_SECONDS) return a single whole-file segment.
     Longer tracks return segments centred at 20%, 50%, and 80% through the file.
+
+    Returns ``(segments, user_warning)`` when metadata vs decoded length disagrees.
     """
     try:
-        duration = librosa_get_duration(path=path)
-        if duration <= 0:
-            return []
-
-        if duration <= SEGMENT_SECONDS * 1.5:
-            audio, _ = librosa_load(path, sr=CLAP_SR, mono=True)
-            return [audio] if len(audio) > 0 else []
-
-        positions = [0.2, 0.5, 0.8]
-        segments: list[np.ndarray] = []
-        for pos in positions:
-            centre = duration * pos
-            offset = max(0.0, centre - SEGMENT_SECONDS / 2)
-            offset = min(offset, max(0.0, duration - SEGMENT_SECONDS))
-            audio, _ = librosa_load(
-                path, sr=CLAP_SR, mono=True,
-                offset=offset, duration=SEGMENT_SECONDS,
-            )
-            if len(audio) > 0:
-                segments.append(audio)
-        return segments
+        return load_resilient_audio_segments(
+            path, sr=CLAP_SR, segment_seconds=SEGMENT_SECONDS,
+        )
     except Exception as e:
         log.warning("Failed to load audio %s: %s", path, e)
-        return []
+        return [], None
 
 
 def _embed_single(audio: np.ndarray) -> np.ndarray | None:
@@ -552,16 +537,25 @@ def _apply_semantic_weighting(
     return _apply_low_rank_semantic_weight(mat, T_n, exp, boost, depth_boost)
 
 
-def generate_embedding(path: str) -> np.ndarray | None:
+def generate_embedding(
+    path: str,
+    *,
+    on_decode_warning: Callable[[str], None] | None = None,
+) -> np.ndarray | None:
     """Generate a CLAP embedding for a single audio file.
 
     Loads multiple segments and averages their embeddings for a more robust
     representation.  Returns a 1-D float32 numpy array, or None on failure.
+
+    *on_decode_warning* — invoked once per file when decoded audio is much shorter
+    than container metadata (damaged / mis-tagged files).
     """
     if not _loaded:
         load_model()
 
-    segments = _load_audio_segments(path)
+    segments, decode_warn = _load_audio_segments(path)
+    if decode_warn and on_decode_warning:
+        on_decode_warning(decode_warn)
     if not segments:
         return None
 
@@ -902,7 +896,7 @@ def _project_umap(mat: np.ndarray) -> np.ndarray:
             _mlx_vis_projection_enabled = False
     import umap  # lazy — heavy import
     n_neighbors = min(15, len(mat) - 1)
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1)
+    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42)
     return reducer.fit_transform(mat)
 
 
@@ -1016,6 +1010,7 @@ def compute_projection(
     sources: tuple[str, ...] = ("clap",),
     feature_mask: np.ndarray | None = None,
     features_blend: float = 0.42,
+    layout_revision: str | None = None,
 ) -> list[dict]:
     """Project cached embeddings to 2D positions.
 
@@ -1034,15 +1029,26 @@ def compute_projection(
     nodes are inferred from track paths; optional *context_folders* supplies
     an explicit seed list instead of deriving from paths.
 
+    *layout_revision* — when provided (from ``compute_layout_revision``),
+    the result is cached under this key.  Subsequent calls with the same
+    revision return the cached layout without recomputing.
+
     Returns ``[{"path": rel, "x": float, "y": float}, ...]`` where x/y
     are in [0, 1].  Tracks without data for every enabled source are omitted.
 
-    **Caching:** composite matrices; per-fingerprint *prepared* rows for each
-    source (normalised CLAP/EffNet, masked+norm+blend features); CLAP/folder
-    ``T_n`` + exponents; and UMAP/t-SNE layouts — each in its own LRU tier.
-    Folder sliders only add a cheap low-rank multiply; toggling source layers
-    reuses prepared rows.  PCA skips layout caching.
+    **Caching:** A deterministic ``layout_revision`` (SHA-256 of sorted
+    paths + all projection parameters) is the primary layout cache key.
+    Composite matrices and semantic-basis directions are still cached in
+    their own LRU tiers (keyed by path-order-dependent hashes) to avoid
+    redundant vector gathering and ``T_n`` construction on revision misses.
+    PCA skips layout caching (fast; global Procrustes reference is per-process).
     """
+    if layout_revision and method in ("umap", "tsne"):
+        hit = _tier_cache_get(_revision_layout_cache, layout_revision)
+        if hit is not None:
+            log.debug("projection: revision cache hit (%s)", method)
+            return hit
+
     paths, mat, clap_dim, clap_col_lo, comp_key = _gather_composite_vecs(
         track_infos,
         feature_cache,
@@ -1062,10 +1068,6 @@ def compute_projection(
         folder_seeds = None
 
     needs_weight = _loaded and (bool(context_tags) or bool(folder_seeds))
-    sem_key = _semantic_param_key(
-        context_tags, folder_seeds, folder_boost, folder_depth_boost,
-    )
-    wkey = f"{comp_key}|{sem_key}" if needs_weight else f"{comp_key}|raw"
 
     mat_proj = mat
     if needs_weight:
@@ -1095,14 +1097,6 @@ def compute_projection(
             mat, T_n, exp, folder_boost, folder_depth_boost,
         )
 
-    lkey = ""
-    if method in ("umap", "tsne"):
-        lkey = f"{wkey}|{method}"
-        hit_layout = _tier_cache_get(_layout_cache, lkey)
-        if hit_layout is not None:
-            log.debug("projection tier: layout cache hit (%s)", method)
-            return hit_layout
-
     if method == "pca":
         coords = _project_pca(mat_proj, paths)
     elif method == "tsne":
@@ -1117,8 +1111,10 @@ def compute_projection(
         for i in range(len(paths))
     ]
 
-    if method in ("umap", "tsne") and lkey:
-        _tier_cache_put(_layout_cache, lkey, result, _LAYOUT_CACHE_MAX)
+    if layout_revision and method in ("umap", "tsne"):
+        _tier_cache_put(
+            _revision_layout_cache, layout_revision, result, _REVISION_LAYOUT_CACHE_MAX,
+        )
 
     return result
 

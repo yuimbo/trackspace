@@ -18,6 +18,8 @@ trackspace/
     feature_cache.py        – FeatureCache (fingerprint → CLAP embedding)
     embeddings.py           – CLAP model loading, inference, UMAP projection
     audio_features.py       – EffNet (ONNX) + librosa audio feature extraction
+    embedding_coverage.py   – coverage stats + generation work-list helpers
+    layout_revision.py      – deterministic layout revision hash
     templates/partials/     – Jinja templates served by Flask (HTMX)
   frontend/                 ← Vite + TypeScript + Alpine.js + HTMX
     src/
@@ -34,6 +36,7 @@ trackspace/
   tests/                    ← test suite
     test_embeddings.py      – smoke tests for fingerprint → CLAP pipeline
     test_audio_features.py  – tests for EffNet + librosa audio features
+    test_embedding_coverage.py – coverage, eligibility, and revision stability
     fixtures/test_track.mp3 – 5 s trimmed mp3 for tests
   data/                     – SQLite caches (gitignored, created at runtime)
   .env                      – HF_TOKEN (gitignored)
@@ -304,6 +307,39 @@ the user via a toggle in the right-panel Options section and stored as
 
 PCA is never shown in the UI toggle — it is only used internally for fast intermediate
 projections while embeddings are being generated.
+
+### Projection caching
+
+Projection results are cached at two levels:
+
+**Server-side (revision-keyed LRU):**
+`_revision_layout_cache` in `embeddings.py` is an `OrderedDict[str, list[dict]]`
+(capped at 16 entries). The key is `layout_revision` — a deterministic SHA-256
+computed by `compute_layout_revision()` from sorted eligible paths, method,
+sources, feature mask/blend, folder/tag context, and cache version constants.
+Because the key is content-addressed, row order in the input data does not
+affect cache identity.
+
+**Client-side (query-string → {revision, positions} map):**
+`_layoutCache` in `controller.ts` maps `_projectionQueryString()` →
+`{ revision, positions }`, capped at 8 entries with LRU eviction.
+Before fetching `/api/embeddings/projection`, the controller checks whether
+a cached entry's `revision` matches the server's current `layout_revision`
+(obtained from `/api/embeddings/status`). If it matches, cached positions
+are applied directly — no projection round-trip. This handles A→B→A cycles
+(e.g. toggling TSNE↔UMAP↔TSNE) without redundant server work.
+
+Both caches are invalidated when new embeddings are generated (server: implicitly
+via new revision; client: `_invalidateLayoutCache()` on SSE `done`).
+
+**Deterministic ordering:** `_build_track_infos` sorts `infos` by path after the
+`as_completed` gather loop. This is critical — `as_completed` returns results in
+nondeterministic order, which would produce different composite cache keys, different
+t-SNE/UMAP row ordering (and thus different layouts), and revision cache misses.
+All new code that builds track info lists must maintain this sort invariant.
+
+**UMAP reproducibility:** The `umap-learn` fallback passes `random_state=42` to
+ensure identical inputs produce identical layouts across runs.
 
 ### Semantic weighting (context-aware projection)
 

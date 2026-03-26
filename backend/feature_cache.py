@@ -22,8 +22,15 @@ class FeatureCache:
         self._db_path = db_path
         self._max_memory = max_memory
         self._mem: OrderedDict[str, np.ndarray] = OrderedDict()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        #: Bumps on successful CLAP/EffNet/features writes — invalidates embedding status caches.
+        self._write_epoch = 0
         self._init_db()
+
+    def write_epoch(self) -> int:
+        """Monotonic counter; increases when cached embedding rows change."""
+        with self._lock:
+            return self._write_epoch
 
     def _init_db(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
@@ -101,8 +108,9 @@ class FeatureCache:
                     (fingerprint, blob, version),
                 )
         except Exception:
-            pass
+            return
         with self._lock:
+            self._write_epoch += 1
             self._lru_put(fingerprint, embedding.astype(np.float32))
 
     def has_embedding(self, fingerprint: str, version: int = 0) -> bool:
@@ -173,9 +181,13 @@ class FeatureCache:
                     "UPDATE audio_features SET clap_embedding=NULL WHERE version < ? AND clap_embedding IS NOT NULL",
                     (current_version,),
                 )
-                return cursor.rowcount
+                n = cursor.rowcount or 0
         except Exception:
             return 0
+        if n:
+            with self._lock:
+                self._write_epoch += 1
+        return n
 
     # ------------------------------------------------------------------
     # EffNet embeddings
@@ -213,8 +225,9 @@ class FeatureCache:
                     (fingerprint, blob, version),
                 )
         except Exception:
-            pass
+            return
         with self._lock:
+            self._write_epoch += 1
             self._lru_put(f"effnet:{fingerprint}", embedding.astype(np.float32))
 
     def has_effnet_embedding(self, fingerprint: str, version: int = 0) -> bool:
@@ -286,9 +299,13 @@ class FeatureCache:
                     "UPDATE audio_features SET effnet_embedding=NULL WHERE effnet_version < ? AND effnet_embedding IS NOT NULL",
                     (current_version,),
                 )
-                return cursor.rowcount
+                n = cursor.rowcount or 0
         except Exception:
             return 0
+        if n:
+            with self._lock:
+                self._write_epoch += 1
+        return n
 
     # ------------------------------------------------------------------
     # Audio features (tempo, key, energy, danceability)
@@ -326,8 +343,9 @@ class FeatureCache:
                     (fingerprint, blob, version),
                 )
         except Exception:
-            pass
+            return
         with self._lock:
+            self._write_epoch += 1
             self._lru_put(f"feat:{fingerprint}", features.astype(np.float32))
 
     def has_audio_features(self, fingerprint: str, version: int = 0) -> bool:
@@ -399,6 +417,10 @@ class FeatureCache:
                     "UPDATE audio_features SET features=NULL WHERE features_version < ? AND features IS NOT NULL",
                     (current_version,),
                 )
-                return cursor.rowcount
+                n = cursor.rowcount or 0
         except Exception:
             return 0
+        if n:
+            with self._lock:
+                self._write_epoch += 1
+        return n

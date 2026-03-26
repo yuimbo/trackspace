@@ -782,6 +782,7 @@ kbd {
 .toast-ok    { background: #0f9b8ecc; }
 .toast-error { background: #e94560cc; }
 .toast-info  { background: #334466cc; }
+.toast-warn  { background: #b8860bcc; }
 
 /* ── Loading overlay ──────────────────────────────────────── */
 #loading-overlay {

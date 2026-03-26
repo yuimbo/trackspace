@@ -198,8 +198,6 @@ export class Model extends EventBus {
   setProjectionMethod(method: ProjectionMethod): void {
     if (this.projectionMethod === method) return;
     this.projectionMethod = method;
-    this.embeddingsReady = false;
-    this.embeddingPositions.clear();
     this.emit("change");
   }
 

@@ -11,7 +11,7 @@ export function dirColor(folderPath: string): string {
 let _$toasts: HTMLElement | null = null;
 export function toast(
   msg: string,
-  type: "info" | "ok" | "error" = "info",
+  type: "info" | "ok" | "error" | "warn" = "info",
 ): void {
   _$toasts ??= document.getElementById("toast-container");
   const el = document.createElement("div");

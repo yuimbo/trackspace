@@ -73,6 +73,23 @@ function postJSON<T = unknown>(url: string, body: unknown): Promise<T> {
   });
 }
 
+/** ``/api/embeddings/projection`` returns ``{ positions, revision }`` (legacy bare array unsupported). */
+function parseProjectionResponse(raw: unknown): {
+  positions: { path: string; x: number; y: number }[];
+  revision: string;
+} {
+  if (
+    raw &&
+    typeof raw === "object" &&
+    "positions" in (raw as object) &&
+    Array.isArray((raw as { positions: unknown }).positions)
+  ) {
+    const o = raw as { positions: { path: string; x: number; y: number }[]; revision?: string };
+    return { positions: o.positions, revision: o.revision ?? "" };
+  }
+  return { positions: [], revision: "" };
+}
+
 // ─── Internal types ──────────────────────────────────────────
 interface DragSnap {
   track: Track;
@@ -97,6 +114,18 @@ interface PendingUpdate {
   path: string;
   tag: string;
   value: number;
+}
+
+/** Subset of ``/api/embeddings/status`` used to avoid duplicate layout fetches. */
+type EmbeddingLayoutStatusHint = {
+  layout_revision?: string;
+};
+
+const LAYOUT_CACHE_MAX = 8;
+
+interface CachedLayout {
+  revision: string;
+  positions: Map<string, { x: number; y: number }>;
 }
 
 type MouseMode =
@@ -575,6 +604,9 @@ export class Controller {
           clearInterval(this._libFlushTimer);
           this._libFlushTimer = 0;
           m.libraryLoadProgress = null;
+          // Eligible paths / layout_revision depend on the track set; drop layout cache
+          // so we never reuse coordinates after a full library rescan.
+          this._invalidateLayoutCache();
           m.emit("change");
         }
       };
@@ -642,8 +674,28 @@ export class Controller {
   private _embedEventSource: EventSource | null = null;
   private _embedBatchCount = 0;
   private _projectionFetchPending = false;
+  /** Query-string → {revision, positions} map so A→B→A revisits are instant. */
+  private _layoutCache = new Map<string, CachedLayout>();
 
-  private async _ensureEmbeddingsAndProject(): Promise<void> {
+  /** Drop all cached layouts (e.g. after embedding batch completes). */
+  private _invalidateLayoutCache(): void {
+    this._layoutCache.clear();
+  }
+
+  /** LRU bump + cap for _layoutCache. */
+  private _layoutCachePut(qs: string, entry: CachedLayout): void {
+    this._layoutCache.delete(qs);
+    this._layoutCache.set(qs, entry);
+    if (this._layoutCache.size > LAYOUT_CACHE_MAX) {
+      const oldest = this._layoutCache.keys().next().value;
+      if (oldest !== undefined) this._layoutCache.delete(oldest);
+    }
+  }
+
+  private async _ensureEmbeddingsAndProject(opts?: {
+    /** If true, do not kick librosa backfill from this call (CLAP/EffNet clicks only). */
+    omitFeaturesGeneration?: boolean;
+  }): Promise<void> {
     const m = this.model;
     try {
       const status = await api<{
@@ -658,7 +710,9 @@ export class Controller {
         features_extracted: number;
         features_pending: number;
         generating: boolean;
-      }>("/api/embeddings/status?folder=&recursive=1");
+        embedding_version?: number;
+        layout_revision?: string;
+      }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
       // Check if required models are still loading.
       if (m.useCLAP && !status.model_ready) {
@@ -676,7 +730,11 @@ export class Controller {
       const sourcesNeeded: string[] = [];
       if (m.useCLAP && status.pending > 0) sourcesNeeded.push("clap");
       if (m.useEffNet && status.effnet_pending > 0) sourcesNeeded.push("effnet");
-      if (m.anyAudioFeaturesEnabled && status.features_pending > 0)
+      if (
+        m.anyAudioFeaturesEnabled &&
+        status.features_pending > 0 &&
+        !opts?.omitFeaturesGeneration
+      )
         sourcesNeeded.push("features");
 
       if (sourcesNeeded.length > 0 && !status.generating) {
@@ -685,17 +743,22 @@ export class Controller {
           m.useEffNet ? status.effnet_pending : 0,
           m.anyAudioFeaturesEnabled ? status.features_pending : 0,
         );
-        toast(`Generating embeddings for ${total} tracks…`, "ok");
+        const workParts: string[] = [];
+        if (m.useCLAP && status.pending > 0)
+          workParts.push(`${status.pending} CLAP`);
+        if (m.useEffNet && status.effnet_pending > 0)
+          workParts.push(`${status.effnet_pending} EffNet`);
+        if (m.anyAudioFeaturesEnabled && status.features_pending > 0)
+          workParts.push(`${status.features_pending} audio features`);
+        const detail =
+          workParts.length > 1 ? ` (${workParts.join(", ")})` : "";
+        toast(`Generating embeddings for ${total} tracks${detail}…`, "ok");
         m.embeddingsGenerating = true;
-
-        const priorityPaths = m.tracks
-          .filter((t) => t.fingerprint && m.passesFilter(t))
-          .map((t) => t.path);
 
         await postJSON("/api/embeddings/generate", {
           folder: "",
           recursive: true,
-          priority_paths: priorityPaths,
+          priority_paths: [],
           sources: sourcesNeeded,
         });
         this._listenEmbeddingStream();
@@ -722,7 +785,7 @@ export class Controller {
         (m.useEffNet && status.effnet_embedded > 0) ||
         (m.anyAudioFeaturesEnabled && status.features_extracted > 0);
       if (m.viewMode === "embeddings" || hasData) {
-        await this._fetchProjection();
+        await this._fetchProjection({ status });
       }
     } catch {
       /* api() already toasted */
@@ -737,7 +800,7 @@ export class Controller {
         const status = await api<{
           model_ready: boolean;
           effnet_model_ready: boolean;
-        }>("/api/embeddings/status?folder=&recursive=1");
+        }>("/api/embeddings/status?folder=&recursive=1&models_only=1");
         const clapOk = !m.useCLAP || status.model_ready;
         const effnetOk = !m.useEffNet || status.effnet_model_ready;
         if (clapOk && effnetOk) {
@@ -759,6 +822,11 @@ export class Controller {
 
     const es = new EventSource("/api/embeddings/stream");
     this._embedEventSource = es;
+
+    es.addEventListener("decode_warning", ((e: MessageEvent) => {
+      const data = JSON.parse(e.data) as { path: string; message: string };
+      toast(`${data.path}: ${data.message}`, "warn");
+    }) as EventListener);
 
     es.addEventListener("progress", ((e: MessageEvent) => {
       const data = JSON.parse(e.data) as {
@@ -790,6 +858,7 @@ export class Controller {
       const m = this.model;
       m.embeddingsGenerating = false;
       m.embeddingProgress = null;
+      this._invalidateLayoutCache();
       toast("Embeddings ready", "ok");
       this.status.update(m);
       this.canvas.scheduleDraw();
@@ -848,9 +917,10 @@ export class Controller {
     m.projectionPending = true;
     this.canvas.scheduleDraw();
     try {
-      const positions = await api<{ path: string; x: number; y: number }[]>(
+      const raw = await api<unknown>(
         `/api/embeddings/projection?${this._projectionQueryString("pca", true)}`,
       );
+      const { positions } = parseProjectionResponse(raw);
       if (!positions.length) return;
 
       const isFirst = m.embeddingPositions.size === 0;
@@ -929,37 +999,83 @@ export class Controller {
     this._animFrame = requestAnimationFrame(step);
   }
 
-  private async _fetchProjection(): Promise<void> {
+  /** Full TSNE/UMAP/… layout.  Checks the client-side layout cache
+   * (keyed by query string + server revision) so A→B→A revisits are instant.
+   * Falls back to ``/api/embeddings/projection`` on miss.  The server also
+   * has a revision-keyed LRU so repeated requests are fast even without client
+   * cache (e.g. after page reload). */
+  private async _fetchProjection(opts?: {
+    status?: EmbeddingLayoutStatusHint;
+  }): Promise<void> {
     const m = this.model;
+    const qs = this._projectionQueryString();
+
+    // --- Client-side cache check ---
+    const cached = this._layoutCache.get(qs);
+    if (cached && m.viewMode === "embeddings" && m.embeddingPositions.size > 0) {
+      let rev = opts?.status?.layout_revision;
+      if (rev === undefined) {
+        if (m.embeddingsGenerating) {
+          // Eligibility / revision can move while the batch fills in; confirm with server.
+          try {
+            const s = await api<EmbeddingLayoutStatusHint>(
+              `/api/embeddings/status?${qs}`,
+            );
+            rev = s.layout_revision;
+          } catch {
+            /* status failed; fall through to full projection */
+          }
+        } else {
+          // No generation running and cache was invalidated on SSE `done` or library reload:
+          // `/status` would repeat the full server scan only to compare this hash — skip it.
+          rev = cached.revision;
+        }
+      }
+      if (rev != null && rev === cached.revision) {
+        this._applyPositions(cached.positions);
+        return;
+      }
+    }
+
+    // --- Full projection fetch ---
     m.projectionPending = true;
     this.canvas.scheduleDraw();
     try {
-      const positions = await api<{ path: string; x: number; y: number }[]>(
-        `/api/embeddings/projection?${this._projectionQueryString()}`,
+      const raw = await api<unknown>(
+        `/api/embeddings/projection?${qs}`,
       );
+      const { positions, revision } = parseProjectionResponse(raw);
       const newPositions = new Map<string, { x: number; y: number }>();
       for (const p of positions) {
         newPositions.set(p.path, { x: p.x, y: p.y });
       }
-      m.embeddingsReady = true;
-      if (m.viewMode === "embeddings") {
-        if (m.embeddingPositions.size > 0) {
-          // Re-projection while already in embedding mode: interpolate from
-          // current positions to the new ones rather than snapping via tag space.
-          this._animatePositionUpdate(newPositions);
-        } else {
-          // First time entering embedding mode: animate from tag positions.
-          m.embeddingPositions = newPositions;
-          this._animateToEmbeddings();
-        }
-      } else {
-        m.embeddingPositions = newPositions;
+      if (revision) {
+        this._layoutCachePut(qs, { revision, positions: newPositions });
       }
+      m.embeddingsReady = true;
+      this._applyPositions(newPositions);
     } catch {
       /* api() already toasted */
     } finally {
       m.projectionPending = false;
       this.canvas.scheduleDraw();
+    }
+  }
+
+  /** Apply a positions map to the model, animating the transition. */
+  private _applyPositions(
+    newPositions: Map<string, { x: number; y: number }>,
+  ): void {
+    const m = this.model;
+    if (m.viewMode === "embeddings") {
+      if (m.embeddingPositions.size > 0) {
+        this._animatePositionUpdate(newPositions);
+      } else {
+        m.embeddingPositions = newPositions;
+        this._animateToEmbeddings();
+      }
+    } else {
+      m.embeddingPositions = newPositions;
     }
   }
 
@@ -1946,13 +2062,18 @@ export class Controller {
       if (!$cb) continue;
       $cb.checked = source === "clap" ? m.useCLAP : m.useEffNet;
       $cb.addEventListener("change", () => {
+        const before = m.activeSources.slice().sort().join(",");
         m.toggleSource(source);
         const actual = source === "clap" ? m.useCLAP : m.useEffNet;
         $cb.checked = actual;
         m.saveLS();
-        if (m.viewMode === "embeddings") {
-          void this._ensureEmbeddingsAndProject();
+        if (m.viewMode !== "embeddings") return;
+        const after = m.activeSources.slice().sort().join(",");
+        if (before === after) {
+          void this._fetchProjection();
+          return;
         }
+        void this._ensureEmbeddingsAndProject({ omitFeaturesGeneration: true });
       });
     }
 
@@ -1967,10 +2088,19 @@ export class Controller {
       const $cb = document.getElementById(elId) as HTMLInputElement | null;
       if (!$cb) continue;
       $cb.addEventListener("change", () => {
+        const sourcesBefore = m.activeSources.slice().sort().join(",");
         m.toggleAudioFeature(dim);
         m.saveLS();
         this._syncAudioFeatureCheckbox(elId, dim);
-        if (m.viewMode === "embeddings") {
+        if (m.viewMode !== "embeddings") return;
+        const sourcesAfter = m.activeSources.slice().sort().join(",");
+        // Turning individual librosa dims on/off only changes the feature *mask* for
+        // projection.  The cache always stores the full 6D vector per fingerprint —
+        // do not run /generate (and the straggler pending toast) on every mask tweak.
+        // When the ``features`` layer is added or removed entirely, run the full path.
+        if (sourcesBefore === sourcesAfter) {
+          void this._fetchProjection();
+        } else {
           void this._ensureEmbeddingsAndProject();
         }
       });
