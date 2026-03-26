@@ -171,7 +171,8 @@ export class Controller {
 
   /** Passed to `/partials/folder-tree` on next HTMX refresh; cleared after swap. */
   pendingRenameForTree: string | null = null;
-  private _folderClickTimer = 0;
+  /** Anchor path (normalised) for Shift+click folder range select. */
+  private _folderShiftAnchor: string | null = null;
 
   private mouse: MouseState;
   private previewPath: string | null = null;
@@ -240,6 +241,7 @@ export class Controller {
     this._bindSidebar();
     this._bindKeyboard();
     this._bindResize();
+    this._bindViewportChrome();
     this._syncModeVisuals();
   }
 
@@ -254,6 +256,8 @@ export class Controller {
       this.tagPanel.render();
       this._syncModeVisuals();
       this._updateFolderHighlights();
+      this._syncFolderTreeActiveLabels();
+      this._updateClearHidesButton();
     });
     this.model.on("tags-dirty", () => this.batch.renderDirty());
   }
@@ -386,7 +390,6 @@ export class Controller {
       if (!label) return;
       e.preventDefault();
       e.stopPropagation();
-      clearTimeout(this._folderClickTimer);
       this._beginFolderLabelRename(label as HTMLElement);
     });
     this.$folderTree.addEventListener("click", (e) =>
@@ -431,6 +434,7 @@ export class Controller {
     // Auto-opened state must be recomputed from scratch after a swap.
     this._autoOpenedFolders.clear();
     this._updateFolderHighlights();
+    this._syncFolderTreeActiveLabels();
   }
 
   private _onFolderTreeClick(e: MouseEvent): void {
@@ -491,19 +495,88 @@ export class Controller {
     const label = t.closest(".folder-label") as HTMLElement | null;
     if (!label) return;
     e.stopPropagation();
-    const path = label.dataset.path ?? ".";
+    this._onFolderLabelActivate(label as HTMLElement, e);
+  }
 
-    clearTimeout(this._folderClickTimer);
-    this._folderClickTimer = setTimeout(() => {
-      this.$folderTree
-        .querySelectorAll(".folder-label.active")
-        .forEach((el) => el.classList.remove("active"));
-      label.classList.add("active");
-      const rel = path === "." ? "" : path;
-      this.model.setFolder(rel);
-      setTimeout(() => this.tagPanel.render(), 0);
+  private _normFolderPath(dataPath: string): string {
+    return dataPath === "." || dataPath === "" ? "" : dataPath;
+  }
+
+  private _flatFolderPathsFromDom(): string[] {
+    const out: string[] = [];
+    for (const row of this.$folderTree.querySelectorAll<HTMLElement>(
+      ".folder-row",
+    )) {
+      out.push(row.dataset.folderPath ?? ".");
+    }
+    return out;
+  }
+
+  private _folderPathsInRangeFromDom(aPath: string, bPath: string): Set<string> {
+    const flat = this._flatFolderPathsFromDom();
+    let ia = flat.indexOf(aPath);
+    let ib = flat.indexOf(bPath);
+    if (ia < 0) ia = 0;
+    if (ib < 0) ib = 0;
+    const lo = Math.min(ia, ib);
+    const hi = Math.max(ia, ib);
+    return new Set(
+      flat.slice(lo, hi + 1).map((p) => this._normFolderPath(p)),
+    );
+  }
+
+  private _syncFolderTreeActiveLabels(): void {
+    const activeNorm = new Set(this.model.viewFolderPaths);
+    for (const label of this.$folderTree.querySelectorAll<HTMLElement>(
+      ".folder-label",
+    )) {
+      const norm = this._normFolderPath(label.dataset.path ?? ".");
+      label.classList.toggle("active", activeNorm.has(norm));
+    }
+  }
+
+  private _updateClearHidesButton(): void {
+    const btn = document.getElementById("viewport-clear-hides");
+    if (!btn) return;
+    btn.classList.toggle("hidden", !this.model.hasExclusions);
+  }
+
+  private _onFolderLabelActivate(label: HTMLElement, e: MouseEvent): void {
+    const path = label.dataset.path ?? ".";
+    const norm = this._normFolderPath(path);
+    const anchorPath = this._folderShiftAnchor;
+
+    if (e.altKey) {
+      e.preventDefault();
+      this.model.hideFolderTree(norm);
       this.model.saveLS();
-    }, 240) as unknown as number;
+      return;
+    }
+
+    if (e.metaKey || e.ctrlKey) {
+      e.preventDefault();
+      this.model.toggleViewFolder(norm);
+      this.model.saveLS();
+      this._folderShiftAnchor = norm;
+      setTimeout(() => this.tagPanel.render(), 0);
+      return;
+    }
+
+    if (e.shiftKey && anchorPath !== null) {
+      e.preventDefault();
+      const anchorData =
+        anchorPath === "" ? "." : anchorPath;
+      const range = this._folderPathsInRangeFromDom(anchorData, path);
+      this.model.setViewFolderUnion(range, norm);
+      this._folderShiftAnchor = norm;
+      this.model.saveLS();
+      setTimeout(() => this.tagPanel.render(), 0);
+      return;
+    }
+
+    this._folderShiftAnchor = norm;
+    this.model.selectOnlyInFolder(path);
+    this.model.saveLS();
   }
 
   private _commitFolderRename(path: string, newName: string): void {
@@ -557,10 +630,11 @@ export class Controller {
   private async _refreshFolderTreeHtmx(): Promise<void> {
     const pr = this.pendingRenameForTree ?? "";
     this.pendingRenameForTree = null;
-    const params = new URLSearchParams({
-      active: this.model.folder,
-      pending_rename: pr,
-    });
+    const m = this.model;
+    const params = new URLSearchParams({ pending_rename: pr });
+    params.set("active", m.folder === "" ? "." : m.folder);
+    for (const fp of m.viewFolderPaths)
+      params.append("active_folders", fp === "" ? "." : fp);
     try {
       await htmx.ajax("get", `/partials/folder-tree?${params}`, {
         target: "#folder-tree",
@@ -1932,6 +2006,27 @@ export class Controller {
 
   /* ── Fit view to visible track bounds ───────────────────── */
 
+  private _vpFromWorldBounds(
+    minX: number,
+    maxX: number,
+    minY: number,
+    maxY: number,
+  ): { ox: number; oy: number; zoom: number } {
+    const midX = (minX + maxX) / 2,
+      midY = (minY + maxY) / 2;
+    const margin = 0.1;
+    const zx =
+      maxX - minX > 0.01 ? (1 - 2 * margin) / (maxX - minX) : 50;
+    const zy =
+      maxY - minY > 0.01 ? (1 - 2 * margin) / (maxY - minY) : 50;
+    const zoom = Math.max(this.canvas.minZoom(), Math.min(50, Math.min(zx, zy)));
+    return {
+      zoom,
+      ox: midX - 1 / (2 * zoom),
+      oy: midY - 1 / (2 * zoom),
+    };
+  }
+
   private _computeFitVP(): { ox: number; oy: number; zoom: number } {
     const m = this.model;
 
@@ -1957,19 +2052,67 @@ export class Controller {
     if (maxX - minX < 0.01 && maxY - minY < 0.01)
       return { ox: 0, oy: 0, zoom: 1 };
 
-    const midX = (minX + maxX) / 2,
-      midY = (minY + maxY) / 2;
-    const margin = 0.1;
-    const zx =
-      maxX - minX > 0.01 ? (1 - 2 * margin) / (maxX - minX) : 50;
-    const zy =
-      maxY - minY > 0.01 ? (1 - 2 * margin) / (maxY - minY) : 50;
-    const zoom = Math.max(this.canvas.minZoom(), Math.min(50, Math.min(zx, zy)));
-    return {
-      zoom,
-      ox: midX - 1 / (2 * zoom),
-      oy: midY - 1 / (2 * zoom),
-    };
+    return this._vpFromWorldBounds(minX, maxX, minY, maxY);
+  }
+
+  private _p80Radius(dists: number[]): number {
+    if (!dists.length) return 0;
+    const s = [...dists].sort((a, b) => a - b);
+    const idx = Math.min(
+      s.length - 1,
+      Math.max(0, Math.ceil(0.8 * s.length) - 1),
+    );
+    return s[idx];
+  }
+
+  /** Fit viewport to an 80th-percentile disc around the centroid (folder hover + H). */
+  private _fitViewToFolderPercentile(prefixNorm: string): void {
+    const m = this.model;
+    const subset: Track[] = [];
+    for (const t of m.allTracks) {
+      if (!m.trackInViewUnion(t) || m.isTrackHidden(t)) continue;
+      if (!m.passesFilter(t)) continue;
+      const tf = t.folder ?? "";
+      if (prefixNorm !== "") {
+        if (tf !== prefixNorm && !tf.startsWith(prefixNorm + "/")) continue;
+      }
+      subset.push(t);
+    }
+    const pos: { wx: number; wy: number }[] = [];
+    for (const t of subset) {
+      const p = this.canvas.worldPosForTrack(t);
+      if (p) pos.push(p);
+    }
+    if (pos.length === 0) return;
+    let cx = 0,
+      cy = 0;
+    for (const p of pos) {
+      cx += p.wx;
+      cy += p.wy;
+    }
+    cx /= pos.length;
+    cy /= pos.length;
+    const dists = pos.map((p) => Math.hypot(p.wx - cx, p.wy - cy));
+    const rmax = this._p80Radius(dists);
+    const inside = pos.filter(
+      (p) => Math.hypot(p.wx - cx, p.wy - cy) <= rmax + 1e-9,
+    );
+    if (inside.length === 0) return;
+    let minX = Infinity,
+      maxX = -Infinity,
+      minY = Infinity,
+      maxY = -Infinity;
+    for (const p of inside) {
+      if (p.wx < minX) minX = p.wx;
+      if (p.wx > maxX) maxX = p.wx;
+      if (p.wy < minY) minY = p.wy;
+      if (p.wy > maxY) maxY = p.wy;
+    }
+    if (maxX - minX < 0.01 && maxY - minY < 0.01) {
+      Object.assign(m.vp, { ox: 0, oy: 0, zoom: 1 });
+      return;
+    }
+    Object.assign(m.vp, this._vpFromWorldBounds(minX, maxX, minY, maxY));
   }
 
   private _fitViewToTracks(): void {
@@ -2208,6 +2351,26 @@ export class Controller {
 
   /* ── Keyboard shortcuts ─────────────────────────────────── */
 
+  /** True if isolating would still exclude at least one currently visible track. */
+  private _wouldIsolateExcludeMore(
+    m: Model,
+    kind: { type: "selection" } | { type: "folder"; prefix: string },
+  ): boolean {
+    for (const t of m.allTracks) {
+      if (!m.trackInViewUnion(t) || m.isTrackHidden(t)) continue;
+      if (kind.type === "selection") {
+        if (!m.selected.has(t.path)) return true;
+      } else {
+        const tf = t.folder ?? "";
+        const p = kind.prefix;
+        const under =
+          p === "" || tf === p || tf.startsWith(p + "/");
+        if (!under) return true;
+      }
+    }
+    return false;
+  }
+
   private _bindKeyboard(): void {
     const m = this.model;
     const hk = this.hotkeyMgr;
@@ -2223,6 +2386,13 @@ export class Controller {
     });
 
     hk.on("fit-view", () => {
+      const hp = this.canvas.hoveredFolderPrefix;
+      if (hp !== null) {
+        this._fitViewToFolderPercentile(hp);
+        this.canvas.scheduleDraw();
+        m.saveLS();
+        return;
+      }
       const vp = m.vp;
       const fit = this._computeFitVP();
       const atFit =
@@ -2240,17 +2410,59 @@ export class Controller {
       m.saveLS();
     });
 
+    hk.on("exclude-selection", () => {
+      const hp = this.canvas.hoveredFolderPrefix;
+      if (hp !== null) {
+        if (m.folderSubtreeFullyExcluded(hp)) {
+          m.revealFolderSubtree(hp);
+        } else {
+          m.hideFolderTree(hp);
+        }
+        m.saveLS();
+        return;
+      }
+      if (m.selected.size) {
+        m.hidePaths([...m.selected]);
+        m.saveLS();
+      }
+    });
+
+    hk.on("isolate-selection", () => {
+      const hp = this.canvas.hoveredFolderPrefix;
+      if (hp !== null) {
+        if (m.folderSubtreeFullyExcluded(hp)) {
+          m.revealThenFocusFolderSubtree(hp);
+        } else if (this._wouldIsolateExcludeMore(m, { type: "folder", prefix: hp })) {
+          m.focusFolderSubtree(hp);
+        } else {
+          m.clearExclusions();
+        }
+        m.saveLS();
+        return;
+      }
+      if (m.selected.size) {
+        if (this._wouldIsolateExcludeMore(m, { type: "selection" })) {
+          m.focusSelection();
+        } else {
+          m.clearExclusions();
+        }
+        m.saveLS();
+      }
+    });
+
+    hk.on("show-all-tracks", () => {
+      m.clearExclusions();
+      m.saveLS();
+    });
+
     hk.on("enter-folder", () => {
       const cv = this.canvas;
       if (cv.hoveredIdx >= 0) {
         const track = m.tracks[cv.hoveredIdx];
         const folder = track?.folder ?? "";
-        if (folder !== m.folder) {
-          m.setFolder(folder);
-          this._treeActivateFolder(folder);
-          setTimeout(() => this.tagPanel.render(), 0);
-          m.saveLS();
-        }
+        m.setFolder(folder);
+        setTimeout(() => this.tagPanel.render(), 0);
+        m.saveLS();
       }
     });
 
@@ -2264,7 +2476,6 @@ export class Controller {
             : null;
       if (parent !== null) {
         m.setFolder(parent);
-        this._treeActivateFolder(parent);
         setTimeout(() => this.tagPanel.render(), 0);
         m.saveLS();
       }
@@ -2304,20 +2515,6 @@ export class Controller {
         m.clearSelection();
       }
     });
-  }
-
-  /* ── Tree folder highlight helper ───────────────────────── */
-
-  private _treeActivateFolder(folder: string): void {
-    const $tree = this.$folderTree;
-    $tree
-      .querySelectorAll(".folder-label.active")
-      .forEach((el) => el.classList.remove("active"));
-    const dataPath = folder === "" ? "." : folder;
-    const label = $tree.querySelector(
-      `.folder-label[data-path="${CSS.escape(dataPath)}"]`,
-    );
-    if (label) label.classList.add("active");
   }
 
   /* ── Folder open/close helpers ──────────────────────────── */
@@ -2371,6 +2568,7 @@ export class Controller {
    *  current selection.  Called after every "change" event and after HTMX
    *  tree swaps. */
   private _updateFolderHighlights(): void {
+    const m = this.model;
     const $tree = this.$folderTree;
     const foldersWithSel = this._getFoldersWithSelection();
 
@@ -2378,6 +2576,11 @@ export class Controller {
     for (const row of $tree.querySelectorAll<HTMLElement>(".folder-row")) {
       const path = row.dataset.folderPath ?? ".";
       row.classList.toggle("folder-sel", foldersWithSel.has(path));
+      const norm = path === "." ? "" : path;
+      row.classList.toggle(
+        "folder-fully-excluded",
+        m.hasExclusions && !m.hasVisibleTracksUnderTreePrefix(norm),
+      );
     }
 
     // Close auto-opened folders that no longer contain selected tracks.
@@ -2413,6 +2616,13 @@ export class Controller {
     window.addEventListener("resize", () => {
       this.canvas.resize();
       this.canvas.scheduleDraw();
+    });
+  }
+
+  private _bindViewportChrome(): void {
+    document.getElementById("viewport-clear-hides")?.addEventListener("click", () => {
+      this.model.clearExclusions();
+      this.model.saveLS();
     });
   }
 }

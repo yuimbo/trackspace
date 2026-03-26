@@ -10,10 +10,15 @@ export class StatusView {
 
   update(model: Model): void {
     const parts: string[] = [];
+    const roots = [...model.viewFolderPaths].sort();
+    const folderLabel =
+      roots.length <= 1
+        ? model.folder || "·"
+        : roots.map((r) => r || "·").join(", ");
     if (model.selected.size) {
       parts.push(`${model.selected.size} selected  ·  ${model.tracks.length} tracks`);
     } else {
-      parts.push(`${model.tracks.length} tracks in /${model.folder}`);
+      parts.push(`${model.tracks.length} tracks in /${folderLabel}`);
     }
     if (model.libraryLoadProgress) {
       const { done, total } = model.libraryLoadProgress;

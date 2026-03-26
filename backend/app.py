@@ -347,12 +347,15 @@ def _dir_color(folder_path: str) -> str:
 def partial_folder_tree():
     """HTML fragment for the folder sidebar (HTMX)."""
     active = request.args.get("active", "")
+    active_folders = request.args.getlist("active_folders")
+    if not active_folders:
+        active_folders = [active if active != "" else "."]
     pending_rename = request.args.get("pending_rename", "")
     tree = _folder_tree(MUSIC_ROOT)
     return render_template(
         "partials/folder_tree.html",
         tree=tree,
-        active_folder=active,
+        active_folders=active_folders,
         pending_rename=pending_rename,
         dir_color=_dir_color,
     )

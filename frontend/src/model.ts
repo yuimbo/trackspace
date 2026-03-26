@@ -43,6 +43,11 @@ class EventBus {
 export class Model extends EventBus {
   allTracks: Track[] = [];
   folder = "";
+  /**
+   * Normalised folder paths ("" = library root). Union of roots for the folder sidebar
+   * selection; each root uses ``recursive`` for subtree inclusion.
+   */
+  viewFolderPaths = new Set<string>([""]);
   recursive = true;
   axisX: string | null = null;
   axisY: string | null = null;
@@ -80,20 +85,61 @@ export class Model extends EventBus {
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
 
+  /** Hidden by path (session-only). */
+  hiddenPaths = new Set<string>();
+  /** Hide every track in this folder and subfolders (normalised "", not "."). */
+  hiddenFolderPrefixes = new Set<string>();
+
   /* ── Computed ──────────────────────────────────────────────── */
+
+  /** True if a track lies under ``root`` using the current ``recursive`` rule. */
+  trackUnderViewRoot(tf: string, root: string): boolean {
+    if (!this.recursive) return tf === root;
+    if (root === "") return true;
+    return tf === root || tf.startsWith(root + "/");
+  }
+
+  /** Track matches at least one selected folder root (ignores hide rules). */
+  trackInViewUnion(t: Track): boolean {
+    const tf = t.folder ?? "";
+    for (const root of this.viewFolderPaths) {
+      if (this.trackUnderViewRoot(tf, root)) return true;
+    }
+    return false;
+  }
+
+  isTrackHidden(t: Track): boolean {
+    if (this.hiddenPaths.has(t.path)) return true;
+    const tf = t.folder ?? "";
+    for (const p of this.hiddenFolderPrefixes) {
+      if (p === "") return true;
+      if (tf === p || tf.startsWith(p + "/")) return true;
+    }
+    return false;
+  }
+
+  /** True while any track or folder subtree is excluded from the current view. */
+  get hasExclusions(): boolean {
+    return this.hiddenPaths.size > 0 || this.hiddenFolderPrefixes.size > 0;
+  }
+
+  /** Visible tracks under ``prefix`` (``""`` or ``"a/b"``), respecting view union + hides. */
+  hasVisibleTracksUnderTreePrefix(treePrefix: string): boolean {
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      const tf = t.folder ?? "";
+      if (treePrefix === "" || tf === treePrefix || tf.startsWith(treePrefix + "/"))
+        return true;
+    }
+    return false;
+  }
 
   get tracks(): Track[] {
     if (this._cache) return this._cache;
-    const f = this.folder;
-    const result =
-      f === "" && this.recursive
-        ? this.allTracks
-        : this.allTracks.filter((t) => {
-            const tf = t.folder ?? "";
-            return this.recursive
-              ? tf === f || tf.startsWith(f + "/")
-              : tf === f;
-          });
+    const result = this.allTracks.filter((t) => {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) return false;
+      return true;
+    });
     this._cache = result;
     return result;
   }
@@ -155,6 +201,21 @@ export class Model extends EventBus {
     this._pathMap = null;
   }
 
+  private _hasAnyVisibleInViewUnion(): boolean {
+    for (const t of this.allTracks) {
+      if (this.trackInViewUnion(t) && !this.isTrackHidden(t)) return true;
+    }
+    return false;
+  }
+
+  /** If every track in the view union is excluded, clear all exclusions (avoid a blank canvas). */
+  private _clearExclusionsIfNoneVisible(): void {
+    if (this._hasAnyVisibleInViewUnion()) return;
+    if (!this.hasExclusions) return;
+    this.hiddenPaths.clear();
+    this.hiddenFolderPrefixes.clear();
+  }
+
   /* ── Mutators ─────────────────────────────────────────────── */
 
   setAllTracks(tracks: Track[]): void {
@@ -172,6 +233,34 @@ export class Model extends EventBus {
 
   setFolder(f: string): void {
     this.folder = f;
+    this.viewFolderPaths = new Set([f]);
+    this._cache = null;
+    this.selected.clear();
+    this.emit("change");
+  }
+
+  /** Replace the multi-folder sidebar selection; ``primary`` is stored in ``folder``. */
+  setViewFolderUnion(paths: Iterable<string>, primary: string): void {
+    const next = new Set(paths);
+    if (next.size === 0) next.add(primary);
+    this.viewFolderPaths = next;
+    this.folder = primary;
+    this._cache = null;
+    this.selected.clear();
+    this.emit("change");
+  }
+
+  /** Cmd/Ctrl-click toggle for folder multi-select. Cannot deselect the last root. */
+  toggleViewFolder(rootNorm: string): void {
+    if (this.viewFolderPaths.has(rootNorm)) {
+      if (this.viewFolderPaths.size <= 1) return;
+      this.viewFolderPaths.delete(rootNorm);
+      if (this.folder === rootNorm)
+        this.folder = [...this.viewFolderPaths][0] ?? "";
+    } else {
+      this.viewFolderPaths.add(rootNorm);
+      this.folder = rootNorm;
+    }
     this._cache = null;
     this.selected.clear();
     this.emit("change");
@@ -181,6 +270,141 @@ export class Model extends EventBus {
     this.recursive = r;
     this._cache = null;
     this.selected.clear();
+    this.emit("change");
+  }
+
+  hidePaths(paths: Iterable<string>): void {
+    this.hiddenPaths = new Set([...this.hiddenPaths, ...paths]);
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  hideFolderTree(prefixNorm: string): void {
+    this.hiddenFolderPrefixes.add(prefixNorm);
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  /** Hide every visible-until-now track that is not currently selected. */
+  focusSelection(): void {
+    const add: string[] = [];
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      if (this.selected.has(t.path)) continue;
+      add.push(t.path);
+    }
+    this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  /** Hide visible tracks not under ``prefixNorm`` (``""`` = library root); same idea as ``focusSelection`` for a hovered folder row. */
+  focusFolderSubtree(prefixNorm: string): void {
+    const add: string[] = [];
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      const tf = t.folder ?? "";
+      const under =
+        prefixNorm === "" ||
+        tf === prefixNorm ||
+        tf.startsWith(prefixNorm + "/");
+      if (under) continue;
+      add.push(t.path);
+    }
+    this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  /**
+   * At least one track in the view union lies under ``prefixNorm``, and every such
+   * track is excluded from the canvas.
+   */
+  folderSubtreeFullyExcluded(prefixNorm: string): boolean {
+    let anyUnder = false;
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t)) continue;
+      const tf = t.folder ?? "";
+      const under =
+        prefixNorm === "" ||
+        tf === prefixNorm ||
+        tf.startsWith(prefixNorm + "/");
+      if (!under) continue;
+      anyUnder = true;
+      if (!this.isTrackHidden(t)) return false;
+    }
+    return anyUnder;
+  }
+
+  private _mutateRevealFolderSubtree(prefixNorm: string): void {
+    for (const p of [...this.hiddenFolderPrefixes]) {
+      if (
+        p === prefixNorm ||
+        p === "" ||
+        (p !== "" && (prefixNorm === p || prefixNorm.startsWith(p + "/")))
+      ) {
+        this.hiddenFolderPrefixes.delete(p);
+      }
+    }
+    const next = new Set(this.hiddenPaths);
+    for (const path of this.hiddenPaths) {
+      const t = this.trackByPath(path);
+      if (!t) {
+        next.delete(path);
+        continue;
+      }
+      const tf = t.folder ?? "";
+      const under =
+        prefixNorm === "" ||
+        tf === prefixNorm ||
+        tf.startsWith(prefixNorm + "/");
+      if (under) next.delete(path);
+    }
+    this.hiddenPaths = next;
+  }
+
+  /**
+   * Bring ``prefixNorm`` back into the view: remove folder exclusions and per-track
+   * exclusions under that subtree (including ancestor folder exclusions that hide it).
+   */
+  revealFolderSubtree(prefixNorm: string): void {
+    this._mutateRevealFolderSubtree(prefixNorm);
+    this._cache = null;
+    this.emit("change");
+  }
+
+  /**
+   * Bring back a fully excluded folder subtree, then exclude everything outside it (single update).
+   * Used when **s** (isolate) is pressed on a hovered folder that is already entirely excluded.
+   */
+  revealThenFocusFolderSubtree(prefixNorm: string): void {
+    this._mutateRevealFolderSubtree(prefixNorm);
+    this._cache = null;
+    const add: string[] = [];
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      const tf = t.folder ?? "";
+      const under =
+        prefixNorm === "" ||
+        tf === prefixNorm ||
+        tf.startsWith(prefixNorm + "/");
+      if (under) continue;
+      add.push(t.path);
+    }
+    this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  clearExclusions(): void {
+    if (!this.hasExclusions) return;
+    this.hiddenPaths.clear();
+    this.hiddenFolderPrefixes.clear();
+    this._cache = null;
     this.emit("change");
   }
 
@@ -296,7 +520,21 @@ export class Model extends EventBus {
 
   selectInFolder(folderPath: string): void {
     const norm = !folderPath || folderPath === "." ? "" : folderPath;
-    for (const t of this.tracks) {
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      const tf = t.folder ?? "";
+      if (norm === "" || tf === norm || tf.startsWith(norm + "/"))
+        this.selected.add(t.path);
+    }
+    this.emit("change");
+  }
+
+  /** Replace selection with every visible track in this folder (and subfolders). */
+  selectOnlyInFolder(folderPath: string): void {
+    const norm = !folderPath || folderPath === "." ? "" : folderPath;
+    this.selected.clear();
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
       const tf = t.folder ?? "";
       if (norm === "" || tf === norm || tf.startsWith(norm + "/"))
         this.selected.add(t.path);
@@ -349,12 +587,31 @@ export class Model extends EventBus {
         t.path = (t.folder ? t.folder + "/" : "") + t.filename;
       }
     }
+    const upd = (s: string) =>
+      s === oldRel || s.startsWith(oldRel + "/")
+        ? newRel + s.slice(oldRel.length)
+        : s;
     if (
       this.folder === oldRel ||
       this.folder.startsWith(oldRel + "/")
     ) {
-      this.folder = newRel + this.folder.slice(oldRel.length);
+      this.folder = upd(this.folder);
     }
+    this.viewFolderPaths = new Set(
+      [...this.viewFolderPaths].map((p) => upd(p)),
+    );
+    this.hiddenFolderPrefixes = new Set(
+      [...this.hiddenFolderPrefixes].map((p) => upd(p)),
+    );
+    const nh = new Set<string>();
+    for (const p of this.hiddenPaths) {
+      nh.add(
+        p === oldRel || p.startsWith(oldRel + "/")
+          ? newRel + p.slice(oldRel.length)
+          : p,
+      );
+    }
+    this.hiddenPaths = nh;
     this._dirty();
   }
 
@@ -366,8 +623,13 @@ export class Model extends EventBus {
       const t = this.trackByPath(p);
       if (!t) continue;
       const fn = t.filename;
+      const newPath = normDest ? `${normDest}/${fn}` : fn;
+      if (this.hiddenPaths.has(p)) {
+        this.hiddenPaths.delete(p);
+        this.hiddenPaths.add(newPath);
+      }
       t.folder = normDest;
-      t.path = normDest ? `${normDest}/${fn}` : fn;
+      t.path = newPath;
     }
     this.selected.clear();
     this._dirty();
@@ -381,6 +643,7 @@ export class Model extends EventBus {
       LS_KEY,
       JSON.stringify({
         folder: this.folder,
+        viewFolders: [...this.viewFolderPaths].sort(),
         recursive: this.recursive,
         axisX: this.axisX,
         axisY: this.axisY,
@@ -410,6 +673,12 @@ export class Model extends EventBus {
       const d = JSON.parse(localStorage.getItem(LS_KEY) ?? "null");
       if (d) {
         this.folder = d.folder ?? "";
+        const vf = (d as { viewFolders?: string[] }).viewFolders;
+        this.viewFolderPaths = new Set(
+          Array.isArray(vf) && vf.length ? vf : [this.folder],
+        );
+        if (!this.viewFolderPaths.has(this.folder))
+          this.folder = [...this.viewFolderPaths][0] ?? "";
         this.recursive = true;
         this.axisX = d.axisX ?? null;
         this.axisY = d.axisY ?? null;

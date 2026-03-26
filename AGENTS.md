@@ -211,6 +211,11 @@ already provides optimistic behavior for that hot path.
 - **`renderShortcutList(container)`** — populates the F1 shortcuts modal from the maps.
   Called once at startup in `main.ts`.
 
+Canvas visibility filtering is described to users as **isolate** (only selection or folder remains;
+action `"isolate-selection"`, **s**) and **exclude** (remove from view, often repeated; action
+`"exclude-selection"`, **Shift+s**), with **Alt+s** as `"show-all-tracks"`. Implementation still
+uses `hiddenPaths` and `hiddenFolderPrefixes` on the model.
+
 **Adding a new hotkey:**
 1. Add an entry to `HOTKEY_MAP` in `hotkeys.ts`.
 2. Register a handler in `Controller._bindKeyboard` via `hk.on("your-action", () => { ... })`.

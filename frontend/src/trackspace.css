@@ -94,6 +94,12 @@ body { display: flex; }
 }
 .folder-row:hover .folder-sel-btn { opacity: 1; }
 
+.folder-row.folder-fully-excluded .folder-label {
+  opacity: 0.4;
+}
+
+.folder-label { user-select: none; }
+
 .folder-arrow {
   width: 14px;
   text-align: center;
@@ -716,6 +722,27 @@ kbd {
   flex-direction: column;
   position: relative;
   min-width: 0;
+}
+
+.viewport-clear-hides {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: 1px solid #ffffff22;
+  background: #16213ef0;
+  color: var(--accent-hi);
+  cursor: pointer;
+  pointer-events: auto;
+}
+.viewport-clear-hides:hover {
+  background: #1a2a4a;
+}
+.viewport-clear-hides.hidden {
+  display: none;
 }
 
 #viewport {

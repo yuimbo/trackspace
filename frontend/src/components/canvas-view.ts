@@ -366,6 +366,11 @@ export class CanvasView {
     };
   }
 
+  /** World (normalised) position for fit / tooling; not clamped. */
+  worldPosForTrack(t: Track): { wx: number; wy: number } | null {
+    return this._resolveTrackWPos(t);
+  }
+
   private _resolveTrackWPos(t: Track): { wx: number; wy: number } | null {
     const m = this.model;
 
