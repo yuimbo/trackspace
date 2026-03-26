@@ -195,6 +195,29 @@ def test_build_folder_directions_returns_exponents():
     assert np.all(exps >= 0)
 
 
+def test_build_folder_directions_adds_orthogonal_pca_for_large_folders():
+    """Residual PCA adds rows beyond hierarchical when a folder has ≥8 tracks."""
+    d = 4
+    paths = [f"m/gen/folk/t{i}.mp3" for i in range(8)]
+    paths += [f"m/gen/rock/t{i}.mp3" for i in range(4)]
+    mat = np.zeros((12, d), dtype=np.float32)
+    mat[:4, 0] = 10.0
+    mat[4:8, 1] = 10.0
+    mat[8:, 2] = 8.0
+    seeds = _folder_seeds_from_track_paths(paths)
+    dirs, exps, _fb = _build_folder_directions(mat, paths, seeds)
+    assert dirs is not None and exps is not None
+    assert len(exps) == len(dirs)
+    hier_only = _build_folder_directions(
+        mat, paths, seeds, min_tracks_pca=10_000,
+    )
+    assert hier_only[0] is not None
+    assert dirs.shape[0] > hier_only[0].shape[0]
+    hier_folk = dirs[0]
+    folk_pc = dirs[1]
+    assert abs(float(np.dot(folk_pc, hier_folk))) < 0.05
+
+
 def test_compute_projection_pca_without_semantics():
     fp = "x"
     infos = [

@@ -24,8 +24,14 @@ import torch
 from transformers import ClapModel, ClapProcessor
 
 from backend.audio_features import load_resilient_audio_segments
+from backend.layout_revision import FOLDER_SEMANTIC_BASIS_VERSION
 
 log = logging.getLogger(__name__)
+
+# Within-folder PCA on deviations orthogonal to the hierarchical contrast axis.
+FOLDER_PCA_MIN_TRACKS = 8
+FOLDER_PCA_MAX_COMPONENTS = 2
+FOLDER_PCA_SECOND_SV_RATIO = 0.18
 
 CLAP_MODEL_ID = "laion/larger_clap_music"
 CLAP_SR = 48000
@@ -170,7 +176,7 @@ def _semantic_basis_param_key(
         fp = ",".join(sorted(folder_seeds))
     else:
         fp = "-"
-    return f"{tags}|{fp}"
+    return f"{tags}|{fp}|fsbv{FOLDER_SEMANTIC_BASIS_VERSION}"
 
 
 def _semantic_param_key(
@@ -320,20 +326,68 @@ def _expand_folder_nodes(folder_seeds: list[str]) -> set[str]:
     return all_nodes
 
 
+def _folder_orthogonal_pc_directions(
+    mat_block: np.ndarray,
+    d_unit: np.ndarray,
+    *,
+    max_components: int,
+    min_second_sv_ratio: float,
+) -> list[np.ndarray]:
+    """Principal directions of within-folder spread after removing the axis *d_unit*.
+
+    *mat_block* is ``(n, D)`` rows for one folder; *d_unit* is the hierarchical
+    ``normalize(c_child - c_parent)`` for that folder.  Returns 0–*max_components*
+    unit vectors orthogonal to *d_unit* (and mutually orthogonal).
+    """
+    n = mat_block.shape[0]
+    if n < 4 or max_components < 1:
+        return []
+
+    c = mat_block.mean(axis=0)
+    x_dev = mat_block - c
+    proj = x_dev @ d_unit
+    x_orth = x_dev - np.outer(proj, d_unit.astype(np.float64))
+
+    _, s, vt = np.linalg.svd(x_orth.astype(np.float64), full_matrices=False)
+    if s.size == 0 or float(s[0]) < 1e-12:
+        return []
+
+    d64 = d_unit.astype(np.float64)
+    out: list[np.ndarray] = []
+    lim = min(max_components, int(vt.shape[0]))
+    for i in range(lim):
+        if i > 0 and float(s[i]) < min_second_sv_ratio * float(s[0]):
+            break
+        v = np.asarray(vt[i], dtype=np.float64)
+        v = v - float(v @ d64) * d64
+        nv = float(np.linalg.norm(v))
+        if nv < 1e-9:
+            continue
+        out.append((v / nv).astype(np.float32))
+    return out
+
+
 def _build_folder_directions(
     mat: np.ndarray,
     paths: list[str],
     folder_seeds: list[str],
     min_tracks: int = 2,
+    min_tracks_pca: int = FOLDER_PCA_MIN_TRACKS,
+    max_pca_components: int = FOLDER_PCA_MAX_COMPONENTS,
 ) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, int]]]:
     """Compute hierarchical contrast directions from actual track embeddings.
 
-    For each folder node the direction is
+    For each folder node the primary direction is
     ``centroid(all tracks under node) − centroid(all tracks under parent)``.
+    When a node has at least *min_tracks_pca* tracks, up to *max_pca_components*
+    extra directions come from PCA on within-folder deviations after removing
+    that hierarchical axis (orthogonal residual spread).
+
     Shared directions among siblings are naturally absorbed by the parent;
     each child retains only its unique contrast.  Later, semantic weights use
     ``folder_boost × folder_depth_boost ** exponent`` where *exponent* is
-    ``depth − 1`` for that node (see *exponents*).
+    ``depth − 1`` for that node (see *exponents*) — the same exponent is used
+    for a node's hierarchical row and its PCA rows.
 
     *folder_seeds* lists folder paths (typically parents of tracks); parent
     nodes are inferred so the client need not enumerate the whole tree.
@@ -394,12 +448,26 @@ def _build_folder_directions(
         if norm < 1e-9:
             continue
 
-        dirs.append(d / norm)
+        d_unit = (d / norm).astype(np.float32)
+        dirs.append(d_unit)
         exps.append(exp)
+
+        idx_list = node_indices[node]
+        if len(idx_list) >= min_tracks_pca and max_pca_components > 0:
+            block = mat[idx_list]
+            extras = _folder_orthogonal_pc_directions(
+                block,
+                d_unit,
+                max_components=max_pca_components,
+                min_second_sv_ratio=FOLDER_PCA_SECOND_SV_RATIO,
+            )
+            for v_pc in extras:
+                dirs.append(v_pc)
+                exps.append(exp)
 
     if dirs:
         log.debug(
-            "folder directions: %d data-driven, %d text-fallback",
+            "folder directions: %d data-driven rows, %d text-fallback",
             len(dirs), len(fallbacks),
         )
         return (
@@ -519,12 +587,12 @@ def _apply_semantic_weighting(
     """Re-weight embedding space using data-driven folder directions and text
     tag directions.
 
-    Folders use *hierarchical centroid decomposition*: each folder's direction
-    is its centroid minus its parent's centroid, capturing only the contrast
-    unique to that hierarchy level.  Deeper levels receive increasing boost so
-    that subtle microgenre differences are amplified rather than collapsed.
-    Folders with fewer than 2 embedded tracks fall back to CLAP text embedding
-    of the folder name.
+    Folders use *hierarchical centroid decomposition*: each folder's primary
+    direction is its centroid minus its parent's centroid.  Large folders also
+    contribute PCA axes of deviation orthogonal to that contrast (within-folder
+    spread).  Deeper levels receive increasing boost so that subtle differences
+    are amplified.  Folders with fewer than 2 embedded tracks fall back to CLAP
+    text embedding of the folder name.
 
     Tags always use CLAP text embedding (they are labels, not track collections).
 

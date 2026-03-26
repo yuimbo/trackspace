@@ -8,6 +8,9 @@ import hashlib
 import json
 from typing import Any
 
+# Bump when folder semantic basis changes (centroid + optional extras, thresholds).
+FOLDER_SEMANTIC_BASIS_VERSION = 1
+
 
 def compute_layout_revision(
     *,
@@ -22,6 +25,7 @@ def compute_layout_revision(
     context_folders: list[str] | None,
     scale_folders: bool,
     cache_versions: tuple[int, int, int],
+    folder_semantic_basis_version: int = FOLDER_SEMANTIC_BASIS_VERSION,
 ) -> str:
     """Return a hex SHA-256 of the canonical payload (lexically sorted JSON keys)."""
     folders_norm: list[str] | None
@@ -40,6 +44,7 @@ def compute_layout_revision(
         "folder_depth_boost": float(folder_depth_boost),
         "method": method,
         "scale_folders": bool(scale_folders),
+        "folder_semantic_basis_version": int(folder_semantic_basis_version),
         "sources": list(sources),
         "feature_mask": [float(x) for x in feature_mask],
     }
