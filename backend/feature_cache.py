@@ -10,11 +10,15 @@ Each data type carries its own ``version`` integer so that bumping one
 source (e.g. CLAP) does not invalidate others (e.g. EffNet).
 """
 
+import logging
+import os
 import sqlite3
 import threading
 from collections import OrderedDict
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class FeatureCache:
@@ -35,6 +39,20 @@ class FeatureCache:
     def _init_db(self) -> None:
         with sqlite3.connect(self._db_path) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
+            if os.environ.get("TRACKSPACE_SQLITE_INTEGRITY", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            ):
+                row = conn.execute("PRAGMA integrity_check").fetchone()
+                if not row or row[0] != "ok":
+                    log.warning(
+                        "FeatureCache %s: PRAGMA integrity_check failed (%r). "
+                        "Stop the server, back up the file if needed, and remove or "
+                        "replace the corrupted DB; it will be recreated empty.",
+                        self._db_path,
+                        row[0] if row else None,
+                    )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audio_features (

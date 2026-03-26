@@ -16,6 +16,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
+from backend.process_limits import raise_nofile_limit
+
+raise_nofile_limit()
+
 from flask import (
     Flask,
     Response,
@@ -47,7 +54,6 @@ from backend.embedding_coverage import (
 )
 from backend.layout_revision import compute_layout_revision
 
-load_dotenv()
 log = logging.getLogger(__name__)
 
 _PKG_DIR = os.path.dirname(os.path.abspath(__file__))

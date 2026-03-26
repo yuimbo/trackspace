@@ -67,3 +67,41 @@ def test_layout_revision_stable_for_same_inputs():
         cache_versions=(2, 1, 1),
     )
     assert r1 == r2
+
+
+def _base_revision_kwargs():
+    return dict(
+        eligible_paths=["a.mp3", "b.mp3"],
+        method="tsne",
+        sources=("clap", "effnet"),
+        feature_mask=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        features_blend=0.42,
+        folder_boost=3.0,
+        folder_depth_boost=1.5,
+        context_tags=["mood"],
+        context_folders=None,
+        scale_folders=True,
+        cache_versions=(2, 1, 1),
+    )
+
+
+def test_layout_revision_changes_when_cache_versions_change():
+    kw = _base_revision_kwargs()
+    r_a = compute_layout_revision(**kw)
+    r_b = compute_layout_revision(**{**kw, "cache_versions": (3, 1, 1)})
+    assert r_a != r_b
+
+
+def test_layout_revision_changes_when_feature_mask_changes():
+    kw = _base_revision_kwargs()
+    r_a = compute_layout_revision(**kw)
+    alt_mask = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    r_b = compute_layout_revision(**{**kw, "feature_mask": alt_mask})
+    assert r_a != r_b
+
+
+def test_layout_revision_changes_when_features_blend_changes():
+    kw = _base_revision_kwargs()
+    r_a = compute_layout_revision(**kw)
+    r_b = compute_layout_revision(**{**kw, "features_blend": 0.9})
+    assert r_a != r_b

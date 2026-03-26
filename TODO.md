@@ -11,10 +11,10 @@
 ## `backend/embeddings.py` (1127 lines)
 - [ ] Decompose into smaller modules: `clap_model.py` (load/infer), `projection_backends.py` (PCA/UMAP/t-SNE), `semantic_weighting.py` (folder/tag basis), and `projection_cache.py` (tiered caches).
 - [ ] Replace unbounded process-lifetime globals (`_source_row_cache`, `_pca_ref_*`) with a bounded cache object that supports explicit reset + telemetry counters (hits/misses/evictions).
-- [ ] Add cache invalidation tests that verify semantic/layout cache keys change when source versions, feature mask, or blend parameters change.
+- [x] Add cache invalidation tests that verify semantic/layout cache keys change when source versions, feature mask, or blend parameters change.
 - [ ] Add numerical stability tests for `_apply_low_rank_semantic_weight` and `_build_folder_directions` (zero norms, tiny clusters, degenerate siblings).
 - [ ] Add backend-selection tests for cuML/mlx-vis fallback paths to ensure runtime exceptions correctly disable that backend and continue on CPU.
-- [ ] Add timing instrumentation logs around `compute_projection` stages (gather, semantic weighting, projection backend) for easier profiling and regression detection.
+- [x] Add timing instrumentation logs around `compute_projection` stages (gather, semantic weighting, projection backend) for easier profiling and regression detection.
 
 ## `backend/audio_features.py` (547 lines)
 - [ ] Move EffNet model download/load concerns into a small `EffnetModelManager` class and keep feature extraction logic separate from model lifecycle.
@@ -28,6 +28,6 @@
 - [ ] Introduce a small generic helper for repeated get/put/has/get_all/count/purge patterns across CLAP/EffNet/features to eliminate copy-paste SQL logic.
 - [ ] Use explicit SQLite transactions (`BEGIN IMMEDIATE`) for batch writes and add `executemany` paths to reduce write amplification during generation jobs.
 - [ ] Add schema migration/version table support so new columns can be added deterministically instead of best-effort `ALTER TABLE` inside try/except.
-- [ ] Add DB-level integrity checks at startup (`PRAGMA integrity_check`, optional) with warning logs and recovery guidance when corruption is detected.
+- [x] Add DB-level integrity checks at startup (`PRAGMA integrity_check`, optional) with warning logs and recovery guidance when corruption is detected.
 - [ ] Add targeted unit tests for LRU behavior with prefixed keys (`fp`, `effnet:fp`, `feat:fp`) and eviction correctness across mixed source access.
 - [ ] Add thread-contention tests for concurrent reads/writes to verify lock usage and sqlite connection strategy stay safe under embedding generation load.

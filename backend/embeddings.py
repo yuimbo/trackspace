@@ -15,6 +15,7 @@ import os
 import platform
 import sys
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import Callable
 
@@ -1074,6 +1075,7 @@ def compute_projection(
             log.debug("projection: revision cache hit (%s)", method)
             return hit
 
+    t0 = time.perf_counter()
     paths, mat, clap_dim, clap_col_lo, comp_key = _gather_composite_vecs(
         track_infos,
         feature_cache,
@@ -1081,8 +1083,16 @@ def compute_projection(
         feature_mask=feature_mask,
         features_blend=features_blend,
     )
+    t_after_gather = time.perf_counter()
 
     if len(paths) < 2:
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "compute_projection method=%s n=%d gather=%.1fms (short-circuit)",
+                method,
+                len(paths),
+                (t_after_gather - t0) * 1000,
+            )
         return [{"path": p, "x": 0.5, "y": 0.5} for p in paths]
 
     if scale_folders:
@@ -1094,6 +1104,7 @@ def compute_projection(
 
     needs_weight = _loaded and (bool(context_tags) or bool(folder_seeds))
 
+    t_before_weight = time.perf_counter()
     mat_proj = mat
     if needs_weight:
         basis_key = f"{comp_key}|{_semantic_basis_param_key(context_tags, folder_seeds)}"
@@ -1121,15 +1132,33 @@ def compute_projection(
         mat_proj = _apply_low_rank_semantic_weight(
             mat, T_n, exp, folder_boost, folder_depth_boost,
         )
+    t_after_weight = time.perf_counter()
 
+    t_before_proj = time.perf_counter()
     if method == "pca":
         coords = _project_pca(mat_proj, paths)
     elif method == "tsne":
         coords = _project_tsne(mat_proj)
     else:
         coords = _project_umap(mat_proj)
+    t_after_proj = time.perf_counter()
 
+    t_before_norm = time.perf_counter()
     normed = _normalise_coords(coords)
+    t_end = time.perf_counter()
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            "compute_projection method=%s n=%d gather=%.1fms weight=%.1fms "
+            "project=%.1fms norm=%.1fms total=%.1fms",
+            method,
+            len(paths),
+            (t_after_gather - t0) * 1000,
+            (t_after_weight - t_before_weight) * 1000,
+            (t_after_proj - t_before_proj) * 1000,
+            (t_end - t_before_norm) * 1000,
+            (t_end - t0) * 1000,
+        )
 
     result = [
         {"path": paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
