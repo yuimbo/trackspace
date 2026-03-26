@@ -8,14 +8,20 @@ to produce a more robust representation.  Cached in the FeatureCache keyed
 by chromaprint fingerprint + EMBEDDING_VERSION.
 """
 
-import os
+import hashlib
+import importlib.util
 import logging
+import os
+import platform
+import sys
 import threading
+from collections import OrderedDict
 
 import numpy as np
 import torch
-import librosa
 from transformers import ClapModel, ClapProcessor
+
+from backend.decode_stderr import librosa_get_duration, librosa_load
 
 log = logging.getLogger(__name__)
 
@@ -26,9 +32,163 @@ NUM_SEGMENTS = 3
 # Bump this when the embedding strategy changes to auto-invalidate stale cache.
 EMBEDDING_VERSION = 2
 
+# Tiered projection LRU (composite gather → semantic direction basis → UMAP/t-SNE).
+# Semantic *weights* (folder contrast + depth emphasis) are applied via a cheap
+# low-rank multiply once ``T_n``/exponents are cached — no full D×D matrix.
+# PCA bypasses layout cache (fast; global Procrustes reference is per-process).
+_COMPOSITE_CACHE_MAX = 10
+_SEMANTIC_BASIS_CACHE_MAX = 10
+_LAYOUT_CACHE_MAX = 16
+_composite_cache: OrderedDict[str, tuple[list[str], np.ndarray, int, int]] = (
+    OrderedDict()
+)
+_semantic_basis_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
+    OrderedDict()
+)
+_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
+
+# Prepared per-source row vectors (L2-normalised CLAP/EffNet; masked+norm+blend features).
+# Lets us switch source *combinations* without re-running per-row normalisation or
+# re-querying FeatureCache rows that are still in this LRU.
+_SOURCE_ROW_CACHE_MAX = 24_000
+_source_row_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
+
+
+def _source_row_cache_get(key: tuple) -> np.ndarray | None:
+    if key not in _source_row_cache:
+        return None
+    _source_row_cache.move_to_end(key)
+    return _source_row_cache[key]
+
+
+def _source_row_cache_put(key: tuple, value: np.ndarray) -> None:
+    _source_row_cache[key] = value
+    _source_row_cache.move_to_end(key)
+    while len(_source_row_cache) > _SOURCE_ROW_CACHE_MAX:
+        _source_row_cache.popitem(last=False)
+
+
+def _tier_cache_get(cache: OrderedDict, key: str):
+    if key not in cache:
+        return None
+    cache.move_to_end(key)
+    return cache[key]
+
+
+def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > max_size:
+        cache.popitem(last=False)
+
+
+def _source_versions_token() -> str:
+    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+
+    return f"C{EMBEDDING_VERSION}E{EFFNET_VERSION}F{FEATURES_VERSION}"
+
+
+def _composite_param_key(
+    paths: list[str],
+    sources: tuple[str, ...],
+    mask: np.ndarray,
+    blend: float,
+) -> str:
+    ph = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
+    return (
+        f"{ph}|{_source_versions_token()}|{','.join(sources)}|"
+        f"{mask.tobytes().hex()}|{blend:.6g}"
+    )
+
+
+def _get_prepared_source_row(
+    source: str,
+    fp: str,
+    raw: np.ndarray,
+    feature_mask: np.ndarray,
+    features_blend: float,
+) -> np.ndarray:
+    """Return one track row for *source* with the same preprocessing as composite gather.
+
+    Rows are cached per (fingerprint, source, version[, feature mask+blend]) so
+    toggling source layers reuses work across different ``sources`` tuples.
+    """
+    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+
+    raw = np.asarray(raw, dtype=np.float32).reshape(-1)
+
+    if source == "clap":
+        key = ("clap", fp, EMBEDDING_VERSION)
+        hit = _source_row_cache_get(key)
+        if hit is not None:
+            return hit
+        n = float(np.linalg.norm(raw))
+        if n < 1e-9:
+            n = 1.0
+        v = (raw / n).astype(np.float32)
+        _source_row_cache_put(key, v)
+        return v
+
+    if source == "effnet":
+        key = ("effnet", fp, EFFNET_VERSION)
+        hit = _source_row_cache_get(key)
+        if hit is not None:
+            return hit
+        n = float(np.linalg.norm(raw))
+        if n < 1e-9:
+            n = 1.0
+        v = (raw / n).astype(np.float32)
+        _source_row_cache_put(key, v)
+        return v
+
+    if source == "features":
+        b = float(np.clip(features_blend, 0.05, 1.0))
+        key = ("features", fp, FEATURES_VERSION, feature_mask.tobytes(), round(b, 9))
+        hit = _source_row_cache_get(key)
+        if hit is not None:
+            return hit
+        v = raw * feature_mask
+        n = float(np.linalg.norm(v))
+        if n < 1e-9:
+            n = 1.0
+        v = (v / n * b).astype(np.float32)
+        _source_row_cache_put(key, v)
+        return v
+
+    raise ValueError(f"unknown source {source!r}")
+
+
+def _semantic_basis_param_key(
+    context_tags: list[str] | None,
+    folder_seeds: list[str] | None,
+) -> str:
+    """Folders + tags only — independent of contrast slider values."""
+    tags = ",".join(sorted(context_tags)) if context_tags else ""
+    if folder_seeds:
+        fp = ",".join(sorted(folder_seeds))
+    else:
+        fp = "-"
+    return f"{tags}|{fp}"
+
+
+def _semantic_param_key(
+    context_tags: list[str] | None,
+    folder_seeds: list[str] | None,
+    folder_boost: float,
+    folder_depth_boost: float,
+) -> str:
+    return (
+        f"{_semantic_basis_param_key(context_tags, folder_seeds)}|"
+        f"{folder_boost:.6g}|{folder_depth_boost:.6g}"
+    )
+
+
 _model: ClapModel | None = None
 _processor: ClapProcessor | None = None
 _model_lock = threading.Lock()
+# Serialises CLAP on MPS/CUDA *and* mlx-vis on Metal: concurrent Metal command
+# encoders from PyTorch and MLX on different threads trigger IOGPU failures.
+_inference_lock = threading.Lock()
 _loaded = False
 
 
@@ -68,12 +228,12 @@ def _load_audio_segments(path: str) -> list[np.ndarray]:
     Longer tracks return segments centred at 20%, 50%, and 80% through the file.
     """
     try:
-        duration = librosa.get_duration(path=path)
+        duration = librosa_get_duration(path=path)
         if duration <= 0:
             return []
 
         if duration <= SEGMENT_SECONDS * 1.5:
-            audio, _ = librosa.load(path, sr=CLAP_SR, mono=True)
+            audio, _ = librosa_load(path, sr=CLAP_SR, mono=True)
             return [audio] if len(audio) > 0 else []
 
         positions = [0.2, 0.5, 0.8]
@@ -82,7 +242,7 @@ def _load_audio_segments(path: str) -> list[np.ndarray]:
             centre = duration * pos
             offset = max(0.0, centre - SEGMENT_SECONDS / 2)
             offset = min(offset, max(0.0, duration - SEGMENT_SECONDS))
-            audio, _ = librosa.load(
+            audio, _ = librosa_load(
                 path, sr=CLAP_SR, mono=True,
                 offset=offset, duration=SEGMENT_SECONDS,
             )
@@ -95,18 +255,23 @@ def _load_audio_segments(path: str) -> list[np.ndarray]:
 
 
 def _embed_single(audio: np.ndarray) -> np.ndarray | None:
-    """Run CLAP inference on a single audio waveform."""
-    try:
-        inputs = _processor(
-            audio=audio,
-            sampling_rate=CLAP_SR,
-            return_tensors="pt",
-        )
-        device = next(_model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    """Run CLAP inference on a single audio waveform.
 
-        with torch.no_grad():
-            outputs = _model.get_audio_features(**inputs)
+    Serialised via ``_inference_lock`` — the CLAP model (especially on MPS)
+    is not safe for concurrent forward passes from multiple threads.
+    """
+    try:
+        with _inference_lock:
+            inputs = _processor(
+                audio=audio,
+                sampling_rate=CLAP_SR,
+                return_tensors="pt",
+            )
+            device = next(_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = _model.get_audio_features(**inputs)
 
         if hasattr(outputs, "pooler_output"):
             tensor = outputs.pooler_output
@@ -130,11 +295,12 @@ def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
     if not _loaded or not texts:
         return None
     try:
-        inputs = _processor(text=texts, return_tensors="pt", padding=True)
-        device = next(_model.parameters()).device
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        with torch.no_grad():
-            outputs = _model.get_text_features(**inputs)
+        with _inference_lock:
+            inputs = _processor(text=texts, return_tensors="pt", padding=True)
+            device = next(_model.parameters()).device
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = _model.get_text_features(**inputs)
         if hasattr(outputs, "pooler_output"):
             tensor = outputs.pooler_output
         elif hasattr(outputs, "last_hidden_state"):
@@ -147,39 +313,54 @@ def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
         return None
 
 
+def _folder_seeds_from_track_paths(paths: list[str]) -> list[str]:
+    """Unique immediate parent folders of tracks (root excluded)."""
+    s: set[str] = set()
+    for p in paths:
+        sep = p.rfind("/")
+        tf = p[:sep] if sep >= 0 else ""
+        if tf:
+            s.add(tf)
+    return sorted(s)
+
+
+def _expand_folder_nodes(folder_seeds: list[str]) -> set[str]:
+    """All folder path strings: seeds plus every ancestor segment."""
+    all_nodes: set[str] = {""}
+    for f in folder_seeds:
+        parts = [p for p in f.split("/") if p]
+        for depth in range(1, len(parts) + 1):
+            all_nodes.add("/".join(parts[:depth]))
+    return all_nodes
+
+
 def _build_folder_directions(
     mat: np.ndarray,
     paths: list[str],
-    context_folders: list[str],
-    boost: float = 3.0,
-    depth_boost: float = 1.5,
+    folder_seeds: list[str],
     min_tracks: int = 2,
-) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, float]]]:
+) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, int]]]:
     """Compute hierarchical contrast directions from actual track embeddings.
 
     For each folder node the direction is
     ``centroid(all tracks under node) − centroid(all tracks under parent)``.
     Shared directions among siblings are naturally absorbed by the parent;
-    each child retains only its unique contrast.  Deeper levels receive
-    *increasing* boost (``boost × depth_boost^(depth−1)``) to amplify the
-    subtle microgenre distinctions that dimensionality reduction tends to
-    collapse.
+    each child retains only its unique contrast.  Later, semantic weights use
+    ``folder_boost × folder_depth_boost ** exponent`` where *exponent* is
+    ``depth − 1`` for that node (see *exponents*).
 
-    Returns *(directions, weights, text_fallbacks)* where *directions* is an
-    ``(K, D)`` normalised array (or *None*), *weights* is ``(K,)``
-    (or *None*), and *text_fallbacks* is a list of ``(leaf_name, weight)``
-    pairs for folders with fewer than *min_tracks* embedded tracks that
-    should fall back to CLAP text embedding.
+    *folder_seeds* lists folder paths (typically parents of tracks); parent
+    nodes are inferred so the client need not enumerate the whole tree.
+
+    Returns *(directions, exponents, text_fallbacks)* where *exponents* is
+    ``(K,)`` int (``depth - 1`` per row, same order as *directions*), and
+    *text_fallbacks* is ``(leaf_name, exponent)`` for CLAP-text fallback
+    directions.
     """
-    if not context_folders:
+    if not folder_seeds:
         return None, None, []
 
-    # Build hierarchy: every folder node including inferred parents.
-    all_nodes: set[str] = {""}
-    for f in context_folders:
-        parts = [p for p in f.split("/") if p]
-        for depth in range(1, len(parts) + 1):
-            all_nodes.add("/".join(parts[:depth]))
+    all_nodes = _expand_folder_nodes(folder_seeds)
 
     # Map each embedding row to its direct folder.
     track_folders: list[str] = []
@@ -204,14 +385,14 @@ def _build_folder_directions(
 
     # Contrast directions.
     dirs: list[np.ndarray] = []
-    wts: list[float] = []
-    fallbacks: list[tuple[str, float]] = []
+    exps: list[int] = []
+    fallbacks: list[tuple[str, int]] = []
 
     for node in sorted(all_nodes - {""}):
         parts = node.split("/")
         parent = "/".join(parts[:-1])
         depth = len(parts)
-        w = boost * (depth_boost ** (depth - 1))
+        exp = depth - 1
 
         c = centroids.get(node)
         pc = centroids.get(parent)
@@ -219,7 +400,7 @@ def _build_folder_directions(
             continue
 
         if len(node_indices[node]) < min_tracks:
-            fallbacks.append((parts[-1], w))
+            fallbacks.append((parts[-1], exp))
             continue
 
         d = c - pc
@@ -228,23 +409,126 @@ def _build_folder_directions(
             continue
 
         dirs.append(d / norm)
-        wts.append(w)
+        exps.append(exp)
 
     if dirs:
         log.debug(
             "folder directions: %d data-driven, %d text-fallback",
             len(dirs), len(fallbacks),
         )
-        return np.stack(dirs), np.array(wts, dtype=np.float32), fallbacks
+        return (
+            np.stack(dirs),
+            np.array(exps, dtype=np.int32),
+            fallbacks,
+        )
     return None, None, fallbacks
+
+
+def _unit_clap_text_dirs_to_full(
+    unit_rows: np.ndarray,
+    d_total: int,
+    clap_lo: int,
+    clap_hi: int,
+) -> np.ndarray:
+    """Place CLAP text direction rows (K, d_txt) into the CLAP column span."""
+    if clap_lo >= clap_hi:
+        raise ValueError("clap column span must be non-empty")
+    slot_w = clap_hi - clap_lo
+    k, d_in = unit_rows.shape
+    out = np.zeros((k, d_total), dtype=np.float32)
+    if d_in <= slot_w:
+        out[:, clap_lo : clap_lo + d_in] = unit_rows
+    else:
+        out[:, clap_lo:clap_hi] = unit_rows[:, :slot_w]
+    return out
+
+
+def _apply_low_rank_semantic_weight(
+    mat: np.ndarray,
+    T_n: np.ndarray,
+    exp: np.ndarray,
+    boost: float,
+    depth_boost: float,
+) -> np.ndarray:
+    """Apply ``mat @ (I + T_n.T diag(w) T_n)`` with ``w_i = boost * depth_boost**exp_i``.
+
+    *exp* holds per-row integer exponents (``depth - 1`` for folders; ``0`` for tags).
+    Never materialises the D×D matrix.
+    """
+    if T_n.shape[0] == 0:
+        return mat
+    gamma = np.power(
+        float(depth_boost), exp.astype(np.float64),
+    ).astype(np.float32)
+    w = (gamma * float(boost)).astype(np.float32)
+    g = mat @ T_n.T
+    return (mat + (g * w) @ T_n).astype(np.float32)
+
+
+def _build_semantic_basis(
+    mat: np.ndarray,
+    paths: list[str],
+    context_tags: list[str] | None,
+    folder_seeds: list[str] | None,
+    clap_lo: int,
+    clap_hi: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(T_n, exp)`` for low-rank semantic weighting (boost-agnostic)."""
+    d_total = mat.shape[1]
+    have_clap_slot = clap_lo < clap_hi
+    all_dirs: list[np.ndarray] = []
+    all_exp: list[np.ndarray] = []
+
+    if folder_seeds:
+        fd, f_exp, fallbacks = _build_folder_directions(mat, paths, folder_seeds)
+        if fd is not None and f_exp is not None:
+            all_dirs.append(fd)
+            all_exp.append(f_exp)
+
+        if fallbacks and have_clap_slot:
+            texts = [t for t, _ in fallbacks]
+            fb_exp = np.array([e for _, e in fallbacks], dtype=np.int32)
+            text_vecs = generate_text_embeddings(texts)
+            if text_vecs is not None and text_vecs.shape[0] > 0:
+                norms = np.linalg.norm(text_vecs, axis=1, keepdims=True)
+                norms[norms < 1e-9] = 1.0
+                full = _unit_clap_text_dirs_to_full(
+                    text_vecs / norms, d_total, clap_lo, clap_hi,
+                )
+                all_dirs.append(full)
+                all_exp.append(fb_exp)
+
+    if context_tags and have_clap_slot:
+        tag_vecs = generate_text_embeddings(context_tags)
+        if tag_vecs is not None and tag_vecs.shape[0] > 0:
+            norms = np.linalg.norm(tag_vecs, axis=1, keepdims=True)
+            norms[norms < 1e-9] = 1.0
+            full = _unit_clap_text_dirs_to_full(
+                tag_vecs / norms, d_total, clap_lo, clap_hi,
+            )
+            all_dirs.append(full)
+            all_exp.append(np.zeros(len(context_tags), dtype=np.int32))
+
+    if not all_dirs:
+        return (
+            np.empty((0, d_total), dtype=np.float32),
+            np.empty((0,), dtype=np.int32),
+        )
+
+    T_n = np.concatenate(all_dirs, axis=0).astype(np.float32)
+    exp = np.concatenate(all_exp)
+    return T_n, exp
 
 
 def _apply_semantic_weighting(
     mat: np.ndarray,
     paths: list[str],
     context_tags: list[str] | None = None,
-    context_folders: list[str] | None = None,
+    folder_seeds: list[str] | None = None,
     boost: float = 3.0,
+    depth_boost: float = 1.5,
+    clap_lo: int = 0,
+    clap_hi: int = 0,
 ) -> np.ndarray:
     """Re-weight embedding space using data-driven folder directions and text
     tag directions.
@@ -258,48 +542,14 @@ def _apply_semantic_weighting(
 
     Tags always use CLAP text embedding (they are labels, not track collections).
 
-    The weighting matrix is ``W = I + T_n^T diag(w) T_n`` where ``T_n``
-    collects all normalised direction vectors and ``w`` their weights.
+    Uses a low-rank multiply equivalent to ``mat @ (I + T_n.T diag(w) T_n)``.
     """
-    all_dirs: list[np.ndarray] = []
-    all_weights: list[np.ndarray] = []
-
-    # --- Data-driven folder directions (hierarchical centroid contrast) ---
-    if context_folders:
-        fd, fw, fallbacks = _build_folder_directions(
-            mat, paths, context_folders, boost=boost,
-        )
-        if fd is not None and fw is not None:
-            all_dirs.append(fd)
-            all_weights.append(fw)
-
-        if fallbacks:
-            texts = [t for t, _ in fallbacks]
-            fb_w = np.array([w for _, w in fallbacks], dtype=np.float32)
-            text_vecs = generate_text_embeddings(texts)
-            if text_vecs is not None and text_vecs.shape[0] > 0:
-                norms = np.linalg.norm(text_vecs, axis=1, keepdims=True)
-                norms[norms < 1e-9] = 1.0
-                all_dirs.append(text_vecs / norms)
-                all_weights.append(fb_w)
-
-    # --- Text-based tag directions ---
-    if context_tags:
-        tag_vecs = generate_text_embeddings(context_tags)
-        if tag_vecs is not None and tag_vecs.shape[0] > 0:
-            norms = np.linalg.norm(tag_vecs, axis=1, keepdims=True)
-            norms[norms < 1e-9] = 1.0
-            all_dirs.append(tag_vecs / norms)
-            all_weights.append(np.full(len(context_tags), boost, dtype=np.float32))
-
-    if not all_dirs:
+    T_n, exp = _build_semantic_basis(
+        mat, paths, context_tags, folder_seeds, clap_lo, clap_hi,
+    )
+    if T_n.shape[0] == 0:
         return mat
-
-    T_n = np.concatenate(all_dirs, axis=0)   # (K, D)
-    weights = np.concatenate(all_weights)     # (K,)
-
-    W = np.eye(mat.shape[1], dtype=np.float32) + T_n.T @ (weights[:, None] * T_n)
-    return (mat @ W).astype(np.float32)
+    return _apply_low_rank_semantic_weight(mat, T_n, exp, boost, depth_boost)
 
 
 def generate_embedding(path: str) -> np.ndarray | None:
@@ -393,17 +643,24 @@ def _gather_composite_vecs(
     track_infos: list[dict],
     feature_cache,
     sources: tuple[str, ...] = ("clap",),
-) -> tuple[list[str], np.ndarray, int]:
+    feature_mask: np.ndarray | None = None,
+    features_blend: float = 0.42,
+) -> tuple[list[str], np.ndarray, int, int, str]:
     """Collect and concatenate vectors from multiple enabled sources.
 
-    Each source block is L2-normalized across the batch before concatenation
-    so that sources with different native dimensionalities contribute equally.
+    Each source block is L2-normalized per row before concatenation so that
+    sources with different native dimensionalities contribute equally.  The
+    audio-features block is then scaled by *features_blend* (< 1 weakens its
+    influence versus CLAP / EffNet).  *feature_mask* zeros individual audio
+    dimensions before normalization (length ``AUDIO_FEATURE_DIM``).
 
-    Returns *(paths, matrix, clap_dim)* where *matrix* is ``(N, D_total)``
-    and *clap_dim* is the width of the CLAP sub-block (0 if CLAP is not
-    among *sources*), used for targeted semantic weighting.
+    Normalised rows are LRU-cached per fingerprint and source so changing the
+    enabled *sources* tuple reuses prepared CLAP/EffNet/feature rows.
+
+    Returns *(paths, matrix, clap_dim, clap_col_lo, composite_cache_key)*.
+    *composite_cache_key* is ``\"\"`` when *paths* is empty.
     """
-    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION, AUDIO_FEATURE_DIM
 
     fps = [t.get("fingerprint") for t in track_infos]
     fp_set = [fp for fp in fps if fp]
@@ -429,23 +686,51 @@ def _gather_composite_vecs(
             fp_order.append(fp)
 
     if not paths:
-        return paths, np.empty((0, 0), dtype=np.float32), 0
+        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, ""
+
+    if feature_mask is None:
+        mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
+    else:
+        mask = np.asarray(feature_mask, dtype=np.float32).reshape(-1)
+        if mask.size != AUDIO_FEATURE_DIM:
+            mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
+
+    blend = float(np.clip(features_blend, 0.05, 1.0))
+    comp_key = _composite_param_key(paths, sources, mask, blend)
+    cached = _tier_cache_get(_composite_cache, comp_key)
+    if cached is not None:
+        _p, _mat, _cd, _clo = cached
+        log.debug("projection tier: composite cache hit")
+        return paths, _mat, _cd, _clo, comp_key
 
     # Build per-source matrices, normalize, and concatenate.
     blocks: list[np.ndarray] = []
     clap_dim = 0
+    clap_col_lo = 0
+    col = 0
     for s in sources:
         smap = source_maps[s]
-        block = np.stack([smap[fp] for fp in fp_order])
-        norms = np.linalg.norm(block, axis=1, keepdims=True)
-        norms[norms < 1e-9] = 1.0
-        block = block / norms
+        block = np.stack(
+            [
+                _get_prepared_source_row(s, fp, smap[fp], mask, blend)
+                for fp in fp_order
+            ],
+            axis=0,
+        )
         if s == "clap":
             clap_dim = block.shape[1]
+            clap_col_lo = col
         blocks.append(block)
+        col += block.shape[1]
 
     mat = np.concatenate(blocks, axis=1).astype(np.float32)
-    return paths, mat, clap_dim
+    _tier_cache_put(
+        _composite_cache,
+        comp_key,
+        (list(paths), mat, clap_dim, clap_col_lo),
+        _COMPOSITE_CACHE_MAX,
+    )
+    return paths, mat, clap_dim, clap_col_lo, comp_key
 
 
 def _normalise_coords(coords: np.ndarray) -> np.ndarray:
@@ -497,8 +782,124 @@ def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
     return coords
 
 
+# RAPIDS cuML manifolds use NVIDIA CUDA only (not Apple MPS). CLAP uses MPS on
+# Apple Silicon when ``torch.cuda`` is false; install cuML per requirements-cuda.txt
+# on Linux/WSL + NVIDIA to accelerate layout. ``TRACKSPACE_CUML=0`` forces CPU.
+_cuml_projection_enabled: bool | None = None
+
+# mlx-vis runs UMAP/t-SNE on Metal (Apple Silicon). Optional; see requirements.txt.
+# ``TRACKSPACE_MLX_VIS=0`` forces CPU after cuML check.
+_mlx_vis_projection_enabled: bool | None = None
+
+
+def reset_projection_backend_cache() -> None:
+    """Clear lazy cuML / mlx-vis detection (e.g. after changing env vars or in tests)."""
+    global _cuml_projection_enabled, _mlx_vis_projection_enabled
+    _cuml_projection_enabled = None
+    _mlx_vis_projection_enabled = None
+
+
+def _use_cuml_projection() -> bool:
+    """True when cuML should run UMAP/t-SNE on a CUDA device."""
+    global _cuml_projection_enabled
+    if _cuml_projection_enabled is not None:
+        return _cuml_projection_enabled
+    raw = os.environ.get("TRACKSPACE_CUML", "1").strip().lower()
+    if raw in ("0", "false", "no"):
+        _cuml_projection_enabled = False
+        return False
+    try:
+        import cupy as cp
+    except ImportError:
+        _cuml_projection_enabled = False
+        return False
+    try:
+        if not cp.cuda.is_available():
+            _cuml_projection_enabled = False
+            return False
+    except Exception:
+        _cuml_projection_enabled = False
+        return False
+    try:
+        import cuml  # noqa: F401
+    except ImportError:
+        _cuml_projection_enabled = False
+        return False
+    _cuml_projection_enabled = True
+    log.info("UMAP/t-SNE: using RAPIDS cuML (CUDA)")
+    return True
+
+
+def _use_mlx_vis_projection() -> bool:
+    """True when mlx-vis should run UMAP/t-SNE on Apple Metal (arm64 macOS)."""
+    global _mlx_vis_projection_enabled
+    if _mlx_vis_projection_enabled is not None:
+        return _mlx_vis_projection_enabled
+    raw = os.environ.get("TRACKSPACE_MLX_VIS", "1").strip().lower()
+    if raw in ("0", "false", "no"):
+        _mlx_vis_projection_enabled = False
+        return False
+    if sys.platform != "darwin" or platform.machine() != "arm64":
+        _mlx_vis_projection_enabled = False
+        return False
+    if importlib.util.find_spec("mlx") is None or importlib.util.find_spec(
+        "mlx_vis",
+    ) is None:
+        _mlx_vis_projection_enabled = False
+        return False
+    _mlx_vis_projection_enabled = True
+    log.info("UMAP/t-SNE: using mlx-vis (Metal)")
+    return True
+
+
+def _mlx_tsne_pca_dim(n_features: int) -> int | None:
+    """mlx-vis TSNE requires ``n_features > pca_dim`` for its PCA prep branch."""
+    if n_features < 2:
+        return None
+    return min(50, n_features - 1)
+
+
 def _project_umap(mat: np.ndarray) -> np.ndarray:
     """Full UMAP 2D projection. Higher quality but slower."""
+    global _cuml_projection_enabled, _mlx_vis_projection_enabled
+    if _use_cuml_projection():
+        try:
+            from cuml.manifold import UMAP
+
+            n_neighbors = min(15, len(mat) - 1)
+            reducer = UMAP(
+                n_components=2,
+                n_neighbors=n_neighbors,
+                min_dist=0.1,
+                random_state=42,
+                output_type="numpy",
+            )
+            return np.asarray(
+                reducer.fit_transform(np.asarray(mat, dtype=np.float32)),
+                dtype=np.float32,
+            )
+        except Exception as e:
+            log.warning("cuML UMAP failed; using umap-learn: %s", e)
+            _cuml_projection_enabled = False
+    if _use_mlx_vis_projection():
+        try:
+            from mlx_vis._umap.umap import UMAP
+
+            n_neighbors = min(15, len(mat) - 1)
+            reducer = UMAP(
+                n_components=2,
+                n_neighbors=n_neighbors,
+                min_dist=0.1,
+                random_state=42,
+                normalize=False,
+            )
+            x = np.asarray(mat, dtype=np.float32)
+            with _inference_lock:
+                y = reducer.fit_transform(x)
+            return np.asarray(y, dtype=np.float32)
+        except Exception as e:
+            log.warning("mlx-vis UMAP failed; using umap-learn: %s", e)
+            _mlx_vis_projection_enabled = False
     import umap  # lazy — heavy import
     n_neighbors = min(15, len(mat) - 1)
     reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1)
@@ -507,6 +908,50 @@ def _project_umap(mat: np.ndarray) -> np.ndarray:
 
 def _project_tsne(mat: np.ndarray) -> np.ndarray:
     """t-SNE 2D projection.  Better at preserving local cluster structure."""
+    global _cuml_projection_enabled, _mlx_vis_projection_enabled
+    if _use_cuml_projection():
+        try:
+            from cuml.manifold import TSNE
+
+            perplexity = min(30.0, max(5.0, (len(mat) - 1) / 3.0))
+            reducer = TSNE(
+                n_components=2,
+                perplexity=float(perplexity),
+                init="pca",
+                random_state=42,
+                method="fft",
+                learning_rate_method="adaptive",
+                output_type="numpy",
+            )
+            return np.asarray(
+                reducer.fit_transform(np.asarray(mat, dtype=np.float32)),
+                dtype=np.float32,
+            )
+        except Exception as e:
+            log.warning("cuML t-SNE failed; using scikit-learn: %s", e)
+            _cuml_projection_enabled = False
+    if _use_mlx_vis_projection():
+        pca_dim = _mlx_tsne_pca_dim(int(np.asarray(mat).shape[1]))
+        if pca_dim is not None:
+            try:
+                from mlx_vis._tsne.tsne import TSNE
+
+                n = len(mat)
+                perplexity = min(30.0, max(5.0, (n - 1) / 3.0))
+                reducer = TSNE(
+                    n_components=2,
+                    perplexity=float(perplexity),
+                    random_state=42,
+                    pca_dim=pca_dim,
+                    normalize=False,
+                )
+                x = np.asarray(mat, dtype=np.float32)
+                with _inference_lock:
+                    y = reducer.fit_transform(x)
+                return np.asarray(y, dtype=np.float32)
+            except Exception as e:
+                log.warning("mlx-vis t-SNE failed; using scikit-learn: %s", e)
+                _mlx_vis_projection_enabled = False
     from sklearn.manifold import TSNE  # lazy — heavy import
     perplexity = min(30.0, max(5.0, (len(mat) - 1) / 3.0))
     reducer = TSNE(
@@ -519,6 +964,45 @@ def _project_tsne(mat: np.ndarray) -> np.ndarray:
     return reducer.fit_transform(mat)
 
 
+def parse_audio_feature_mask(raw: str | None) -> np.ndarray:
+    """Six ``0``/``1`` characters: tempo, key_cos, key_sin, mode, energy, dance."""
+    from backend.audio_features import AUDIO_FEATURE_DIM
+
+    if not raw or not str(raw).strip():
+        return np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
+    s = str(raw).strip().replace(",", "")
+    if len(s) != AUDIO_FEATURE_DIM or any(c not in "01" for c in s):
+        return np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
+    return np.array([float(int(c)) for c in s], dtype=np.float32)
+
+
+def parse_features_blend(raw: str | None, default: float = 0.42) -> float:
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(np.clip(float(raw), 0.05, 1.0))
+    except ValueError:
+        return default
+
+
+def parse_folder_boost(raw: str | None, default: float = 3.0) -> float:
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(np.clip(float(raw), 0.0, 12.0))
+    except ValueError:
+        return default
+
+
+def parse_folder_depth_boost(raw: str | None, default: float = 1.5) -> float:
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(np.clip(float(raw), 1.0, 3.0))
+    except ValueError:
+        return default
+
+
 def compute_projection(
     track_infos: list[dict],
     feature_cache,
@@ -526,7 +1010,12 @@ def compute_projection(
     method: str = "umap",
     context_tags: list[str] | None = None,
     context_folders: list[str] | None = None,
+    scale_folders: bool = False,
+    folder_boost: float = 3.0,
+    folder_depth_boost: float = 1.5,
     sources: tuple[str, ...] = ("clap",),
+    feature_mask: np.ndarray | None = None,
+    features_blend: float = 0.42,
 ) -> list[dict]:
     """Project cached embeddings to 2D positions.
 
@@ -537,48 +1026,101 @@ def compute_projection(
     ``("clap", "effnet", "features")``.  Each source block is
     L2-normalized before concatenation.
 
-    *context_tags* / *context_folders* — when provided the embedding space
-    is re-weighted before projection.  Text-based directions are applied
-    only to the CLAP sub-dimensions (requires CLAP in *sources*).
-    Folder centroid decomposition works on the full composite vector.
+    *context_tags* — when provided the embedding space is re-weighted before
+    projection.  Text-based directions apply only to the CLAP sub-space
+    (requires CLAP in *sources*).
+
+    Folder centroid decomposition runs when *scale_folders* is True.  Folder
+    nodes are inferred from track paths; optional *context_folders* supplies
+    an explicit seed list instead of deriving from paths.
 
     Returns ``[{"path": rel, "x": float, "y": float}, ...]`` where x/y
     are in [0, 1].  Tracks without data for every enabled source are omitted.
+
+    **Caching:** composite matrices; per-fingerprint *prepared* rows for each
+    source (normalised CLAP/EffNet, masked+norm+blend features); CLAP/folder
+    ``T_n`` + exponents; and UMAP/t-SNE layouts — each in its own LRU tier.
+    Folder sliders only add a cheap low-rank multiply; toggling source layers
+    reuses prepared rows.  PCA skips layout caching.
     """
-    paths, mat, clap_dim = _gather_composite_vecs(
-        track_infos, feature_cache, sources=sources,
+    paths, mat, clap_dim, clap_col_lo, comp_key = _gather_composite_vecs(
+        track_infos,
+        feature_cache,
+        sources=sources,
+        feature_mask=feature_mask,
+        features_blend=features_blend,
     )
 
     if len(paths) < 2:
         return [{"path": p, "x": 0.5, "y": 0.5} for p in paths]
 
-    if (context_tags or context_folders) and _loaded:
-        if clap_dim > 0:
-            # Semantic weighting applies only to the CLAP sub-dimensions.
-            clap_block = mat[:, :clap_dim].copy()
-            clap_block = _apply_semantic_weighting(
-                clap_block, paths, context_tags, context_folders,
+    if scale_folders:
+        folder_seeds = (
+            list(context_folders) if context_folders else _folder_seeds_from_track_paths(paths)
+        )
+    else:
+        folder_seeds = None
+
+    needs_weight = _loaded and (bool(context_tags) or bool(folder_seeds))
+    sem_key = _semantic_param_key(
+        context_tags, folder_seeds, folder_boost, folder_depth_boost,
+    )
+    wkey = f"{comp_key}|{sem_key}" if needs_weight else f"{comp_key}|raw"
+
+    mat_proj = mat
+    if needs_weight:
+        basis_key = f"{comp_key}|{_semantic_basis_param_key(context_tags, folder_seeds)}"
+        basis = _tier_cache_get(_semantic_basis_cache, basis_key)
+        if basis is None:
+            clap_hi = clap_col_lo + clap_dim
+            tags_for_weight = context_tags if clap_dim > 0 else None
+            T_n, exp = _build_semantic_basis(
+                mat,
+                paths,
+                tags_for_weight,
+                folder_seeds,
+                clap_col_lo,
+                clap_hi,
             )
-            mat = np.concatenate([clap_block, mat[:, clap_dim:]], axis=1)
+            _tier_cache_put(
+                _semantic_basis_cache,
+                basis_key,
+                (T_n, exp),
+                _SEMANTIC_BASIS_CACHE_MAX,
+            )
         else:
-            # No CLAP dims — only data-driven folder weighting on full matrix.
-            mat = _apply_semantic_weighting(
-                mat, paths, context_tags=None, context_folders=context_folders,
-            )
+            T_n, exp = basis
+            log.debug("projection tier: semantic basis cache hit")
+        mat_proj = _apply_low_rank_semantic_weight(
+            mat, T_n, exp, folder_boost, folder_depth_boost,
+        )
+
+    lkey = ""
+    if method in ("umap", "tsne"):
+        lkey = f"{wkey}|{method}"
+        hit_layout = _tier_cache_get(_layout_cache, lkey)
+        if hit_layout is not None:
+            log.debug("projection tier: layout cache hit (%s)", method)
+            return hit_layout
 
     if method == "pca":
-        coords = _project_pca(mat, paths)
+        coords = _project_pca(mat_proj, paths)
     elif method == "tsne":
-        coords = _project_tsne(mat)
+        coords = _project_tsne(mat_proj)
     else:
-        coords = _project_umap(mat)
+        coords = _project_umap(mat_proj)
 
     normed = _normalise_coords(coords)
 
-    return [
+    result = [
         {"path": paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
         for i in range(len(paths))
     ]
+
+    if method in ("umap", "tsne") and lkey:
+        _tier_cache_put(_layout_cache, lkey, result, _LAYOUT_CACHE_MAX)
+
+    return result
 
 
 # Keep old name as alias for backward compat

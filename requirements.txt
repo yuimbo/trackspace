@@ -9,3 +9,6 @@ scikit-learn>=1.3
 umap-learn>=0.5
 watchdog>=4.0
 onnxruntime>=1.17
+
+# Apple Silicon — Metal-accelerated UMAP/t-SNE (optional; ``backend.embeddings``).
+mlx-vis>=0.7.0; sys_platform == "darwin" and platform_machine == "arm64"

@@ -58,7 +58,18 @@ export class Model extends EventBus {
   scaleByFolders = true;
   useCLAP = true;
   useEffNet = false;
-  useAudioFeatures = false;
+  /** Audio descriptors (librosa 6-vector); each toggles dims before projection. */
+  useAudioFeatureTempo = false;
+  useAudioFeatureKey = false;
+  useAudioFeatureMode = false;
+  useAudioFeatureEnergy = false;
+  useAudioFeatureDance = false;
+  /** Overall gain for the audio-feature block (matches server default). */
+  featuresBlend = 0.42;
+  /** Folder semantic re-weighting strength (server default 3). */
+  folderContrastBoost = 3.0;
+  /** Emphasis on deeper folder contrasts; 1=flat, 3=strong edge boost. */
+  folderDepthBoost = 1.5;
   embeddingPositions: Map<string, { x: number; y: number }> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
@@ -192,27 +203,79 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
+  get anyAudioFeaturesEnabled(): boolean {
+    return (
+      this.useAudioFeatureTempo ||
+      this.useAudioFeatureKey ||
+      this.useAudioFeatureMode ||
+      this.useAudioFeatureEnergy ||
+      this.useAudioFeatureDance
+    );
+  }
+
+  /** Six ``0``/``1`` chars: tempo, key_cos, key_sin, mode, energy, danceability. */
+  audioFeatureMask(): string {
+    const b = (x: boolean) => (x ? "1" : "0");
+    return [
+      b(this.useAudioFeatureTempo),
+      b(this.useAudioFeatureKey),
+      b(this.useAudioFeatureKey),
+      b(this.useAudioFeatureMode),
+      b(this.useAudioFeatureEnergy),
+      b(this.useAudioFeatureDance),
+    ].join("");
+  }
+
   get activeSources(): string[] {
     const s: string[] = [];
     if (this.useCLAP) s.push("clap");
     if (this.useEffNet) s.push("effnet");
-    if (this.useAudioFeatures) s.push("features");
+    if (this.anyAudioFeaturesEnabled) s.push("features");
     return s;
   }
 
-  toggleSource(source: "clap" | "effnet" | "features"): void {
-    const field =
-      source === "clap"
-        ? "useCLAP"
-        : source === "effnet"
-          ? "useEffNet"
-          : "useAudioFeatures";
+  toggleSource(source: "clap" | "effnet"): void {
+    const field = source === "clap" ? "useCLAP" : "useEffNet";
     const next = !this[field];
     if (!next && this.activeSources.length <= 1) return;
     (this as Record<string, unknown>)[field] = next;
-    this.embeddingsReady = false;
-    this.embeddingPositions.clear();
     this.emit("change");
+  }
+
+  toggleAudioFeature(
+    dim: "tempo" | "key" | "mode" | "energy" | "dance",
+  ): void {
+    const field =
+      dim === "tempo"
+        ? "useAudioFeatureTempo"
+        : dim === "key"
+          ? "useAudioFeatureKey"
+          : dim === "mode"
+            ? "useAudioFeatureMode"
+            : dim === "energy"
+              ? "useAudioFeatureEnergy"
+              : "useAudioFeatureDance";
+    const prev = this[field as keyof Model] as boolean;
+    const next = !prev;
+    if (!next && !this.useCLAP && !this.useEffNet && !this._anyAudioBesides(field)) {
+      return;
+    }
+    (this as Record<string, unknown>)[field] = next;
+    this.emit("change");
+  }
+
+  private _anyAudioBesides(
+    field: "useAudioFeatureTempo" | "useAudioFeatureKey" | "useAudioFeatureMode" | "useAudioFeatureEnergy" | "useAudioFeatureDance",
+  ): boolean {
+    const m: Record<string, boolean> = {
+      useAudioFeatureTempo: this.useAudioFeatureTempo,
+      useAudioFeatureKey: this.useAudioFeatureKey,
+      useAudioFeatureMode: this.useAudioFeatureMode,
+      useAudioFeatureEnergy: this.useAudioFeatureEnergy,
+      useAudioFeatureDance: this.useAudioFeatureDance,
+    };
+    m[field] = false;
+    return Object.values(m).some(Boolean);
   }
 
   setFilterRange(tag: string, r: [number, number]): void {
@@ -331,7 +394,14 @@ export class Model extends EventBus {
         scaleByFolders: this.scaleByFolders,
         useCLAP: this.useCLAP,
         useEffNet: this.useEffNet,
-        useAudioFeatures: this.useAudioFeatures,
+        useAudioFeatureTempo: this.useAudioFeatureTempo,
+        useAudioFeatureKey: this.useAudioFeatureKey,
+        useAudioFeatureMode: this.useAudioFeatureMode,
+        useAudioFeatureEnergy: this.useAudioFeatureEnergy,
+        useAudioFeatureDance: this.useAudioFeatureDance,
+        featuresBlend: this.featuresBlend,
+        folderContrastBoost: this.folderContrastBoost,
+        folderDepthBoost: this.folderDepthBoost,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -353,7 +423,15 @@ export class Model extends EventBus {
         this.scaleByFolders = d.scaleByFolders ?? true;
         this.useCLAP = d.useCLAP ?? true;
         this.useEffNet = d.useEffNet ?? false;
-        this.useAudioFeatures = d.useAudioFeatures ?? false;
+        const legacyAudio = (d as { useAudioFeatures?: boolean }).useAudioFeatures;
+        this.useAudioFeatureTempo = d.useAudioFeatureTempo ?? legacyAudio ?? false;
+        this.useAudioFeatureKey = d.useAudioFeatureKey ?? legacyAudio ?? false;
+        this.useAudioFeatureMode = d.useAudioFeatureMode ?? legacyAudio ?? false;
+        this.useAudioFeatureEnergy = d.useAudioFeatureEnergy ?? legacyAudio ?? false;
+        this.useAudioFeatureDance = d.useAudioFeatureDance ?? legacyAudio ?? false;
+        this.featuresBlend = d.featuresBlend ?? 0.42;
+        this.folderContrastBoost = d.folderContrastBoost ?? 3.0;
+        this.folderDepthBoost = d.folderDepthBoost ?? 1.5;
       }
     } catch {
       /* start fresh */

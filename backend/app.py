@@ -10,8 +10,6 @@ import argparse
 import threading
 import queue
 import time
-import hashlib
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
@@ -49,16 +47,6 @@ _DATA_DIR = os.path.join(_PROJECT_DIR, "data")
 os.makedirs(_DATA_DIR, exist_ok=True)
 _CACHE = TrackCache(os.path.join(_DATA_DIR, "track_cache.db"))
 _FEATURES = FeatureCache(os.path.join(_DATA_DIR, "audio_features.db"))
-
-# In-process LRU cache for projection results.
-# Key: "{library_hash}|{method}|{context_tags}|{context_folders}"
-# where library_hash is a SHA-256 of the sorted set of fingerprints that
-# currently have embeddings.  The hash changes automatically whenever tracks
-# are added, removed, or re-embedded, so stale entries are never returned.
-# PCA projections are intentionally excluded (they are fast and their
-# Procrustes-alignment reference state changes with each call).
-_PROJECTION_CACHE_MAX = 8
-_projection_cache: OrderedDict[str, list[dict]] = OrderedDict()
 
 class _FilesystemHandler(FileSystemEventHandler):
     """React to filesystem changes under MUSIC_ROOT.
@@ -736,6 +724,14 @@ def api_embeddings_generate():
                     audio_features.generate_effnet_embeddings_batch(effnet_paths)
                     if effnet_paths else {}
                 )
+                feature_paths = [
+                    os.path.join(MUSIC_ROOT, t["path"])
+                    for t, needed in chunk if "features" in needed
+                ]
+                feature_results = (
+                    audio_features.generate_audio_features_batch(feature_paths)
+                    if feature_paths else {}
+                )
 
                 for t, needed in chunk:
                     abs_path = os.path.join(MUSIC_ROOT, t["path"])
@@ -757,7 +753,7 @@ def api_embeddings_generate():
                             ok = False
 
                     if "features" in needed:
-                        feat = audio_features.extract_audio_features(abs_path)
+                        feat = feature_results.get(abs_path)
                         if feat is not None:
                             _FEATURES.put_audio_features(fp, feat, version=FEATURES_VERSION)
                         else:
@@ -806,7 +802,7 @@ def api_embeddings_stream():
             with _embed_lock:
                 running = _embed_status["running"]
             if not running:
-                yield f"event: done\ndata: {{}}\n\n"
+                yield "event: done\ndata: {}\n\n"
                 return
 
             while True:
@@ -831,17 +827,23 @@ def api_embeddings_stream():
     )
 
 
-@app.route("/api/embeddings/umap")
-def api_embeddings_umap():
-    """Return 2D positions for tracks with embeddings.
+@app.route("/api/embeddings/projection")
+@app.route("/api/embeddings/umap")  # backward compat alias
+def api_embeddings_projection():
+    """Return 2D positions (PCA / t-SNE / UMAP) for the active embedding mix.
 
     Query params:
-        folder          – relative path (default: root)
-        recursive       – "1" to include subfolders
-        method          – "umap" (default), "tsne", or "pca" (fast, for live updates)
-        context_tags    – comma-separated tag names (full boost)
-        context_folders – comma-separated folder paths (depth-scaled boost)
-        sources         – comma-separated embedding sources (default: "clap")
+        folder              – relative path (default: root)
+        recursive           – "1" to include subfolders
+        method              – "umap" (default), "tsne", or "pca" (fast, for live updates)
+        context_tags        – comma-separated tag names (full boost)
+        scale_folders       – "1" to enable folder centroid re-weighting (hierarchy from paths)
+        context_folders     – optional explicit folder seeds (legacy; implies scaling if set)
+        folder_boost        – folder / tag contrast strength (default 3)
+        folder_depth_boost  – multiply deeper folder contrasts (1=uniform, up to 3)
+        sources             – comma-separated: clap, effnet, features
+        feature_mask        – six 0/1 chars: tempo, key×2, mode, energy, dance
+        features_blend      – scale of audio-feature block after norm (default 0.42)
     """
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
@@ -852,42 +854,38 @@ def api_embeddings_umap():
     raw_folders = request.args.get("context_folders", "")
     raw_sources = request.args.get("sources", "clap")
     tag_names = [s.strip() for s in raw_tags.split(",") if s.strip()] if raw_tags else []
-    folder_paths = [s.strip() for s in raw_folders.split(",") if s.strip()] if raw_folders else []
+    explicit_folders = (
+        [s.strip() for s in raw_folders.split(",") if s.strip()] if raw_folders else []
+    )
+    scale_folders = request.args.get("scale_folders", "") == "1"
+    if not scale_folders and explicit_folders:
+        scale_folders = True
+    feature_mask = embeddings.parse_audio_feature_mask(request.args.get("feature_mask"))
+    features_blend = embeddings.parse_features_blend(request.args.get("features_blend"))
+    folder_boost = embeddings.parse_folder_boost(request.args.get("folder_boost"))
+    folder_depth_boost = embeddings.parse_folder_depth_boost(
+        request.args.get("folder_depth_boost"),
+    )
     sources = tuple(s.strip() for s in raw_sources.split(",") if s.strip() in ("clap", "effnet", "features"))
     if not sources:
         sources = ("clap",)
     folder = _resolve(rel)
     infos = _build_track_infos(folder, recursive)
 
-    # Build a cache key that includes the active sources.  PCA is excluded:
-    # it is fast and its Procrustes reference state changes per call.
-    cache_key: str | None = None
-    if method != "pca":
-        fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-        present_fps = sorted(_FEATURES.get_all_embeddings(fps, version=EMBEDDING_VERSION).keys())
-        if present_fps:
-            lib_hash = hashlib.sha256(",".join(present_fps).encode()).hexdigest()[:20]
-            tags_part = ",".join(sorted(tag_names))
-            folders_part = ",".join(sorted(folder_paths))
-            sources_part = ",".join(sorted(sources))
-            cache_key = f"{lib_hash}|{method}|{tags_part}|{folders_part}|{sources_part}"
-            if cache_key in _projection_cache:
-                _projection_cache.move_to_end(cache_key)
-                log.debug("projection cache hit: %s", cache_key)
-                return jsonify(_projection_cache[cache_key])
-
     positions = embeddings.compute_projection(
-        infos, _FEATURES, version=EMBEDDING_VERSION, method=method,
-        context_tags=tag_names, context_folders=folder_paths,
+        infos,
+        _FEATURES,
+        version=EMBEDDING_VERSION,
+        method=method,
+        context_tags=tag_names,
+        context_folders=explicit_folders if explicit_folders else None,
+        scale_folders=scale_folders,
+        folder_boost=folder_boost,
+        folder_depth_boost=folder_depth_boost,
         sources=sources,
+        feature_mask=feature_mask,
+        features_blend=features_blend,
     )
-
-    if cache_key is not None:
-        _projection_cache[cache_key] = positions
-        _projection_cache.move_to_end(cache_key)
-        if len(_projection_cache) > _PROJECTION_CACHE_MAX:
-            evicted = _projection_cache.popitem(last=False)
-            log.debug("projection cache evicted: %s", evicted[0])
 
     return jsonify(positions)
 
@@ -970,6 +968,11 @@ def main():
             else:
                 print("EffNet model not available (essentia-tensorflow may not be installed).")
         threading.Thread(target=_bg_load_effnet, daemon=True).start()
+    def _bg_warm_audio_features():
+        print("Warming audio feature pipeline…")
+        audio_features.warmup_audio_features()
+        print("Audio feature pipeline warm.")
+    threading.Thread(target=_bg_warm_audio_features, daemon=True).start()
     app.run(host=args.host, port=args.port, debug=True)
 
 

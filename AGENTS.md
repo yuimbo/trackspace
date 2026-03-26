@@ -265,6 +265,22 @@ Never cache a `None` fingerprint and treat it as a permanent result.
 
 - Model: `laion/larger_clap_music` loaded in a background thread at server startup
   (does not block Flask from accepting requests).
+- **Inference lock:** `_inference_lock` serialises all CLAP forward passes
+  (`_embed_single` for audio, `generate_text_embeddings` for text).  MPS and
+  CUDA are not safe for concurrent dispatches from multiple threads; without
+  the lock, a Flask request running semantic-weighting text inference while
+  the generation thread is producing audio embeddings would crash or hang.
+- **Projection lock sharing:** The same `_inference_lock` also wraps mlx-vis
+  (`UMAP` / `TSNE`) runs on Apple Metal.  Running PyTorch MPS (CLAP) and MLX
+  command buffers concurrently from separate Flask threads can hit IOGPU
+  assertion failures (e.g. `commit command buffer with uncommitted encoder`).
+- **Rule for new GPU code paths:** If a path dispatches work to MPS/Metal/CUDA
+  from request threads, either (1) guard it with `_inference_lock`, or
+  (2) prove the backend is thread-safe under mixed-framework load before
+  allowing concurrent execution.
+- **Rule for env-toggle tests:** Backend enable flags are cached lazily; after
+  changing `TRACKSPACE_CUML` / `TRACKSPACE_MLX_VIS` in tests, call
+  `reset_projection_backend_cache()` before running a projection.
 - Uses MPS (Apple Silicon), CUDA, or CPU — whichever is available.
 - Audio is loaded via librosa at 48 kHz.  Three 15 s segments (at 20 %/50 %/80 %
   through the file) are embedded independently and averaged for robustness.
@@ -325,7 +341,7 @@ leaf name.
 1. The frontend collects `model.contextTags` (tag names) and `model.contextFolders`
    (unique full folder paths from all tracks).
 2. These are sent as `context_tags` and `context_folders` query params on
-   `GET /api/embeddings/umap`.
+   `GET /api/embeddings/projection` (legacy alias: `/api/embeddings/umap`).
 3. `_build_folder_directions()` infers the folder hierarchy from the leaf paths,
    computes centroids per node (including all descendants), and derives one
    normalised contrast direction per node.  Intermediate parent nodes that were
@@ -361,10 +377,11 @@ Each enabled source block is **L2-normalized across the batch** before
 concatenation so that 1280D EffNet does not dominate 6D audio features.
 A track is included only if it has data for every enabled source.
 
-**Semantic weighting with composite vectors:** Text-based directions (tag names,
-folder-name fallbacks) only apply to the CLAP sub-dimensions. Folder centroid
-decomposition works on the full composite vector regardless of which sources
-are active.
+**Semantic weighting with composite vectors:** Folder centroid
+decomposition uses the **full** composite matrix.  CLAP text directions
+(tags, folder-name fallbacks) are placed in the **CLAP column span**
+(``clap_col_lo : clap_col_lo + clap_dim``), which depends on *sources* order —
+``mat[:, :clap_dim]`` was wrong when CLAP was not the first block.
 
 ### Independent versioning per source
 
@@ -413,5 +430,9 @@ equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
 - During generation the controller opens an `EventSource` on `/api/embeddings/stream`.
   As embeddings complete, PCA is re-fetched at intervals (roughly every 10 % of the
   batch) so dots appear progressively on canvas rather than all at once.
+  Incremental PCA intentionally skips `context_tags` / `context_folders`
+  (semantic weighting) to avoid contending with the generation thread for
+  the CLAP model; the final TSNE/UMAP projection after generation applies
+  full weighting.
 - Switching projection method or source checkboxes re-fetches positions from the
   backend and animates the transition.

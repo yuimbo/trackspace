@@ -34,11 +34,16 @@ import urllib.request
 import librosa
 import numpy as np
 
+from backend.decode_stderr import librosa_get_duration, librosa_load
+
 log = logging.getLogger(__name__)
 
 # ── Versioning ────────────────────────────────────────────────
 EFFNET_VERSION = 3
-FEATURES_VERSION = 2
+FEATURES_VERSION = 3
+
+# Full ``extract_audio_features`` vector layout (see docstring above).
+AUDIO_FEATURE_DIM = 6
 
 # ── EffNet model state ────────────────────────────────────────
 _effnet_session = None
@@ -193,12 +198,12 @@ def _load_effnet_segments(path: str) -> list[np.ndarray]:
     Longer tracks return segments centred at 20%, 50%, and 80%.
     """
     try:
-        duration = librosa.get_duration(path=path)
+        duration = librosa_get_duration(path=path)
         if duration <= 0:
             return []
 
         if duration <= _EFFNET_SEGMENT_SECONDS * 1.5:
-            audio, _ = librosa.load(path, sr=_EFFNET_SR, mono=True)
+            audio, _ = librosa_load(path, sr=_EFFNET_SR, mono=True)
             return [audio] if len(audio) > 0 else []
 
         positions = [0.2, 0.5, 0.8]
@@ -207,7 +212,7 @@ def _load_effnet_segments(path: str) -> list[np.ndarray]:
             centre = duration * pos
             offset = max(0.0, centre - _EFFNET_SEGMENT_SECONDS / 2)
             offset = min(offset, max(0.0, duration - _EFFNET_SEGMENT_SECONDS))
-            audio, _ = librosa.load(
+            audio, _ = librosa_load(
                 path, sr=_EFFNET_SR, mono=True,
                 offset=offset, duration=_EFFNET_SEGMENT_SECONDS,
             )
@@ -347,6 +352,39 @@ _PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F",
 
 _BPM_LO = 60.0
 _BPM_HI = 200.0
+_FEATURE_SR = 22050
+_FEATURE_EXCERPT_SECONDS = 20.0
+_FEATURE_HOP = 1024
+
+
+def _load_feature_audio_excerpt(path: str) -> tuple[np.ndarray, int] | tuple[None, None]:
+    """Load a bounded excerpt for lightweight feature extraction.
+
+    For long tracks, decode a centered excerpt to avoid full-file decode cost.
+    This keeps runtime predictable while preserving enough rhythmic/harmonic
+    content for coarse descriptors.
+    """
+    try:
+        duration = librosa_get_duration(path=path)
+        if duration <= 0:
+            return None, None
+
+        if duration <= _FEATURE_EXCERPT_SECONDS * 1.25:
+            audio, sr = librosa_load(path, sr=_FEATURE_SR, mono=True)
+            return (audio, sr) if len(audio) > 0 else (None, None)
+
+        offset = max(0.0, (duration - _FEATURE_EXCERPT_SECONDS) * 0.5)
+        audio, sr = librosa_load(
+            path,
+            sr=_FEATURE_SR,
+            mono=True,
+            offset=offset,
+            duration=_FEATURE_EXCERPT_SECONDS,
+        )
+        return (audio, sr) if len(audio) > 0 else (None, None)
+    except Exception as e:
+        log.warning("Audio excerpt load failed for %s: %s", path, e)
+        return None, None
 
 
 def detect_key(audio: np.ndarray, sr: int = 44100) -> tuple[str, str]:
@@ -356,7 +394,8 @@ def detect_key(audio: np.ndarray, sr: int = 44100) -> tuple[str, str]:
     classes (sharps only, e.g. ``"C#"`` not ``"Db"``) and *scale* is
     ``"major"`` or ``"minor"``.
     """
-    chroma = librosa.feature.chroma_cqt(y=audio, sr=sr)
+    # STFT chroma is much cheaper than CQT and sufficient for coarse key hints.
+    chroma = librosa.feature.chroma_stft(y=audio, sr=sr, n_fft=2048, hop_length=_FEATURE_HOP)
     mean_chroma = chroma.mean(axis=1)  # (12,)
 
     best_corr = -np.inf
@@ -379,14 +418,21 @@ def detect_key(audio: np.ndarray, sr: int = 44100) -> tuple[str, str]:
     return best_key, best_scale
 
 
-def _compute_danceability(audio: np.ndarray, sr: int = 44100) -> float:
+def _compute_danceability(
+    audio: np.ndarray,
+    sr: int = 44100,
+    onset_env: np.ndarray | None = None,
+    tempo_bpm: float | None = None,
+    hop_length: int = _FEATURE_HOP,
+) -> float:
     """Estimate danceability from onset strength regularity.
 
     Measures how periodic/regular the rhythmic onsets are by computing the
     autocorrelation of the onset strength envelope and comparing the peak
     at the dominant tempo lag to the overall mean.
     """
-    onset_env = librosa.onset.onset_strength(y=audio, sr=sr)
+    if onset_env is None:
+        onset_env = librosa.onset.onset_strength(y=audio, sr=sr, hop_length=hop_length)
     if len(onset_env) < 4:
         return 0.0
 
@@ -396,12 +442,12 @@ def _compute_danceability(audio: np.ndarray, sr: int = 44100) -> float:
 
     ac = ac / (ac[0] + 1e-9)
 
-    tempo_bpm = librosa.feature.tempo(onset_envelope=onset_env, sr=sr)
-    if hasattr(tempo_bpm, "__len__"):
-        tempo_bpm = float(tempo_bpm[0])
+    if tempo_bpm is None:
+        tempo_bpm = librosa.feature.tempo(onset_envelope=onset_env, sr=sr)
+        if hasattr(tempo_bpm, "__len__"):
+            tempo_bpm = float(tempo_bpm[0])
 
     # Convert BPM to lag in onset-envelope frames.
-    hop_length = 512  # librosa default for onset_strength
     frames_per_sec = sr / hop_length
     if tempo_bpm > 0:
         lag = int(round(60.0 * frames_per_sec / tempo_bpm))
@@ -424,12 +470,13 @@ def extract_audio_features(path: str) -> np.ndarray | None:
     or None on failure.
     """
     try:
-        audio, sr = librosa.load(path, sr=44100, mono=True)
-        if len(audio) == 0:
+        audio, sr = _load_feature_audio_excerpt(path)
+        if audio is None or sr is None or len(audio) == 0:
             return None
 
         # Tempo
-        tempo = librosa.feature.tempo(y=audio, sr=sr)
+        onset_env = librosa.onset.onset_strength(y=audio, sr=sr, hop_length=_FEATURE_HOP)
+        tempo = librosa.feature.tempo(onset_envelope=onset_env, sr=sr)
         if hasattr(tempo, "__len__"):
             tempo = float(tempo[0])
         tempo_norm = float(np.clip((tempo - _BPM_LO) / (_BPM_HI - _BPM_LO), 0.0, 1.0))
@@ -448,7 +495,9 @@ def extract_audio_features(path: str) -> np.ndarray | None:
         energy_norm = float(np.clip(np.log1p(mean_rms * 100) / 5.0, 0.0, 1.0))
 
         # Danceability
-        danceability = _compute_danceability(audio, sr)
+        danceability = _compute_danceability(
+            audio, sr, onset_env=onset_env, tempo_bpm=tempo, hop_length=_FEATURE_HOP
+        )
 
         return np.array(
             [tempo_norm, key_cos, key_sin, mode, energy_norm, danceability],
@@ -457,3 +506,42 @@ def extract_audio_features(path: str) -> np.ndarray | None:
     except Exception as e:
         log.warning("Audio feature extraction failed for %s: %s", path, e)
         return None
+
+
+def generate_audio_features_batch(
+    paths: list[str],
+) -> dict[str, np.ndarray | None]:
+    """Extract audio features for multiple paths.
+
+    IMPORTANT: MP3 decode in the librosa/audioread stack is not reliably
+    thread-safe in this app's mixed workload, so preprocessing must remain
+    sequential to avoid intermittent native crashes.
+    """
+    if not paths:
+        return {}
+
+    results: dict[str, np.ndarray | None] = {p: None for p in paths}
+    for p in paths:
+        results[p] = extract_audio_features(p)
+
+    return results
+
+
+def warmup_audio_features() -> None:
+    """Pre-warm librosa kernels used by feature extraction.
+
+    This reduces first-call latency spikes without touching user files.
+    """
+    try:
+        seconds = 4
+        n = int(_FEATURE_SR * seconds)
+        t = np.linspace(0.0, seconds, num=n, endpoint=False, dtype=np.float32)
+        audio = 0.2 * np.sin(2 * np.pi * 220.0 * t) + 0.15 * np.sin(2 * np.pi * 440.0 * t)
+        _ = librosa.onset.onset_strength(y=audio, sr=_FEATURE_SR, hop_length=_FEATURE_HOP)
+        _ = librosa.feature.tempo(y=audio, sr=_FEATURE_SR, hop_length=_FEATURE_HOP)
+        _ = librosa.feature.chroma_stft(y=audio, sr=_FEATURE_SR, n_fft=2048, hop_length=_FEATURE_HOP)
+        _ = librosa.feature.rms(y=audio)
+        _ = detect_key(audio, _FEATURE_SR)
+        _ = _compute_danceability(audio, _FEATURE_SR, hop_length=_FEATURE_HOP)
+    except Exception as e:
+        log.debug("Audio feature warmup skipped: %s", e)

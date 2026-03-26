@@ -1,0 +1,16 @@
+# Optional: GPU UMAP/t-SNE via RAPIDS cuML (NVIDIA CUDA only).
+#
+# On Apple Silicon, install ``mlx-vis`` (see requirements.txt marker) for
+# Metal-accelerated UMAP/t-SNE; disable with ``TRACKSPACE_MLX_VIS=0``.
+#
+# cuML is not available for Apple Silicon / Metal (MPS). CLAP inference still
+# uses MPS when PyTorch exposes it.
+#
+# Install RAPIDS matching your CUDA version:
+#   https://docs.rapids.ai/install
+#
+# Example (conda, adjust cuda-version channel):
+#   conda install -c rapidsai -c conda-forge -c nvidia cuml python=3.11 cuda-version=12.8
+#
+# Force CPU projections even if cuML is installed:
+#   export TRACKSPACE_CUML=0

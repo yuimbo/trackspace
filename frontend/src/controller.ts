@@ -229,18 +229,60 @@ export class Controller {
     this.model.on("tags-dirty", () => this.batch.renderDirty());
   }
 
-  /** Dim controls that belong to the inactive view mode. */
+  /** Sync all sidebar controls to match current model state. */
   private _syncModeVisuals(): void {
-    const isEmbed = this.model.viewMode === "embeddings";
+    const m = this.model;
+    const isEmbed = m.viewMode === "embeddings";
+
+    // Dim embedding-only controls when in tag mode
     const embedEls = [
       document.getElementById("projection-method"),
       document.getElementById("embedding-sources"),
+      document.getElementById("folder-tune-controls"),
       document.getElementById("scale-tags-toggle")?.closest("label"),
       document.getElementById("scale-folders-toggle")?.closest("label"),
     ];
     for (const el of embedEls) {
       el?.classList.toggle("mode-dimmed", !isEmbed);
     }
+
+    // View mode checkbox
+    const $vm = document.getElementById("view-mode-toggle") as HTMLInputElement | null;
+    if ($vm) $vm.checked = isEmbed;
+
+    // Projection toggle active state
+    const $toggle = document.getElementById("projection-toggle");
+    if ($toggle) {
+      for (const btn of $toggle.querySelectorAll<HTMLElement>(".toggle-btn")) {
+        btn.classList.toggle("active", btn.dataset.method === m.projectionMethod);
+      }
+    }
+
+    // Source checkboxes
+    const srcMap: [string, boolean][] = [
+      ["source-clap", m.useCLAP],
+      ["source-effnet", m.useEffNet],
+      ["source-feat-tempo", m.useAudioFeatureTempo],
+      ["source-feat-key", m.useAudioFeatureKey],
+      ["source-feat-mode", m.useAudioFeatureMode],
+      ["source-feat-energy", m.useAudioFeatureEnergy],
+      ["source-feat-dance", m.useAudioFeatureDance],
+    ];
+    for (const [id, val] of srcMap) {
+      const $cb = document.getElementById(id) as HTMLInputElement | null;
+      if ($cb) $cb.checked = val;
+    }
+
+    const $fb = document.getElementById("folder-boost-range") as HTMLInputElement | null;
+    const $fdb = document.getElementById("folder-depth-boost-range") as HTMLInputElement | null;
+    if ($fb) $fb.value = String(m.folderContrastBoost);
+    if ($fdb) $fdb.value = String(m.folderDepthBoost);
+
+    // Scaling checkboxes
+    const $st = document.getElementById("scale-tags-toggle") as HTMLInputElement | null;
+    const $sf = document.getElementById("scale-folders-toggle") as HTMLInputElement | null;
+    if ($st) $st.checked = m.scaleByTags;
+    if ($sf) $sf.checked = m.scaleByFolders;
   }
 
   /* ── View callbacks ─────────────────────────────────────── */
@@ -599,7 +641,7 @@ export class Controller {
   private _embedPollTimer = 0;
   private _embedEventSource: EventSource | null = null;
   private _embedBatchCount = 0;
-  private _umapFetchPending = false;
+  private _projectionFetchPending = false;
 
   private async _ensureEmbeddingsAndProject(): Promise<void> {
     const m = this.model;
@@ -634,13 +676,14 @@ export class Controller {
       const sourcesNeeded: string[] = [];
       if (m.useCLAP && status.pending > 0) sourcesNeeded.push("clap");
       if (m.useEffNet && status.effnet_pending > 0) sourcesNeeded.push("effnet");
-      if (m.useAudioFeatures && status.features_pending > 0) sourcesNeeded.push("features");
+      if (m.anyAudioFeaturesEnabled && status.features_pending > 0)
+        sourcesNeeded.push("features");
 
       if (sourcesNeeded.length > 0 && !status.generating) {
         const total = Math.max(
           m.useCLAP ? status.pending : 0,
           m.useEffNet ? status.effnet_pending : 0,
-          m.useAudioFeatures ? status.features_pending : 0,
+          m.anyAudioFeaturesEnabled ? status.features_pending : 0,
         );
         toast(`Generating embeddings for ${total} tracks…`, "ok");
         m.embeddingsGenerating = true;
@@ -662,16 +705,24 @@ export class Controller {
       if (status.generating) {
         m.embeddingsGenerating = true;
         this._listenEmbeddingStream();
+        // Still refetch layout: option changes must hit /api/embeddings/projection even
+        // while a batch job runs — otherwise only /status appears and the map never
+        // updates for the new source / scaling / method mix.
+        if (m.viewMode === "embeddings") {
+          void this._fetchProjection();
+        }
         return;
       }
 
-      // Check if at least some data exists for the active sources.
+      // In embedding mode always refresh the layout — `hasData` keyed only to
+      // individual sources missed the case where the *combination* of enabled
+      // sources changes (or counts are briefly inconsistent with the cache).
       const hasData =
         (m.useCLAP && status.embedded > 0) ||
         (m.useEffNet && status.effnet_embedded > 0) ||
-        (m.useAudioFeatures && status.features_extracted > 0);
-      if (hasData) {
-        await this._fetchUmapPositions();
+        (m.anyAudioFeaturesEnabled && status.features_extracted > 0);
+      if (m.viewMode === "embeddings" || hasData) {
+        await this._fetchProjection();
       }
     } catch {
       /* api() already toasted */
@@ -719,6 +770,7 @@ export class Controller {
       const m = this.model;
       m.embeddingProgress = { done: data.done, total: data.total };
       this.status.update(m);
+      this.canvas.scheduleDraw();
 
       this._embedBatchCount++;
       const interval = Math.max(5, Math.floor(data.total / 10));
@@ -726,10 +778,10 @@ export class Controller {
         data.done >= 2 &&
         (this._embedBatchCount >= interval || data.done === data.total) &&
         m.viewMode === "embeddings" &&
-        !this._umapFetchPending
+        !this._projectionFetchPending
       ) {
         this._embedBatchCount = 0;
-        void this._fetchUmapIncremental();
+        void this._fetchProjectionIncremental();
       }
     }) as EventListener);
 
@@ -740,8 +792,9 @@ export class Controller {
       m.embeddingProgress = null;
       toast("Embeddings ready", "ok");
       this.status.update(m);
+      this.canvas.scheduleDraw();
       if (m.viewMode === "embeddings") {
-        void this._fetchUmapPositions();
+        void this._fetchProjection();
       }
     });
 
@@ -751,6 +804,7 @@ export class Controller {
       m.embeddingsGenerating = false;
       m.embeddingProgress = null;
       this.status.update(m);
+      this.canvas.scheduleDraw();
     });
   }
 
@@ -761,34 +815,45 @@ export class Controller {
     }
   }
 
-  private _projectionQueryString(methodOverride?: string): string {
+  private _projectionQueryString(methodOverride?: string, skipContext = false): string {
     const m = this.model;
     const method = methodOverride ?? m.projectionMethod;
     const sources = m.activeSources.join(",");
     let qs = `folder=&recursive=1&method=${method}&sources=${encodeURIComponent(sources)}`;
-    if (m.scaleByTags) {
-      const tags = m.contextTags.join(",");
-      if (tags) qs += `&context_tags=${encodeURIComponent(tags)}`;
-    }
-    if (m.scaleByFolders) {
-      const folders = m.contextFolders.join(",");
-      if (folders) qs += `&context_folders=${encodeURIComponent(folders)}`;
+    qs += `&feature_mask=${m.audioFeatureMask()}`;
+    qs += `&features_blend=${encodeURIComponent(String(m.featuresBlend))}`;
+    qs += `&folder_boost=${encodeURIComponent(String(m.folderContrastBoost))}`;
+    qs += `&folder_depth_boost=${encodeURIComponent(String(m.folderDepthBoost))}`;
+    if (!skipContext) {
+      if (m.scaleByTags) {
+        const tags = m.contextTags.join(",");
+        if (tags) qs += `&context_tags=${encodeURIComponent(tags)}`;
+      }
+      if (m.scaleByFolders) {
+        qs += "&scale_folders=1";
+      }
     }
     return qs;
   }
 
-  /** Fetch PCA positions during ongoing generation, animating the transition. */
-  private async _fetchUmapIncremental(): Promise<void> {
-    this._umapFetchPending = true;
+  /** Fetch PCA positions during ongoing generation, animating the transition.
+   *
+   *  Context (semantic weighting) is intentionally skipped: PCA is a quick
+   *  preview and the CLAP model is busy with audio inference on the generation
+   *  thread — concurrent text inference can fail on MPS / CUDA.
+   */
+  private async _fetchProjectionIncremental(): Promise<void> {
+    this._projectionFetchPending = true;
     const m = this.model;
     m.projectionPending = true;
     this.canvas.scheduleDraw();
     try {
       const positions = await api<{ path: string; x: number; y: number }[]>(
-        `/api/embeddings/umap?${this._projectionQueryString("pca")}`,
+        `/api/embeddings/projection?${this._projectionQueryString("pca", true)}`,
       );
-      const isFirst = m.embeddingPositions.size === 0;
+      if (!positions.length) return;
 
+      const isFirst = m.embeddingPositions.size === 0;
       const newPositions = new Map<string, { x: number; y: number }>();
       for (const p of positions) {
         newPositions.set(p.path, { x: p.x, y: p.y });
@@ -801,10 +866,10 @@ export class Controller {
       } else {
         this._animatePositionUpdate(newPositions);
       }
-    } catch {
-      /* silent — generation still ongoing */
+    } catch (e) {
+      console.warn("[trackspace] incremental PCA fetch failed:", e);
     } finally {
-      this._umapFetchPending = false;
+      this._projectionFetchPending = false;
       m.projectionPending = false;
       this.canvas.scheduleDraw();
     }
@@ -864,13 +929,13 @@ export class Controller {
     this._animFrame = requestAnimationFrame(step);
   }
 
-  private async _fetchUmapPositions(): Promise<void> {
+  private async _fetchProjection(): Promise<void> {
     const m = this.model;
     m.projectionPending = true;
     this.canvas.scheduleDraw();
     try {
       const positions = await api<{ path: string; x: number; y: number }[]>(
-        `/api/embeddings/umap?${this._projectionQueryString()}`,
+        `/api/embeddings/projection?${this._projectionQueryString()}`,
       );
       const newPositions = new Map<string, { x: number; y: number }>();
       for (const p of positions) {
@@ -1866,39 +1931,96 @@ export class Controller {
 
     this._initProjectionToggle();
     this._initSourceCheckboxes();
+    this._initFolderTuneSliders();
     this._initScalingToggles();
   }
 
   private _initSourceCheckboxes(): void {
     const m = this.model;
-    const ids: [string, "clap" | "effnet" | "features"][] = [
+    const main: [string, "clap" | "effnet"][] = [
       ["source-clap", "clap"],
       ["source-effnet", "effnet"],
-      ["source-features", "features"],
     ];
-    for (const [elId, source] of ids) {
+    for (const [elId, source] of main) {
       const $cb = document.getElementById(elId) as HTMLInputElement | null;
       if (!$cb) continue;
-      $cb.checked =
-        source === "clap"
-          ? m.useCLAP
-          : source === "effnet"
-            ? m.useEffNet
-            : m.useAudioFeatures;
+      $cb.checked = source === "clap" ? m.useCLAP : m.useEffNet;
       $cb.addEventListener("change", () => {
         m.toggleSource(source);
-        // If toggleSource was a no-op (would leave zero sources), revert checkbox.
-        const actual =
-          source === "clap"
-            ? m.useCLAP
-            : source === "effnet"
-              ? m.useEffNet
-              : m.useAudioFeatures;
+        const actual = source === "clap" ? m.useCLAP : m.useEffNet;
         $cb.checked = actual;
         m.saveLS();
         if (m.viewMode === "embeddings") {
           void this._ensureEmbeddingsAndProject();
         }
+      });
+    }
+
+    const feats: [string, "tempo" | "key" | "mode" | "energy" | "dance"][] = [
+      ["source-feat-tempo", "tempo"],
+      ["source-feat-key", "key"],
+      ["source-feat-mode", "mode"],
+      ["source-feat-energy", "energy"],
+      ["source-feat-dance", "dance"],
+    ];
+    for (const [elId, dim] of feats) {
+      const $cb = document.getElementById(elId) as HTMLInputElement | null;
+      if (!$cb) continue;
+      $cb.addEventListener("change", () => {
+        m.toggleAudioFeature(dim);
+        m.saveLS();
+        this._syncAudioFeatureCheckbox(elId, dim);
+        if (m.viewMode === "embeddings") {
+          void this._ensureEmbeddingsAndProject();
+        }
+      });
+    }
+  }
+
+  private _syncAudioFeatureCheckbox(
+    elId: string,
+    dim: "tempo" | "key" | "mode" | "energy" | "dance",
+  ): void {
+    const m = this.model;
+    const $cb = document.getElementById(elId) as HTMLInputElement | null;
+    if (!$cb) return;
+    const val =
+      dim === "tempo"
+        ? m.useAudioFeatureTempo
+        : dim === "key"
+          ? m.useAudioFeatureKey
+          : dim === "mode"
+            ? m.useAudioFeatureMode
+            : dim === "energy"
+              ? m.useAudioFeatureEnergy
+              : m.useAudioFeatureDance;
+    $cb.checked = val;
+  }
+
+  private _initFolderTuneSliders(): void {
+    const m = this.model;
+    const $fb = document.getElementById("folder-boost-range") as HTMLInputElement | null;
+    const $fdb = document.getElementById("folder-depth-boost-range") as HTMLInputElement | null;
+    if ($fb) {
+      $fb.value = String(m.folderContrastBoost);
+      $fb.addEventListener("input", () => {
+        m.folderContrastBoost = parseFloat($fb.value);
+      });
+      $fb.addEventListener("change", () => {
+        m.folderContrastBoost = parseFloat($fb.value);
+        m.saveLS();
+        if (m.viewMode === "embeddings") void this._fetchProjection();
+      });
+    }
+    if ($fdb) {
+      $fdb.value = String(m.folderDepthBoost);
+      $fdb.addEventListener("input", () => {
+        m.folderDepthBoost = parseFloat($fdb.value);
+      });
+      $fdb.addEventListener("change", () => {
+        m.folderDepthBoost = parseFloat($fdb.value);
+        m.saveLS();
+        if (m.viewMode === "embeddings") void this._fetchProjection();
       });
     }
   }
@@ -1915,9 +2037,9 @@ export class Controller {
       m.scaleByTags = $tags.checked;
       m.scaleByFolders = $folders.checked;
       m.saveLS();
-      if (m.viewMode === "embeddings" && m.embeddingsReady) {
-        void this._fetchUmapPositions();
-      } else if (m.viewMode !== "embeddings") {
+      if (m.viewMode === "embeddings") {
+        void this._fetchProjection();
+      } else {
         void this._switchToMode("embeddings");
       }
     };
@@ -1947,7 +2069,7 @@ export class Controller {
       syncActive();
       m.saveLS();
       if (m.viewMode === "embeddings") {
-        void this._fetchUmapPositions();
+        void this._fetchProjection();
       } else {
         void this._switchToMode("embeddings");
       }
