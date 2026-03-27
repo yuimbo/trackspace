@@ -13,7 +13,7 @@ import queue
 import time
 import shutil
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -26,7 +26,6 @@ raise_nofile_limit()
 
 from flask import (
     Flask,
-    Response,
     request,
     jsonify,
     send_file,
@@ -51,9 +50,21 @@ from backend.embedding_coverage import (
     batch_fetch_maps,
     build_generation_work,
     coverage_payload,
-    eligible_paths_for_projection,
 )
-from backend.layout_revision import compute_layout_revision
+from backend.services.layout_revision_for_status import layout_revision_for_projection
+from backend.services.parallel_reads import iter_parallel_reads, read_paths_parallel
+from backend.services.track_payload import (
+    build_track_list as build_track_list_service,
+    track_dict_from_read as track_dict_from_read_service,
+)
+from backend.services.virtual_paths import (
+    is_mp3 as is_mp3_service,
+    list_mp3s as list_mp3s_service,
+    resolve_virtual_path as resolve_virtual_path_service,
+    root_and_rel_from_virtual as root_and_rel_from_virtual_service,
+    virtual_from_abs as virtual_from_abs_service,
+)
+from backend.sse import sse_response
 
 log = logging.getLogger(__name__)
 
@@ -360,30 +371,11 @@ def _load_roots_state(default_root: str | None) -> None:
 
 
 def _root_and_rel_from_virtual(vpath: str) -> tuple[str, str]:
-    raw = (vpath or "").strip().lstrip("/")
-    if not raw:
-        abort(400)
-    parts = raw.split("/", 1)
-    rid = parts[0]
-    rel = parts[1] if len(parts) > 1 else ""
-    root_abs = ROOTS.get(rid)
-    if not root_abs:
-        abort(404)
-    return root_abs, rel
+    return root_and_rel_from_virtual_service(vpath, ROOTS)
 
 
 def _virtual_from_abs(abs_path: str) -> str:
-    best_rid = None
-    best_root = None
-    for rid, root in ROOTS.items():
-        if abs_path == root or abs_path.startswith(root.rstrip(os.sep) + os.sep):
-            if best_root is None or len(root) > len(best_root):
-                best_rid = rid
-                best_root = root
-    if not best_rid or not best_root:
-        abort(400)
-    rel = os.path.relpath(abs_path, best_root)
-    return best_rid if rel == "." else f"{best_rid}/{rel}"
+    return virtual_from_abs_service(abs_path, ROOTS)
 
 
 # ---------------------------------------------------------------------------
@@ -391,16 +383,11 @@ def _virtual_from_abs(abs_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve(rel: str) -> str:
-    """Resolve a client-supplied virtual path against active roots safely."""
-    root_abs, rel_inside = _root_and_rel_from_virtual(rel)
-    joined = os.path.normpath(os.path.join(root_abs, rel_inside))
-    if not (joined == root_abs or joined.startswith(root_abs.rstrip(os.sep) + os.sep)):
-        abort(403)
-    return joined
+    return resolve_virtual_path_service(rel, ROOTS)
 
 
 def _is_mp3(name: str) -> bool:
-    return name.lower().endswith(".mp3")
+    return is_mp3_service(name)
 
 
 def _list_mp3s_under_abs(folder: str, recursive: bool = False) -> list[str]:
@@ -420,13 +407,7 @@ def _list_mp3s_under_abs(folder: str, recursive: bool = False) -> list[str]:
 
 
 def _list_mp3s(folder_vpath: str, recursive: bool = False) -> list[str]:
-    """Return absolute mp3 paths for one virtual folder, or all roots when empty."""
-    if folder_vpath in ("", "."):
-        results: list[str] = []
-        for root_abs in ROOTS.values():
-            results.extend(_list_mp3s_under_abs(root_abs, recursive=True))
-        return sorted(results)
-    return _list_mp3s_under_abs(_resolve(folder_vpath), recursive)
+    return list_mp3s_service(folder_vpath, ROOTS, recursive)
 
 
 def _folder_tree(root: str, root_id: str, rel_prefix: str = "") -> dict:
@@ -588,10 +569,7 @@ def api_tracks():
 
     # Read each file's ID3 header once (tags + metadata) in parallel threads.
     # _cached_read_all checks the in-memory LRU then SQLite before hitting disk.
-    results: dict[str, dict] = {}
-    futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
-    for fut in as_completed(futures):
-        results[futures[fut]] = fut.result()
+    results = read_paths_parallel(paths, read_fn=_cached_read_all, executor=_THREAD_POOL)
 
     return jsonify(_build_track_list(paths, results))
 
@@ -602,47 +580,23 @@ def _track_dict_from_read(
     *,
     feat_by_fp: dict[str, object] | None = None,
 ) -> dict:
-    """One API track object from a filesystem path and ``_cached_read_all`` payload."""
-    rel_path = _virtual_from_abs(p)
-    folder_rel = _virtual_from_abs(os.path.dirname(p))
-    fp = info.get("fingerprint")
-    bpm: int | None = None
-    musical_key: str | None = None
-    if isinstance(fp, str) and fp:
-        arr = feat_by_fp.get(fp) if feat_by_fp is not None else _FEATURES.get_audio_features(
-            fp, FEATURES_VERSION
-        )
-        if arr is not None:
-            bpm, musical_key = audio_features.audio_features_display_bpm_key(arr)
-    return {
-        "path": rel_path,
-        "filename": os.path.basename(p),
-        "folder": folder_rel,
-        "tags": info.get("tags", {}),
-        "artist": info.get("artist", ""),
-        "title": info.get("title", ""),
-        "fingerprint": info.get("fingerprint"),
-        "bpm": bpm,
-        "musical_key": musical_key,
-    }
+    return track_dict_from_read_service(
+        p,
+        info,
+        virtual_from_abs=_virtual_from_abs,
+        display_bpm_key=audio_features.audio_features_display_bpm_key,
+        get_audio_features=lambda fp: _FEATURES.get_audio_features(fp, FEATURES_VERSION),
+        feat_by_fp=feat_by_fp,
+    )
 
 
 def _build_track_list(paths: list[str], results: dict[str, dict]) -> list[dict]:
-    """Convert path→data mapping into the track dicts the frontend expects."""
-    fps_ordered: list[str] = []
-    seen: set[str] = set()
-    for p in paths:
-        fp = results.get(p, {}).get("fingerprint")
-        if not isinstance(fp, str) or not fp or fp in seen:
-            continue
-        seen.add(fp)
-        fps_ordered.append(fp)
-    feat_map = (
-        _FEATURES.get_all_audio_features(fps_ordered, FEATURES_VERSION)
-        if fps_ordered
-        else {}
+    return build_track_list_service(
+        paths,
+        results,
+        track_dict_builder=_track_dict_from_read,
+        get_all_audio_features=lambda fps: _FEATURES.get_all_audio_features(fps, FEATURES_VERSION),
     )
-    return [_track_dict_from_read(p, results.get(p, {}), feat_by_fp=feat_map) for p in paths]
 
 
 @app.route("/api/library/stream")
@@ -666,11 +620,8 @@ def api_library_stream():
     q: queue.Queue[dict] = queue.Queue(maxsize=total + 100)
 
     def _scan() -> None:
-        futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
         done = 0
-        for fut in as_completed(futures):
-            p = futures[fut]
-            info = fut.result()
+        for p, info in iter_parallel_reads(paths, read_fn=_cached_read_all, executor=_THREAD_POOL):
             done += 1
             q.put_nowait({
                 "type": "progress",
@@ -694,11 +645,7 @@ def api_library_stream():
             if etype == "done":
                 break
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return sse_response(generate())
 
 
 # ---------------------------------------------------------------------------
@@ -712,10 +659,9 @@ def api_tags():
     recursive = request.args.get("recursive", "1") == "1"
     paths = _list_mp3s(rel, recursive)
     # Use the same cached reads as api_tracks to avoid redundant disk I/O.
-    futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
     names: set[str] = set()
-    for fut in as_completed(futures):
-        names.update(fut.result().get("tags", {}).keys())
+    for _, info in iter_parallel_reads(paths, read_fn=_cached_read_all, executor=_THREAD_POOL):
+        names.update(info.get("tags", {}).keys())
     return jsonify(sorted(names))
 
 
@@ -944,22 +890,11 @@ def _parse_projection_params(
     )
 
 
-def _feature_mask_as_list(params: _ProjectionParams) -> list[float]:
-    import numpy as np
-
-    m = params.feature_mask
-    arr = np.asarray(m, dtype=np.float64).reshape(-1)
-    return [float(x) for x in arr]
-
-
 def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
     """Build lightweight track info dicts with path + fingerprint for embedding ops."""
     paths = _list_mp3s(folder_vpath, recursive)
-    futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
     infos = []
-    for fut in as_completed(futures):
-        p = futures[fut]
-        info = fut.result()
+    for p, info in iter_parallel_reads(paths, read_fn=_cached_read_all, executor=_THREAD_POOL):
         rel_path = _virtual_from_abs(p)
         infos.append({
             "path": rel_path,
@@ -1014,21 +949,12 @@ def api_embeddings_status():
         maps = batch_fetch_maps(_FEATURES, fps, versions)
         base = coverage_payload(infos, maps, versions)
         proj = _parse_projection_params(request, default_when_no_method=False)
-        if proj is not None:
-            eligible = eligible_paths_for_projection(infos, maps, proj.sources)
-            layout_revision = compute_layout_revision(
-                eligible_paths=eligible,
-                method=proj.method,
-                sources=proj.sources,
-                feature_mask=_feature_mask_as_list(proj),
-                features_blend=proj.features_blend,
-                folder_boost=proj.folder_boost,
-                folder_depth_boost=proj.folder_depth_boost,
-                context_tags=proj.tag_names,
-                context_folders=proj.explicit_folders if proj.explicit_folders else None,
-                scale_folders=proj.scale_folders,
-                cache_versions=(versions.clap, versions.effnet, versions.features),
-            )
+        layout_revision = layout_revision_for_projection(
+            infos,
+            maps,
+            proj,
+            cache_versions=(versions.clap, versions.effnet, versions.features),
+        )
     else:
         cov_key = (lib_sig, write_epoch, proj_fp)
         with _embed_status_cache_lock:
@@ -1043,22 +969,12 @@ def api_embeddings_status():
             maps = batch_fetch_maps(_FEATURES, fps, versions)
             base = coverage_payload(infos, maps, versions)
             proj = _parse_projection_params(request, default_when_no_method=False)
-            layout_revision = None
-            if proj is not None:
-                eligible = eligible_paths_for_projection(infos, maps, proj.sources)
-                layout_revision = compute_layout_revision(
-                    eligible_paths=eligible,
-                    method=proj.method,
-                    sources=proj.sources,
-                    feature_mask=_feature_mask_as_list(proj),
-                    features_blend=proj.features_blend,
-                    folder_boost=proj.folder_boost,
-                    folder_depth_boost=proj.folder_depth_boost,
-                    context_tags=proj.tag_names,
-                    context_folders=proj.explicit_folders if proj.explicit_folders else None,
-                    scale_folders=proj.scale_folders,
-                    cache_versions=(versions.clap, versions.effnet, versions.features),
-                )
+            layout_revision = layout_revision_for_projection(
+                infos,
+                maps,
+                proj,
+                cache_versions=(versions.clap, versions.effnet, versions.features),
+            )
             with _embed_status_cache_lock:
                 _status_coverage_lru[cov_key] = (dict(base), layout_revision)
                 _status_coverage_lru.move_to_end(cov_key)
@@ -1274,11 +1190,7 @@ def api_embeddings_stream():
                 if q in _embed_subscribers:
                     _embed_subscribers.remove(q)
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    return sse_response(generate())
 
 
 @app.route("/api/embeddings/projection")
@@ -1308,18 +1220,10 @@ def api_embeddings_projection():
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
     pversions = SourceVersions(EMBEDDING_VERSION, EFFNET_VERSION, FEATURES_VERSION)
     maps = batch_fetch_maps(_FEATURES, fps, pversions)
-    eligible = eligible_paths_for_projection(infos, maps, proj.sources)
-    revision = compute_layout_revision(
-        eligible_paths=eligible,
-        method=proj.method,
-        sources=proj.sources,
-        feature_mask=_feature_mask_as_list(proj),
-        features_blend=proj.features_blend,
-        folder_boost=proj.folder_boost,
-        folder_depth_boost=proj.folder_depth_boost,
-        context_tags=proj.tag_names,
-        context_folders=proj.explicit_folders if proj.explicit_folders else None,
-        scale_folders=proj.scale_folders,
+    revision = layout_revision_for_projection(
+        infos,
+        maps,
+        proj,
         cache_versions=(pversions.clap, pversions.effnet, pversions.features),
     )
 
