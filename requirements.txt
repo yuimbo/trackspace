@@ -9,9 +9,8 @@ librosa>=0.10
 cython>=3.0.10
 madmom>=0.16.1
 scikit-learn>=1.3
-umap-learn>=0.5
 watchdog>=4.0
 onnxruntime>=1.17
 
-# Apple Silicon — Metal-accelerated UMAP/t-SNE (optional; ``backend.embeddings``).
+# Apple Silicon — Metal-accelerated t-SNE (optional; ``backend.embeddings``).
 mlx-vis>=0.7.0; sys_platform == "darwin" and platform_machine == "arm64"

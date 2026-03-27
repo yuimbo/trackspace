@@ -50,40 +50,17 @@
     <h2>Options</h2>
     <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
     <label><input type="checkbox" id="view-mode-toggle" /> Embedding space <kbd>E</kbd></label>
-    <div id="projection-method" class="option-row">
-      <span class="option-label">Projection</span>
-      <div class="toggle-group" id="projection-toggle">
-        <button class="toggle-btn" data-method="tsne">t-SNE</button>
-        <button class="toggle-btn" data-method="umap">UMAP</button>
-      </div>
-    </div>
-    <div id="embedding-sources" class="option-row option-stack">
-      <span class="option-label">Sources</span>
-      <div class="source-checks">
-        <label><input type="checkbox" id="source-clap" checked /> CLAP</label>
-        <label><input type="checkbox" id="source-effnet" /> EffNet</label>
-      </div>
-      <div class="audio-feature-grid">
-        <span class="option-sublabel">Audio features</span>
-        <label><input type="checkbox" id="source-feat-tempo" /> Tempo</label>
-        <label><input type="checkbox" id="source-feat-key" /> Key</label>
-        <label><input type="checkbox" id="source-feat-mode" /> Mode</label>
-        <label><input type="checkbox" id="source-feat-energy" /> Energy</label>
-        <label><input type="checkbox" id="source-feat-dance" /> Dance</label>
-      </div>
-    </div>
-    <label><input type="checkbox" id="scale-tags-toggle" checked /> Tag scaling</label>
-    <label><input type="checkbox" id="scale-folders-toggle" checked /> Folder scaling</label>
-    <div id="folder-tune-controls" class="option-stack">
-      <label class="folder-tune">
-        <span>Folder contrast</span>
-        <input type="range" id="folder-boost-range" min="0" max="6" step="0.25" value="3" />
-      </label>
-      <label class="folder-tune">
-        <span>Depth emphasis</span>
-        <input type="range" id="folder-depth-boost-range" min="1" max="3" step="0.05" value="1.5" />
-      </label>
-    </div>
+    <label class="folder-tune">
+      <span>Explode <kbd>X</kbd> + scroll</span>
+      <input
+        type="range"
+        id="explode-strength-range"
+        min="0.05"
+        max="0.20"
+        step="0.01"
+        value="0.10"
+      />
+    </label>
   </section>
 
   <section id="features-section" x-data>

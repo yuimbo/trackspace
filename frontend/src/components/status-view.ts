@@ -172,11 +172,7 @@ ${last}
     const p = model.embeddingProgress!;
     const pct =
       p.total > 0 ? Math.round((100 * p.done) / p.total) : 0;
-    const srcs = model.activeSources
-      .map((s) =>
-        s === "clap" ? "CLAP" : s === "effnet" ? "EffNet" : "Audio features",
-      )
-      .join(", ");
+    const srcs = "CLAP, EffNet, audio features (tempo·energy·dance)";
     let last = "";
     if (p.lastPath) {
       const ok =
@@ -235,12 +231,7 @@ ${last}
     if (model.viewMode === "embeddings") {
       addSep();
       const mode = document.createElement("span");
-      const srcs = model.activeSources
-        .map((s) =>
-          s === "clap" ? "CLAP" : s === "effnet" ? "EffNet" : "Audio",
-        )
-        .join("+");
-      mode.textContent = `Embedding Space (${model.projectionMethod.toUpperCase()}) [${srcs}]`;
+      mode.textContent = "Embedding Space (t-SNE) — CLAP+EffNet+audio";
       this.$el.appendChild(mode);
     }
 

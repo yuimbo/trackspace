@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from flask import Blueprint, jsonify, request
 
+from backend.embeddings.projection_config import FROZEN_SOURCES
 from backend.services.embedding_status_cache import EmbeddingStatusCache
 
 log = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ def create_api_embeddings_blueprint(
         rel = data.get("folder", "")
         recursive = data.get("recursive", True)
         priority_paths: list[str] = data.get("priority_paths", [])
-        sources: list[str] = data.get("sources", ["clap"])
+        sources: list[str] = list(FROZEN_SOURCES)
         folder = rel
 
         if "clap" in sources and not embeddings_mod.is_model_ready():

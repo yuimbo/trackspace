@@ -4,12 +4,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:all": "concurrently --names backend,frontend --prefix-colors cyan,magenta \"cd .. && .venv/bin/python -m backend.app${ROOT:+ $ROOT}\" \"vite\"",
+    "dev:all": "concurrently --names backend,frontend --prefix-colors cyan,magenta \"cd .. && .venv/bin/python -m backend.app${ROOT:+ $ROOT}\" \"wait-on tcp:127.0.0.1:5111 && vite\"",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview"
   },
   "devDependencies": {
     "concurrently": "^9.2.1",
+    "wait-on": "^8.0.5",
     "typescript": "^5.7",
     "vite": "^6.2"
   },

@@ -222,21 +222,15 @@ def _projection_matrix(n_rows: int, n_cols: int, seed: int = 42) -> np.ndarray:
     return (x / norms).astype(np.float32)
 
 
-@pytest.mark.parametrize("method", ["umap", "tsne"])
-def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
-    """Compare CPU (umap-learn / sklearn) vs cuML or mlx-vis when available."""
-    from backend.embeddings.layout import (
-        _project_tsne,
-        _project_umap,
-        reset_projection_backend_cache,
-    )
+def test_profile_projection_cpu_vs_gpu(monkeypatch):
+    """Compare CPU (sklearn) vs cuML or mlx-vis t-SNE when available."""
+    from backend.embeddings.layout import _project_tsne, reset_projection_backend_cache
 
     n_env = int(os.environ.get("TRACKSPACE_PROFILE_PROJECTION_N", "320"))
     d_env = int(os.environ.get("TRACKSPACE_PROFILE_PROJECTION_D", "128"))
     n_rows = max(80, min(n_env, 10_000))
     n_cols = max(8, min(d_env, 2048))
     X = _projection_matrix(n_rows, n_cols)
-    proj = _project_umap if method == "umap" else _project_tsne
 
     runs = int(os.environ.get("TRACKSPACE_PROFILE_PROJECTION_RUNS", "3"))
 
@@ -244,11 +238,10 @@ def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
         monkeypatch.setenv("TRACKSPACE_CUML", "0")
         monkeypatch.setenv("TRACKSPACE_MLX_VIS", "0")
         reset_projection_backend_cache()
-        return proj(X.copy())
+        return _project_tsne(X.copy())
 
-    # Warm CPU path too — first umap-learn call can trigger heavy Numba compilation.
     out_cpu, cpu_samples = _timed_runs(run_cpu, runs=runs, warmup=True)
-    _print_stats(f"{method}_cpu", cpu_samples)
+    _print_stats("tsne_cpu", cpu_samples)
     assert out_cpu.shape == (n_rows, 2)
     assert np.isfinite(out_cpu).all()
 
@@ -259,10 +252,10 @@ def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
             monkeypatch.setenv("TRACKSPACE_CUML", "1")
             monkeypatch.setenv("TRACKSPACE_MLX_VIS", "0")
             reset_projection_backend_cache()
-            return proj(X.copy())
+            return _project_tsne(X.copy())
 
         out_gpu, gpu_samples = _timed_runs(run_gpu, runs=runs, warmup=True)
-        _print_stats(f"{method}_cuml", gpu_samples)
+        _print_stats("tsne_cuml", gpu_samples)
     elif _mlx_vis_available():
         accel = "mlx_vis"
 
@@ -270,14 +263,12 @@ def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
             monkeypatch.setenv("TRACKSPACE_CUML", "0")
             monkeypatch.setenv("TRACKSPACE_MLX_VIS", "1")
             reset_projection_backend_cache()
-            return proj(X.copy())
+            return _project_tsne(X.copy())
 
         out_gpu, gpu_samples = _timed_runs(run_gpu, runs=runs, warmup=True)
-        _print_stats(f"{method}_mlx_vis", gpu_samples)
+        _print_stats("tsne_mlx_vis", gpu_samples)
     else:
-        print(
-            f"{method}_gpu: skipped (no CUDA+cuML and no mlx-vis on this machine)"
-        )
+        print("tsne_gpu: skipped (no CUDA+cuML and no mlx-vis on this machine)")
         return
 
     assert out_gpu.shape == (n_rows, 2)
@@ -287,23 +278,23 @@ def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
     if gpu_mean > 0:
         speedup = cpu_mean / gpu_mean
         print(
-            f"{method}_speedup_{accel:<8} "
+            f"tsne_speedup_{accel:<8} "
             f"x{speedup:0.2f}  (CPU {cpu_mean*1000:.1f} ms vs "
             f"GPU {gpu_mean*1000:.1f} ms)"
         )
 
 
 def test_profile_projection_cpu_only_quick(monkeypatch):
-    """Small CPU UMAP timing — runs everywhere."""
-    from backend.embeddings.layout import _project_umap, reset_projection_backend_cache
+    """Small CPU t-SNE timing — runs everywhere."""
+    from backend.embeddings.layout import _project_tsne, reset_projection_backend_cache
 
     monkeypatch.setenv("TRACKSPACE_CUML", "0")
     monkeypatch.setenv("TRACKSPACE_MLX_VIS", "0")
     reset_projection_backend_cache()
 
     X = _projection_matrix(48, 16)
-    out, samples = _timed_runs(lambda: _project_umap(X.copy()), runs=2)
-    _print_stats("umap_cpu_quick", samples)
+    out, samples = _timed_runs(lambda: _project_tsne(X.copy()), runs=2)
+    _print_stats("tsne_cpu_quick", samples)
 
     assert out.shape == (48, 2)
     assert np.isfinite(out).all()

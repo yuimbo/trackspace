@@ -1,9 +1,4 @@
-import {
-  type Model,
-  type Track,
-  type ProjectionMethod,
-  isAudioFeatureAxisId,
-} from "./model";
+import { type Model, type Track, isAudioFeatureAxisId } from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -258,6 +253,7 @@ export class Controller {
     this._bindCanvas();
     this._bindSidebar();
     this._bindKeyboard();
+    this._bindExplodeKeys();
     this._bindResize();
     this._bindViewportChrome();
     this._syncModeVisuals();
@@ -292,56 +288,10 @@ export class Controller {
   private _syncModeVisuals(): void {
     const m = this.model;
     const isEmbed = m.viewMode === "embeddings";
-
-    // Dim embedding-only controls when in tag mode
-    const embedEls = [
-      document.getElementById("projection-method"),
-      document.getElementById("embedding-sources"),
-      document.getElementById("folder-tune-controls"),
-      document.getElementById("scale-tags-toggle")?.closest("label"),
-      document.getElementById("scale-folders-toggle")?.closest("label"),
-    ];
-    for (const el of embedEls) {
-      el?.classList.toggle("mode-dimmed", !isEmbed);
-    }
-
-    // View mode checkbox
     const $vm = document.getElementById("view-mode-toggle") as HTMLInputElement | null;
     if ($vm) $vm.checked = isEmbed;
-
-    // Projection toggle active state
-    const $toggle = document.getElementById("projection-toggle");
-    if ($toggle) {
-      for (const btn of $toggle.querySelectorAll<HTMLElement>(".toggle-btn")) {
-        btn.classList.toggle("active", btn.dataset.method === m.projectionMethod);
-      }
-    }
-
-    // Source checkboxes
-    const srcMap: [string, boolean][] = [
-      ["source-clap", m.useCLAP],
-      ["source-effnet", m.useEffNet],
-      ["source-feat-tempo", m.useAudioFeatureTempo],
-      ["source-feat-key", m.useAudioFeatureKey],
-      ["source-feat-mode", m.useAudioFeatureMode],
-      ["source-feat-energy", m.useAudioFeatureEnergy],
-      ["source-feat-dance", m.useAudioFeatureDance],
-    ];
-    for (const [id, val] of srcMap) {
-      const $cb = document.getElementById(id) as HTMLInputElement | null;
-      if ($cb) $cb.checked = val;
-    }
-
-    const $fb = document.getElementById("folder-boost-range") as HTMLInputElement | null;
-    const $fdb = document.getElementById("folder-depth-boost-range") as HTMLInputElement | null;
-    if ($fb) $fb.value = String(m.folderContrastBoost);
-    if ($fdb) $fdb.value = String(m.folderDepthBoost);
-
-    // Scaling checkboxes
-    const $st = document.getElementById("scale-tags-toggle") as HTMLInputElement | null;
-    const $sf = document.getElementById("scale-folders-toggle") as HTMLInputElement | null;
-    if ($st) $st.checked = m.scaleByTags;
-    if ($sf) $sf.checked = m.scaleByFolders;
+    const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
+    if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
   }
 
   /* ── View callbacks ─────────────────────────────────────── */
@@ -966,10 +916,7 @@ export class Controller {
     }
   }
 
-  private async _ensureEmbeddingsAndProject(opts?: {
-    /** If true, do not kick librosa backfill from this call (CLAP/EffNet clicks only). */
-    omitFeaturesGeneration?: boolean;
-  }): Promise<void> {
+  private async _ensureEmbeddingsAndProject(): Promise<void> {
     const m = this.model;
     try {
       const status = await api<{
@@ -988,14 +935,12 @@ export class Controller {
         layout_revision?: string;
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
-      const modelsBlocked =
-        (m.useCLAP && !status.model_ready) ||
-        (m.useEffNet && !status.effnet_model_ready);
+      const modelsBlocked = !status.model_ready || !status.effnet_model_ready;
       m.embeddingModelsLoading = modelsBlocked;
       if (modelsBlocked) {
-        if (m.useCLAP && !status.model_ready) {
+        if (!status.model_ready) {
           toast("CLAP model loading…", "ok");
-        } else if (m.useEffNet && !status.effnet_model_ready) {
+        } else if (!status.effnet_model_ready) {
           toast("EffNet model loading…", "ok");
         }
         this._pollModelReady();
@@ -1005,29 +950,22 @@ export class Controller {
 
       m.embeddingModelsLoading = false;
 
-      // Determine which sources need generation.
       const sourcesNeeded: string[] = [];
-      if (m.useCLAP && status.pending > 0) sourcesNeeded.push("clap");
-      if (m.useEffNet && status.effnet_pending > 0) sourcesNeeded.push("effnet");
-      if (
-        m.anyAudioFeaturesEnabled &&
-        status.features_pending > 0 &&
-        !opts?.omitFeaturesGeneration
-      )
-        sourcesNeeded.push("features");
+      if (status.pending > 0) sourcesNeeded.push("clap");
+      if (status.effnet_pending > 0) sourcesNeeded.push("effnet");
+      if (status.features_pending > 0) sourcesNeeded.push("features");
 
       if (sourcesNeeded.length > 0 && !status.generating) {
         const total = Math.max(
-          m.useCLAP ? status.pending : 0,
-          m.useEffNet ? status.effnet_pending : 0,
-          m.anyAudioFeaturesEnabled ? status.features_pending : 0,
+          status.pending,
+          status.effnet_pending,
+          status.features_pending,
         );
         const workParts: string[] = [];
-        if (m.useCLAP && status.pending > 0)
-          workParts.push(`${status.pending} CLAP`);
-        if (m.useEffNet && status.effnet_pending > 0)
+        if (status.pending > 0) workParts.push(`${status.pending} CLAP`);
+        if (status.effnet_pending > 0)
           workParts.push(`${status.effnet_pending} EffNet`);
-        if (m.anyAudioFeaturesEnabled && status.features_pending > 0)
+        if (status.features_pending > 0)
           workParts.push(`${status.features_pending} audio features`);
         const detail =
           workParts.length > 1 ? ` (${workParts.join(", ")})` : "";
@@ -1039,7 +977,6 @@ export class Controller {
           folder: "",
           recursive: true,
           priority_paths: [],
-          sources: sourcesNeeded,
         });
         this._listenEmbeddingStream();
         return;
@@ -1049,23 +986,15 @@ export class Controller {
         m.embeddingsGenerating = true;
         this.canvas.scheduleDraw();
         this._listenEmbeddingStream();
-        // Still refetch layout: option changes must hit /api/embeddings/projection even
-        // while a batch job runs — otherwise only /status appears and the map never
-        // updates for the new source / scaling / method mix.
-        if (m.viewMode === "embeddings") {
+        // Keep showing the last stable layout while embeddings regenerate; only
+        // fetch a layout when we have no positions yet (first-time progressive PCA).
+        if (m.viewMode === "embeddings" && m.embeddingPositions.size === 0) {
           void this._fetchProjection();
         }
         return;
       }
 
-      // In embedding mode always refresh the layout — `hasData` keyed only to
-      // individual sources missed the case where the *combination* of enabled
-      // sources changes (or counts are briefly inconsistent with the cache).
-      const hasData =
-        (m.useCLAP && status.embedded > 0) ||
-        (m.useEffNet && status.effnet_embedded > 0) ||
-        (m.anyAudioFeaturesEnabled && status.features_extracted > 0);
-      if (m.viewMode === "embeddings" || hasData) {
+      if (m.viewMode === "embeddings") {
         await this._fetchProjection({ status });
       }
     } catch {
@@ -1086,9 +1015,7 @@ export class Controller {
           model_ready: boolean;
           effnet_model_ready: boolean;
         }>("/api/embeddings/status?folder=&recursive=1&models_only=1");
-        const clapOk = !m.useCLAP || status.model_ready;
-        const effnetOk = !m.useEffNet || status.effnet_model_ready;
-        if (clapOk && effnetOk) {
+        if (status.model_ready && status.effnet_model_ready) {
           toast("Models ready", "ok");
           await this._ensureEmbeddingsAndProject();
         } else {
@@ -1139,6 +1066,7 @@ export class Controller {
         data.done >= 2 &&
         (this._embedBatchCount >= interval || data.done === data.total) &&
         m.viewMode === "embeddings" &&
+        m.embeddingPositions.size === 0 &&
         !this._projectionFetchPending
       ) {
         this._embedBatchCount = 0;
@@ -1177,25 +1105,9 @@ export class Controller {
     }
   }
 
-  private _projectionQueryString(methodOverride?: string, skipContext = false): string {
-    const m = this.model;
-    const method = methodOverride ?? m.projectionMethod;
-    const sources = m.activeSources.join(",");
-    let qs = `folder=&recursive=1&method=${method}&sources=${encodeURIComponent(sources)}`;
-    qs += `&feature_mask=${m.audioFeatureMask()}`;
-    qs += `&features_blend=${encodeURIComponent(String(m.featuresBlend))}`;
-    qs += `&folder_boost=${encodeURIComponent(String(m.folderContrastBoost))}`;
-    qs += `&folder_depth_boost=${encodeURIComponent(String(m.folderDepthBoost))}`;
-    if (!skipContext) {
-      if (m.scaleByTags) {
-        const tags = m.contextTags.join(",");
-        if (tags) qs += `&context_tags=${encodeURIComponent(tags)}`;
-      }
-      if (m.scaleByFolders) {
-        qs += "&scale_folders=1";
-      }
-    }
-    return qs;
+  private _projectionQueryString(methodOverride?: string): string {
+    const method = methodOverride ?? "tsne";
+    return `folder=&recursive=1&method=${method}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.
@@ -1211,7 +1123,7 @@ export class Controller {
     this.canvas.scheduleDraw();
     try {
       const raw = await api<unknown>(
-        `/api/embeddings/projection?${this._projectionQueryString("pca", true)}`,
+        `/api/embeddings/projection?${this._projectionQueryString("pca")}`,
       );
       const { positions } = parseProjectionResponse(raw);
       if (!positions.length) return;
@@ -1292,8 +1204,8 @@ export class Controller {
     this._animFrame = requestAnimationFrame(step);
   }
 
-  /** Full TSNE/UMAP/… layout.  Checks the client-side layout cache
-   * (keyed by query string + server revision) so A→B→A revisits are instant.
+  /** Full t-SNE layout.  Checks the client-side layout cache
+   * (keyed by query string + server revision) for instant revisits.
    * Falls back to ``/api/embeddings/projection`` on miss.  The server also
    * has a revision-keyed LRU so repeated requests are fast even without client
    * cache (e.g. after page reload). */
@@ -1728,6 +1640,7 @@ export class Controller {
     const m = this.model;
     const cv = this.canvas;
     const mouse = this.mouse;
+    m.suppressExplodeVisual = true;
     this._fillDragSnapFromSelection();
     mouse.mode = "drag";
     cv.$canvas.style.cursor = "move";
@@ -1755,6 +1668,7 @@ export class Controller {
     const m = this.model;
     const cv = this.canvas;
     const mouse = this.mouse;
+    m.suppressExplodeVisual = true;
     const [wx, wy] = cv.s2w(sx, sy);
 
     mouse.mode = "txform";
@@ -2029,6 +1943,7 @@ export class Controller {
       this._flushPending();
       mouse.mode = "idle";
       mouse.txSnap = null;
+      m.suppressExplodeVisual = false;
       cv.$canvas.style.cursor = "";
       cv.scheduleDraw();
       this.status.update(m);
@@ -2089,6 +2004,7 @@ export class Controller {
     this.mouse.mode = "idle";
     this.mouse.snap = null;
     this.canvas.$canvas.style.cursor = "";
+    this.model.suppressExplodeVisual = false;
     this.model.emit("change");
   }
 
@@ -2128,6 +2044,23 @@ export class Controller {
       e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? cv.$canvas.clientHeight : 1;
     const dx = e.deltaX * norm,
       dy = e.deltaY * norm;
+
+    if (m.explodeHold && this._pointerOverCanvas) {
+      const step =
+        e.deltaMode === 1
+          ? Math.sign(dy) * 0.01
+          : e.deltaMode === 2
+            ? Math.sign(dy) * 0.015
+            : -dy * 0.0002;
+      m.explodeStrength = clamp(m.explodeStrength + step, 0.05, 0.2);
+      const $ex = document.getElementById(
+        "explode-strength-range",
+      ) as HTMLInputElement | null;
+      if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
+      m.saveLS();
+      cv.scheduleDraw();
+      return;
+    }
 
     if (e.ctrlKey) {
       const factor = Math.exp(-dy * 0.005);
@@ -2200,6 +2133,8 @@ export class Controller {
     } else {
       this._commitDrag();
     }
+
+    this.model.suppressExplodeVisual = false;
 
     // Reset interaction state immediately so that any canvas mousemove events
     // fired during the async network call below are ignored.
@@ -2467,6 +2402,19 @@ export class Controller {
     $vm.checked = m.viewMode === "embeddings";
     $vm.addEventListener("change", () => void this._toggleViewMode());
 
+    const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
+    if ($ex) {
+      $ex.value = String(m.explodeStrength);
+      $ex.addEventListener("input", () => {
+        m.explodeStrength = clamp(parseFloat($ex.value) || 0.1, 0.05, 0.2);
+        this.canvas.scheduleDraw();
+      });
+      $ex.addEventListener("change", () => {
+        m.explodeStrength = clamp(parseFloat($ex.value) || 0.1, 0.05, 0.2);
+        m.saveLS();
+      });
+    }
+
     $addT.addEventListener("click", () => {
       let name = "new_tag";
       let n = 1;
@@ -2480,165 +2428,6 @@ export class Controller {
       this._renderTagPanels();
     });
 
-    this._initProjectionToggle();
-    this._initSourceCheckboxes();
-    this._initFolderTuneSliders();
-    this._initScalingToggles();
-  }
-
-  private _initSourceCheckboxes(): void {
-    const m = this.model;
-    const main: [string, "clap" | "effnet"][] = [
-      ["source-clap", "clap"],
-      ["source-effnet", "effnet"],
-    ];
-    for (const [elId, source] of main) {
-      const $cb = document.getElementById(elId) as HTMLInputElement | null;
-      if (!$cb) continue;
-      $cb.checked = source === "clap" ? m.useCLAP : m.useEffNet;
-      $cb.addEventListener("change", () => {
-        const before = m.activeSources.slice().sort().join(",");
-        m.toggleSource(source);
-        const actual = source === "clap" ? m.useCLAP : m.useEffNet;
-        $cb.checked = actual;
-        m.saveLS();
-        if (m.viewMode !== "embeddings") return;
-        const after = m.activeSources.slice().sort().join(",");
-        if (before === after) {
-          void this._fetchProjection();
-          return;
-        }
-        void this._ensureEmbeddingsAndProject({ omitFeaturesGeneration: true });
-      });
-    }
-
-    const feats: [string, "tempo" | "key" | "mode" | "energy" | "dance"][] = [
-      ["source-feat-tempo", "tempo"],
-      ["source-feat-key", "key"],
-      ["source-feat-mode", "mode"],
-      ["source-feat-energy", "energy"],
-      ["source-feat-dance", "dance"],
-    ];
-    for (const [elId, dim] of feats) {
-      const $cb = document.getElementById(elId) as HTMLInputElement | null;
-      if (!$cb) continue;
-      $cb.addEventListener("change", () => {
-        const sourcesBefore = m.activeSources.slice().sort().join(",");
-        m.toggleAudioFeature(dim);
-        m.saveLS();
-        this._syncAudioFeatureCheckbox(elId, dim);
-        if (m.viewMode !== "embeddings") return;
-        const sourcesAfter = m.activeSources.slice().sort().join(",");
-        // Turning individual librosa dims on/off only changes the feature *mask* for
-        // projection.  The cache always stores the full 6D vector per fingerprint —
-        // do not run /generate (and the straggler pending toast) on every mask tweak.
-        // When the ``features`` layer is added or removed entirely, run the full path.
-        if (sourcesBefore === sourcesAfter) {
-          void this._fetchProjection();
-        } else {
-          void this._ensureEmbeddingsAndProject();
-        }
-      });
-    }
-  }
-
-  private _syncAudioFeatureCheckbox(
-    elId: string,
-    dim: "tempo" | "key" | "mode" | "energy" | "dance",
-  ): void {
-    const m = this.model;
-    const $cb = document.getElementById(elId) as HTMLInputElement | null;
-    if (!$cb) return;
-    const val =
-      dim === "tempo"
-        ? m.useAudioFeatureTempo
-        : dim === "key"
-          ? m.useAudioFeatureKey
-          : dim === "mode"
-            ? m.useAudioFeatureMode
-            : dim === "energy"
-              ? m.useAudioFeatureEnergy
-              : m.useAudioFeatureDance;
-    $cb.checked = val;
-  }
-
-  private _initFolderTuneSliders(): void {
-    const m = this.model;
-    const $fb = document.getElementById("folder-boost-range") as HTMLInputElement | null;
-    const $fdb = document.getElementById("folder-depth-boost-range") as HTMLInputElement | null;
-    if ($fb) {
-      $fb.value = String(m.folderContrastBoost);
-      $fb.addEventListener("input", () => {
-        m.folderContrastBoost = parseFloat($fb.value);
-      });
-      $fb.addEventListener("change", () => {
-        m.folderContrastBoost = parseFloat($fb.value);
-        m.saveLS();
-        if (m.viewMode === "embeddings") void this._fetchProjection();
-      });
-    }
-    if ($fdb) {
-      $fdb.value = String(m.folderDepthBoost);
-      $fdb.addEventListener("input", () => {
-        m.folderDepthBoost = parseFloat($fdb.value);
-      });
-      $fdb.addEventListener("change", () => {
-        m.folderDepthBoost = parseFloat($fdb.value);
-        m.saveLS();
-        if (m.viewMode === "embeddings") void this._fetchProjection();
-      });
-    }
-  }
-
-  private _initScalingToggles(): void {
-    const m = this.model;
-    const $tags = document.getElementById("scale-tags-toggle") as HTMLInputElement;
-    const $folders = document.getElementById("scale-folders-toggle") as HTMLInputElement;
-
-    $tags.checked = m.scaleByTags;
-    $folders.checked = m.scaleByFolders;
-
-    const onToggle = () => {
-      m.scaleByTags = $tags.checked;
-      m.scaleByFolders = $folders.checked;
-      m.saveLS();
-      if (m.viewMode === "embeddings") {
-        void this._fetchProjection();
-      } else {
-        void this._switchToMode("embeddings");
-      }
-    };
-
-    $tags.addEventListener("change", onToggle);
-    $folders.addEventListener("change", onToggle);
-  }
-
-  private _initProjectionToggle(): void {
-    const m = this.model;
-    const $toggle = document.getElementById("projection-toggle");
-    if (!$toggle) return;
-
-    const syncActive = () => {
-      for (const btn of $toggle.querySelectorAll<HTMLElement>(".toggle-btn")) {
-        btn.classList.toggle("active", btn.dataset.method === m.projectionMethod);
-      }
-    };
-    syncActive();
-
-    $toggle.addEventListener("click", (e) => {
-      const btn = (e.target as HTMLElement).closest<HTMLElement>(".toggle-btn");
-      if (!btn || !btn.dataset.method) return;
-      const method = btn.dataset.method as ProjectionMethod;
-      if (method === m.projectionMethod) return;
-      m.setProjectionMethod(method);
-      syncActive();
-      m.saveLS();
-      if (m.viewMode === "embeddings") {
-        void this._fetchProjection();
-      } else {
-        void this._switchToMode("embeddings");
-      }
-    });
   }
 
   /* ── Keyboard shortcuts ─────────────────────────────────── */
@@ -2675,6 +2464,52 @@ export class Controller {
       if (t) return t.folder ?? "";
     }
     return null;
+  }
+
+  private _explodeKeysAllowed(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el) return true;
+    if (el.tagName === "TEXTAREA") return false;
+    if (el.tagName === "INPUT") {
+      const type = (el as HTMLInputElement).type.toLowerCase();
+      const isTextEntry =
+        type === "" ||
+        type === "text" ||
+        type === "password" ||
+        type === "email" ||
+        type === "search" ||
+        type === "url" ||
+        type === "tel" ||
+        type === "number" ||
+        type === "date" ||
+        type === "time" ||
+        type === "datetime-local" ||
+        type === "month" ||
+        type === "week";
+      if (isTextEntry) return false;
+    }
+    return true;
+  }
+
+  /** Hold **X** (outside text fields) for explode preview on the canvas. */
+  private _bindExplodeKeys(): void {
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.code !== "KeyX" || e.repeat) return;
+      if (!this._explodeKeysAllowed(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      this.model.explodeHold = true;
+      this.canvas.scheduleDraw();
+    });
+    document.addEventListener("keyup", (e: KeyboardEvent) => {
+      if (e.code !== "KeyX") return;
+      this.model.explodeHold = false;
+      this.canvas.scheduleDraw();
+    });
+    window.addEventListener("blur", () => {
+      if (!this.model.explodeHold) return;
+      this.model.explodeHold = false;
+      this.canvas.scheduleDraw();
+    });
   }
 
   private _bindKeyboard(): void {
@@ -2780,6 +2615,7 @@ export class Controller {
       if (mouse.mode === "drag") {
         this._revertDragSnapToBaseline();
         this._cleanupDocDrag();
+        m.suppressExplodeVisual = false;
         mouse.mode = "idle";
         mouse.snap = null;
         cv.dragGhosts = null;

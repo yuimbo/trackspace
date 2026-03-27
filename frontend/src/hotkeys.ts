@@ -35,6 +35,7 @@ export const MOUSE_HINTS: { label: string; description: string }[] = [
   { label: "Click folder",    description: "Select all tracks in this folder (and subfolders)" },
   { label: "⌘/Ctrl+click",    description: "Add this folder’s tracks to the selection" },
   { label: "Shift+click",     description: "Add tracks from each folder between anchor and this row (set anchor with a normal click)" },
+  { label: "Hold X + scroll", description: "Explode strength (5–20%) on canvas" },
   { label: "Alt+click folder", description: "Exclude folder from the view" },
   { label: "Drag→folder",     description: "Move files to folder" },
   { label: "Dbl-click tag",   description: "Rename tag" },

@@ -12,7 +12,6 @@ _PUBLIC = frozenset({
     "_load_audio_segments",
     "batch_ensure_embeddings",
     "compute_projection",
-    "compute_umap",
     "generate_embedding",
     "generate_text_embeddings",
     "is_model_ready",

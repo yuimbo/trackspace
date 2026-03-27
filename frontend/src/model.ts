@@ -67,21 +67,11 @@ const _LIBROSA_AXIS_DISPLAY: Record<string, string> = {
   danceability: "Dance",
 };
 
-/** Short phrases for CLAP semantic-weighting (orientation in embedding space). */
-const _LIBROSA_AXIS_CONTEXT: Record<string, string> = {
-  tempo: "tempo",
-  key: "musical key",
-  mode: "major or minor mode",
-  energy: "audio energy",
-  danceability: "danceability",
-};
-
 export function isAudioFeatureAxisId(tag: string): boolean {
   return _LIBROSA_FEATURE_SET.has(tag);
 }
 
 export type ViewMode = "tags" | "embeddings";
-export type ProjectionMethod = "umap" | "tsne";
 
 export interface Viewport {
   ox: number;
@@ -130,23 +120,6 @@ export class Model extends EventBus {
   _knownTags: string[] = [];
 
   viewMode: ViewMode = "tags";
-  projectionMethod: ProjectionMethod = "tsne";
-  scaleByTags = true;
-  scaleByFolders = true;
-  useCLAP = true;
-  useEffNet = false;
-  /** Audio descriptors (librosa 6-vector); each toggles dims before projection. */
-  useAudioFeatureTempo = false;
-  useAudioFeatureKey = false;
-  useAudioFeatureMode = false;
-  useAudioFeatureEnergy = false;
-  useAudioFeatureDance = false;
-  /** Overall gain for the audio-feature block (matches server default). */
-  featuresBlend = 0.42;
-  /** Folder semantic re-weighting strength (server default 3). */
-  folderContrastBoost = 3.0;
-  /** Emphasis on deeper folder contrasts; 1=flat, 3=strong edge boost. */
-  folderDepthBoost = 1.5;
   embeddingPositions: Map<string, { x: number; y: number }> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
@@ -160,6 +133,15 @@ export class Model extends EventBus {
   projectionPending = false;
   /** True while CLAP/EffNet are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
+  /**
+   * Hold **X** on the canvas: nudge dots by tag axes (embedding mode) or toward
+   * embedding layout (tag mode). Strength 0.05–0.20 of a unit square chord.
+   */
+  explodeStrength = 0.1;
+  /** While true, user is holding X (not persisted). */
+  explodeHold = false;
+  /** Hide explode offset during tag drag / transform so coordinates stay consistent. */
+  suppressExplodeVisual = false;
   libraryLoadProgress: {
     done: number;
     total: number;
@@ -245,22 +227,6 @@ export class Model extends EventBus {
     return this.tracks.some((t) => t.tags[tag] !== undefined);
   }
 
-  /** Tag names for semantic weighting (all get full boost). */
-  get contextTags(): string[] {
-    const base = [...this.tags];
-    const extra: string[] = [];
-    for (const id of LIBROSA_FEATURE_AXIS_IDS) {
-      const filtered = (() => {
-        const r = this.filterRanges[id];
-        return r && (r[0] > 0 || r[1] < 1);
-      })();
-      const active =
-        this.axisX === id || this.axisY === id || filtered;
-      if (active) extra.push(_LIBROSA_AXIS_CONTEXT[id]);
-    }
-    return [...new Set([...base, ...extra])];
-  }
-
   axisDisplayName(axis: string): string {
     return _LIBROSA_AXIS_DISPLAY[axis] ?? axis;
   }
@@ -280,15 +246,6 @@ export class Model extends EventBus {
     const k = axis as keyof TrackAudioFeatures;
     const v = row[k];
     return typeof v === "number" ? v : undefined;
-  }
-
-  /** Unique folder paths for semantic weighting (depth determines boost). */
-  get contextFolders(): string[] {
-    const s = new Set<string>();
-    for (const t of this.allTracks) {
-      if (t.folder) s.add(t.folder);
-    }
-    return [...s];
   }
 
   trackByPath(path: string): Track | undefined {
@@ -501,87 +458,6 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
-  setProjectionMethod(method: ProjectionMethod): void {
-    if (this.projectionMethod === method) return;
-    this.projectionMethod = method;
-    this.emit("change");
-  }
-
-  get anyAudioFeaturesEnabled(): boolean {
-    return (
-      this.useAudioFeatureTempo ||
-      this.useAudioFeatureKey ||
-      this.useAudioFeatureMode ||
-      this.useAudioFeatureEnergy ||
-      this.useAudioFeatureDance
-    );
-  }
-
-  /** Six ``0``/``1`` chars: tempo, key_cos, key_sin, mode, energy, danceability. */
-  audioFeatureMask(): string {
-    const b = (x: boolean) => (x ? "1" : "0");
-    return [
-      b(this.useAudioFeatureTempo),
-      b(this.useAudioFeatureKey),
-      b(this.useAudioFeatureKey),
-      b(this.useAudioFeatureMode),
-      b(this.useAudioFeatureEnergy),
-      b(this.useAudioFeatureDance),
-    ].join("");
-  }
-
-  get activeSources(): string[] {
-    const s: string[] = [];
-    if (this.useCLAP) s.push("clap");
-    if (this.useEffNet) s.push("effnet");
-    if (this.anyAudioFeaturesEnabled) s.push("features");
-    return s;
-  }
-
-  toggleSource(source: "clap" | "effnet"): void {
-    const field = source === "clap" ? "useCLAP" : "useEffNet";
-    const next = !this[field];
-    if (!next && this.activeSources.length <= 1) return;
-    (this as Record<string, unknown>)[field] = next;
-    this.emit("change");
-  }
-
-  toggleAudioFeature(
-    dim: "tempo" | "key" | "mode" | "energy" | "dance",
-  ): void {
-    const field =
-      dim === "tempo"
-        ? "useAudioFeatureTempo"
-        : dim === "key"
-          ? "useAudioFeatureKey"
-          : dim === "mode"
-            ? "useAudioFeatureMode"
-            : dim === "energy"
-              ? "useAudioFeatureEnergy"
-              : "useAudioFeatureDance";
-    const prev = this[field as keyof Model] as boolean;
-    const next = !prev;
-    if (!next && !this.useCLAP && !this.useEffNet && !this._anyAudioBesides(field)) {
-      return;
-    }
-    (this as Record<string, unknown>)[field] = next;
-    this.emit("change");
-  }
-
-  private _anyAudioBesides(
-    field: "useAudioFeatureTempo" | "useAudioFeatureKey" | "useAudioFeatureMode" | "useAudioFeatureEnergy" | "useAudioFeatureDance",
-  ): boolean {
-    const m: Record<string, boolean> = {
-      useAudioFeatureTempo: this.useAudioFeatureTempo,
-      useAudioFeatureKey: this.useAudioFeatureKey,
-      useAudioFeatureMode: this.useAudioFeatureMode,
-      useAudioFeatureEnergy: this.useAudioFeatureEnergy,
-      useAudioFeatureDance: this.useAudioFeatureDance,
-    };
-    m[field] = false;
-    return Object.values(m).some(Boolean);
-  }
-
   setFilterRange(tag: string, r: [number, number]): void {
     this.filterRanges[tag] = r;
     this.emit("change");
@@ -750,19 +626,7 @@ export class Model extends EventBus {
         filterRanges: this.filterRanges,
         hoverPreview: this.hoverPreview,
         viewMode: this.viewMode,
-        projectionMethod: this.projectionMethod,
-        scaleByTags: this.scaleByTags,
-        scaleByFolders: this.scaleByFolders,
-        useCLAP: this.useCLAP,
-        useEffNet: this.useEffNet,
-        useAudioFeatureTempo: this.useAudioFeatureTempo,
-        useAudioFeatureKey: this.useAudioFeatureKey,
-        useAudioFeatureMode: this.useAudioFeatureMode,
-        useAudioFeatureEnergy: this.useAudioFeatureEnergy,
-        useAudioFeatureDance: this.useAudioFeatureDance,
-        featuresBlend: this.featuresBlend,
-        folderContrastBoost: this.folderContrastBoost,
-        folderDepthBoost: this.folderDepthBoost,
+        explodeStrength: this.explodeStrength,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -782,20 +646,10 @@ export class Model extends EventBus {
         this.filterRanges = _migrateFilterRanges(d.filterRanges);
         this.hoverPreview = d.hoverPreview ?? false;
         this.viewMode = d.viewMode ?? "tags";
-        this.projectionMethod = d.projectionMethod ?? "tsne";
-        this.scaleByTags = d.scaleByTags ?? true;
-        this.scaleByFolders = d.scaleByFolders ?? true;
-        this.useCLAP = d.useCLAP ?? true;
-        this.useEffNet = d.useEffNet ?? false;
-        const legacyAudio = (d as { useAudioFeatures?: boolean }).useAudioFeatures;
-        this.useAudioFeatureTempo = d.useAudioFeatureTempo ?? legacyAudio ?? false;
-        this.useAudioFeatureKey = d.useAudioFeatureKey ?? legacyAudio ?? false;
-        this.useAudioFeatureMode = d.useAudioFeatureMode ?? legacyAudio ?? false;
-        this.useAudioFeatureEnergy = d.useAudioFeatureEnergy ?? legacyAudio ?? false;
-        this.useAudioFeatureDance = d.useAudioFeatureDance ?? legacyAudio ?? false;
-        this.featuresBlend = d.featuresBlend ?? 0.42;
-        this.folderContrastBoost = d.folderContrastBoost ?? 3.0;
-        this.folderDepthBoost = d.folderDepthBoost ?? 1.5;
+        const ex = Number((d as { explodeStrength?: number }).explodeStrength);
+        this.explodeStrength = Number.isFinite(ex)
+          ? Math.min(0.2, Math.max(0.05, ex))
+          : 0.1;
       }
     } catch {
       /* start fresh */

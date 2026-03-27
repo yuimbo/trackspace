@@ -2,8 +2,8 @@
 
 CLAP model I/O lives in `clap.py`. EffNet and librosa descriptors live in
 `effnet` / `librosa_audio_features`). This module concatenates cached source rows, applies
-folder/tag re-weighting (CLAP text directions in the CLAP column span), and runs
-PCA / UMAP / t-SNE. Re-exported from ``backend.embeddings``.
+folder re-weighting (CLAP text fallbacks in the CLAP column span), and runs PCA
+(preview) or t-SNE (final layout). Re-exported from ``backend.embeddings``.
 """
 
 import hashlib
@@ -36,10 +36,10 @@ FOLDER_PCA_MIN_TRACKS = 8
 FOLDER_PCA_MAX_COMPONENTS = 2
 FOLDER_PCA_SECOND_SV_RATIO = 0.18
 
-# Tiered projection LRU (composite gather → semantic direction basis → UMAP/t-SNE).
-_COMPOSITE_CACHE_MAX = 10
-_SEMANTIC_BASIS_CACHE_MAX = 10
-_REVISION_LAYOUT_CACHE_MAX = 16
+# Tiered projection LRU (composite gather → semantic direction basis → t-SNE).
+_COMPOSITE_CACHE_MAX = 24
+_SEMANTIC_BASIS_CACHE_MAX = 16
+_REVISION_LAYOUT_CACHE_MAX = 32
 _composite_cache: OrderedDict[str, tuple[list[str], np.ndarray, int, int]] = (
     OrderedDict()
 )
@@ -587,7 +587,7 @@ def _use_cuml_projection() -> bool:
         _cuml_projection_enabled = False
         return False
     _cuml_projection_enabled = True
-    log.info("UMAP/t-SNE: using RAPIDS cuML (CUDA)")
+    log.info("t-SNE: using RAPIDS cuML (CUDA)")
     return True
 
 
@@ -608,7 +608,7 @@ def _use_mlx_vis_projection() -> bool:
         _mlx_vis_projection_enabled = False
         return False
     _mlx_vis_projection_enabled = True
-    log.info("UMAP/t-SNE: using mlx-vis (Metal)")
+    log.info("t-SNE: using mlx-vis (Metal)")
     return True
 
 
@@ -625,52 +625,6 @@ def _mlx_tsne_max_points() -> int:
     except ValueError:
         return 10_000
     return v
-
-
-def _project_umap(mat: np.ndarray) -> np.ndarray:
-    global _cuml_projection_enabled, _mlx_vis_projection_enabled
-    if _use_cuml_projection():
-        try:
-            from cuml.manifold import UMAP
-
-            n_neighbors = min(15, len(mat) - 1)
-            reducer = UMAP(
-                n_components=2,
-                n_neighbors=n_neighbors,
-                min_dist=0.1,
-                random_state=42,
-                output_type="numpy",
-            )
-            return np.asarray(
-                reducer.fit_transform(np.asarray(mat, dtype=np.float32)),
-                dtype=np.float32,
-            )
-        except Exception as e:
-            log.warning("cuML UMAP failed; using umap-learn: %s", e)
-            _cuml_projection_enabled = False
-    if _use_mlx_vis_projection():
-        try:
-            from mlx_vis._umap.umap import UMAP
-
-            n_neighbors = min(15, len(mat) - 1)
-            reducer = UMAP(
-                n_components=2,
-                n_neighbors=n_neighbors,
-                min_dist=0.1,
-                random_state=42,
-                normalize=False,
-            )
-            x = np.asarray(mat, dtype=np.float32)
-            with _inference_lock:
-                y = reducer.fit_transform(x)
-            return np.asarray(y, dtype=np.float32)
-        except Exception as e:
-            log.warning("mlx-vis UMAP failed; using umap-learn: %s", e)
-            _mlx_vis_projection_enabled = False
-    import umap  # lazy — heavy import
-    n_neighbors = min(15, len(mat) - 1)
-    reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors, min_dist=0.1, random_state=42)
-    return reducer.fit_transform(mat)
 
 
 def _project_tsne(mat: np.ndarray) -> np.ndarray:
@@ -773,7 +727,7 @@ def compute_projection(
     track_infos: list[dict],
     feature_cache,
     version: int = EMBEDDING_VERSION,
-    method: str = "umap",
+    method: str = "tsne",
     context_tags: list[str] | None = None,
     context_folders: list[str] | None = None,
     scale_folders: bool = False,
@@ -784,10 +738,10 @@ def compute_projection(
     features_blend: float = 0.42,
     layout_revision: str | None = None,
 ) -> list[dict]:
-    if layout_revision and method in ("umap", "tsne"):
+    if layout_revision and method == "tsne":
         hit = _tier_cache_get(_revision_layout_cache, layout_revision)
         if hit is not None:
-            log.debug("projection: revision cache hit (%s)", method)
+            log.debug("projection: revision cache hit (tsne)")
             return hit
 
     t0 = time.perf_counter()
@@ -852,10 +806,10 @@ def compute_projection(
     t_before_proj = time.perf_counter()
     if method == "pca":
         coords = _project_pca(mat_proj, paths)
-    elif method == "tsne":
-        coords = _project_tsne(mat_proj)
     else:
-        coords = _project_umap(mat_proj)
+        if method != "tsne":
+            log.debug("unknown projection method %r; using t-SNE", method)
+        coords = _project_tsne(mat_proj)
     t_after_proj = time.perf_counter()
 
     t_before_norm = time.perf_counter()
@@ -880,12 +834,9 @@ def compute_projection(
         for i in range(len(paths))
     ]
 
-    if layout_revision and method in ("umap", "tsne"):
+    if layout_revision and method == "tsne":
         _tier_cache_put(
             _revision_layout_cache, layout_revision, result, _REVISION_LAYOUT_CACHE_MAX,
         )
 
     return result
-
-
-compute_umap = compute_projection

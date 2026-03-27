@@ -7,6 +7,7 @@ from backend.embeddings.coverage import (
     eligible_paths_for_projection,
 )
 from backend.embeddings.layout_revision import compute_layout_revision
+from backend.embeddings.projection_config import PROJECTION_RECIPE_VERSION
 
 
 def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
@@ -42,28 +43,10 @@ def test_eligible_paths_requires_all_sources():
 def test_layout_revision_stable_for_same_inputs():
     r1 = compute_layout_revision(
         eligible_paths=["b.mp3", "a.mp3"],
-        method="tsne",
-        sources=("clap", "effnet"),
-        feature_mask=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        features_blend=0.42,
-        folder_boost=3.0,
-        folder_depth_boost=1.5,
-        context_tags=["energy", "mood"],
-        context_folders=None,
-        scale_folders=True,
         cache_versions=(2, 1, 1),
     )
     r2 = compute_layout_revision(
         eligible_paths=["a.mp3", "b.mp3"],
-        method="tsne",
-        sources=("clap", "effnet"),
-        feature_mask=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        features_blend=0.42,
-        folder_boost=3.0,
-        folder_depth_boost=1.5,
-        context_tags=["mood", "energy"],
-        context_folders=None,
-        scale_folders=True,
         cache_versions=(2, 1, 1),
     )
     assert r1 == r2
@@ -72,15 +55,6 @@ def test_layout_revision_stable_for_same_inputs():
 def _base_revision_kwargs():
     return dict(
         eligible_paths=["a.mp3", "b.mp3"],
-        method="tsne",
-        sources=("clap", "effnet"),
-        feature_mask=[1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-        features_blend=0.42,
-        folder_boost=3.0,
-        folder_depth_boost=1.5,
-        context_tags=["mood"],
-        context_folders=None,
-        scale_folders=True,
         cache_versions=(2, 1, 1),
     )
 
@@ -92,16 +66,10 @@ def test_layout_revision_changes_when_cache_versions_change():
     assert r_a != r_b
 
 
-def test_layout_revision_changes_when_feature_mask_changes():
+def test_layout_revision_changes_when_recipe_version_changes():
     kw = _base_revision_kwargs()
     r_a = compute_layout_revision(**kw)
-    alt_mask = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-    r_b = compute_layout_revision(**{**kw, "feature_mask": alt_mask})
-    assert r_a != r_b
-
-
-def test_layout_revision_changes_when_features_blend_changes():
-    kw = _base_revision_kwargs()
-    r_a = compute_layout_revision(**kw)
-    r_b = compute_layout_revision(**{**kw, "features_blend": 0.9})
+    r_b = compute_layout_revision(
+        **{**kw, "projection_recipe_version": PROJECTION_RECIPE_VERSION + 1},
+    )
     assert r_a != r_b
