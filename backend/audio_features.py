@@ -201,8 +201,10 @@ def _mono_centered_window_or_full(
         audio, sr_o = librosa_load(
             path, sr=sr, mono=True, offset=offset, duration=read_dur,
         )
+        partial_ok = True
     except Exception:
         audio, sr_o = librosa_load(path, sr=sr, mono=True)
+        partial_ok = False
     if audio.size == 0:
         audio, sr_o = librosa_load(path, sr=sr, mono=True)
         if audio.size == 0:
@@ -216,8 +218,14 @@ def _mono_centered_window_or_full(
         return audio, sr_o, warn
     dec = float(audio.shape[0]) / float(sr_o)
     warn = None
-    if meta_dur > window_seconds * 1.25 and dec < meta_dur * 0.35:
-        warn = decode_reliability_user_message(meta_dur, dec)
+    if partial_ok:
+        # Bound excerpt: decoded length should match *read_dur*, not *meta_dur*.
+        expected = min(float(read_dur), meta_dur)
+        if expected >= 2.0 and dec < expected * 0.25:
+            warn = decode_reliability_user_message(meta_dur, dec)
+    else:
+        if meta_dur > window_seconds * 1.25 and dec < meta_dur * 0.35:
+            warn = decode_reliability_user_message(meta_dur, dec)
     return audio, sr_o, warn
 
 

@@ -11,6 +11,7 @@ import argparse
 import threading
 import queue
 import time
+import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -125,7 +126,7 @@ class _FilesystemHandler(FileSystemEventHandler):
             log.exception("Watchdog: failed to read new file %s", abs_path)
             return
 
-        rel_path = os.path.relpath(abs_path, MUSIC_ROOT)
+        rel_path = _virtual_from_abs(abs_path)
         log.info("Watchdog: ingested %s", rel_path)
 
         fp = data.get("fingerprint")
@@ -192,11 +193,11 @@ _status_coverage_lru: OrderedDict[tuple[str, int, str], tuple[dict, str | None]]
 _embed_status_cache_lock = threading.Lock()
 
 
-def _library_mtime_signature(folder_abs: str, recursive: bool) -> str:
-    """Cheap fingerprint of the mp3 set under *folder_abs* (path + mtime per file)."""
+def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
+    """Cheap fingerprint of mp3 set under one virtual folder (or all roots)."""
     h = hashlib.sha256()
-    for p in _list_mp3s(folder_abs, recursive):
-        rel = os.path.relpath(p, MUSIC_ROOT)
+    for p in _list_mp3s(folder_vpath, recursive):
+        rel = _virtual_from_abs(p)
         h.update(rel.encode("utf-8", errors="replace"))
         h.update(b"\0")
         try:
@@ -260,7 +261,129 @@ DIST_DIR = os.path.join(_PROJECT_DIR, "frontend", "dist")
 
 app = Flask(__name__, static_folder=None, template_folder=os.path.join(_PKG_DIR, "templates"))
 
-MUSIC_ROOT: str = ""  # set via CLI
+MUSIC_ROOT: str = ""  # initial CLI root
+ROOTS: "OrderedDict[str, str]" = OrderedDict()
+_ROOTS_STATE_PATH = os.path.join(_DATA_DIR, "roots.json")
+_OBSERVER: Observer | None = None
+_ROOT_WATCHES: dict[str, object] = {}
+
+
+def _stable_root_id(abs_path: str) -> str:
+    base = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
+    rid = base
+    i = 1
+    while rid in ROOTS and ROOTS[rid] != abs_path:
+        rid = f"{base[:6]}{i:02d}"
+        i += 1
+    return rid
+
+
+def _add_root(abs_path: str) -> tuple[bool, str]:
+    """Insert a root folder and merge redundant descendants."""
+    p = os.path.abspath(abs_path)
+    if not os.path.isdir(p):
+        raise FileNotFoundError(p)
+    for rid, root_abs in list(ROOTS.items()):
+        if p == root_abs or p.startswith(root_abs.rstrip(os.sep) + os.sep):
+            return False, rid
+    for rid, root_abs in list(ROOTS.items()):
+        if root_abs.startswith(p.rstrip(os.sep) + os.sep):
+            del ROOTS[rid]
+    rid = _stable_root_id(p)
+    ROOTS[rid] = p
+    return True, rid
+
+
+def _remove_root(root_id: str) -> bool:
+    if root_id in ROOTS:
+        del ROOTS[root_id]
+        return True
+    return False
+
+
+def _schedule_root_watch(root_id: str) -> None:
+    """Start watchdog monitoring for one root when observer is active."""
+    if _OBSERVER is None:
+        return
+    root_abs = ROOTS.get(root_id)
+    if not root_abs or root_id in _ROOT_WATCHES:
+        return
+    try:
+        _ROOT_WATCHES[root_id] = _OBSERVER.schedule(_FilesystemHandler(), root_abs, recursive=True)
+    except Exception:
+        log.exception("Watchdog: failed to schedule root watch for %s (%s)", root_id, root_abs)
+
+
+def _unschedule_root_watch(root_id: str) -> None:
+    """Stop watchdog monitoring for one root when observer is active."""
+    watch = _ROOT_WATCHES.pop(root_id, None)
+    if _OBSERVER is None or watch is None:
+        return
+    try:
+        _OBSERVER.unschedule(watch)
+    except Exception:
+        log.exception("Watchdog: failed to unschedule root watch for %s", root_id)
+
+
+def _save_roots_state() -> None:
+    """Persist active roots so they survive process restarts."""
+    payload = {"roots": list(ROOTS.values())}
+    with open(_ROOTS_STATE_PATH, "w", encoding="utf-8") as f:
+        _json.dump(payload, f)
+
+
+def _load_roots_state(default_root: str | None) -> None:
+    """Load persisted roots.
+
+    If the JSON is missing/empty and *default_root* is set, use that single root.
+    If *default_root* is ``None`` (no CLI path / env), start with no roots until
+    the user adds one in the UI — do **not** impute cwd.
+    """
+    ROOTS.clear()
+    loaded_any = False
+    try:
+        with open(_ROOTS_STATE_PATH, "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        for raw in data.get("roots", []):
+            p = os.path.abspath(str(raw))
+            if os.path.isdir(p):
+                _add_root(p)
+                loaded_any = True
+    except Exception:
+        loaded_any = False
+
+    if not loaded_any and default_root is not None:
+        _add_root(default_root)
+
+    # Normalize persisted state (drops deleted/nonexistent paths, merged descendants).
+    _save_roots_state()
+
+
+def _root_and_rel_from_virtual(vpath: str) -> tuple[str, str]:
+    raw = (vpath or "").strip().lstrip("/")
+    if not raw:
+        abort(400)
+    parts = raw.split("/", 1)
+    rid = parts[0]
+    rel = parts[1] if len(parts) > 1 else ""
+    root_abs = ROOTS.get(rid)
+    if not root_abs:
+        abort(404)
+    return root_abs, rel
+
+
+def _virtual_from_abs(abs_path: str) -> str:
+    best_rid = None
+    best_root = None
+    for rid, root in ROOTS.items():
+        if abs_path == root or abs_path.startswith(root.rstrip(os.sep) + os.sep):
+            if best_root is None or len(root) > len(best_root):
+                best_rid = rid
+                best_root = root
+    if not best_rid or not best_root:
+        abort(400)
+    rel = os.path.relpath(abs_path, best_root)
+    return best_rid if rel == "." else f"{best_rid}/{rel}"
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +391,10 @@ MUSIC_ROOT: str = ""  # set via CLI
 # ---------------------------------------------------------------------------
 
 def _resolve(rel: str) -> str:
-    """Resolve a client-supplied relative path against MUSIC_ROOT safely."""
-    joined = os.path.normpath(os.path.join(MUSIC_ROOT, rel))
-    if not joined.startswith(MUSIC_ROOT):
+    """Resolve a client-supplied virtual path against active roots safely."""
+    root_abs, rel_inside = _root_and_rel_from_virtual(rel)
+    joined = os.path.normpath(os.path.join(root_abs, rel_inside))
+    if not (joined == root_abs or joined.startswith(root_abs.rstrip(os.sep) + os.sep)):
         abort(403)
     return joined
 
@@ -279,8 +403,8 @@ def _is_mp3(name: str) -> bool:
     return name.lower().endswith(".mp3")
 
 
-def _list_mp3s(folder: str, recursive: bool = False) -> list[str]:
-    """Return absolute paths of mp3 files in *folder*."""
+def _list_mp3s_under_abs(folder: str, recursive: bool = False) -> list[str]:
+    """Return absolute paths of mp3 files in one absolute folder."""
     results = []
     if recursive:
         for dirpath, _, filenames in os.walk(folder):
@@ -295,18 +419,30 @@ def _list_mp3s(folder: str, recursive: bool = False) -> list[str]:
     return sorted(results)
 
 
-def _folder_tree(root: str) -> dict:
-    """Return a nested dict representing the subfolder tree under *root*."""
-    name = os.path.basename(root) or root
+def _list_mp3s(folder_vpath: str, recursive: bool = False) -> list[str]:
+    """Return absolute mp3 paths for one virtual folder, or all roots when empty."""
+    if folder_vpath in ("", "."):
+        results: list[str] = []
+        for root_abs in ROOTS.values():
+            results.extend(_list_mp3s_under_abs(root_abs, recursive=True))
+        return sorted(results)
+    return _list_mp3s_under_abs(_resolve(folder_vpath), recursive)
+
+
+def _folder_tree(root: str, root_id: str, rel_prefix: str = "") -> dict:
+    """Return a nested dict representing the subfolder tree under one root."""
+    name = os.path.basename(root.rstrip(os.sep)) or root
     children = []
     try:
         for entry in sorted(os.listdir(root)):
             full = os.path.join(root, entry)
             if os.path.isdir(full) and not entry.startswith("."):
-                children.append(_folder_tree(full))
+                child_rel = entry if not rel_prefix else f"{rel_prefix}/{entry}"
+                children.append(_folder_tree(full, root_id, child_rel))
     except PermissionError:
         pass
-    return {"name": name, "path": os.path.relpath(root, MUSIC_ROOT), "children": children}
+    vpath = root_id if not rel_prefix else f"{root_id}/{rel_prefix}"
+    return {"name": name, "path": vpath, "children": children, "root_id": root_id}
 
 
 def _cached_read_all(path: str) -> dict:
@@ -355,10 +491,10 @@ def partial_folder_tree():
     if not active_folders:
         active_folders = [active if active != "" else "."]
     pending_rename = request.args.get("pending_rename", "")
-    tree = _folder_tree(MUSIC_ROOT)
+    trees = [_folder_tree(root_abs, rid) for rid, root_abs in ROOTS.items()]
     return render_template(
         "partials/folder_tree.html",
-        tree=tree,
+        trees=trees,
         active_folders=active_folders,
         pending_rename=pending_rename,
         dir_color=_dir_color,
@@ -390,10 +526,48 @@ def serve_assets(filename):
 
 @app.route("/api/folders")
 def api_folders():
-    """Return the folder tree under MUSIC_ROOT (or a subpath)."""
+    """Return the folder tree for all roots (or a subpath)."""
     rel = request.args.get("root", "")
-    root = _resolve(rel)
-    return jsonify(_folder_tree(root))
+    if rel in ("", "."):
+        return jsonify({"roots": [_folder_tree(root_abs, rid) for rid, root_abs in ROOTS.items()]})
+    root_abs = _resolve(rel)
+    parts = rel.split("/", 1)
+    root_id = parts[0]
+    rel_inside = parts[1] if len(parts) > 1 else ""
+    return jsonify(_folder_tree(root_abs, root_id, rel_inside))
+
+
+@app.route("/api/roots/add", methods=["POST"])
+def api_roots_add():
+    data = request.get_json(force=True)
+    path = (data.get("path") or "").strip()
+    if not path:
+        abort(400)
+    abs_path = os.path.abspath(path)
+    if not os.path.isdir(abs_path):
+        return jsonify({"ok": False, "error": "Directory not found"})
+    before_ids = set(ROOTS.keys())
+    changed, root_id = _add_root(abs_path)
+    after_ids = set(ROOTS.keys())
+    for rid in sorted(before_ids - after_ids):
+        _unschedule_root_watch(rid)
+    for rid in sorted(after_ids - before_ids):
+        _schedule_root_watch(rid)
+    _save_roots_state()
+    return jsonify({"ok": True, "changed": changed, "root_id": root_id})
+
+
+@app.route("/api/roots/remove", methods=["POST"])
+def api_roots_remove():
+    data = request.get_json(force=True)
+    root_id = (data.get("root_id") or "").strip()
+    if not root_id:
+        abort(400)
+    if not _remove_root(root_id):
+        return jsonify({"ok": False, "error": "Unknown root"})
+    _unschedule_root_watch(root_id)
+    _save_roots_state()
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
@@ -410,9 +584,7 @@ def api_tracks():
     """
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "0") == "1"
-    folder = _resolve(rel)
-
-    paths = _list_mp3s(folder, recursive)
+    paths = _list_mp3s(rel, recursive)
 
     # Read each file's ID3 header once (tags + metadata) in parallel threads.
     # _cached_read_all checks the in-memory LRU then SQLite before hitting disk.
@@ -431,10 +603,8 @@ def _track_dict_from_read(
     feat_by_fp: dict[str, object] | None = None,
 ) -> dict:
     """One API track object from a filesystem path and ``_cached_read_all`` payload."""
-    rel_path = os.path.relpath(p, MUSIC_ROOT)
-    folder_rel = os.path.relpath(os.path.dirname(p), MUSIC_ROOT)
-    if folder_rel == ".":
-        folder_rel = ""
+    rel_path = _virtual_from_abs(p)
+    folder_rel = _virtual_from_abs(os.path.dirname(p))
     fp = info.get("fingerprint")
     bpm: int | None = None
     musical_key: str | None = None
@@ -489,8 +659,7 @@ def api_library_stream():
     """
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "0") == "1"
-    folder = _resolve(rel)
-    paths = _list_mp3s(folder, recursive)
+    paths = _list_mp3s(rel, recursive)
     total = len(paths)
 
     # Each SSE client gets its own queue; the scan thread fills it.
@@ -541,8 +710,7 @@ def api_tags():
     """Return all known tag names across currently visible tracks."""
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
-    folder = _resolve(rel)
-    paths = _list_mp3s(folder, recursive)
+    paths = _list_mp3s(rel, recursive)
     # Use the same cached reads as api_tracks to avoid redundant disk I/O.
     futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
     names: set[str] = set()
@@ -607,7 +775,7 @@ def api_create_folder():
     if os.path.exists(new_dir):
         return jsonify({"ok": False, "error": "Already exists"})
     os.makedirs(new_dir)
-    return jsonify({"ok": True, "path": os.path.relpath(new_dir, MUSIC_ROOT)})
+    return jsonify({"ok": True, "path": _virtual_from_abs(new_dir)})
 
 
 @app.route("/api/folders/rename", methods=["POST"])
@@ -628,7 +796,7 @@ def api_rename_folder():
         return jsonify({"ok": False, "error": "Already exists"})
     os.rename(old_abs, new_abs)
     _CACHE.remap_prefix(old_abs + os.sep, new_abs + os.sep)
-    return jsonify({"ok": True, "path": os.path.relpath(new_abs, MUSIC_ROOT)})
+    return jsonify({"ok": True, "path": _virtual_from_abs(new_abs)})
 
 
 @app.route("/api/tracks/move", methods=["POST"])
@@ -653,7 +821,10 @@ def api_move_tracks():
         if os.path.exists(dst):
             errors.append(f"Already exists: {os.path.basename(src)}")
             continue
-        os.rename(src, dst)
+        try:
+            os.rename(src, dst)
+        except OSError:
+            shutil.move(src, dst)
         _CACHE.remap(src, dst)
         moved += 1
     return jsonify({"ok": True, "moved": moved, "errors": errors})
@@ -666,7 +837,7 @@ def api_rename_tag():
     Body: {"old": "energy", "new": "vibe", "folder": "", "recursive": true}
     """
     data = request.get_json(force=True)
-    folder = _resolve(data.get("folder", ""))
+    folder = data.get("folder", "")
     recursive = data.get("recursive", True)
     paths = _list_mp3s(folder, recursive)
     count = sum(1 for p in paths if rename_tag(p, data["old"], data["new"]))
@@ -680,7 +851,7 @@ def api_delete_tag():
     Body: {"name": "energy", "folder": "", "recursive": true}
     """
     data = request.get_json(force=True)
-    folder = _resolve(data.get("folder", ""))
+    folder = data.get("folder", "")
     recursive = data.get("recursive", True)
     paths = _list_mp3s(folder, recursive)
     for p in paths:
@@ -781,15 +952,15 @@ def _feature_mask_as_list(params: _ProjectionParams) -> list[float]:
     return [float(x) for x in arr]
 
 
-def _build_track_infos(folder_abs: str, recursive: bool) -> list[dict]:
+def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
     """Build lightweight track info dicts with path + fingerprint for embedding ops."""
-    paths = _list_mp3s(folder_abs, recursive)
+    paths = _list_mp3s(folder_vpath, recursive)
     futures = {_THREAD_POOL.submit(_cached_read_all, p): p for p in paths}
     infos = []
     for fut in as_completed(futures):
         p = futures[fut]
         info = fut.result()
-        rel_path = os.path.relpath(p, MUSIC_ROOT)
+        rel_path = _virtual_from_abs(p)
         infos.append({
             "path": rel_path,
             "fingerprint": info.get("fingerprint"),
@@ -825,9 +996,8 @@ def api_embeddings_status():
 
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
-    folder = _resolve(rel)
-    lib_sig = _library_mtime_signature(folder, recursive)
-    infos = _track_infos_cached(folder, recursive, lib_sig)
+    lib_sig = _library_mtime_signature(rel, recursive)
+    infos = _track_infos_cached(rel, recursive, lib_sig)
 
     versions = SourceVersions(EMBEDDING_VERSION, EFFNET_VERSION, FEATURES_VERSION)
     write_epoch = _FEATURES.write_epoch()
@@ -922,7 +1092,7 @@ def api_embeddings_generate():
     recursive = data.get("recursive", True)
     priority_paths: list[str] = data.get("priority_paths", [])
     sources: list[str] = data.get("sources", ["clap"])
-    folder = _resolve(rel)
+    folder = rel
 
     # Validate that required models are ready.
     if "clap" in sources and not embeddings.is_model_ready():
@@ -973,7 +1143,7 @@ def api_embeddings_generate():
                     break
 
                 effnet_paths = [
-                    os.path.join(MUSIC_ROOT, t["path"])
+                    _resolve(t["path"])
                     for t, needed in chunk if "effnet" in needed
                 ]
                 effnet_decode_warns: dict[str, str] = {}
@@ -984,9 +1154,9 @@ def api_embeddings_generate():
                     if effnet_paths else {}
                 )
                 for abs_p, msg in effnet_decode_warns.items():
-                    _note_decode(os.path.relpath(abs_p, MUSIC_ROOT), msg)
+                    _note_decode(_virtual_from_abs(abs_p), msg)
                 feature_paths = [
-                    os.path.join(MUSIC_ROOT, t["path"])
+                    _resolve(t["path"])
                     for t, needed in chunk if "features" in needed
                 ]
                 feat_decode_warns: dict[str, str] = {}
@@ -997,10 +1167,10 @@ def api_embeddings_generate():
                     if feature_paths else {}
                 )
                 for abs_p, msg in feat_decode_warns.items():
-                    _note_decode(os.path.relpath(abs_p, MUSIC_ROOT), msg)
+                    _note_decode(_virtual_from_abs(abs_p), msg)
 
                 for t, needed in chunk:
-                    abs_path = os.path.join(MUSIC_ROOT, t["path"])
+                    abs_path = _resolve(t["path"])
                     fp = t["fingerprint"]
                     ok = True
                     failures: list[str] = []
@@ -1131,8 +1301,7 @@ def api_embeddings_projection():
     """
     rel = request.args.get("folder", "")
     recursive = request.args.get("recursive", "1") == "1"
-    folder = _resolve(rel)
-    infos = _build_track_infos(folder, recursive)
+    infos = _build_track_infos(rel, recursive)
 
     proj = _parse_projection_params(request, default_when_no_method=True)
 
@@ -1194,8 +1363,12 @@ def _start_gc_thread(interval: int = 600) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Trackspace server")
-    parser.add_argument("root", nargs="?", default=".",
-                        help="Root music directory to serve (default: cwd)")
+    parser.add_argument(
+        "root",
+        nargs="?",
+        default=None,
+        help="Optional initial music root (otherwise use persisted roots only; no implicit cwd)",
+    )
     parser.add_argument("-p", "--port", type=int, default=5111)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--no-clap", action="store_true",
@@ -1207,8 +1380,13 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
     global MUSIC_ROOT
-    MUSIC_ROOT = os.path.abspath(args.root)
-    print(f"Trackspace serving: {MUSIC_ROOT}")
+    cli_root = os.path.abspath(args.root) if args.root else None
+    MUSIC_ROOT = cli_root or ""
+    _load_roots_state(cli_root)
+    if ROOTS:
+        print(f"Trackspace serving roots: {', '.join(ROOTS.values())}")
+    else:
+        print("Trackspace: no library roots — add folders in the sidebar (or pass a path on the CLI)")
 
     from backend.fingerprint import _FPCALC
     if _FPCALC:
@@ -1216,10 +1394,12 @@ def main():
     else:
         print("WARNING: fpcalc not found — fingerprinting disabled. Install: brew install chromaprint")
 
-    _observer = Observer()
-    _observer.schedule(_FilesystemHandler(), MUSIC_ROOT, recursive=True)
-    _observer.daemon = True
-    _observer.start()
+    global _OBSERVER
+    _OBSERVER = Observer()
+    _OBSERVER.daemon = True
+    _OBSERVER.start()
+    for rid in list(ROOTS.keys()):
+        _schedule_root_watch(rid)
 
     _start_gc_thread()
 

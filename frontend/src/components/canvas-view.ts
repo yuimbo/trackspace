@@ -1,5 +1,6 @@
 import type { Model, Track } from "../model";
 import { dirColor } from "../lib/toast";
+import { displayFolderPath } from "../lib/path-presenter";
 
 
 // ─── Types ───────────────────────────────────────────────────
@@ -802,9 +803,7 @@ export class CanvasView {
       return;
     }
 
-    const folderLine = (track.folder || "").trim()
-      ? track.folder
-      : "Library root";
+    const folderLine = displayFolderPath(track.folder || "");
     const ar = (track.artist || "").trim();
     const ti = (track.title || "").trim();
     const titleLine =

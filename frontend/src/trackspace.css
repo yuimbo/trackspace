@@ -68,12 +68,27 @@ body { display: flex; }
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 4px;
   margin-bottom: 4px;
   flex-shrink: 0;
 }
 #folder-controls button {
   font-size: 11px;
   padding: 2px 8px;
+}
+#root-drop-hint {
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+  flex-shrink: 0;
+}
+#folder-section.root-drop-active #folder-tree {
+  outline: 1px dashed var(--accent-hi);
+  outline-offset: -2px;
+  background: #ffffff08;
+}
+.folder-row.root-dragging {
+  opacity: 0.45;
 }
 
 #folder-tree {
@@ -92,8 +107,6 @@ body { display: flex; }
   padding: 1px 0;
   user-select: none;
 }
-.folder-row:hover .folder-sel-btn { opacity: 1; }
-
 .folder-row.folder-fully-excluded .folder-label {
   opacity: 0.4;
 }
@@ -106,6 +119,12 @@ body { display: flex; }
   font-size: 10px;
   color: var(--fg-dim);
   flex-shrink: 0;
+}
+.folder-arrow.folder-arrow-add {
+  color: var(--accent);
+}
+.folder-arrow.folder-arrow-add:hover {
+  color: var(--accent-hi);
 }
 
 .folder-swatch {
@@ -142,14 +161,33 @@ body { display: flex; }
   opacity: 1;
   box-shadow: 0 0 6px 2px var(--accent);
 }
+.folder-row.folder-hover .folder-swatch {
+  opacity: 1;
+  box-shadow: 0 0 6px 2px var(--accent);
+}
+.folder-row.folder-hover-track .folder-swatch {
+  opacity: 1;
+  box-shadow: 0 0 6px 2px var(--accent);
+}
 .folder-row.folder-sel .folder-label:not(.active):not(:hover) {
+  color: var(--accent-hi);
+}
+.folder-row.folder-hover .folder-label:not(.active):not(:hover) {
+  color: var(--accent-hi);
+}
+.folder-row.folder-hover-track .folder-label:not(.active):not(:hover) {
   color: var(--accent-hi);
 }
 .folder-row.folder-sel .folder-label.active {
   text-shadow: 0 0 8px var(--accent-hi);
 }
+.folder-row.folder-hover .folder-label.active {
+  text-shadow: 0 0 8px var(--accent-hi);
+}
+.folder-row.folder-hover-track .folder-label.active {
+  text-shadow: 0 0 8px var(--accent-hi);
+}
 
-.folder-sel-btn,
 .folder-add-btn,
 .folder-reveal-btn,
 .folder-rename-btn {
@@ -161,13 +199,27 @@ body { display: flex; }
   opacity: 0;
   transition: opacity 0.15s;
 }
-.folder-row:hover .folder-add-btn,
 .folder-row:hover .folder-reveal-btn,
 .folder-row:hover .folder-rename-btn { opacity: 1; }
-.folder-sel-btn:hover,
 .folder-add-btn:hover,
 .folder-reveal-btn:hover,
 .folder-rename-btn:hover { color: var(--accent-hi); }
+
+.folder-create-label {
+  flex: 1;
+  min-width: 0;
+  opacity: 0.75;
+  color: var(--accent);
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.folder-create-label:hover {
+  opacity: 1;
+  background: #ffffff08;
+}
+.folder-row-create .folder-swatch {
+  opacity: 0.35;
+}
 
 .folder-rename-input {
   flex: 1;
@@ -724,6 +776,39 @@ kbd {
   min-width: 0;
 }
 
+.selected-folders-overlay {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  max-width: 320px;
+  max-height: 40%;
+  overflow: auto;
+  padding: 6px 8px;
+  border: 1px solid #ffffff22;
+  border-radius: 4px;
+  background: #16213ef0;
+}
+.selected-folders-overlay::-webkit-scrollbar { width: 4px; }
+.selected-folders-overlay::-webkit-scrollbar-thumb { background: #ffffff22; border-radius: 3px; }
+.selected-folders-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+.selected-folder-row {
+  gap: 3px;
+  padding: 0;
+}
+.selected-folder-row .folder-label {
+  font-size: 11px;
+}
+.selected-folder-row .folder-arrow {
+  color: transparent;
+}
+
 .viewport-clear-hides {
   position: absolute;
   top: 8px;
@@ -896,6 +981,46 @@ kbd {
   font-size: 10px;
   color: #ffffff28;
   user-select: none;
+}
+
+#root-add-modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 260;
+}
+#root-add-content {
+  width: min(520px, calc(100vw - 48px));
+  background: var(--bg-side);
+  border: 1px solid #ffffff1f;
+  border-radius: 8px;
+  padding: 16px;
+}
+#root-add-content h2 {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+#root-add-input {
+  width: 100%;
+  background: #ffffff12;
+  border: 1px solid #ffffff24;
+  border-radius: 4px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  padding: 8px 10px;
+}
+#root-add-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 /* ── Hidden utility ───────────────────────────────────────── */

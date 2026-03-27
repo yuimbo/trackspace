@@ -7,7 +7,8 @@ import type {
   StatusView,
   TxHandle,
 } from "./components";
-import { toast, showLoad, hideLoad } from "./lib/toast";
+import { toast, showLoad, hideLoad, dirColor } from "./lib/toast";
+import { displayFolderLeaf, displayFolderPath } from "./lib/path-presenter";
 import {
   CommandManager,
   RenameTagCommand,
@@ -187,6 +188,8 @@ export class Controller {
   private _autoOpenedFolders = new Set<string>();
   /** True while the pointer is inside the viewport canvas (for hover resync). */
   private _pointerOverCanvas = false;
+  private _rootDragId: string | null = null;
+  private _rootDragRow: HTMLElement | null = null;
 
   constructor(
     model: Model,
@@ -239,6 +242,7 @@ export class Controller {
     this._wireModel();
     this._wireViewCallbacks();
     this._bindFolderTree();
+    this._bindRootImport();
     this._bindCanvas();
     this._bindSidebar();
     this._bindKeyboard();
@@ -441,6 +445,150 @@ export class Controller {
     this._autoOpenedFolders.clear();
     this._updateFolderHighlights();
     this._syncFolderTreeActiveLabels();
+    this._wireRootRowDrags();
+  }
+
+  private _bindRootImport(): void {
+    const $section = document.getElementById("folder-section");
+    const $addRoot = document.getElementById("btn-add-root");
+    const $modal = document.getElementById("root-add-modal");
+    const $input = document.getElementById("root-add-input") as HTMLInputElement | null;
+    const $ok = document.getElementById("root-add-ok");
+    const $cancel = document.getElementById("root-add-cancel");
+
+    const closeModal = () => {
+      if (!$modal) return;
+      $modal.classList.add("hidden");
+    };
+    const openModal = async () => {
+      if (!$modal) return;
+      $modal.classList.remove("hidden");
+      if ($input) {
+        $input.value = "";
+        try {
+          const clip = (await navigator.clipboard.readText()).trim();
+          const firstLine = clip.split(/\r?\n/, 1)[0]?.trim() ?? "";
+          const normalized = firstLine.startsWith("file://")
+            ? decodeURIComponent(firstLine.replace(/^file:\/\//, ""))
+            : firstLine;
+          if (normalized.startsWith("/")) {
+            $input.value = normalized;
+            $input.select();
+          }
+        } catch {
+          // Clipboard access may be blocked; keep the input blank.
+        }
+        $input.focus();
+      }
+    };
+    const submitModal = () => {
+      const raw = $input?.value.trim() ?? "";
+      if (!raw) return;
+      closeModal();
+      void this._addRootPath(raw);
+    };
+
+    if ($addRoot) $addRoot.addEventListener("click", openModal);
+    if ($ok) $ok.addEventListener("click", submitModal);
+    if ($cancel) $cancel.addEventListener("click", closeModal);
+    if ($modal) {
+      $modal.addEventListener("click", (e) => {
+        if (e.target === $modal) closeModal();
+      });
+    }
+    if ($input) {
+      $input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          submitModal();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          closeModal();
+        }
+      });
+    }
+    if (!$section) return;
+    $section.addEventListener("dragover", (e) => {
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      e.preventDefault();
+      $section.classList.add("root-drop-active");
+    });
+    $section.addEventListener("dragleave", (e) => {
+      if (e.currentTarget !== e.target) return;
+      $section.classList.remove("root-drop-active");
+    });
+    $section.addEventListener("drop", (e) => {
+      e.preventDefault();
+      $section.classList.remove("root-drop-active");
+      const dt = e.dataTransfer;
+      if (!dt) return;
+      const candidates: string[] = [];
+      for (const f of Array.from(dt.files || [])) {
+        const p = (f as File & { path?: string }).path;
+        if (p) candidates.push(p);
+      }
+      const text = dt.getData("text/plain").trim();
+      if (text) candidates.push(text);
+      const first = candidates.find((p) => p.startsWith("/"));
+      if (!first) {
+        toast("Drop a folder from Finder, or paste an absolute path.", "warn");
+        return;
+      }
+      void this._addRootPath(first);
+    });
+  }
+
+  private async _addRootPath(path: string): Promise<void> {
+    const res = await postJSON<{ ok: boolean; changed?: boolean; error?: string }>(
+      "/api/roots/add",
+      { path },
+    );
+    if (!res.ok) {
+      toast(res.error || "Failed to add root", "error");
+      return;
+    }
+    await this._reloadLibraryAndTree();
+    toast(res.changed ? "Root added" : "Root already covered", "ok");
+  }
+
+  private _wireRootRowDrags(): void {
+    for (const row of this.$folderTree.querySelectorAll<HTMLElement>(".folder-row[data-root-id]")) {
+      row.draggable = true;
+      row.addEventListener("dragstart", () => {
+        const rootId = row.dataset.rootId;
+        if (!rootId) return;
+        this._rootDragId = rootId;
+        this._rootDragRow = row;
+        row.classList.add("root-dragging");
+      });
+      row.addEventListener("dragend", (e) => {
+        const rootId = this._rootDragId;
+        const rowEl = this._rootDragRow;
+        this._rootDragId = null;
+        this._rootDragRow = null;
+        rowEl?.classList.remove("root-dragging");
+        const panel = document.getElementById("folder-section");
+        const underPanel = panel
+          ? e.clientX >= panel.getBoundingClientRect().left &&
+            e.clientX <= panel.getBoundingClientRect().right &&
+            e.clientY >= panel.getBoundingClientRect().top &&
+            e.clientY <= panel.getBoundingClientRect().bottom
+          : false;
+        if (!rootId || underPanel) return;
+        void this._removeRoot(rootId);
+      });
+    }
+  }
+
+  private async _removeRoot(rootId: string): Promise<void> {
+    const res = await postJSON<{ ok: boolean; error?: string }>("/api/roots/remove", { root_id: rootId });
+    if (!res.ok) {
+      toast(res.error || "Failed to remove root", "error");
+      return;
+    }
+    await this._reloadLibraryAndTree();
+    toast("Root removed", "ok");
   }
 
   private _onFolderTreeClick(e: MouseEvent): void {
@@ -463,14 +611,6 @@ export class Controller {
           this._autoOpenedFolders.delete(folderPath);
         }
       }
-      return;
-    }
-
-    if (t.closest(".folder-sel-btn")) {
-      e.stopPropagation();
-      const btn = t.closest(".folder-sel-btn") as HTMLElement;
-      const path = btn.dataset.path ?? ".";
-      this.model.selectInFolder(path);
       return;
     }
 
@@ -533,12 +673,13 @@ export class Controller {
 
   private _syncFolderTreeActiveLabels(): void {
     const activeNorm = new Set<string>([this.model.folder]);
-    for (const label of this.$folderTree.querySelectorAll<HTMLElement>(
-      ".folder-label",
+    for (const label of document.querySelectorAll<HTMLElement>(
+      "#folder-tree .folder-label, #selected-folders-overlay .folder-label",
     )) {
       const norm = this._normFolderPath(label.dataset.path ?? ".");
       label.classList.toggle("active", activeNorm.has(norm));
     }
+    this._renderSelectedLeafFoldersOverlay();
   }
 
   private _updateClearHidesButton(): void {
@@ -663,6 +804,7 @@ export class Controller {
   private _loadLibrary(): Promise<void> {
     const $progress = document.getElementById("loading-progress");
     const m = this.model;
+    m.setAllTracks([]);
 
     return new Promise((resolve) => {
       let firstFlushDone = false;
@@ -742,6 +884,23 @@ export class Controller {
     this.canvas.scheduleDraw();
     this.status.update(this.model);
 
+    if (this.model.viewMode === "embeddings") {
+      void this._ensureEmbeddingsAndProject();
+    }
+  }
+
+  private async _reloadLibraryAndTree(): Promise<void> {
+    showLoad();
+    try {
+      await Promise.all([this._refreshFolderTreeHtmx(), this._loadLibrary()]);
+    } finally {
+      hideLoad();
+    }
+    this.tagPanel.render();
+    this.props.render();
+    this.batch.render();
+    this.canvas.scheduleDraw();
+    this.status.update(this.model);
     if (this.model.viewMode === "embeddings") {
       void this._ensureEmbeddingsAndProject();
     }
@@ -2204,7 +2363,6 @@ export class Controller {
       "view-mode-toggle",
     ) as HTMLInputElement;
     const $addT = document.getElementById("btn-add-tag")!;
-    const $addF = document.getElementById("btn-add-folder")!;
 
     $hov.checked = m.hoverPreview;
     $hov.addEventListener("change", () => {
@@ -2228,8 +2386,6 @@ export class Controller {
       this.tagPanel.scheduleRenameAfterRender(name);
       this.tagPanel.render();
     });
-
-    $addF.addEventListener("click", () => this._createSubfolder(m.folder));
 
     this._initProjectionToggle();
     this._initSourceCheckboxes();
@@ -2609,11 +2765,24 @@ export class Controller {
     const m = this.model;
     const $tree = this.$folderTree;
     const foldersWithSel = this._getFoldersWithSelection();
+    const hoveredTrack =
+      this.canvas.hoveredIdx >= 0 ? m.tracks[this.canvas.hoveredIdx] : null;
+    const hoveredLeafPath =
+      hoveredTrack != null ? (hoveredTrack.folder || ".") : null;
 
-    // Update glow class on every folder row.
-    for (const row of $tree.querySelectorAll<HTMLElement>(".folder-row")) {
-      const path = row.dataset.folderPath ?? ".";
-      row.classList.toggle("folder-sel", foldersWithSel.has(path));
+    // Update glow class on every folder row in tree and selected-folders overlay.
+    for (const row of document.querySelectorAll<HTMLElement>(
+      "#folder-tree .folder-row, #selected-folders-overlay .folder-row",
+    )) {
+      if (row.classList.contains("folder-row-create")) continue;
+      const path = row.dataset.folderPath;
+      if (!path) continue;
+      const inOverlay = !!row.closest("#selected-folders-overlay");
+      row.classList.toggle("folder-sel", !inOverlay && foldersWithSel.has(path));
+      row.classList.toggle(
+        "folder-hover-track",
+        inOverlay && hoveredLeafPath != null && path === hoveredLeafPath,
+      );
       const norm = path === "." ? "" : path;
       row.classList.toggle(
         "folder-fully-excluded",
@@ -2662,5 +2831,88 @@ export class Controller {
       this.model.clearExclusions();
       this.model.saveLS();
     });
+    document
+      .getElementById("selected-folders-overlay")
+      ?.addEventListener("click", (e) => {
+        const label = (e.target as HTMLElement).closest<HTMLElement>(
+          ".folder-label[data-path]",
+        );
+        if (!label) return;
+        e.stopPropagation();
+        this._onFolderLabelActivate(label, e as MouseEvent);
+      });
+    document
+      .getElementById("selected-folders-overlay")
+      ?.addEventListener("mouseleave", () => {
+        const fromDrag =
+          this.mouse.mode === "drag" || this.mouse.mode === "txform";
+        if (fromDrag) return;
+        this.canvas.hoveredFolderPrefix = null;
+        this.canvas.scheduleDraw();
+      });
+  }
+
+  private _renderSelectedLeafFoldersOverlay(): void {
+    const host = document.getElementById("selected-folders-overlay");
+    if (!host) return;
+    const counts = new Map<string, number>();
+    for (const path of this.model.selected) {
+      const t = this.model.trackByPath(path);
+      if (!t) continue;
+      const folder = t.folder ?? "";
+      counts.set(folder, (counts.get(folder) ?? 0) + 1);
+    }
+    if (counts.size === 0) {
+      host.classList.add("hidden");
+      host.innerHTML = "";
+      return;
+    }
+    const items = [...counts.entries()].sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    });
+    const current = this.model.folder;
+    host.innerHTML = "";
+    const title = document.createElement("div");
+    title.className = "selected-folders-title";
+    title.textContent = "Selected folders";
+    host.appendChild(title);
+    for (const [folder, count] of items) {
+      const row = document.createElement("div");
+      row.className = "folder-row selected-folder-row";
+      row.dataset.folderPath = folder === "" ? "." : folder;
+      row.addEventListener("mouseenter", () => {
+        row.classList.add("folder-hover");
+        this.canvas.hoveredSiblingFolder = null;
+        this.canvas.hoveredFolderPrefix = folder;
+        this.canvas.scheduleDraw();
+      });
+      row.addEventListener("mouseleave", () => {
+        row.classList.remove("folder-hover");
+        const fromDrag =
+          this.mouse.mode === "drag" || this.mouse.mode === "txform";
+        if (fromDrag) return;
+        this.canvas.hoveredFolderPrefix = null;
+        this.canvas.scheduleDraw();
+      });
+      const arrow = document.createElement("span");
+      arrow.className = "folder-arrow";
+      arrow.textContent = "\u2003";
+      row.appendChild(arrow);
+      const swatch = document.createElement("span");
+      swatch.className = "folder-swatch";
+      swatch.style.background = dirColor(folder);
+      row.appendChild(swatch);
+      const item = document.createElement("span");
+      item.className = "folder-label";
+      if (current === folder) item.classList.add("active");
+      item.dataset.path = folder === "" ? "." : folder;
+      item.title = displayFolderPath(folder);
+      const label = displayFolderLeaf(folder);
+      item.textContent = `${label} (${count})`;
+      row.appendChild(item);
+      host.appendChild(row);
+    }
+    host.classList.remove("hidden");
   }
 }

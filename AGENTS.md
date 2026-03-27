@@ -477,3 +477,11 @@ equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
   full weighting.
 - Switching projection method or source checkboxes re-fetches positions from the
   backend and animates the transition.
+
+
+# Continuous improvement
+After any major session, ask yourself:
+
+Based on how our session went above, any architectural insights about things to abstract or refactor we can add to architecture_plan.md?
+
+Or any common pitfalls we can not for future reference in AGENTS.md?

@@ -5,12 +5,20 @@
   {%- set has_kids = node.children and node.children | length > 0 -%}
   {%- set expanded = depth < 1 -%}
   {%- set parent_for_create = '' if node.path == '.' else node.path -%}
-<div class="folder-row" style="padding-left: {{ depth * 14 }}px" data-folder-path="{{ node.path }}">
-  <span class="folder-arrow"{% if has_kids %} data-folder-toggle="1" style="cursor:pointer"{% endif %}>{% if has_kids %}{% if expanded %}▾{% else %}▸{% endif %}{% else %}&#x2003;{% endif %}</span>
+<div class="folder-row" style="padding-left: {{ depth * 14 }}px" data-folder-path="{{ node.path }}"{% if depth == 0 %} data-root-id="{{ node.root_id }}"{% endif %}>
+  <span
+    class="folder-arrow{% if not has_kids %} folder-add-btn folder-arrow-add{% endif %}"
+    {% if has_kids %}
+      data-folder-toggle="1"
+      style="cursor:pointer"
+    {% else %}
+      title="Create subfolder"
+      data-parent="{{ parent_for_create }}"
+      style="cursor:pointer"
+    {% endif %}
+  >{% if has_kids %}{% if expanded %}▾{% else %}▸{% endif %}{% else %}+{% endif %}</span>
   <span class="folder-swatch" style="background: {{ dir_color(norm_path) }}"></span>
   <span class="folder-label{% if is_active %} active{% endif %}" data-path="{{ node.path }}"{% if pending_rename == node.path %} data-start-rename="1"{% endif %}>{{ node.name | e }}</span>
-  <span class="folder-sel-btn" title="Add this folder's tracks to the current selection" data-path="{{ node.path }}">◉</span>
-  <span class="folder-add-btn" title="Create subfolder here" data-parent="{{ parent_for_create }}">+</span>
   <span class="folder-reveal-btn" title="Open in Finder" data-path="{{ node.path }}">↗</span>
   {%- if node.path != '.' %}
   {# <span class="folder-rename-btn" title="Rename folder" data-path="{{ node.path }}" data-folder-name="{{ node.name | e }}">✎</span> #}
@@ -18,10 +26,17 @@
 </div>
 {%- if has_kids %}
 <div class="folder-children" style="display: {% if expanded %}block{% else %}none{% endif %}">
+  <div class="folder-row folder-row-create" style="padding-left: {{ (depth + 1) * 14 }}px">
+    <span class="folder-arrow">&#x2003;</span>
+    <span class="folder-swatch"></span>
+    <span class="folder-add-btn folder-create-label" title="Create subfolder" data-parent="{{ parent_for_create }}">+ New folder</span>
+  </div>
   {%- for child in node.children %}
   {{ branch(child, depth + 1, active_folders, pending_rename) }}
   {%- endfor %}
 </div>
 {%- endif %}
 {%- endmacro %}
+{% for tree in trees %}
 {{ branch(tree, 0, active_folders, pending_rename) }}
+{% endfor %}

@@ -13,8 +13,9 @@
   <section id="folder-section" x-data>
     <h2>Folders</h2>
     <div id="folder-controls">
-      <button id="btn-add-folder" type="button" title="Create subfolder in current folder">+ Folder</button>
+      <button id="btn-add-root" type="button" title="Add root folder by path">+ Root</button>
     </div>
+    <div id="root-drop-hint">Drop folders here to add roots. Drag a root row outside to remove.</div>
     <div id="folder-tree"></div>
   </section>
 </aside>
@@ -22,6 +23,7 @@
 <!-- component: main-viewport -->
 <main id="main">
   <button type="button" id="viewport-clear-hides" class="viewport-clear-hides hidden" title="Show all tracks again (Alt+s)">Show all</button>
+  <div id="selected-folders-overlay" class="selected-folders-overlay hidden"></div>
   <canvas id="viewport"></canvas>
 
   <footer id="statusbar">
@@ -106,6 +108,17 @@
   <div id="shortcuts-content">
     <h2>Shortcuts</h2>
     <div id="shortcut-list" class="shortcut-list"></div>
+  </div>
+</div>
+
+<div id="root-add-modal" class="hidden">
+  <div id="root-add-content">
+    <h2>Add Root Folder</h2>
+    <input id="root-add-input" type="text" placeholder="/absolute/path/to/music" spellcheck="false" />
+    <div id="root-add-actions">
+      <button id="root-add-cancel" type="button">Cancel</button>
+      <button id="root-add-ok" type="button">OK</button>
+    </div>
   </div>
 </div>
 
