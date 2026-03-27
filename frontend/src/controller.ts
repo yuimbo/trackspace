@@ -982,17 +982,22 @@ export class Controller {
         layout_revision?: string;
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
-      // Check if required models are still loading.
-      if (m.useCLAP && !status.model_ready) {
-        toast("CLAP model loading…", "ok");
+      const modelsBlocked =
+        (m.useCLAP && !status.model_ready) ||
+        (m.useEffNet && !status.effnet_model_ready);
+      m.embeddingModelsLoading = modelsBlocked;
+      if (modelsBlocked) {
+        if (m.useCLAP && !status.model_ready) {
+          toast("CLAP model loading…", "ok");
+        } else if (m.useEffNet && !status.effnet_model_ready) {
+          toast("EffNet model loading…", "ok");
+        }
         this._pollModelReady();
+        this.canvas.scheduleDraw();
         return;
       }
-      if (m.useEffNet && !status.effnet_model_ready) {
-        toast("EffNet model loading…", "ok");
-        this._pollModelReady();
-        return;
-      }
+
+      m.embeddingModelsLoading = false;
 
       // Determine which sources need generation.
       const sourcesNeeded: string[] = [];
@@ -1022,6 +1027,7 @@ export class Controller {
           workParts.length > 1 ? ` (${workParts.join(", ")})` : "";
         toast(`Generating embeddings for ${total} tracks${detail}…`, "ok");
         m.embeddingsGenerating = true;
+        this.canvas.scheduleDraw();
 
         await postJSON("/api/embeddings/generate", {
           folder: "",
@@ -1035,6 +1041,7 @@ export class Controller {
 
       if (status.generating) {
         m.embeddingsGenerating = true;
+        this.canvas.scheduleDraw();
         this._listenEmbeddingStream();
         // Still refetch layout: option changes must hit /api/embeddings/projection even
         // while a batch job runs — otherwise only /status appears and the map never
@@ -1057,6 +1064,10 @@ export class Controller {
       }
     } catch {
       /* api() already toasted */
+    } finally {
+      if (this.model.viewMode !== "embeddings") {
+        this.model.embeddingModelsLoading = false;
+      }
     }
   }
 
@@ -1512,6 +1523,7 @@ export class Controller {
 
     if (m.viewMode === "tags") {
       m.setViewMode("embeddings");
+      m.embeddingModelsLoading = false;
       // Restore a previously saved embedding viewport, or default to full [0,1] view.
       const saved = this._savedVpByMode.get("embeddings");
       if (saved) {
@@ -1530,6 +1542,7 @@ export class Controller {
       }
     } else {
       m.setViewMode("tags");
+      m.embeddingModelsLoading = false;
       // Restore a previously saved tag viewport, or leave as-is (first time back).
       const saved = this._savedVpByMode.get("tags");
       if (saved) {

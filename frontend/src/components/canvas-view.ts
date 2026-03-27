@@ -695,6 +695,41 @@ export class CanvasView {
 
   /* ── Mode badge ─────────────────────────────────────────── */
 
+  /** Centred pill while embedding space has nothing to plot yet or layout is in flight. */
+  private _embeddingWaitLabel(m: Model): string | null {
+    if (m.viewMode !== "embeddings") return null;
+    if (m.projectionPending) return "clustering…";
+    if (m.embeddingPositions.size > 0) return null;
+    if (m.embeddingsReady) return null;
+    if (m.embeddingModelsLoading) return "loading models…";
+    if (m.embeddingsGenerating && m.embeddingProgress)
+      return `generating ${m.embeddingProgress.done}/${m.embeddingProgress.total}…`;
+    if (m.embeddingsGenerating) return "generating embeddings…";
+    return "loading…";
+  }
+
+  private _drawCenterStatusPill(w: number, h: number, label: string): void {
+    const ctx = this.ctx;
+    const cx = w / 2;
+    const cy = h / 2;
+    ctx.font = "bold 22px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const metrics = ctx.measureText(label);
+    const pw = metrics.width + 28;
+    const ph = 44;
+    const rx = 8;
+    ctx.beginPath();
+    ctx.roundRect(cx - pw / 2, cy - ph / 2, pw, ph, rx);
+    ctx.fillStyle = "rgba(10,14,30,0.72)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(180,220,255,0.35)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = "rgba(180,220,255,0.9)";
+    ctx.fillText(label, cx, cy);
+  }
+
   private _drawModeBadge(w: number, h: number): void {
     const m = this.model;
     if (m.viewMode !== "embeddings") return;
@@ -708,7 +743,11 @@ export class CanvasView {
     ctx.fillStyle = "rgba(120,200,255,0.6)";
     ctx.fillText("EMBEDDING SPACE", w - 8, 8);
     let y = 22;
-    if (m.embeddingsGenerating && m.embeddingProgress) {
+    if (
+      m.embeddingsGenerating &&
+      m.embeddingProgress &&
+      m.embeddingPositions.size > 0
+    ) {
       ctx.fillStyle = "rgba(255,200,100,0.6)";
       ctx.fillText(
         `generating ${m.embeddingProgress.done}/${m.embeddingProgress.total}…`,
@@ -718,30 +757,8 @@ export class CanvasView {
       y += 14;
     }
 
-    // Large centred "clustering…" overlay
-    if (m.projectionPending) {
-      const cx = w / 2;
-      const cy = h / 2;
-      const label = "clustering…";
-      ctx.font = "bold 22px monospace";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      const metrics = ctx.measureText(label);
-      const pw = metrics.width + 28;
-      const ph = 44;
-      const rx = 8;
-      // pill background
-      ctx.beginPath();
-      ctx.roundRect(cx - pw / 2, cy - ph / 2, pw, ph, rx);
-      ctx.fillStyle = "rgba(10,14,30,0.72)";
-      ctx.fill();
-      ctx.strokeStyle = "rgba(180,220,255,0.35)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      // label
-      ctx.fillStyle = "rgba(180,220,255,0.9)";
-      ctx.fillText(label, cx, cy);
-    }
+    const wait = this._embeddingWaitLabel(m);
+    if (wait) this._drawCenterStatusPill(w, h, wait);
 
     ctx.restore();
   }

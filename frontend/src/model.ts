@@ -152,6 +152,8 @@ export class Model extends EventBus {
   embeddingsGenerating = false;
   embeddingProgress: { done: number; total: number } | null = null;
   projectionPending = false;
+  /** True while CLAP/EffNet are not ready yet (embedding mode waits on `_pollModelReady`). */
+  embeddingModelsLoading = false;
   libraryLoadProgress: { done: number; total: number } | null = null;
 
   private _cache: Track[] | null = null;
