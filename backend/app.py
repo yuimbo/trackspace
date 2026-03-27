@@ -66,6 +66,23 @@ log = logging.getLogger(__name__)
 state = TrackspaceState.create()
 
 
+def _purge_stale_embedding_cache_rows() -> tuple[int, int, int]:
+    """NULL out cached blobs older than current version constants.
+
+    Runs once when ``backend.app`` is imported so stale rows are cleared before
+    any HTTP handler runs (not only when ``main()`` is invoked).
+    """
+    fc = state.feature_cache
+    return (
+        fc.purge_old_versions(EMBEDDING_VERSION),
+        fc.purge_old_effnet_versions(EFFNET_VERSION),
+        fc.purge_old_feature_versions(FEATURES_VERSION),
+    )
+
+
+_startup_purge_clap, _startup_purge_effnet, _startup_purge_feat = _purge_stale_embedding_cache_rows()
+
+
 def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
     """Cheap fingerprint of mp3 set under one virtual folder (or all roots)."""
     h = hashlib.sha256()
@@ -407,15 +424,21 @@ def main():
     pruned = state.track_cache.prune_missing()
     if pruned:
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
-    purged = state.feature_cache.purge_old_versions(EMBEDDING_VERSION)
-    if purged:
-        print(f"CLAP: purged {purged} stale v<{EMBEDDING_VERSION} entr{'y' if purged == 1 else 'ies'}")
-    purged_effnet = state.feature_cache.purge_old_effnet_versions(EFFNET_VERSION)
-    if purged_effnet:
-        print(f"EffNet: purged {purged_effnet} stale v<{EFFNET_VERSION} entr{'y' if purged_effnet == 1 else 'ies'}")
-    purged_feat = state.feature_cache.purge_old_feature_versions(FEATURES_VERSION)
-    if purged_feat:
-        print(f"Features: purged {purged_feat} stale v<{FEATURES_VERSION} entr{'y' if purged_feat == 1 else 'ies'}")
+    if _startup_purge_clap:
+        print(
+            f"CLAP: purged {_startup_purge_clap} stale v<{EMBEDDING_VERSION} "
+            f"entr{'y' if _startup_purge_clap == 1 else 'ies'} (on load)"
+        )
+    if _startup_purge_effnet:
+        print(
+            f"EffNet: purged {_startup_purge_effnet} stale v<{EFFNET_VERSION} "
+            f"entr{'y' if _startup_purge_effnet == 1 else 'ies'} (on load)"
+        )
+    if _startup_purge_feat:
+        print(
+            f"Features: purged {_startup_purge_feat} stale v<{FEATURES_VERSION} "
+            f"entr{'y' if _startup_purge_feat == 1 else 'ies'} (on load)"
+        )
     print(f"Versions: CLAP={EMBEDDING_VERSION} EffNet={EFFNET_VERSION} Features={FEATURES_VERSION}")
     if not args.no_clap:
         def _bg_load_clap():

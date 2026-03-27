@@ -423,6 +423,38 @@ body { display: flex; }
   padding-bottom: 4px;
 }
 
+.batch-tag-slider-wrap {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.batch-tag-slider-wrap .txslider {
+  flex: 1;
+  min-width: 0;
+  margin: 0 2px 0 0;
+}
+
+.batch-tag-clear {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 1;
+  font-size: 14px;
+  color: var(--fg-dim);
+  background: #ffffff0a;
+  border: 1px solid #ffffff14;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.batch-tag-clear:hover {
+  color: var(--fg);
+  background: #ffffff18;
+  border-color: #ffffff28;
+}
+
 .batch-tag-label {
   font-size: 10px;
   white-space: nowrap;
@@ -556,7 +588,23 @@ body { display: flex; }
 .axis-btn.mode-dimmed { opacity: 0.25; }
 .axis-btn.mode-dimmed:hover { opacity: 0.6; }
 
-/* ── Tag section (right panel) ────────────────────────────── */
+/* ── Features + tag sections (right panel) ───────────────── */
+#features-section {
+  flex-shrink: 0;
+  max-height: 30%;
+  display: flex;
+  flex-direction: column;
+  padding-top: 6px;
+  overflow: hidden;
+}
+
+#features-section .features-heading {
+  font-size: inherit;
+  font-weight: 600;
+  margin: 0 0 4px 0;
+  flex-shrink: 0;
+}
+
 #tag-section {
   flex-shrink: 0;
   max-height: 38%;
@@ -577,6 +625,7 @@ body { display: flex; }
 }
 #tag-controls h2 { margin-bottom: 0; }
 
+#feature-list,
 #tag-list {
   list-style: none;
   font-size: 12px;
@@ -585,9 +634,12 @@ body { display: flex; }
   min-height: 0;
   padding-right: 2px;
 }
+#feature-list::-webkit-scrollbar,
 #tag-list::-webkit-scrollbar { width: 4px; }
+#feature-list::-webkit-scrollbar-thumb,
 #tag-list::-webkit-scrollbar-thumb { background: #ffffff18; border-radius: 3px; }
 
+#feature-list li,
 #tag-list li {
   display: flex;
   align-items: center;
@@ -603,6 +655,12 @@ body { display: flex; }
   overflow: hidden;
   text-overflow: ellipsis;
   font-size: 11px;
+}
+
+#feature-list .feature-name {
+  max-width: 72px;
+  color: var(--fg-dim);
+  font-size: 10px;
 }
 
 .tag-rename-input {

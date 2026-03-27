@@ -1,4 +1,9 @@
-import type { Model, Track, ProjectionMethod } from "./model";
+import {
+  type Model,
+  type Track,
+  type ProjectionMethod,
+  isAudioFeatureAxisId,
+} from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -25,6 +30,10 @@ const FLUSH_MS = 500;
 
 // ─── Utilities ───────────────────────────────────────────────
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
+
+function axisWritable(axis: string | null): boolean {
+  return !!(axis && !isAudioFeatureAxisId(axis));
+}
 
 function debounce<Args extends unknown[]>(
   fn: (...args: Args) => void,
@@ -114,7 +123,7 @@ interface TxBounds {
 interface PendingUpdate {
   path: string;
   tag: string;
-  value: number;
+  value: number | null;
 }
 
 /** Subset of ``/api/embeddings/status`` used to avoid duplicate layout fetches. */
@@ -166,6 +175,7 @@ export class Controller {
   private canvas: CanvasView;
   private $folderTree: HTMLElement;
   private tagPanel: TagPanelView;
+  private featuresPanel: TagPanelView;
   private props: PropertiesView;
   private batch: BatchView;
   private status: StatusView;
@@ -195,6 +205,7 @@ export class Controller {
     model: Model,
     canvasView: CanvasView,
     tagPanelView: TagPanelView,
+    featuresPanelView: TagPanelView,
     propsView: PropertiesView,
     batchView: BatchView,
     statusView: StatusView,
@@ -203,6 +214,7 @@ export class Controller {
     this.canvas = canvasView;
     this.$folderTree = document.getElementById("folder-tree")!;
     this.tagPanel = tagPanelView;
+    this.featuresPanel = featuresPanelView;
     this.props = propsView;
     this.batch = batchView;
     this.status = statusView;
@@ -251,6 +263,11 @@ export class Controller {
     this._syncModeVisuals();
   }
 
+  private _renderTagPanels(): void {
+    this.tagPanel.render();
+    this.featuresPanel.render();
+  }
+
   /* ── Model events ───────────────────────────────────────── */
 
   private _wireModel(): void {
@@ -259,7 +276,7 @@ export class Controller {
       this.status.update(this.model);
       this.props.render();
       this.batch.render();
-      this.tagPanel.render();
+      this._renderTagPanels();
       this._syncModeVisuals();
       this._updateFolderHighlights();
       this._syncFolderTreeActiveLabels();
@@ -332,21 +349,25 @@ export class Controller {
   private _wireViewCallbacks(): void {
     const m = this.model;
 
-    this.tagPanel.onAxisChange = (which, tag) => {
+    const onTagAxis = (which: string, tag: string) => {
       if (m.viewMode === "tags") {
         this._animateAxisChange(which as "axisX" | "axisY", tag);
       } else {
         m.toggleAxis(which as "axisX" | "axisY", tag);
         void this._switchToMode("tags");
       }
-      this.tagPanel.render();
+      this._renderTagPanels();
       m.saveLS();
     };
+    this.tagPanel.onAxisChange = onTagAxis;
+    this.featuresPanel.onAxisChange = onTagAxis;
 
-    this.tagPanel.onFilterChange = (tag, range) => {
+    const onTagFilter = (tag: string, range: [number, number]) => {
       m.setFilterRange(tag, range);
       m.saveLS();
     };
+    this.tagPanel.onFilterChange = onTagFilter;
+    this.featuresPanel.onFilterChange = onTagFilter;
 
     this.tagPanel.onTagRename = (oldName, newName) => {
       void this.cmdMgr.run(new RenameTagCommand(oldName, newName), m);
@@ -388,6 +409,10 @@ export class Controller {
 
     this.batch.onDragEnd = () => {
       m.emit("change");
+    };
+
+    this.batch.onClearTagFromSelection = (tag: string) => {
+      void this._clearTagFromSelection(tag);
     };
   }
 
@@ -706,7 +731,9 @@ export class Controller {
       this.model.selectInFolder(path);
       this.model.saveLS();
       this._folderShiftAnchor = norm;
-      setTimeout(() => this.tagPanel.render(), 0);
+      setTimeout(() => {
+        this._renderTagPanels();
+      }, 0);
       return;
     }
 
@@ -719,7 +746,7 @@ export class Controller {
       this.model.addTracksUnderFolderPrefixes(range);
       this._folderShiftAnchor = norm;
       this.model.saveLS();
-      setTimeout(() => this.tagPanel.render(), 0);
+      setTimeout(() => this._renderTagPanels(), 0);
       return;
     }
 
@@ -877,7 +904,7 @@ export class Controller {
     } finally {
       hideLoad();
     }
-    this.tagPanel.render();
+    this._renderTagPanels();
     this.props.render();
     this.batch.render();
     this.canvas.resize();
@@ -896,7 +923,7 @@ export class Controller {
     } finally {
       hideLoad();
     }
-    this.tagPanel.render();
+    this._renderTagPanels();
     this.props.render();
     this.batch.render();
     this.canvas.scheduleDraw();
@@ -1334,8 +1361,8 @@ export class Controller {
         if (existing) {
           startPos.set(t.path, { ...existing });
         } else {
-          const wx = m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5;
-          const wy = m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5;
+          const wx = m.axisX ? m.axisScalar(t, m.axisX) : 0.5;
+          const wy = m.axisY ? m.axisScalar(t, m.axisY) : 0.5;
           startPos.set(t.path, { x: wx, y: wy });
         }
       }
@@ -1399,8 +1426,8 @@ export class Controller {
       for (const track of m.tracks) {
         const start = startPos.get(track.path);
         if (!start) continue;
-        const tx = m.axisX ? (track.tags[m.axisX] ?? 0.5) : 0.5;
-        const ty = m.axisY ? (track.tags[m.axisY] ?? 0.5) : 0.5;
+        const tx = m.axisX ? m.axisScalar(track, m.axisX) : 0.5;
+        const ty = m.axisY ? m.axisScalar(track, m.axisY) : 0.5;
         cv.animPositions!.set(track.path, {
           x: start.x + (tx - start.x) * ease,
           y: start.y + (ty - start.y) * ease,
@@ -1434,8 +1461,8 @@ export class Controller {
         startPos.set(t.path, { ...existing });
       } else {
         startPos.set(t.path, {
-          x: m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5,
-          y: m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5,
+          x: m.axisX ? m.axisScalar(t, m.axisX) : 0.5,
+          y: m.axisY ? m.axisScalar(t, m.axisY) : 0.5,
         });
       }
     }
@@ -1460,8 +1487,8 @@ export class Controller {
         const track = m.trackByPath(path);
         if (!track) continue;
         // Target is the new tag position (axes are already updated).
-        const tx = m.axisX ? (track.tags[m.axisX] ?? 0.5) : 0.5;
-        const ty = m.axisY ? (track.tags[m.axisY] ?? 0.5) : 0.5;
+        const tx = m.axisX ? m.axisScalar(track, m.axisX) : 0.5;
+        const ty = m.axisY ? m.axisScalar(track, m.axisY) : 0.5;
         cv.animPositions!.set(path, {
           x: start.x + (tx - start.x) * ease,
           y: start.y + (ty - start.y) * ease,
@@ -1631,7 +1658,11 @@ export class Controller {
       if (m.viewMode !== "embeddings") {
         this._fillDragSnapFromSelection();
       }
-    } else if (txh?.type === "move" && m.viewMode !== "embeddings") {
+    } else if (
+      txh?.type === "move" &&
+      m.viewMode !== "embeddings" &&
+      (axisWritable(m.axisX) || axisWritable(m.axisY))
+    ) {
       // Clicked inside the selection bounding box — same drag path as track drag.
       mouse.hitInSelectionBox = true;
       mouse.mode = "pending";
@@ -1659,8 +1690,8 @@ export class Controller {
       if (t)
         mouse.snap.set(path, {
           track: t,
-          x: m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5,
-          y: m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5,
+          x: m.axisX ? m.axisScalar(t, m.axisX) : 0.5,
+          y: m.axisY ? m.axisScalar(t, m.axisY) : 0.5,
         });
     }
   }
@@ -1711,8 +1742,8 @@ export class Controller {
       const t = m.trackByPath(path);
       if (t)
         mouse.txSnap.set(path, {
-          wx: m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5,
-          wy: m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5,
+          wx: m.axisX ? m.axisScalar(t, m.axisX) : 0.5,
+          wy: m.axisY ? m.axisScalar(t, m.axisY) : 0.5,
           track: t,
         });
     }
@@ -1740,9 +1771,12 @@ export class Controller {
       const dx = wx - mouse.txStart!.wx;
       const dy = wy - mouse.txStart!.wy;
       for (const [, snap] of mouse.txSnap!) {
-        if (m.axisX) snap.track.tags[m.axisX] = clamp(snap.wx + dx);
-        if (m.axisY) snap.track.tags[m.axisY] = clamp(snap.wy + dy);
+        if (axisWritable(m.axisX))
+          snap.track.tags[m.axisX!] = clamp(snap.wx + dx);
+        if (axisWritable(m.axisY))
+          snap.track.tags[m.axisY!] = clamp(snap.wy + dy);
       }
+      m.emit("tags-dirty");
       return;
     }
 
@@ -1771,11 +1805,12 @@ export class Controller {
 
     for (const [, snap] of mouse.txSnap!) {
       const t = snap.track;
-      if (affectsX)
+      if (affectsX && axisWritable(m.axisX))
         t.tags[m.axisX!] = clamp(axAnchor + (snap.wx - axAnchor) * scaleX);
-      if (affectsY)
+      if (affectsY && axisWritable(m.axisY))
         t.tags[m.axisY!] = clamp(ayAnchor + (snap.wy - ayAnchor) * scaleY);
     }
+    m.emit("tags-dirty");
   }
 
   /**
@@ -1866,7 +1901,10 @@ export class Controller {
     if (mouse.mode === "pending") {
       if (
         Math.hypot(sx - mouse.sx, sy - mouse.sy) > DRAG_THRESH &&
-        m.selected.size > 0
+        m.selected.size > 0 &&
+        (m.viewMode === "embeddings" ||
+          axisWritable(m.axisX) ||
+          axisWritable(m.axisY))
       ) {
         this._startDocDragFromSelection();
       }
@@ -1881,9 +1919,12 @@ export class Controller {
         const dx = cwx - swx,
           dy = cwy - swy;
         for (const [, snap] of mouse.snap!) {
-          if (m.axisX) snap.track.tags[m.axisX] = clamp(snap.x + dx);
-          if (m.axisY) snap.track.tags[m.axisY] = clamp(snap.y + dy);
+          if (axisWritable(m.axisX))
+            snap.track.tags[m.axisX!] = clamp(snap.x + dx);
+          if (axisWritable(m.axisY))
+            snap.track.tags[m.axisY!] = clamp(snap.y + dy);
         }
+        m.emit("tags-dirty");
       }
       cv.scheduleDraw();
       return;
@@ -1945,17 +1986,17 @@ export class Controller {
       for (const path of m.selected) {
         const t = m.trackByPath(path);
         if (!t) continue;
-        if (m.axisX && t.tags[m.axisX] !== undefined)
+        if (axisWritable(m.axisX) && t.tags[m.axisX!] !== undefined)
           this.pending.set(`${path}|${m.axisX}`, {
             path,
-            tag: m.axisX,
-            value: t.tags[m.axisX],
+            tag: m.axisX!,
+            value: t.tags[m.axisX!],
           });
-        if (m.axisY && t.tags[m.axisY] !== undefined)
+        if (axisWritable(m.axisY) && t.tags[m.axisY!] !== undefined)
           this.pending.set(`${path}|${m.axisY}`, {
             path,
-            tag: m.axisY,
-            value: t.tags[m.axisY],
+            tag: m.axisY!,
+            value: t.tags[m.axisY!],
           });
       }
       this._flushPending();
@@ -1966,7 +2007,7 @@ export class Controller {
       this.status.update(m);
       this.props.render();
       this.batch.render();
-      this.tagPanel.render();
+      this._renderTagPanels();
       return;
     }
 
@@ -2143,7 +2184,7 @@ export class Controller {
     this.status.update(this.model);
     this.props.render();
     this.batch.render();
-    this.tagPanel.render();
+    this._renderTagPanels();
 
     if (folderEl) {
       const dest =
@@ -2167,10 +2208,35 @@ export class Controller {
     // In embedding mode no tag values were mutated during the drag, nothing to revert.
     if (m.viewMode === "embeddings") return;
     for (const [, snap] of this.mouse.snap ?? []) {
-      if (m.axisX) snap.track.tags[m.axisX] = snap.x;
-      if (m.axisY) snap.track.tags[m.axisY] = snap.y;
+      if (axisWritable(m.axisX)) snap.track.tags[m.axisX!] = snap.x;
+      if (axisWritable(m.axisY)) snap.track.tags[m.axisY!] = snap.y;
     }
     m.emit("tags-dirty");
+  }
+
+  private async _clearTagFromSelection(tag: string): Promise<void> {
+    const m = this.model;
+    if (isAudioFeatureAxisId(tag)) return;
+    const updates: PendingUpdate[] = [];
+    for (const path of m.selected) {
+      const t = m.trackByPath(path);
+      if (!t || t.tags[tag] === undefined) continue;
+      delete t.tags[tag];
+      updates.push({ path, tag, value: null });
+      this.pending.delete(`${path}|${tag}`);
+    }
+    if (!updates.length) {
+      m.emit("change");
+      return;
+    }
+    this.canvas.scheduleDraw();
+    try {
+      await postJSON("/api/tracks/tags", { updates });
+      toast(`Removed "${tag}" from ${updates.length} track(s)`, "ok");
+    } catch {
+      /* postJSON already toasted */
+    }
+    m.emit("change");
   }
 
   private _commitDrag(): void {
@@ -2178,17 +2244,17 @@ export class Controller {
     // In embedding mode no tag values were changed during the drag; nothing to persist.
     if (m.viewMode === "embeddings") return;
     for (const [path, snap] of this.mouse.snap ?? []) {
-      if (m.axisX)
+      if (axisWritable(m.axisX))
         this.pending.set(`${path}|${m.axisX}`, {
           path,
-          tag: m.axisX,
-          value: snap.track.tags[m.axisX],
+          tag: m.axisX!,
+          value: snap.track.tags[m.axisX!],
         });
-      if (m.axisY)
+      if (axisWritable(m.axisY))
         this.pending.set(`${path}|${m.axisY}`, {
           path,
-          tag: m.axisY,
-          value: snap.track.tags[m.axisY],
+          tag: m.axisY!,
+          value: snap.track.tags[m.axisY!],
         });
     }
     this._flushPending();
@@ -2244,8 +2310,8 @@ export class Controller {
       minY = Infinity,
       maxY = -Infinity;
     for (const t of visible) {
-      const wx = m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5;
-      const wy = m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5;
+      const wx = m.axisX ? m.axisScalar(t, m.axisX) : 0.5;
+      const wy = m.axisY ? m.axisScalar(t, m.axisY) : 0.5;
       if (wx < minX) minX = wx;
       if (wx > maxX) maxX = wx;
       if (wy < minY) minY = wy;
@@ -2377,14 +2443,14 @@ export class Controller {
     $addT.addEventListener("click", () => {
       let name = "new_tag";
       let n = 1;
-      while (m.tags.includes(name)) {
+      while (m.tags.includes(name) || isAudioFeatureAxisId(name)) {
         n++;
         name = `new_tag_${n}`;
       }
       m.addKnownTag(name);
       m.saveLS();
       this.tagPanel.scheduleRenameAfterRender(name);
-      this.tagPanel.render();
+      this._renderTagPanels();
     });
 
     this._initProjectionToggle();

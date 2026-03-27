@@ -1,4 +1,5 @@
 import type { Model } from "../model";
+import { isAudioFeatureAxisId } from "../model";
 
 
 export class BatchView {
@@ -11,6 +12,7 @@ export class BatchView {
   onApply: ((tag: string, updates: Map<string, number>) => void) | null =
     null;
   onDragEnd: (() => void) | null = null;
+  onClearTagFromSelection: ((tag: string) => void) | null = null;
 
   constructor(model: Model, container: HTMLElement) {
     this.model = model;
@@ -43,6 +45,7 @@ export class BatchView {
     grid.className = "batch-tag-grid";
 
     for (const tag of m.tags) {
+      if (isAudioFeatureAxisId(tag)) continue;
       const snap = this._getOrCreateSnapshot(tag);
       const vals = [...snap.values()];
       const hasVals = vals.length > 0;
@@ -63,8 +66,24 @@ export class BatchView {
         ? this._makeSingleSlider(tag, origAvg, !hasVals)
         : this._makeTransformSlider(tag, origLo, origHi);
 
+      const wrap = document.createElement("div");
+      wrap.className = "batch-tag-slider-wrap";
+      wrap.appendChild(slider);
+
+      const clearBtn = document.createElement("button");
+      clearBtn.type = "button";
+      clearBtn.className = "batch-tag-clear";
+      clearBtn.textContent = "×";
+      clearBtn.title = "Remove tag from all selected tracks";
+      clearBtn.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        this.onClearTagFromSelection?.(tag);
+      });
+      wrap.appendChild(clearBtn);
+
       grid.appendChild(label);
-      grid.appendChild(slider);
+      grid.appendChild(wrap);
     }
 
     this.$el.appendChild(grid);

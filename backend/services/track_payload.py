@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Callable
 from typing import Any
@@ -20,10 +21,29 @@ def track_dict_from_read(
     fp = info.get("fingerprint")
     bpm: int | None = None
     musical_key: str | None = None
+    audio_features_payload: dict[str, float] | None = None
     if isinstance(fp, str) and fp:
         arr = feat_by_fp.get(fp) if feat_by_fp is not None else get_audio_features(fp)
         if arr is not None:
             bpm, musical_key = display_bpm_key(arr)
+            try:
+                flat = arr.flatten()
+                tempo_norm = float(flat[0])
+                kc = float(flat[1])
+                ks = float(flat[2])
+                mode = float(flat[3])
+                energy_norm = float(flat[4])
+                dance = float(flat[5])
+                key_norm = (math.atan2(ks, kc) / (2 * math.pi) + 0.5) % 1.0
+                audio_features_payload = {
+                    "tempo": tempo_norm,
+                    "key": key_norm,
+                    "mode": mode,
+                    "energy": energy_norm,
+                    "danceability": dance,
+                }
+            except (IndexError, TypeError, ValueError):
+                audio_features_payload = None
     return {
         "path": rel_path,
         "filename": os.path.basename(path),
@@ -34,6 +54,7 @@ def track_dict_from_read(
         "fingerprint": info.get("fingerprint"),
         "bpm": bpm,
         "musical_key": musical_key,
+        "audio_features": audio_features_payload,
     }
 
 

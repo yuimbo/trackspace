@@ -26,6 +26,7 @@ trackspace/
       audio_decode.py       – resilient librosa decode (segments, seeks, metadata mismatch)
       effnet.py             – Discogs-EffNet ONNX + Essentia-style mel / patches
       librosa_audio_features.py – 6-D classical descriptors (tempo, key, energy, danceability)
+      madmom_tempo.py        – optional madmom RNN tempo (used by librosa_audio_features when installed)
       audio_features.py     – re-exports decode / EffNet / librosa (imported by shim above)
     templates/partials/     – Jinja templates served by Flask (HTMX)
   frontend/                 ← Vite + TypeScript + Alpine.js + HTMX
@@ -410,7 +411,7 @@ The user can activate any combination (at least one must stay on):
 |--------|--------|-----------|-------|
 | CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
 | EffNet | `backend/embeddings/effnet.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
-| Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` — no ML model needed |
+| Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
 
 **Audio feature vector (6D):**
 `[tempo_norm, key_cos, key_sin, mode, energy_norm, danceability]`
@@ -456,7 +457,7 @@ followed by `np.log10(10000 * mel + 1)`.  The mel is then patched into
 equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
 
 **Audio feature extraction** uses librosa only (no ML model):
-- Tempo: `librosa.feature.tempo()`
+- Tempo: **madmom** (`RNNBeatProcessor` + comb `TempoEstimationProcessor`) when importable, else `librosa.feature.tempo()` (same audio clip; `FEATURES_VERSION` 6+). Classical-feature excerpts stay at **22.05 kHz** for librosa; madmom receives a **44.1 kHz** resample of that buffer only. Optional env **`TRACKSPACE_MADMOM_FAST=1`** uses one BLSTM instead of the default eight-network ensemble for a large speedup with slightly less robust tempo (pick one setting per library and keep it stable, or bump ``FEATURES_VERSION`` / purge features when toggling). Profile locally: ``.venv/bin/python tests/profile_madmom_tempo.py``.
 - Key: Krumhansl-Schmuckler algorithm on `librosa.feature.chroma_cqt()`
 - Energy: `librosa.feature.rms()` (log-scaled)
 - Danceability: onset strength autocorrelation regularity
@@ -486,9 +487,44 @@ equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
   backend and animates the transition.
 
 
+## Backend: packages, imports, and refactors
+
+Principles that emerged from consolidating the embedding / audio-feature stack into
+`backend/embeddings/` and similar cleanups:
+
+- **Co-locate what changes together.**  CLAP, EffNet, librosa features, FeatureCache,
+  coverage, layout revision, and 2-D layout share caches, versions, and import edges — a
+  dedicated subpackage keeps the mental model and grep scope small.
+
+- **Resolve the “package vs module file” clash.**  A directory `embeddings/` cannot
+  coexist with `embeddings.py`; the heavy layout/projection implementation lives in a
+  clearly named module (`layout.py`) inside the package, and `embeddings/__init__.py`
+  defines the public façade.
+
+- **Preserve stable import paths with thin shims.**  When a widely used entry point moves
+  (e.g. `from backend import audio_features`), a tiny module at the old path that
+  delegates to the new one avoids churn across `app`, tests, and docs.
+
+- **Lazy package exports when import cost differs wildly.**  If loading
+  `package/__init__.py` would pull Torch, projection backends, or other heavy stacks,
+  but some callers only need a small submodule, use module-level `__getattr__` (or
+  import submodules only) so cheap imports stay cheap.
+
+- **Tests that touch internals should name the implementation module.**  Facades and lazy
+  `__init__` may not expose `_cache` globals; import `backend.embeddings.layout` (or the
+  relevant submodule) when asserting on tier caches and similar details.
+
+- **Short names inside a package; drop repeated prefixes.**  e.g. `coverage.py` under
+  `embeddings/`, not `embedding_coverage.py` — the package path already supplies context.
+
+- **Delete dead code deliberately.**  Unused helpers and redundant `__all__` lists (only
+  relevant for `from module import *` or some re-export tooling) add noise; remove them
+  when nothing references them.
+
+
 # Continuous improvement
 After any major session, ask yourself:
 
 Based on how our session went above, any architectural insights about things to abstract or refactor we can add to architecture_plan.md?
 
-Or any common pitfalls we can not for future reference in AGENTS.md?
+Or any common pitfalls we can note for future reference in AGENTS.md?

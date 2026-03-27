@@ -1,4 +1,5 @@
 import type { Model, Track } from "../model";
+import { isAudioFeatureAxisId } from "../model";
 import { dirColor } from "../lib/toast";
 import { displayFolderPath } from "../lib/path-presenter";
 
@@ -70,6 +71,8 @@ export class CanvasView {
   txHandles: TxHandle[] = [];
   _txBox: TxBox | null = null;
   _txWorld: TxWorld | null = null;
+  /** False when both axes are analysis features — box interior is not a drag target. */
+  _txAllowBoxDrag = false;
 
   /** Transient per-track positions used during animated mode transitions. */
   animPositions: Map<string, { x: number; y: number }> | null = null;
@@ -171,7 +174,14 @@ export class CanvasView {
         return h;
     }
     const b = this._txBox;
-    if (b && sx > b.sl && sx < b.sr && sy > b.st && sy < b.sb)
+    if (
+      this._txAllowBoxDrag &&
+      b &&
+      sx > b.sl &&
+      sx < b.sr &&
+      sy > b.st &&
+      sy < b.sb
+    )
       return { type: "move", cursor: "move" };
     return null;
   }
@@ -190,6 +200,7 @@ export class CanvasView {
     this.txHandles = [];
     this._txBox = null;
     this._txWorld = null;
+    this._txAllowBoxDrag = false;
 
     if (tracks.length === 0) {
       ctx.fillStyle = "#444";
@@ -345,12 +356,12 @@ export class CanvasView {
     if (m.viewMode === "embeddings") {
       ctx.fillText("Embedding Space", w / 2, h - 2);
     } else {
-      if (m.axisX) ctx.fillText(m.axisX, w / 2, h - 2);
+      if (m.axisX) ctx.fillText(m.axisDisplayName(m.axisX), w / 2, h - 2);
       if (m.axisY) {
         ctx.save();
         ctx.translate(8, h / 2);
         ctx.rotate(-Math.PI / 2);
-        ctx.fillText(m.axisY, 0, 0);
+        ctx.fillText(m.axisDisplayName(m.axisY), 0, 0);
         ctx.restore();
       }
     }
@@ -362,10 +373,11 @@ export class CanvasView {
 
   private _tagPos(t: Track): { wx: number; wy: number } {
     const m = this.model;
-    const tx = m.axisX, ty = m.axisY;
+    const tx = m.axisX,
+      ty = m.axisY;
     return {
-      wx: tx ? (t.tags[tx] ?? 0.5) : 0.5,
-      wy: ty ? (t.tags[ty] ?? 0.5) : 0.5,
+      wx: tx ? m.axisScalar(t, tx) : 0.5,
+      wy: ty ? m.axisScalar(t, ty) : 0.5,
     };
   }
 
@@ -562,14 +574,18 @@ export class CanvasView {
     for (const path of m.selected) {
       const t = m.trackByPath(path);
       if (!t || !m.passesFilter(t)) continue;
-      const wx = m.axisX ? (t.tags[m.axisX] ?? 0.5) : 0.5;
-      const wy = m.axisY ? (t.tags[m.axisY] ?? 0.5) : 0.5;
+      const wx = m.axisX ? m.axisScalar(t, m.axisX) : 0.5;
+      const wy = m.axisY ? m.axisScalar(t, m.axisY) : 0.5;
       if (wx < minX) minX = wx;
       if (wx > maxX) maxX = wx;
       if (wy < minY) minY = wy;
       if (wy > maxY) maxY = wy;
     }
     if (!isFinite(minX)) return;
+
+    const canTxX = !!(m.axisX && !isAudioFeatureAxisId(m.axisX));
+    const canTxY = !!(m.axisY && !isAudioFeatureAxisId(m.axisY));
+    this._txAllowBoxDrag = canTxX || canTxY;
 
     this._txWorld = { minX, maxX, minY, maxY };
 
@@ -606,7 +622,7 @@ export class CanvasView {
 
     this.txHandles = [];
     if (hasRange) {
-      if (m.axisX && m.axisY) {
+      if (m.axisX && m.axisY && canTxX && canTxY) {
         this.txHandles.push(
           { type: "nw", sx: bsl, sy: bst, cursor: "nw-resize" },
           { type: "ne", sx: bsr, sy: bst, cursor: "ne-resize" },
@@ -614,12 +630,12 @@ export class CanvasView {
           { type: "se", sx: bsr, sy: bsb, cursor: "se-resize" },
         );
       }
-      if (m.axisY)
+      if (m.axisY && canTxY)
         this.txHandles.push(
           { type: "n", sx: mx, sy: bst, cursor: "n-resize" },
           { type: "s", sx: mx, sy: bsb, cursor: "s-resize" },
         );
-      if (m.axisX)
+      if (m.axisX && canTxX)
         this.txHandles.push(
           { type: "e", sx: bsr, sy: my, cursor: "e-resize" },
           { type: "w", sx: bsl, sy: my, cursor: "w-resize" },

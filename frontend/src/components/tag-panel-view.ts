@@ -1,5 +1,7 @@
 import type { Model } from "../model";
+import { isAudioFeatureAxisId, LIBROSA_FEATURE_AXIS_IDS } from "../model";
 
+export type TagPanelVariant = "tags" | "features";
 
 export class TagPanelView {
   model: Model;
@@ -14,7 +16,11 @@ export class TagPanelView {
   private _pendingRename: string | null = null;
   private _interacting = false;
 
-  constructor(model: Model, container: HTMLElement) {
+  constructor(
+    model: Model,
+    container: HTMLElement,
+    private readonly _variant: TagPanelVariant = "tags",
+  ) {
     this.model = model;
     this.$el = container;
   }
@@ -23,12 +29,16 @@ export class TagPanelView {
     if (this._interacting) return;
     this.$el.innerHTML = "";
     const m = this.model;
-    for (const tag of m.tags) {
+    const rowTags =
+      this._variant === "features"
+        ? [...LIBROSA_FEATURE_AXIS_IDS]
+        : m.tags;
+    for (const tag of rowTags) {
       const li = document.createElement("li");
       this._buildTagRow(li, tag);
       this.$el.appendChild(li);
     }
-    if (this._pendingRename) {
+    if (this._variant === "tags" && this._pendingRename) {
       const tag = this._pendingRename;
       this._pendingRename = null;
       requestAnimationFrame(() => this.beginRename(tag));
@@ -57,6 +67,10 @@ export class TagPanelView {
       done = true;
       const raw = input.value.trim().toLowerCase().replace(/\s+/g, "_");
       if (!raw || raw === oldName) {
+        input.replaceWith(nameEl);
+        return;
+      }
+      if (isAudioFeatureAxisId(raw)) {
         input.replaceWith(nameEl);
         return;
       }
@@ -95,14 +109,18 @@ export class TagPanelView {
     if (!m.tagHasValuesInView(tag)) li.classList.add("tag-no-values");
 
     const name = document.createElement("span");
-    name.className = "tag-name";
+    name.className =
+      this._variant === "features" ? "tag-name feature-name" : "tag-name";
     name.dataset.tag = tag;
-    name.textContent = tag;
-    name.addEventListener("dblclick", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.beginRename(tag);
-    });
+    name.textContent =
+      this._variant === "features" ? m.axisDisplayName(tag) : tag;
+    if (this._variant === "tags") {
+      name.addEventListener("dblclick", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        this.beginRename(tag);
+      });
+    }
     li.appendChild(name);
 
     (

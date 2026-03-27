@@ -1,3 +1,13 @@
+/** Cached librosa descriptors ([0,1]) when the fingerprint has a features row. */
+export interface TrackAudioFeatures {
+  tempo: number;
+  /** Circle-of-fifths angle mapped to [0, 1). */
+  key: number;
+  mode: number;
+  energy: number;
+  danceability: number;
+}
+
 export interface Track {
   path: string;
   filename: string;
@@ -9,6 +19,65 @@ export interface Track {
   /** From cached librosa features when available (after embedding/analysis pass). */
   bpm?: number | null;
   musical_key?: string | null;
+  /** Same pipeline as embedding "Audio features"; snake_case from API. */
+  audio_features?: TrackAudioFeatures | null;
+}
+
+/** Librosa analysis dimensions (reserved; not canvas-writable; listed under Features). */
+export const LIBROSA_FEATURE_AXIS_IDS = [
+  "tempo",
+  "key",
+  "mode",
+  "energy",
+  "danceability",
+] as const;
+
+const _LIBROSA_FEATURE_SET = new Set<string>(LIBROSA_FEATURE_AXIS_IDS);
+
+const LEGACY_LIBROSA_AXIS_MAP: Record<string, string> = {
+  "audio:tempo": "tempo",
+  "audio:key": "key",
+  "audio:mode": "mode",
+  "audio:energy": "energy",
+  "audio:danceability": "danceability",
+};
+
+function _migrateLibrosaAxisId(axis: string | null): string | null {
+  if (!axis) return null;
+  return LEGACY_LIBROSA_AXIS_MAP[axis] ?? axis;
+}
+
+function _migrateFilterRanges(
+  raw: Record<string, [number, number]> | undefined,
+): Record<string, [number, number]> {
+  if (!raw) return {};
+  const out: Record<string, [number, number]> = {};
+  for (const [k, v] of Object.entries(raw)) {
+    const nk = LEGACY_LIBROSA_AXIS_MAP[k] ?? k;
+    out[nk] = v;
+  }
+  return out;
+}
+
+const _LIBROSA_AXIS_DISPLAY: Record<string, string> = {
+  tempo: "Tempo",
+  key: "Key",
+  mode: "Mode",
+  energy: "Energy",
+  danceability: "Dance",
+};
+
+/** Short phrases for CLAP semantic-weighting (orientation in embedding space). */
+const _LIBROSA_AXIS_CONTEXT: Record<string, string> = {
+  tempo: "tempo",
+  key: "musical key",
+  mode: "major or minor mode",
+  energy: "audio energy",
+  danceability: "danceability",
+};
+
+export function isAudioFeatureAxisId(tag: string): boolean {
+  return _LIBROSA_FEATURE_SET.has(tag);
 }
 
 export type ViewMode = "tags" | "embeddings";
@@ -143,21 +212,61 @@ export class Model extends EventBus {
     const withVals = new Set<string>();
     for (const t of this.tracks)
       for (const k of Object.keys(t.tags)) withVals.add(k);
-    return [...s].sort((a, b) => {
-      const ha = withVals.has(a),
-        hb = withVals.has(b);
-      if (ha !== hb) return ha ? -1 : 1;
-      return a < b ? -1 : a > b ? 1 : 0;
-    });
+    return [...s]
+      .filter((tag) => !isAudioFeatureAxisId(tag))
+      .sort((a, b) => {
+        const ha = withVals.has(a),
+          hb = withVals.has(b);
+        if (ha !== hb) return ha ? -1 : 1;
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
   }
 
   tagHasValuesInView(tag: string): boolean {
+    if (isAudioFeatureAxisId(tag))
+      return this.tracks.some(
+        (t) =>
+          this._audioFeatureScalar(t, tag) !== undefined ||
+          t.tags[tag] !== undefined,
+      );
     return this.tracks.some((t) => t.tags[tag] !== undefined);
   }
 
   /** Tag names for semantic weighting (all get full boost). */
   get contextTags(): string[] {
-    return [...this.tags];
+    const base = [...this.tags];
+    const extra: string[] = [];
+    for (const id of LIBROSA_FEATURE_AXIS_IDS) {
+      const filtered = (() => {
+        const r = this.filterRanges[id];
+        return r && (r[0] > 0 || r[1] < 1);
+      })();
+      const active =
+        this.axisX === id || this.axisY === id || filtered;
+      if (active) extra.push(_LIBROSA_AXIS_CONTEXT[id]);
+    }
+    return [...new Set([...base, ...extra])];
+  }
+
+  axisDisplayName(axis: string): string {
+    return _LIBROSA_AXIS_DISPLAY[axis] ?? axis;
+  }
+
+  /** World-axis value in [0, 1] for tag mode (ID3 tags or cached audio features). */
+  axisScalar(track: Track, axis: string | null): number {
+    if (!axis) return 0.5;
+    const af = this._audioFeatureScalar(track, axis);
+    if (af !== undefined) return af;
+    return track.tags[axis] ?? 0.5;
+  }
+
+  private _audioFeatureScalar(track: Track, axis: string): number | undefined {
+    if (!isAudioFeatureAxisId(axis)) return undefined;
+    const row = track.audio_features;
+    if (!row) return undefined;
+    const k = axis as keyof TrackAudioFeatures;
+    const v = row[k];
+    return typeof v === "number" ? v : undefined;
   }
 
   /** Unique folder paths for semantic weighting (depth determines boost). */
@@ -179,7 +288,10 @@ export class Model extends EventBus {
 
   passesFilter(track: Track): boolean {
     for (const [tag, [lo, hi]] of Object.entries(this.filterRanges)) {
-      const v = track.tags[tag];
+      let v: number | undefined;
+      if (isAudioFeatureAxisId(tag))
+        v = this._audioFeatureScalar(track, tag) ?? track.tags[tag];
+      else v = track.tags[tag];
       if (v === undefined) continue;
       if (v < lo || v > hi) return false;
     }
@@ -530,6 +642,7 @@ export class Model extends EventBus {
   }
 
   renameTag(oldName: string, newName: string): void {
+    if (isAudioFeatureAxisId(oldName)) return;
     // Update tag values in every track
     for (const t of this.allTracks) {
       if (oldName in t.tags) {
@@ -651,9 +764,9 @@ export class Model extends EventBus {
         // focus resets to root until you click a folder label.
         this.folder = "";
         this.recursive = true;
-        this.axisX = d.axisX ?? null;
-        this.axisY = d.axisY ?? null;
-        this.filterRanges = d.filterRanges ?? {};
+        this.axisX = _migrateLibrosaAxisId(d.axisX ?? null);
+        this.axisY = _migrateLibrosaAxisId(d.axisY ?? null);
+        this.filterRanges = _migrateFilterRanges(d.filterRanges);
         this.hoverPreview = d.hoverPreview ?? false;
         this.viewMode = d.viewMode ?? "tags";
         this.projectionMethod = d.projectionMethod ?? "tsne";

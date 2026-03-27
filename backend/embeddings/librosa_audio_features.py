@@ -13,11 +13,12 @@ from .audio_decode import (
     _mono_full_short_metadata_decode,
     _probe_long_track_decode,
 )
+from . import madmom_tempo
 from backend.decode_stderr import librosa_get_duration
 
 log = logging.getLogger(__name__)
 
-FEATURES_VERSION = 3
+FEATURES_VERSION = 6
 AUDIO_FEATURE_DIM = 6
 
 _KEY_TO_FIFTHS: dict[str, int] = {
@@ -40,6 +41,7 @@ _PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F",
 
 _BPM_LO = 60.0
 _BPM_HI = 200.0
+# 22.05 kHz keeps librosa STFT/onset/chroma cheap; madmom upsamples its copy to 44.1 kHz.
 _FEATURE_SR = 22050
 _FEATURE_EXCERPT_SECONDS = 20.0
 _FEATURE_HOP = 1024
@@ -161,6 +163,9 @@ def extract_audio_features_and_warning(
         tempo = librosa.feature.tempo(onset_envelope=onset_env, sr=sr)
         if hasattr(tempo, "__len__"):
             tempo = float(tempo[0])
+        madmom_bpm = madmom_tempo.estimate_tempo_bpm(audio, sr)
+        if madmom_bpm is not None:
+            tempo = madmom_bpm
         tempo_norm = float(np.clip((tempo - _BPM_LO) / (_BPM_HI - _BPM_LO), 0.0, 1.0))
 
         key_str, scale_str = detect_key(audio, sr)
@@ -245,5 +250,6 @@ def warmup_audio_features() -> None:
         _ = librosa.feature.rms(y=audio)
         _ = detect_key(audio, _FEATURE_SR)
         _ = _compute_danceability(audio, _FEATURE_SR, hop_length=_FEATURE_HOP)
+        madmom_tempo.warmup_madmom_tempo()
     except Exception as e:
         log.debug("Audio feature warmup skipped: %s", e)

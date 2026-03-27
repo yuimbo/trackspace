@@ -350,6 +350,20 @@ def test_audio_features_deterministic():
     np.testing.assert_array_equal(f1, f2)
 
 
+def test_madmom_tempo_when_installed():
+    from backend.embeddings import madmom_tempo as mt
+    from backend.embeddings.librosa_audio_features import _load_feature_audio_excerpt
+
+    if not mt.is_madmom_tempo_available():
+        pytest.skip("madmom not installed or failed to import")
+    audio, sr, _ = _load_feature_audio_excerpt(TEST_TRACK)
+    assert audio is not None and sr is not None
+    bpm = mt.estimate_tempo_bpm(audio, sr)
+    assert bpm is not None
+    assert math.isfinite(bpm)
+    assert 40.0 < bpm < 250.0
+
+
 # ── Standalone runner ─────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -367,6 +381,7 @@ if __name__ == "__main__":
         test_audio_features_ranges,
         test_audio_features_ranges_harmonic,
         test_audio_features_deterministic,
+        test_madmom_tempo_when_installed,
     ]
 
     for t in tests:

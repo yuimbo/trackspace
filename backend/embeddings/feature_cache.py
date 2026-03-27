@@ -91,6 +91,15 @@ class FeatureCache:
         if len(self._mem) > self._max_memory:
             self._mem.popitem(last=False)
 
+    def _evict_mem_keys_with_prefix_unlocked(self, prefix: str) -> None:
+        dead = [k for k in self._mem if k.startswith(prefix)]
+        for k in dead:
+            del self._mem[k]
+
+    def _evict_mem_keys_with_prefix(self, prefix: str) -> None:
+        with self._lock:
+            self._evict_mem_keys_with_prefix_unlocked(prefix)
+
     # ------------------------------------------------------------------
     # CLAP embeddings (original API — unchanged signatures)
     # ------------------------------------------------------------------
@@ -323,6 +332,7 @@ class FeatureCache:
         if n:
             with self._lock:
                 self._write_epoch += 1
+                self._evict_mem_keys_with_prefix_unlocked("effnet:")
         return n
 
     # ------------------------------------------------------------------
@@ -441,4 +451,5 @@ class FeatureCache:
         if n:
             with self._lock:
                 self._write_epoch += 1
+                self._evict_mem_keys_with_prefix_unlocked("feat:")
         return n

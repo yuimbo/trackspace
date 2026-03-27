@@ -23,6 +23,11 @@ model.loadLS();
 
 const canvas = new CanvasView(model);
 const tagPanel = new TagPanelView(model, document.getElementById("tag-list")!);
+const featuresPanel = new TagPanelView(
+  model,
+  document.getElementById("feature-list")!,
+  "features",
+);
 const props = new PropertiesView(
   model,
   document.getElementById("properties-list")!,
@@ -30,7 +35,15 @@ const props = new PropertiesView(
 const batch = new BatchView(model, document.getElementById("batch-list")!);
 const status = new StatusView();
 
-const ctrl = new Controller(model, canvas, tagPanel, props, batch, status);
+const ctrl = new Controller(
+  model,
+  canvas,
+  tagPanel,
+  featuresPanel,
+  props,
+  batch,
+  status,
+);
 void ctrl.init();
 
 renderShortcutList(document.getElementById("shortcut-list")!);
