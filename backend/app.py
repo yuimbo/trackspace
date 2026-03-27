@@ -3,14 +3,11 @@
 
 import hashlib
 import os
-import sys
-import subprocess
 import json as _json
 import logging
 import argparse
 import threading
 import time
-import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -22,20 +19,10 @@ from backend.process_limits import raise_nofile_limit
 
 raise_nofile_limit()
 
-from flask import (
-    Flask,
-    request,
-    jsonify,
-    send_file,
-    send_from_directory,
-    render_template,
-    abort,
-)
-
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileMovedEvent, DirMovedEvent
 
-from backend.tags import write_tag, delete_tag, rename_tag, read_all
+from backend.tags import read_all
 from backend.cache import TrackCache
 from backend.fingerprint import compute_fingerprint
 from backend.feature_cache import FeatureCache
@@ -70,8 +57,7 @@ from backend.services.virtual_paths import (
     root_and_rel_from_virtual as root_and_rel_from_virtual_service,
     virtual_from_abs as virtual_from_abs_service,
 )
-from backend.routes.api_embeddings import create_api_embeddings_blueprint
-from backend.routes.api_library import create_api_library_blueprint
+from backend.factory import TrackspaceBlueprintDeps, create_app
 from backend.sse import sse_response
 
 log = logging.getLogger(__name__)
@@ -259,8 +245,6 @@ def _emit_decode_warning_once(rel_path: str, message: str, seen_paths: set[str])
 
 DIST_DIR = os.path.join(_PROJECT_DIR, "frontend", "dist")
 
-app = Flask(__name__, static_folder=None, template_folder=os.path.join(_PKG_DIR, "templates"))
-
 MUSIC_ROOT: str = ""  # initial CLI root
 ROOTS: "OrderedDict[str, str]" = OrderedDict()
 _ROOTS_STATE_PATH = os.path.join(_DATA_DIR, "roots.json")
@@ -415,6 +399,16 @@ def _folder_tree(root: str, root_id: str, rel_prefix: str = "") -> dict:
     return {"name": name, "path": vpath, "children": children, "root_id": root_id}
 
 
+def _dir_color(folder_path: str) -> str:
+    """Deterministic folder swatch colour (matches frontend dirColor())."""
+    if not folder_path:
+        return "hsl(350,60%,55%)"
+    h = 0
+    for ch in folder_path:
+        h = (h * 31 + ord(ch)) & 0x3FFFF
+    return f"hsl({h % 360},65%,60%)"
+
+
 def _cached_read_all(path: str) -> dict:
     """Read ID3 tags + metadata + fingerprint for *path*, consulting cache first.
 
@@ -466,8 +460,9 @@ def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
     return infos
 
 
-app.register_blueprint(
-    create_api_embeddings_blueprint(
+app = create_app(
+    template_folder=os.path.join(_PKG_DIR, "templates"),
+    deps=TrackspaceBlueprintDeps(
         embeddings_mod=embeddings,
         audio_features_mod=audio_features,
         embedding_version=EMBEDDING_VERSION,
@@ -487,290 +482,33 @@ app.register_blueprint(
         projection_query_fingerprint=_embedding_projection_query_fingerprint,
         parse_projection_params_fn=_parse_projection_params,
         build_track_infos_fn=_build_track_infos,
-        resolve_virtual_path=_resolve,
-        virtual_from_abs_path=_virtual_from_abs,
         broadcast_embed_event=_broadcast_embed_event,
         emit_decode_warning_once=_emit_decode_warning_once,
         broadcaster=_embed_broadcaster,
         is_generating=_embed_is_running,
         sse_response=sse_response,
-    )
-)
-app.register_blueprint(
-    create_api_library_blueprint(
         list_mp3s=_list_mp3s,
         cached_read_all=_cached_read_all,
         executor=_THREAD_POOL,
-        feature_cache=_FEATURES,
-        features_version=FEATURES_VERSION,
-        audio_features_mod=audio_features,
         read_paths_parallel=read_paths_parallel,
         iter_parallel_reads=iter_parallel_reads,
         track_dict_from_read_service=track_dict_from_read_service,
         build_track_list_service=build_track_list_service,
         emit_scan_progress_events=emit_scan_progress_events,
-        sse_response=sse_response,
+        roots=ROOTS,
+        folder_tree=_folder_tree,
+        add_root=_add_root,
+        remove_root=_remove_root,
+        schedule_root_watch=_schedule_root_watch,
+        unschedule_root_watch=_unschedule_root_watch,
+        save_roots_state=_save_roots_state,
+        track_cache=_CACHE,
+        dir_color_fn=_dir_color,
+        resolve_virtual_path=_resolve,
         virtual_from_abs=_virtual_from_abs,
-    )
+        dist_dir=DIST_DIR,
+    ),
 )
-
-
-def _dir_color(folder_path: str) -> str:
-    """Deterministic folder swatch colour (matches frontend dirColor())."""
-    if not folder_path:
-        return "hsl(350,60%,55%)"
-    h = 0
-    for ch in folder_path:
-        h = (h * 31 + ord(ch)) & 0x3FFFF
-    return f"hsl({h % 360},65%,60%)"
-
-
-# ---------------------------------------------------------------------------
-# HTMX partials
-# ---------------------------------------------------------------------------
-
-@app.route("/partials/folder-tree")
-def partial_folder_tree():
-    """HTML fragment for the folder sidebar (HTMX)."""
-    active = request.args.get("active", "")
-    active_folders = request.args.getlist("active_folders")
-    if not active_folders:
-        active_folders = [active if active != "" else "."]
-    pending_rename = request.args.get("pending_rename", "")
-    trees = [_folder_tree(root_abs, rid) for rid, root_abs in ROOTS.items()]
-    return render_template(
-        "partials/folder_tree.html",
-        trees=trees,
-        active_folders=active_folders,
-        pending_rename=pending_rename,
-        dir_color=_dir_color,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Page – serve Vite build (production)
-# ---------------------------------------------------------------------------
-
-@app.route("/")
-def index():
-    if os.path.isdir(DIST_DIR):
-        return send_from_directory(DIST_DIR, "index.html")
-    return (
-        "Frontend not built. Run <code>npm run build</code> in <code>frontend/</code>, "
-        "or use the Vite dev server (<code>npm run dev</code>) for development."
-    ), 404
-
-
-@app.route("/assets/<path:filename>")
-def serve_assets(filename):
-    return send_from_directory(os.path.join(DIST_DIR, "assets"), filename)
-
-
-# ---------------------------------------------------------------------------
-# API – Folders
-# ---------------------------------------------------------------------------
-
-@app.route("/api/folders")
-def api_folders():
-    """Return the folder tree for all roots (or a subpath)."""
-    rel = request.args.get("root", "")
-    if rel in ("", "."):
-        return jsonify({"roots": [_folder_tree(root_abs, rid) for rid, root_abs in ROOTS.items()]})
-    root_abs = _resolve(rel)
-    parts = rel.split("/", 1)
-    root_id = parts[0]
-    rel_inside = parts[1] if len(parts) > 1 else ""
-    return jsonify(_folder_tree(root_abs, root_id, rel_inside))
-
-
-@app.route("/api/roots/add", methods=["POST"])
-def api_roots_add():
-    data = request.get_json(force=True)
-    path = (data.get("path") or "").strip()
-    if not path:
-        abort(400)
-    abs_path = os.path.abspath(path)
-    if not os.path.isdir(abs_path):
-        return jsonify({"ok": False, "error": "Directory not found"})
-    before_ids = set(ROOTS.keys())
-    changed, root_id = _add_root(abs_path)
-    after_ids = set(ROOTS.keys())
-    for rid in sorted(before_ids - after_ids):
-        _unschedule_root_watch(rid)
-    for rid in sorted(after_ids - before_ids):
-        _schedule_root_watch(rid)
-    _save_roots_state()
-    return jsonify({"ok": True, "changed": changed, "root_id": root_id})
-
-
-@app.route("/api/roots/remove", methods=["POST"])
-def api_roots_remove():
-    data = request.get_json(force=True)
-    root_id = (data.get("root_id") or "").strip()
-    if not root_id:
-        abort(400)
-    if not _remove_root(root_id):
-        return jsonify({"ok": False, "error": "Unknown root"})
-    _unschedule_root_watch(root_id)
-    _save_roots_state()
-    return jsonify({"ok": True})
-
-
-# ---------------------------------------------------------------------------
-# API – Tracks
-# ---------------------------------------------------------------------------
-
-@app.route("/api/tracks/tags", methods=["POST"])
-def api_update_tags():
-    """Batch-update tag values.
-
-    Expects JSON body:
-        { "updates": [ {"path": "rel/file.mp3", "tag": "energy", "value": 0.7}, … ] }
-
-    A null value deletes the tag.
-    """
-    data = request.get_json(force=True)
-    updates = data.get("updates", [])
-    for u in updates:
-        abs_path = _resolve(u["path"])
-        tagname = u["tag"]
-        value = u.get("value")
-        if value is None:
-            delete_tag(abs_path, tagname)
-        else:
-            write_tag(abs_path, tagname, value)
-    return jsonify({"ok": True, "count": len(updates)})
-
-
-@app.route("/api/folders/reveal", methods=["POST"])
-def api_reveal_folder():
-    """Open a folder in the OS file manager (Finder on macOS, Explorer on Windows).
-
-    Body: {"path": "rel/path/to/folder"}
-    """
-    data = request.get_json(force=True)
-    abs_path = _resolve(data.get("path", ""))
-    if not os.path.isdir(abs_path):
-        abort(404)
-    if sys.platform == "darwin":
-        subprocess.Popen(["open", abs_path])
-    elif sys.platform == "win32":
-        subprocess.Popen(["explorer", abs_path])
-    else:
-        subprocess.Popen(["xdg-open", abs_path])
-    return jsonify({"ok": True})
-
-
-@app.route("/api/folders/create", methods=["POST"])
-def api_create_folder():
-    """Create a new subdirectory.
-
-    Body: {"parent": "rel/path", "name": "new_dir"}
-    """
-    data = request.get_json(force=True)
-    parent = _resolve(data.get("parent", ""))
-    name = os.path.basename(data.get("name", "").strip())
-    if not name:
-        abort(400)
-    new_dir = os.path.join(parent, name)
-    if os.path.exists(new_dir):
-        return jsonify({"ok": False, "error": "Already exists"})
-    os.makedirs(new_dir)
-    return jsonify({"ok": True, "path": _virtual_from_abs(new_dir)})
-
-
-@app.route("/api/folders/rename", methods=["POST"])
-def api_rename_folder():
-    """Rename a folder (leaf name only).
-
-    Body: {"path": "rel/path/to/folder", "name": "new_name"}
-    """
-    data = request.get_json(force=True)
-    old_abs = _resolve(data.get("path", ""))
-    new_name = os.path.basename(data.get("name", "").strip())
-    if not new_name:
-        abort(400)
-    if not os.path.isdir(old_abs):
-        abort(404)
-    new_abs = os.path.join(os.path.dirname(old_abs), new_name)
-    if os.path.exists(new_abs):
-        return jsonify({"ok": False, "error": "Already exists"})
-    os.rename(old_abs, new_abs)
-    _CACHE.remap_prefix(old_abs + os.sep, new_abs + os.sep)
-    return jsonify({"ok": True, "path": _virtual_from_abs(new_abs)})
-
-
-@app.route("/api/tracks/move", methods=["POST"])
-def api_move_tracks():
-    """Move files to a different folder.
-
-    Body: {"paths": ["rel/file.mp3", ...], "dest": "rel/dest/folder"}
-    """
-    data = request.get_json(force=True)
-    dest_abs = _resolve(data.get("dest", ""))
-    if not os.path.isdir(dest_abs):
-        abort(400)
-    moved, errors = 0, []
-    for rel in data.get("paths", []):
-        src = _resolve(rel)
-        if not os.path.isfile(src):
-            errors.append(f"Not found: {rel}")
-            continue
-        dst = os.path.join(dest_abs, os.path.basename(src))
-        if src == dst:
-            continue  # already in this folder — skip silently
-        if os.path.exists(dst):
-            errors.append(f"Already exists: {os.path.basename(src)}")
-            continue
-        try:
-            os.rename(src, dst)
-        except OSError:
-            shutil.move(src, dst)
-        _CACHE.remap(src, dst)
-        moved += 1
-    return jsonify({"ok": True, "moved": moved, "errors": errors})
-
-
-@app.route("/api/tags/rename", methods=["POST"])
-def api_rename_tag():
-    """Rename a tag across all files in a folder.
-
-    Body: {"old": "energy", "new": "vibe", "folder": "", "recursive": true}
-    """
-    data = request.get_json(force=True)
-    folder = data.get("folder", "")
-    recursive = data.get("recursive", True)
-    paths = _list_mp3s(folder, recursive)
-    count = sum(1 for p in paths if rename_tag(p, data["old"], data["new"]))
-    return jsonify({"ok": True, "renamed": count})
-
-
-@app.route("/api/tags/delete", methods=["POST"])
-def api_delete_tag():
-    """Delete a tag from all files in a folder.
-
-    Body: {"name": "energy", "folder": "", "recursive": true}
-    """
-    data = request.get_json(force=True)
-    folder = data.get("folder", "")
-    recursive = data.get("recursive", True)
-    paths = _list_mp3s(folder, recursive)
-    for p in paths:
-        delete_tag(p, data["name"])
-    return jsonify({"ok": True, "files": len(paths)})
-
-
-# ---------------------------------------------------------------------------
-# API – Audio preview
-# ---------------------------------------------------------------------------
-
-@app.route("/api/audio/<path:relpath>")
-def api_audio(relpath):
-    """Stream an mp3 file for hover-preview playback."""
-    abs_path = _resolve(relpath)
-    if not os.path.isfile(abs_path):
-        abort(404)
-    return send_file(abs_path, mimetype="audio/mpeg")
 
 
 # ---------------------------------------------------------------------------

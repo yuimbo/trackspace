@@ -1,12 +1,13 @@
 # Trackspace — architecture backlog
 
-This file lists **remaining** modularisation work. It replaces the old “plan + migration checklist” now that several backend extractions and the embeddings blueprint are landed. Product architecture is still described in `AGENTS.md`.
+This file lists **remaining** modularisation work. HTTP routes live under `backend/routes/`; `backend/factory.py` provides `create_app()`; `backend/app.py` builds wiring, roots, and the filesystem watcher. Product architecture is still described in `AGENTS.md`.
 
 ## Scale snapshot (indicative)
 
 | Area | File | Lines (approx.) | Notes |
 |------|------|-----------------|--------|
-| Backend entry + HTTP | `backend/app.py` | ~960 | Still owns most routes, roots, FS watcher, caches |
+| Backend entry + wiring | `backend/app.py` | ~610 | Roots, watcher, helpers, `TrackspaceBlueprintDeps`, `main()` |
+| App factory | `backend/factory.py` | ~150 | `create_app()` + blueprint registration |
 | ML / layout | `backend/embeddings.py` | ~1245 | Still a god module; split is optional/phase 2 |
 | Frontend orchestration | `frontend/src/controller.ts` | ~2920 | Largest remaining refactor target |
 | State | `frontend/src/model.ts` | ~685 | Optional persistence / EventBus split |
@@ -19,23 +20,11 @@ Collapse module-level singletons (`ROOTS`, caches, executor, embed locks, observ
 
 **Why:** tests and future blueprints avoid import-order hazards and implicit globals.
 
-### 2. Blueprints for the rest of the API (besides embeddings + library)
-
-Embeddings live in `backend/routes/api_embeddings.py` (`/api/embeddings/*`) and
-library routes live in `backend/routes/api_library.py`
-(``/api/tracks``, ``/api/library/stream``, ``/api/tags``). Still in `app.py`:
-
-- **Folders + HTMX:** `/partials/folder-tree`, `/api/folders*`, roots add/remove, reveal, track moves
-- **Tag mutation:** `/api/tracks/tags`, `/api/tags/*`
-- **Static:** `/`, `/assets/*`, `/api/audio/*` (or keep static/audio in a tiny blueprint)
-
-Target: `app.py` / `backend/factory.py` only wires context + `register_blueprint` + lifecycle (watcher, GC, model warmups).
-
-### 3. Extract filesystem watcher
+### 2. Extract filesystem watcher
 
 Move `_FilesystemHandler` + ingest thread + root watch scheduling from `app.py` to e.g. `backend/fs_watch.py` (no Flask imports).
 
-### 4. Optional: split `backend/embeddings.py`
+### 3. Optional: split `backend/embeddings.py`
 
 Suggested seam (only when that file is actively being edited):
 
@@ -46,15 +35,15 @@ Suggested seam (only when that file is actively being edited):
 
 Keep `backend/embeddings.py` as a thin facade re-exporting public symbols if you want minimal churn for imports.
 
-### 5. Roots registry service
+### 4. Roots registry service
 
 Promote roots merge rules + `data/roots.json` load/save + validation from `app.py` into `backend/services/roots_registry.py`, pairing with `backend/services/virtual_paths.py`.
 
-### 6. Decode-warning policy consolidation
+### 5. Decode-warning policy consolidation
 
 Single mode-aware helper (e.g. `decode_reliability.py`) for `full_decode` vs `partial_window` vs `segment_seek`, used by CLAP / EffNet / audio-feature paths.
 
-### 7. “No hidden scope” tests
+### 6. “No hidden scope” tests
 
 Light integration tests for multi-root: full-library listing, embedding status/projection with empty folder, and UI-focused assertions where feasible.
 
