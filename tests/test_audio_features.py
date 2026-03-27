@@ -23,7 +23,7 @@ TEST_TRACK_HARMONIC = os.path.join(FIXTURE_DIR, "test_track_2.mp3")
 
 def test_mel_preprocessing():
     import librosa
-    from backend.audio_features import compute_mel_spectrogram, _EFFNET_SR
+    from backend.embeddings.effnet import compute_mel_spectrogram, _EFFNET_SR
 
     audio, _ = librosa.load(TEST_TRACK, sr=_EFFNET_SR, mono=True)
     mel = compute_mel_spectrogram(audio)
@@ -39,11 +39,11 @@ def test_mel_preprocessing():
 
 def test_mel_patching():
     import librosa
-    from backend.audio_features import (
+    from backend.embeddings.effnet import (
         compute_mel_spectrogram,
         patch_mel_spectrogram,
-        _EFFNET_SR,
         _EFFNET_PATCH_FRAMES,
+        _EFFNET_SR,
     )
 
     audio, _ = librosa.load(TEST_TRACK, sr=_EFFNET_SR, mono=True)
@@ -59,7 +59,7 @@ def test_mel_patching():
 
 def test_mel_patching_short_audio():
     """A very short signal should still produce one zero-padded patch."""
-    from backend.audio_features import patch_mel_spectrogram, _EFFNET_PATCH_FRAMES
+    from backend.embeddings.effnet import patch_mel_spectrogram, _EFFNET_PATCH_FRAMES
 
     short_mel = np.random.rand(10, 96).astype(np.float32)
     patches = patch_mel_spectrogram(short_mel)
@@ -74,12 +74,12 @@ def test_feature_excerpt_falls_back_when_seek_returns_empty():
     returns an empty array without raising. Full-file decode must still succeed."""
     from unittest.mock import patch
 
-    from backend import audio_features as af
+    import backend.embeddings.librosa_audio_features as laf
 
-    with patch.object(af, "librosa_get_duration", return_value=600.0):
-        audio, sr, warn = af._load_feature_audio_excerpt(TEST_TRACK)
+    with patch.object(laf, "librosa_get_duration", return_value=600.0):
+        audio, sr, warn = laf._load_feature_audio_excerpt(TEST_TRACK)
     assert audio is not None and audio.size > 0
-    assert sr == af._FEATURE_SR
+    assert sr == laf._FEATURE_SR
     assert warn is not None
     assert "600" in warn
 
@@ -88,7 +88,7 @@ def test_feature_excerpt_falls_back_when_seek_returns_empty():
 
 @pytest.fixture(scope="module")
 def effnet_loaded():
-    from backend.audio_features import load_effnet, is_effnet_ready
+    from backend.embeddings.effnet import is_effnet_ready, load_effnet
     load_effnet()
     return is_effnet_ready()
 
@@ -97,7 +97,7 @@ def test_effnet_embedding(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embedding
+    from backend.embeddings.effnet import generate_effnet_embedding
 
     emb = generate_effnet_embedding(TEST_TRACK)
     print(f"EffNet embedding: shape={emb.shape}, dtype={emb.dtype}")
@@ -115,7 +115,7 @@ def test_effnet_embedding_harmonic(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embedding
+    from backend.embeddings.effnet import generate_effnet_embedding
 
     emb = generate_effnet_embedding(TEST_TRACK_HARMONIC)
     print(f"EffNet (harmonic): shape={emb.shape}")
@@ -130,7 +130,7 @@ def test_effnet_deterministic(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embedding
+    from backend.embeddings.effnet import generate_effnet_embedding
 
     emb1 = generate_effnet_embedding(TEST_TRACK)
     emb2 = generate_effnet_embedding(TEST_TRACK)
@@ -146,7 +146,7 @@ def test_effnet_batch(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embeddings_batch
+    from backend.embeddings.effnet import generate_effnet_embeddings_batch
 
     paths = [TEST_TRACK, TEST_TRACK_HARMONIC]
     results = generate_effnet_embeddings_batch(paths)
@@ -169,7 +169,7 @@ def test_effnet_batch_matches_single(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import (
+    from backend.embeddings.effnet import (
         generate_effnet_embedding,
         generate_effnet_embeddings_batch,
     )
@@ -188,7 +188,7 @@ def test_effnet_batch_matches_single(effnet_loaded):
 
 def test_effnet_batch_empty():
     """Empty path list should return empty dict without errors."""
-    from backend.audio_features import generate_effnet_embeddings_batch
+    from backend.embeddings.effnet import generate_effnet_embeddings_batch
 
     assert generate_effnet_embeddings_batch([]) == {}
 
@@ -198,7 +198,7 @@ def test_effnet_batch_invalid_path(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embeddings_batch
+    from backend.embeddings.effnet import generate_effnet_embeddings_batch
 
     bogus = "/nonexistent/file.mp3"
     results = generate_effnet_embeddings_batch([TEST_TRACK, bogus])
@@ -213,7 +213,7 @@ def test_effnet_batch_invalid_path(effnet_loaded):
 def test_key_detection_harmonic():
     """Detect key on the harmonic track (ID3 says Am)."""
     import librosa
-    from backend.audio_features import detect_key
+    from backend.embeddings.librosa_audio_features import detect_key
 
     audio, sr = librosa.load(TEST_TRACK_HARMONIC, sr=44100, mono=True)
     key, scale = detect_key(audio, sr)
@@ -227,7 +227,7 @@ def test_key_detection_harmonic():
 def test_key_detection_returns_valid():
     """Key detection on the rhythmic track should still return a valid result."""
     import librosa
-    from backend.audio_features import detect_key
+    from backend.embeddings.librosa_audio_features import detect_key
 
     audio, sr = librosa.load(TEST_TRACK, sr=44100, mono=True)
     key, scale = detect_key(audio, sr)
@@ -241,7 +241,7 @@ def test_key_detection_returns_valid():
 # ── Circle-of-fifths encoding ────────────────────────────────
 
 def test_circle_of_fifths_mapping():
-    from backend.audio_features import _KEY_TO_FIFTHS
+    from backend.embeddings.librosa_audio_features import _KEY_TO_FIFTHS
 
     all_keys = {"C", "C#", "D", "D#", "E", "F",
                 "F#", "G", "G#", "A", "A#", "B"}
@@ -254,7 +254,7 @@ def test_circle_of_fifths_mapping():
 
 def test_circle_of_fifths_unit_circle():
     """Verify that the cos/sin encoding lies on the unit circle."""
-    from backend.audio_features import _KEY_TO_FIFTHS
+    from backend.embeddings.librosa_audio_features import _KEY_TO_FIFTHS
 
     for key, pos in _KEY_TO_FIFTHS.items():
         angle = 2.0 * math.pi * pos / 12.0
@@ -268,7 +268,7 @@ def test_circle_of_fifths_unit_circle():
 def test_harmonically_close_keys_are_geometrically_close():
     """Adjacent keys on the circle of fifths (e.g. C and G) should be
     closer in 2D than distant keys (e.g. C and F#)."""
-    from backend.audio_features import _KEY_TO_FIFTHS
+    from backend.embeddings.librosa_audio_features import _KEY_TO_FIFTHS
 
     def encode(key: str) -> tuple[float, float]:
         pos = _KEY_TO_FIFTHS[key]
@@ -289,7 +289,7 @@ def test_harmonically_close_keys_are_geometrically_close():
 # ── Full audio feature extraction ─────────────────────────────
 
 def test_audio_features_shape():
-    from backend.audio_features import extract_audio_features
+    from backend.embeddings.librosa_audio_features import extract_audio_features
 
     feat = extract_audio_features(TEST_TRACK)
     print(f"Features: shape={feat.shape}, dtype={feat.dtype}, values={feat}")
@@ -301,7 +301,7 @@ def test_audio_features_shape():
 
 
 def test_audio_features_shape_harmonic():
-    from backend.audio_features import extract_audio_features
+    from backend.embeddings.librosa_audio_features import extract_audio_features
 
     feat = extract_audio_features(TEST_TRACK_HARMONIC)
     print(f"Features (harmonic): shape={feat.shape}, values={feat}")
@@ -313,7 +313,7 @@ def test_audio_features_shape_harmonic():
 
 
 def test_audio_features_ranges():
-    from backend.audio_features import extract_audio_features
+    from backend.embeddings.librosa_audio_features import extract_audio_features
 
     feat = extract_audio_features(TEST_TRACK)
     tempo_norm, key_cos, key_sin, mode, energy_norm, danceability = feat
@@ -327,7 +327,7 @@ def test_audio_features_ranges():
 
 
 def test_audio_features_ranges_harmonic():
-    from backend.audio_features import extract_audio_features
+    from backend.embeddings.librosa_audio_features import extract_audio_features
 
     feat = extract_audio_features(TEST_TRACK_HARMONIC)
     tempo_norm, key_cos, key_sin, mode, energy_norm, danceability = feat
@@ -341,7 +341,7 @@ def test_audio_features_ranges_harmonic():
 
 
 def test_audio_features_deterministic():
-    from backend.audio_features import extract_audio_features
+    from backend.embeddings.librosa_audio_features import extract_audio_features
 
     f1 = extract_audio_features(TEST_TRACK)
     f2 = extract_audio_features(TEST_TRACK)
@@ -375,7 +375,7 @@ if __name__ == "__main__":
         print("  OK")
 
     print("\n--- EffNet tests (require model download) ---")
-    from backend.audio_features import load_effnet, is_effnet_ready
+    from backend.embeddings.effnet import is_effnet_ready, load_effnet
     load_effnet()
     if is_effnet_ready():
         test_effnet_embedding(True)

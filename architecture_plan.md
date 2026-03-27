@@ -1,49 +1,33 @@
 # Trackspace — architecture backlog
 
-This file lists **remaining** modularisation work. HTTP routes live under `backend/routes/`; `backend/factory.py` provides `create_app()`; `backend/app.py` builds wiring, roots, and the filesystem watcher. Product architecture is still described in `AGENTS.md`.
+This file lists **remaining** modularisation work. HTTP routes live under `backend/routes/`; `backend/factory.py` provides `create_app()`; `backend/trackspace_state.py` holds `TrackspaceState` (caches, roots, embed/SSE, pool, watcher handles); `backend/services/roots_registry.py` owns root ids / merge rules / `roots.json` I/O; `backend/app.py` wires helpers and CLI; the watchdog handler lives in `backend/fs_watch.py`. Product architecture is still described in `AGENTS.md`.
 
 ## Scale snapshot (indicative)
 
 | Area | File | Lines (approx.) | Notes |
 |------|------|-----------------|--------|
-| Backend entry + wiring | `backend/app.py` | ~610 | Roots, watcher, helpers, `TrackspaceBlueprintDeps`, `main()` |
+| Backend entry + wiring | `backend/app.py` | ~490 | Helpers, `TrackspaceBlueprintDeps`, `main()`; uses `state` |
+| Process state | `backend/trackspace_state.py` | ~70 | `TrackspaceState.create()` |
 | App factory | `backend/factory.py` | ~150 | `create_app()` + blueprint registration |
-| ML / layout | `backend/embeddings.py` | ~1245 | Still a god module; split is optional/phase 2 |
+| ML / layout | `backend/embeddings/` (see `layout.py`) | ~920+ | Package: composite layout + projection; CLAP in `clap.py`; audio in `audio_decode` / `effnet` / `librosa_audio_features` |
 | Frontend orchestration | `frontend/src/controller.ts` | ~2920 | Largest remaining refactor target |
 | State | `frontend/src/model.ts` | ~685 | Optional persistence / EventBus split |
 
 ## Backend — still to do
 
-### 1. `AppContext` / `TrackspaceState` (replace sprawling `app.py` globals)
+### 1. TrackspaceState lifecycle (optional)
 
-Collapse module-level singletons (`ROOTS`, caches, executor, embed locks, observer, …) into one object built in `main()` and passed into blueprint factories (or hung off `g.ctx`).
+`TrackspaceState.create()` still runs at import time alongside `create_app(...)`; `state` is also on `app.extensions["trackspace_state"]`. Further work if needed: build state after CLI parse in `main()`, or expose `create_app(state=...)` for tests that inject a fresh state.
 
-**Why:** tests and future blueprints avoid import-order hazards and implicit globals.
+### 2. Optional: split `backend/embeddings/layout.py` further
 
-### 2. Extract filesystem watcher
+CLAP already lives in `embeddings/clap.py`. Remaining seams if `layout.py` grows again: semantic weighting vs projection backends (each ~300+ LOC).
 
-Move `_FilesystemHandler` + ingest thread + root watch scheduling from `app.py` to e.g. `backend/fs_watch.py` (no Flask imports).
-
-### 3. Optional: split `backend/embeddings.py`
-
-Suggested seam (only when that file is actively being edited):
-
-- Model / inference
-- Semantic weighting
-- Composite vector assembly
-- Projection backends + caches
-
-Keep `backend/embeddings.py` as a thin facade re-exporting public symbols if you want minimal churn for imports.
-
-### 4. Roots registry service
-
-Promote roots merge rules + `data/roots.json` load/save + validation from `app.py` into `backend/services/roots_registry.py`, pairing with `backend/services/virtual_paths.py`.
-
-### 5. Decode-warning policy consolidation
+### 3. Decode-warning policy consolidation
 
 Single mode-aware helper (e.g. `decode_reliability.py`) for `full_decode` vs `partial_window` vs `segment_seek`, used by CLAP / EffNet / audio-feature paths.
 
-### 6. “No hidden scope” tests
+### 4. “No hidden scope” tests
 
 Light integration tests for multi-root: full-library listing, embedding status/projection with empty folder, and UI-focused assertions where feasible.
 

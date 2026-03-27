@@ -56,7 +56,7 @@ def _print_stats(label: str, samples: list[float]) -> None:
 
 @pytest.fixture(scope="module")
 def effnet_loaded() -> bool:
-    from backend.audio_features import is_effnet_ready, load_effnet
+    from backend.embeddings.effnet import is_effnet_ready, load_effnet
 
     load_effnet()
     return is_effnet_ready()
@@ -74,7 +74,7 @@ def clap_loaded() -> bool:
 
 
 def test_profile_audio_features():
-    from backend.audio_features import extract_audio_features
+    from backend.embeddings.librosa_audio_features import extract_audio_features
 
     result, samples = _timed_runs(lambda: extract_audio_features(TEST_TRACK), runs=5)
     _print_stats("audio_features", samples)
@@ -86,7 +86,7 @@ def test_profile_audio_features():
 
 
 def test_profile_audio_features_batch_vs_sequential():
-    from backend.audio_features import (
+    from backend.embeddings.librosa_audio_features import (
         extract_audio_features,
         generate_audio_features_batch,
     )
@@ -125,7 +125,7 @@ def test_profile_effnet_single(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embedding
+    from backend.embeddings.effnet import generate_effnet_embedding
 
     result, samples = _timed_runs(
         lambda: generate_effnet_embedding(TEST_TRACK),
@@ -144,7 +144,7 @@ def test_profile_effnet_batch(effnet_loaded):
     if not effnet_loaded:
         pytest.skip("onnxruntime or EffNet model not available")
 
-    from backend.audio_features import generate_effnet_embeddings_batch
+    from backend.embeddings.effnet import generate_effnet_embeddings_batch
 
     paths = [TEST_TRACK, TEST_TRACK_HARMONIC]
     result, samples = _timed_runs(
@@ -225,7 +225,7 @@ def _projection_matrix(n_rows: int, n_cols: int, seed: int = 42) -> np.ndarray:
 @pytest.mark.parametrize("method", ["umap", "tsne"])
 def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
     """Compare CPU (umap-learn / sklearn) vs cuML or mlx-vis when available."""
-    from backend.embeddings import (
+    from backend.embeddings.layout import (
         _project_tsne,
         _project_umap,
         reset_projection_backend_cache,
@@ -295,7 +295,7 @@ def test_profile_projection_cpu_vs_gpu(method: str, monkeypatch):
 
 def test_profile_projection_cpu_only_quick(monkeypatch):
     """Small CPU UMAP timing — runs everywhere."""
-    from backend.embeddings import _project_umap, reset_projection_backend_cache
+    from backend.embeddings.layout import _project_umap, reset_projection_backend_cache
 
     monkeypatch.setenv("TRACKSPACE_CUML", "0")
     monkeypatch.setenv("TRACKSPACE_MLX_VIS", "0")

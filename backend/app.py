@@ -3,13 +3,10 @@
 
 import hashlib
 import os
-import json as _json
 import logging
 import argparse
 import threading
 import time
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 
 from dotenv import load_dotenv
 
@@ -20,26 +17,28 @@ from backend.process_limits import raise_nofile_limit
 raise_nofile_limit()
 
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileMovedEvent, DirMovedEvent
 
 from backend.tags import read_all
-from backend.cache import TrackCache
 from backend.fingerprint import compute_fingerprint
-from backend.feature_cache import FeatureCache
-from backend import embeddings
 from backend import audio_features
-from backend.embeddings import EMBEDDING_VERSION
-from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
-from backend.embedding_coverage import (
+from backend import embeddings
+from backend.embeddings.clap import EMBEDDING_VERSION
+from backend.embeddings.effnet import EFFNET_VERSION
+from backend.embeddings.librosa_audio_features import FEATURES_VERSION
+from backend.embeddings.coverage import (
     SourceVersions,
     batch_fetch_maps,
     build_generation_work,
     coverage_payload,
 )
 from backend.services.layout_revision_for_status import layout_revision_for_projection
-from backend.services.embedding_broadcaster import EmbeddingBroadcaster
-from backend.services.embedding_status_cache import EmbeddingStatusCache
 from backend.services.library_scan import emit_scan_progress_events
+from backend.services.roots_registry import (
+    add_root as roots_add,
+    load_roots_state as roots_load,
+    remove_root as roots_remove,
+    save_roots_state as roots_save,
+)
 from backend.services.parallel_reads import iter_parallel_reads, read_paths_parallel
 from backend.services.projection_request import (
     ProjectionParams,
@@ -58,140 +57,13 @@ from backend.services.virtual_paths import (
     virtual_from_abs as virtual_from_abs_service,
 )
 from backend.factory import TrackspaceBlueprintDeps, create_app
+from backend.fs_watch import FilesystemWatchDeps, TrackspaceFilesystemHandler
 from backend.sse import sse_response
+from backend.trackspace_state import PKG_DIR, TrackspaceState
 
 log = logging.getLogger(__name__)
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_DIR = os.path.dirname(_PKG_DIR)
-
-_THREAD_POOL = ThreadPoolExecutor(max_workers=min(32, (os.cpu_count() or 4) * 4))
-_DATA_DIR = os.path.join(_PROJECT_DIR, "data")
-os.makedirs(_DATA_DIR, exist_ok=True)
-_CACHE = TrackCache(os.path.join(_DATA_DIR, "track_cache.db"))
-_FEATURES = FeatureCache(os.path.join(_DATA_DIR, "audio_features.db"))
-
-class _FilesystemHandler(FileSystemEventHandler):
-    """React to filesystem changes under MUSIC_ROOT.
-
-    * Moved files/folders  → remap TrackCache keys.
-    * New MP3 files        → pre-warm tag cache and (if CLAP is ready)
-                             generate a CLAP embedding in the background.
-    """
-
-    # How long to wait after a FileCreatedEvent before reading, to let
-    # large file copies finish writing.  We poll size until stable.
-    _SETTLE_SECS = 3.0
-    _SETTLE_POLLS = 3
-
-    def on_moved(self, event) -> None:
-        if isinstance(event, DirMovedEvent):
-            old_prefix = event.src_path.rstrip(os.sep) + os.sep
-            new_prefix = event.dest_path.rstrip(os.sep) + os.sep
-            _CACHE.remap_prefix(old_prefix, new_prefix)
-        elif isinstance(event, FileMovedEvent):
-            _CACHE.remap(event.src_path, event.dest_path)
-            # Treat intra-library moves of MP3s the same as new arrivals so
-            # embeddings are generated if they were missing at the source.
-            if _is_mp3(event.dest_path):
-                threading.Thread(
-                    target=self._ingest_new,
-                    args=(event.dest_path,),
-                    daemon=True,
-                ).start()
-
-    def on_created(self, event) -> None:
-        if isinstance(event, FileCreatedEvent) and _is_mp3(event.src_path):
-            threading.Thread(
-                target=self._ingest_new,
-                args=(event.src_path,),
-                daemon=True,
-            ).start()
-
-    def _ingest_new(self, abs_path: str) -> None:
-        """Wait for the file to finish writing, read tags, then embed."""
-        # Poll until file size is stable (handles slow copies).
-        prev_size = -1
-        for _ in range(self._SETTLE_POLLS):
-            time.sleep(self._SETTLE_SECS / self._SETTLE_POLLS)
-            try:
-                cur_size = os.path.getsize(abs_path)
-            except OSError:
-                return  # file disappeared
-            if cur_size == prev_size:
-                break
-            prev_size = cur_size
-
-        if not os.path.isfile(abs_path):
-            return
-
-        try:
-            data = _cached_read_all(abs_path)
-        except Exception:
-            log.exception("Watchdog: failed to read new file %s", abs_path)
-            return
-
-        rel_path = _virtual_from_abs(abs_path)
-        log.info("Watchdog: ingested %s", rel_path)
-
-        fp = data.get("fingerprint")
-        if not fp or not embeddings.is_model_ready():
-            return
-        if _FEATURES.has_embedding(fp, version=EMBEDDING_VERSION):
-            return
-
-        with _embed_lock:
-            if _embed_status["running"]:
-                # A bulk generation is in flight; the new file will be
-                # included when the user next triggers embedding mode.
-                return
-            _embed_status.update({"running": True, "done": 0, "total": 1, "error": None})
-
-        def _run() -> None:
-            try:
-                warn_seen: set[str] = set()
-                emb = embeddings.generate_embedding(
-                    abs_path,
-                    on_decode_warning=lambda m: _emit_decode_warning_once(
-                        rel_path, m, warn_seen,
-                    ),
-                )
-                ok = emb is not None
-                if ok:
-                    _FEATURES.put_embedding(fp, emb, version=EMBEDDING_VERSION)
-                evt: dict = {
-                    "type": "progress",
-                    "path": rel_path,
-                    "ok": ok,
-                    "done": 1,
-                    "total": 1,
-                }
-                if not ok:
-                    evt["failures"] = ["clap"]
-                    log.warning("Watchdog: CLAP embedding failed for %s", rel_path)
-                _broadcast_embed_event(evt)
-                log.info("Watchdog: embedding %s for %s", "ok" if ok else "failed", rel_path)
-            except Exception as e:
-                log.exception("Watchdog: embedding generation failed for %s", rel_path)
-                with _embed_lock:
-                    _embed_status["error"] = str(e)
-                _broadcast_embed_event({"type": "error", "error": str(e)})
-            finally:
-                with _embed_lock:
-                    _embed_status["running"] = False
-                _broadcast_embed_event({"type": "done"})
-
-        threading.Thread(target=_run, daemon=True).start()
-
-
-_embed_status: dict = {"running": False, "done": 0, "total": 0, "error": None}
-_embed_lock = threading.Lock()
-
-# SSE broadcast: each connected EventSource client gets its own Queue.
-_embed_broadcaster = EmbeddingBroadcaster()
-
-# Embedding /status caches (see api_embeddings_status).
-_status_cache = EmbeddingStatusCache(track_infos_max=8, status_coverage_max=48)
+state = TrackspaceState.create()
 
 
 def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
@@ -215,21 +87,21 @@ def _embedding_projection_query_fingerprint(req) -> str:
 
 def _track_infos_cached(folder_abs: str, recursive: bool, lib_sig: str) -> list[dict]:
     key = (folder_abs, recursive, lib_sig)
-    cached = _status_cache.get_track_infos(key)
+    cached = state.status_cache.get_track_infos(key)
     if cached is not None:
         return cached
     infos = _build_track_infos(folder_abs, recursive)
-    _status_cache.put_track_infos(key, infos)
+    state.status_cache.put_track_infos(key, infos)
     return infos
 
 
 def _broadcast_embed_event(event: dict) -> None:
-    _embed_broadcaster.publish(event)
+    state.embed_broadcaster.publish(event)
 
 
 def _embed_is_running() -> bool:
-    with _embed_lock:
-        return bool(_embed_status["running"])
+    with state.embed_lock:
+        return bool(state.embed_status["running"])
 
 
 def _emit_decode_warning_once(rel_path: str, message: str, seen_paths: set[str]) -> None:
@@ -243,112 +115,56 @@ def _emit_decode_warning_once(rel_path: str, message: str, seen_paths: set[str])
         "message": message,
     })
 
-DIST_DIR = os.path.join(_PROJECT_DIR, "frontend", "dist")
-
-MUSIC_ROOT: str = ""  # initial CLI root
-ROOTS: "OrderedDict[str, str]" = OrderedDict()
-_ROOTS_STATE_PATH = os.path.join(_DATA_DIR, "roots.json")
-_OBSERVER: Observer | None = None
-_ROOT_WATCHES: dict[str, object] = {}
-
-
-def _stable_root_id(abs_path: str) -> str:
-    base = hashlib.sha1(abs_path.encode("utf-8")).hexdigest()[:8]
-    rid = base
-    i = 1
-    while rid in ROOTS and ROOTS[rid] != abs_path:
-        rid = f"{base[:6]}{i:02d}"
-        i += 1
-    return rid
-
-
 def _add_root(abs_path: str) -> tuple[bool, str]:
-    """Insert a root folder and merge redundant descendants."""
-    p = os.path.abspath(abs_path)
-    if not os.path.isdir(p):
-        raise FileNotFoundError(p)
-    for rid, root_abs in list(ROOTS.items()):
-        if p == root_abs or p.startswith(root_abs.rstrip(os.sep) + os.sep):
-            return False, rid
-    for rid, root_abs in list(ROOTS.items()):
-        if root_abs.startswith(p.rstrip(os.sep) + os.sep):
-            del ROOTS[rid]
-    rid = _stable_root_id(p)
-    ROOTS[rid] = p
-    return True, rid
+    return roots_add(abs_path, state.roots)
 
 
 def _remove_root(root_id: str) -> bool:
-    if root_id in ROOTS:
-        del ROOTS[root_id]
-        return True
-    return False
+    return roots_remove(root_id, state.roots)
 
 
 def _schedule_root_watch(root_id: str) -> None:
     """Start watchdog monitoring for one root when observer is active."""
-    if _OBSERVER is None:
+    if state.observer is None:
         return
-    root_abs = ROOTS.get(root_id)
-    if not root_abs or root_id in _ROOT_WATCHES:
+    root_abs = state.roots.get(root_id)
+    if not root_abs or root_id in state.root_watches:
         return
     try:
-        _ROOT_WATCHES[root_id] = _OBSERVER.schedule(_FilesystemHandler(), root_abs, recursive=True)
+        state.root_watches[root_id] = state.observer.schedule(
+            TrackspaceFilesystemHandler(FILESYSTEM_WATCH_DEPS),
+            root_abs,
+            recursive=True,
+        )
     except Exception:
         log.exception("Watchdog: failed to schedule root watch for %s (%s)", root_id, root_abs)
 
 
 def _unschedule_root_watch(root_id: str) -> None:
     """Stop watchdog monitoring for one root when observer is active."""
-    watch = _ROOT_WATCHES.pop(root_id, None)
-    if _OBSERVER is None or watch is None:
+    watch = state.root_watches.pop(root_id, None)
+    if state.observer is None or watch is None:
         return
     try:
-        _OBSERVER.unschedule(watch)
+        state.observer.unschedule(watch)
     except Exception:
         log.exception("Watchdog: failed to unschedule root watch for %s", root_id)
 
 
 def _save_roots_state() -> None:
-    """Persist active roots so they survive process restarts."""
-    payload = {"roots": list(ROOTS.values())}
-    with open(_ROOTS_STATE_PATH, "w", encoding="utf-8") as f:
-        _json.dump(payload, f)
+    roots_save(state.roots, state.roots_state_path)
 
 
 def _load_roots_state(default_root: str | None) -> None:
-    """Load persisted roots.
-
-    If the JSON is missing/empty and *default_root* is set, use that single root.
-    If *default_root* is ``None`` (no CLI path / env), start with no roots until
-    the user adds one in the UI — do **not** impute cwd.
-    """
-    ROOTS.clear()
-    loaded_any = False
-    try:
-        with open(_ROOTS_STATE_PATH, "r", encoding="utf-8") as f:
-            data = _json.load(f)
-        for raw in data.get("roots", []):
-            p = os.path.abspath(str(raw))
-            if os.path.isdir(p):
-                _add_root(p)
-                loaded_any = True
-    except Exception:
-        loaded_any = False
-
-    if not loaded_any and default_root is not None:
-        _add_root(default_root)
-
-    # Normalize persisted state (drops deleted/nonexistent paths, merged descendants).
-    _save_roots_state()
+    roots_load(state.roots, state.roots_state_path, default_root=default_root)
 
 
 def _root_and_rel_from_virtual(vpath: str) -> tuple[str, str]:
-    return root_and_rel_from_virtual_service(vpath, ROOTS)
+    return root_and_rel_from_virtual_service(vpath, state.roots)
 
 
 def _virtual_from_abs(abs_path: str) -> str:
-    return virtual_from_abs_service(abs_path, ROOTS)
+    return virtual_from_abs_service(abs_path, state.roots)
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +172,7 @@ def _virtual_from_abs(abs_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _resolve(rel: str) -> str:
-    return resolve_virtual_path_service(rel, ROOTS)
+    return resolve_virtual_path_service(rel, state.roots)
 
 
 def _is_mp3(name: str) -> bool:
@@ -380,7 +196,7 @@ def _list_mp3s_under_abs(folder: str, recursive: bool = False) -> list[str]:
 
 
 def _list_mp3s(folder_vpath: str, recursive: bool = False) -> list[str]:
-    return list_mp3s_service(folder_vpath, ROOTS, recursive)
+    return list_mp3s_service(folder_vpath, state.roots, recursive)
 
 
 def _folder_tree(root: str, root_id: str, rel_prefix: str = "") -> dict:
@@ -421,7 +237,7 @@ def _cached_read_all(path: str) -> dict:
     except OSError:
         return read_all(path)
 
-    cached = _CACHE.get(path, mtime)
+    cached = state.track_cache.get(path, mtime)
     if cached is not None and cached.get("fingerprint"):
         return cached
 
@@ -429,8 +245,23 @@ def _cached_read_all(path: str) -> dict:
     if not data.get("fingerprint"):
         data["fingerprint"] = compute_fingerprint(path)
     if data.get("fingerprint") or cached is None:
-        _CACHE.put(path, mtime, data)
+        state.track_cache.put(path, mtime, data)
     return data
+
+
+FILESYSTEM_WATCH_DEPS = FilesystemWatchDeps(
+    track_cache=state.track_cache,
+    cached_read_all=_cached_read_all,
+    virtual_from_abs=_virtual_from_abs,
+    is_mp3_path=_is_mp3,
+    embeddings_mod=embeddings,
+    embedding_version=EMBEDDING_VERSION,
+    feature_cache=state.feature_cache,
+    embed_lock=state.embed_lock,
+    embed_status=state.embed_status,
+    broadcast_embed_event=_broadcast_embed_event,
+    emit_decode_warning_once=_emit_decode_warning_once,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +281,9 @@ def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
     """Build lightweight track info dicts with path + fingerprint for embedding ops."""
     paths = _list_mp3s(folder_vpath, recursive)
     infos = []
-    for p, info in iter_parallel_reads(paths, read_fn=_cached_read_all, executor=_THREAD_POOL):
+    for p, info in iter_parallel_reads(
+        paths, read_fn=_cached_read_all, executor=state.thread_pool,
+    ):
         rel_path = _virtual_from_abs(p)
         infos.append({
             "path": rel_path,
@@ -461,22 +294,22 @@ def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
 
 
 app = create_app(
-    template_folder=os.path.join(_PKG_DIR, "templates"),
+    template_folder=os.path.join(PKG_DIR, "templates"),
     deps=TrackspaceBlueprintDeps(
         embeddings_mod=embeddings,
         audio_features_mod=audio_features,
         embedding_version=EMBEDDING_VERSION,
         effnet_version=EFFNET_VERSION,
         features_version=FEATURES_VERSION,
-        feature_cache=_FEATURES,
+        feature_cache=state.feature_cache,
         source_versions_cls=SourceVersions,
         batch_fetch_maps=batch_fetch_maps,
         build_generation_work=build_generation_work,
         coverage_payload=coverage_payload,
         layout_revision_for_projection=layout_revision_for_projection,
-        embed_lock=_embed_lock,
-        embed_status=_embed_status,
-        status_cache=_status_cache,
+        embed_lock=state.embed_lock,
+        embed_status=state.embed_status,
+        status_cache=state.status_cache,
         library_mtime_signature=_library_mtime_signature,
         track_infos_cached=_track_infos_cached,
         projection_query_fingerprint=_embedding_projection_query_fingerprint,
@@ -484,31 +317,32 @@ app = create_app(
         build_track_infos_fn=_build_track_infos,
         broadcast_embed_event=_broadcast_embed_event,
         emit_decode_warning_once=_emit_decode_warning_once,
-        broadcaster=_embed_broadcaster,
+        broadcaster=state.embed_broadcaster,
         is_generating=_embed_is_running,
         sse_response=sse_response,
         list_mp3s=_list_mp3s,
         cached_read_all=_cached_read_all,
-        executor=_THREAD_POOL,
+        executor=state.thread_pool,
         read_paths_parallel=read_paths_parallel,
         iter_parallel_reads=iter_parallel_reads,
         track_dict_from_read_service=track_dict_from_read_service,
         build_track_list_service=build_track_list_service,
         emit_scan_progress_events=emit_scan_progress_events,
-        roots=ROOTS,
+        roots=state.roots,
         folder_tree=_folder_tree,
         add_root=_add_root,
         remove_root=_remove_root,
         schedule_root_watch=_schedule_root_watch,
         unschedule_root_watch=_unschedule_root_watch,
         save_roots_state=_save_roots_state,
-        track_cache=_CACHE,
+        track_cache=state.track_cache,
         dir_color_fn=_dir_color,
         resolve_virtual_path=_resolve,
         virtual_from_abs=_virtual_from_abs,
-        dist_dir=DIST_DIR,
+        dist_dir=state.dist_dir,
     ),
 )
+app.extensions["trackspace_state"] = state
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +354,7 @@ def _start_gc_thread(interval: int = 600) -> None:
     def _loop() -> None:
         while True:
             time.sleep(interval)
-            pruned = _CACHE.prune_missing()
+            pruned = state.track_cache.prune_missing()
             if pruned:
                 log.info("GC: pruned %d stale cache entr%s", pruned, "y" if pruned == 1 else "ies")
     threading.Thread(target=_loop, daemon=True, name="trackspace-gc").start()
@@ -548,12 +382,11 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
-    global MUSIC_ROOT
     cli_root = os.path.abspath(args.root) if args.root else None
-    MUSIC_ROOT = cli_root or ""
+    state.music_root = cli_root or ""
     _load_roots_state(cli_root)
-    if ROOTS:
-        print(f"Trackspace serving roots: {', '.join(ROOTS.values())}")
+    if state.roots:
+        print(f"Trackspace serving roots: {', '.join(state.roots.values())}")
     else:
         print("Trackspace: no library roots — add folders in the sidebar (or pass a path on the CLI)")
 
@@ -563,25 +396,24 @@ def main():
     else:
         print("WARNING: fpcalc not found — fingerprinting disabled. Install: brew install chromaprint")
 
-    global _OBSERVER
-    _OBSERVER = Observer()
-    _OBSERVER.daemon = True
-    _OBSERVER.start()
-    for rid in list(ROOTS.keys()):
+    state.observer = Observer()
+    state.observer.daemon = True
+    state.observer.start()
+    for rid in list(state.roots.keys()):
         _schedule_root_watch(rid)
 
     _start_gc_thread()
 
-    pruned = _CACHE.prune_missing()
+    pruned = state.track_cache.prune_missing()
     if pruned:
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
-    purged = _FEATURES.purge_old_versions(EMBEDDING_VERSION)
+    purged = state.feature_cache.purge_old_versions(EMBEDDING_VERSION)
     if purged:
         print(f"CLAP: purged {purged} stale v<{EMBEDDING_VERSION} entr{'y' if purged == 1 else 'ies'}")
-    purged_effnet = _FEATURES.purge_old_effnet_versions(EFFNET_VERSION)
+    purged_effnet = state.feature_cache.purge_old_effnet_versions(EFFNET_VERSION)
     if purged_effnet:
         print(f"EffNet: purged {purged_effnet} stale v<{EFFNET_VERSION} entr{'y' if purged_effnet == 1 else 'ies'}")
-    purged_feat = _FEATURES.purge_old_feature_versions(FEATURES_VERSION)
+    purged_feat = state.feature_cache.purge_old_feature_versions(FEATURES_VERSION)
     if purged_feat:
         print(f"Features: purged {purged_feat} stale v<{FEATURES_VERSION} entr{'y' if purged_feat == 1 else 'ies'}")
     print(f"Versions: CLAP={EMBEDDING_VERSION} EffNet={EFFNET_VERSION} Features={FEATURES_VERSION}")

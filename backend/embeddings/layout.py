@@ -1,11 +1,9 @@
-"""CLAP audio embedding generation and UMAP projection.
+"""Shared embedding-space layout: composite vectors, semantic weighting, 2-D projection.
 
-Uses ``laion/larger_clap_music`` for content-based audio embeddings.
-The model is loaded eagerly at import time (called once at server startup).
-
-Embeddings are generated from multiple segments of each track and averaged
-to produce a more robust representation.  Cached in the FeatureCache keyed
-by chromaprint fingerprint + EMBEDDING_VERSION.
+CLAP model I/O lives in `clap.py`. EffNet and librosa descriptors live in
+`effnet` / `librosa_audio_features`). This module concatenates cached source rows, applies
+folder/tag re-weighting (CLAP text directions in the CLAP column span), and runs
+PCA / UMAP / t-SNE. Re-exported from ``backend.embeddings``.
 """
 
 import hashlib
@@ -14,17 +12,22 @@ import logging
 import os
 import platform
 import sys
-import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
-
 import numpy as np
-import torch
-from transformers import ClapModel, ClapProcessor
 
-from backend.audio_features import load_resilient_audio_segments
-from backend.layout_revision import FOLDER_SEMANTIC_BASIS_VERSION
+from .clap import (
+    CLAP_SR,
+    EMBEDDING_VERSION,
+    batch_ensure_embeddings,
+    generate_embedding,
+    generate_text_embeddings,
+    inference_lock as _inference_lock,
+    is_model_ready,
+    load_model,
+    _load_audio_segments,
+)
+from .layout_revision import FOLDER_SEMANTIC_BASIS_VERSION
 
 log = logging.getLogger(__name__)
 
@@ -33,17 +36,7 @@ FOLDER_PCA_MIN_TRACKS = 8
 FOLDER_PCA_MAX_COMPONENTS = 2
 FOLDER_PCA_SECOND_SV_RATIO = 0.18
 
-CLAP_MODEL_ID = "laion/larger_clap_music"
-CLAP_SR = 48000
-SEGMENT_SECONDS = 15
-NUM_SEGMENTS = 3
-# Bump this when the embedding strategy changes to auto-invalidate stale cache.
-EMBEDDING_VERSION = 2
-
 # Tiered projection LRU (composite gather → semantic direction basis → UMAP/t-SNE).
-# Semantic *weights* (folder contrast + depth emphasis) are applied via a cheap
-# low-rank multiply once ``T_n``/exponents are cached — no full D×D matrix.
-# PCA bypasses layout cache (fast; global Procrustes reference is per-process).
 _COMPOSITE_CACHE_MAX = 10
 _SEMANTIC_BASIS_CACHE_MAX = 10
 _REVISION_LAYOUT_CACHE_MAX = 16
@@ -55,9 +48,6 @@ _semantic_basis_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
 )
 _revision_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
 
-# Prepared per-source row vectors (L2-normalised CLAP/EffNet; masked+norm+blend features).
-# Lets us switch source *combinations* without re-running per-row normalisation or
-# re-querying FeatureCache rows that are still in this LRU.
 _SOURCE_ROW_CACHE_MAX = 24_000
 _source_row_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
@@ -91,7 +81,8 @@ def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
 
 
 def _source_versions_token() -> str:
-    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+    from .effnet import EFFNET_VERSION
+    from .librosa_audio_features import FEATURES_VERSION
 
     return f"C{EMBEDDING_VERSION}E{EFFNET_VERSION}F{FEATURES_VERSION}"
 
@@ -116,12 +107,9 @@ def _get_prepared_source_row(
     feature_mask: np.ndarray,
     features_blend: float,
 ) -> np.ndarray:
-    """Return one track row for *source* with the same preprocessing as composite gather.
-
-    Rows are cached per (fingerprint, source, version[, feature mask+blend]) so
-    toggling source layers reuses work across different ``sources`` tuples.
-    """
-    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION
+    """Return one track row for *source* with the same preprocessing as composite gather."""
+    from .effnet import EFFNET_VERSION
+    from .librosa_audio_features import FEATURES_VERSION
 
     raw = np.asarray(raw, dtype=np.float32).reshape(-1)
 
@@ -170,7 +158,6 @@ def _semantic_basis_param_key(
     context_tags: list[str] | None,
     folder_seeds: list[str] | None,
 ) -> str:
-    """Folders + tags only — independent of contrast slider values."""
     tags = ",".join(sorted(context_tags)) if context_tags else ""
     if folder_seeds:
         fp = ",".join(sorted(folder_seeds))
@@ -179,134 +166,7 @@ def _semantic_basis_param_key(
     return f"{tags}|{fp}|fsbv{FOLDER_SEMANTIC_BASIS_VERSION}"
 
 
-def _semantic_param_key(
-    context_tags: list[str] | None,
-    folder_seeds: list[str] | None,
-    folder_boost: float,
-    folder_depth_boost: float,
-) -> str:
-    return (
-        f"{_semantic_basis_param_key(context_tags, folder_seeds)}|"
-        f"{folder_boost:.6g}|{folder_depth_boost:.6g}"
-    )
-
-
-_model: ClapModel | None = None
-_processor: ClapProcessor | None = None
-_model_lock = threading.Lock()
-# Serialises CLAP on MPS/CUDA *and* mlx-vis on Metal: concurrent Metal command
-# encoders from PyTorch and MLX on different threads trigger IOGPU failures.
-_inference_lock = threading.Lock()
-_loaded = False
-
-
-def is_model_ready() -> bool:
-    return _loaded
-
-
-def load_model() -> None:
-    """Eagerly load the CLAP model and processor into GPU/CPU memory."""
-    global _model, _processor, _loaded
-    if _loaded:
-        return
-    with _model_lock:
-        if _loaded:
-            return
-        token = os.environ.get("HF_TOKEN")
-        log.info("Loading CLAP model %s …", CLAP_MODEL_ID)
-        _processor = ClapProcessor.from_pretrained(CLAP_MODEL_ID, token=token)
-        _model = ClapModel.from_pretrained(CLAP_MODEL_ID, token=token)
-        _model.eval()
-        if torch.cuda.is_available():
-            _model = _model.cuda()
-            log.info("Using CUDA acceleration")
-        elif torch.backends.mps.is_available():
-            _model = _model.to("mps")
-            log.info("Using MPS acceleration (Apple Silicon)")
-        else:
-            log.info("Using CPU inference")
-        _loaded = True
-        log.info("CLAP model loaded.")
-
-
-def _load_audio_segments(path: str) -> tuple[list[np.ndarray], str | None]:
-    """Load up to NUM_SEGMENTS segments from different parts of the track.
-
-    Short tracks (≤ 1.5× SEGMENT_SECONDS) return a single whole-file segment.
-    Longer tracks return segments centred at 20%, 50%, and 80% through the file.
-
-    Returns ``(segments, user_warning)`` when metadata vs decoded length disagrees.
-    """
-    try:
-        return load_resilient_audio_segments(
-            path, sr=CLAP_SR, segment_seconds=SEGMENT_SECONDS,
-        )
-    except Exception as e:
-        log.warning("Failed to load audio %s: %s", path, e)
-        return [], None
-
-
-def _embed_single(audio: np.ndarray) -> np.ndarray | None:
-    """Run CLAP inference on a single audio waveform.
-
-    Serialised via ``_inference_lock`` — the CLAP model (especially on MPS)
-    is not safe for concurrent forward passes from multiple threads.
-    """
-    try:
-        with _inference_lock:
-            inputs = _processor(
-                audio=audio,
-                sampling_rate=CLAP_SR,
-                return_tensors="pt",
-            )
-            device = next(_model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            with torch.no_grad():
-                outputs = _model.get_audio_features(**inputs)
-
-        if hasattr(outputs, "pooler_output"):
-            tensor = outputs.pooler_output
-        elif hasattr(outputs, "last_hidden_state"):
-            tensor = outputs.last_hidden_state[:, 0]
-        else:
-            tensor = outputs
-
-        return tensor.squeeze(0).cpu().numpy().astype(np.float32)
-    except Exception as e:
-        log.warning("CLAP segment inference failed: %s", e)
-        return None
-
-
-def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
-    """Generate CLAP text embeddings for a list of strings.
-
-    Returns an (N, D) float32 array, or None if the model isn't ready.
-    Used to derive semantic directions from tag names and folder names.
-    """
-    if not _loaded or not texts:
-        return None
-    try:
-        with _inference_lock:
-            inputs = _processor(text=texts, return_tensors="pt", padding=True)
-            device = next(_model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
-                outputs = _model.get_text_features(**inputs)
-        if hasattr(outputs, "pooler_output"):
-            tensor = outputs.pooler_output
-        elif hasattr(outputs, "last_hidden_state"):
-            tensor = outputs.last_hidden_state[:, 0]
-        else:
-            tensor = outputs
-        return tensor.cpu().numpy().astype(np.float32)
-    except Exception as e:
-        log.warning("CLAP text embedding failed: %s", e)
-        return None
-
-
 def _folder_seeds_from_track_paths(paths: list[str]) -> list[str]:
-    """Unique immediate parent folders of tracks (root excluded)."""
     s: set[str] = set()
     for p in paths:
         sep = p.rfind("/")
@@ -317,7 +177,6 @@ def _folder_seeds_from_track_paths(paths: list[str]) -> list[str]:
 
 
 def _expand_folder_nodes(folder_seeds: list[str]) -> set[str]:
-    """All folder path strings: seeds plus every ancestor segment."""
     all_nodes: set[str] = {""}
     for f in folder_seeds:
         parts = [p for p in f.split("/") if p]
@@ -333,12 +192,6 @@ def _folder_orthogonal_pc_directions(
     max_components: int,
     min_second_sv_ratio: float,
 ) -> list[np.ndarray]:
-    """Principal directions of within-folder spread after removing the axis *d_unit*.
-
-    *mat_block* is ``(n, D)`` rows for one folder; *d_unit* is the hierarchical
-    ``normalize(c_child - c_parent)`` for that folder.  Returns 0–*max_components*
-    unit vectors orthogonal to *d_unit* (and mutually orthogonal).
-    """
     n = mat_block.shape[0]
     if n < 4 or max_components < 1:
         return []
@@ -375,40 +228,16 @@ def _build_folder_directions(
     min_tracks_pca: int = FOLDER_PCA_MIN_TRACKS,
     max_pca_components: int = FOLDER_PCA_MAX_COMPONENTS,
 ) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, int]]]:
-    """Compute hierarchical contrast directions from actual track embeddings.
-
-    For each folder node the primary direction is
-    ``centroid(all tracks under node) − centroid(all tracks under parent)``.
-    When a node has at least *min_tracks_pca* tracks, up to *max_pca_components*
-    extra directions come from PCA on within-folder deviations after removing
-    that hierarchical axis (orthogonal residual spread).
-
-    Shared directions among siblings are naturally absorbed by the parent;
-    each child retains only its unique contrast.  Later, semantic weights use
-    ``folder_boost × folder_depth_boost ** exponent`` where *exponent* is
-    ``depth − 1`` for that node (see *exponents*) — the same exponent is used
-    for a node's hierarchical row and its PCA rows.
-
-    *folder_seeds* lists folder paths (typically parents of tracks); parent
-    nodes are inferred so the client need not enumerate the whole tree.
-
-    Returns *(directions, exponents, text_fallbacks)* where *exponents* is
-    ``(K,)`` int (``depth - 1`` per row, same order as *directions*), and
-    *text_fallbacks* is ``(leaf_name, exponent)`` for CLAP-text fallback
-    directions.
-    """
     if not folder_seeds:
         return None, None, []
 
     all_nodes = _expand_folder_nodes(folder_seeds)
 
-    # Map each embedding row to its direct folder.
     track_folders: list[str] = []
     for p in paths:
         sep = p.rfind("/")
         track_folders.append(p[:sep] if sep >= 0 else "")
 
-    # Accumulate track indices per node (includes all descendants).
     node_indices: dict[str, list[int]] = {n: [] for n in all_nodes}
     for i, tf in enumerate(track_folders):
         node_indices[""].append(i)
@@ -418,12 +247,10 @@ def _build_folder_directions(
             if ancestor in node_indices:
                 node_indices[ancestor].append(i)
 
-    # Centroid per node.
     centroids: dict[str, np.ndarray | None] = {}
     for n, idx_list in node_indices.items():
         centroids[n] = mat[idx_list].mean(axis=0) if idx_list else None
 
-    # Contrast directions.
     dirs: list[np.ndarray] = []
     exps: list[int] = []
     fallbacks: list[tuple[str, int]] = []
@@ -484,7 +311,6 @@ def _unit_clap_text_dirs_to_full(
     clap_lo: int,
     clap_hi: int,
 ) -> np.ndarray:
-    """Place CLAP text direction rows (K, d_txt) into the CLAP column span."""
     if clap_lo >= clap_hi:
         raise ValueError("clap column span must be non-empty")
     slot_w = clap_hi - clap_lo
@@ -504,11 +330,6 @@ def _apply_low_rank_semantic_weight(
     boost: float,
     depth_boost: float,
 ) -> np.ndarray:
-    """Apply ``mat @ (I + T_n.T diag(w) T_n)`` with ``w_i = boost * depth_boost**exp_i``.
-
-    *exp* holds per-row integer exponents (``depth - 1`` for folders; ``0`` for tags).
-    Never materialises the D×D matrix.
-    """
     if T_n.shape[0] == 0:
         return mat
     gamma = np.power(
@@ -527,7 +348,6 @@ def _build_semantic_basis(
     clap_lo: int,
     clap_hi: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``(T_n, exp)`` for low-rank semantic weighting (boost-agnostic)."""
     d_total = mat.shape[1]
     have_clap_slot = clap_lo < clap_hi
     all_dirs: list[np.ndarray] = []
@@ -584,20 +404,6 @@ def _apply_semantic_weighting(
     clap_lo: int = 0,
     clap_hi: int = 0,
 ) -> np.ndarray:
-    """Re-weight embedding space using data-driven folder directions and text
-    tag directions.
-
-    Folders use *hierarchical centroid decomposition*: each folder's primary
-    direction is its centroid minus its parent's centroid.  Large folders also
-    contribute PCA axes of deviation orthogonal to that contrast (within-folder
-    spread).  Deeper levels receive increasing boost so that subtle differences
-    are amplified.  Folders with fewer than 2 embedded tracks fall back to CLAP
-    text embedding of the folder name.
-
-    Tags always use CLAP text embedding (they are labels, not track collections).
-
-    Uses a low-rank multiply equivalent to ``mat @ (I + T_n.T diag(w) T_n)``.
-    """
     T_n, exp = _build_semantic_basis(
         mat, paths, context_tags, folder_seeds, clap_lo, clap_hi,
     )
@@ -606,88 +412,11 @@ def _apply_semantic_weighting(
     return _apply_low_rank_semantic_weight(mat, T_n, exp, boost, depth_boost)
 
 
-def generate_embedding(
-    path: str,
-    *,
-    on_decode_warning: Callable[[str], None] | None = None,
-) -> np.ndarray | None:
-    """Generate a CLAP embedding for a single audio file.
-
-    Loads multiple segments and averages their embeddings for a more robust
-    representation.  Returns a 1-D float32 numpy array, or None on failure.
-
-    *on_decode_warning* — invoked once per file when decoded audio is much shorter
-    than container metadata (damaged / mis-tagged files).
-    """
-    if not _loaded:
-        load_model()
-
-    segments, decode_warn = _load_audio_segments(path)
-    if decode_warn and on_decode_warning:
-        on_decode_warning(decode_warn)
-    if not segments:
-        return None
-
-    segment_embs: list[np.ndarray] = []
-    for audio in segments:
-        emb = _embed_single(audio)
-        if emb is not None:
-            segment_embs.append(emb)
-
-    if not segment_embs:
-        return None
-
-    return np.mean(segment_embs, axis=0).astype(np.float32)
-
-
-def batch_ensure_embeddings(
-    track_infos: list[dict],
-    music_root: str,
-    feature_cache,
-    version: int = EMBEDDING_VERSION,
-) -> dict[str, bool]:
-    """Ensure every track with a fingerprint has a CLAP embedding.
-
-    *track_infos* is a list of dicts with at least ``path`` (relative) and
-    ``fingerprint`` keys — the same shape returned by _cached_read_all +
-    the track-list builder in app.py.
-
-    Returns ``{rel_path: True/False}`` indicating whether an embedding
-    exists (either already cached or freshly generated).
-    """
-    result: dict[str, bool] = {}
-    to_generate: list[tuple[str, str]] = []  # (abs_path, fingerprint)
-
-    fps = [t["fingerprint"] for t in track_infos if t.get("fingerprint")]
-    existing = feature_cache.get_all_embeddings(fps, version=version)
-
-    for t in track_infos:
-        fp = t.get("fingerprint")
-        if not fp:
-            result[t["path"]] = False
-            continue
-        if fp in existing:
-            result[t["path"]] = True
-            continue
-        to_generate.append((os.path.join(music_root, t["path"]), fp))
-        result[t["path"]] = False
-
-    for abs_path, fp in to_generate:
-        emb = generate_embedding(abs_path)
-        if emb is not None:
-            feature_cache.put_embedding(fp, emb, version=version)
-            rel = os.path.relpath(abs_path, music_root)
-            result[rel] = True
-
-    return result
-
-
 def _gather_vecs(
     track_infos: list[dict],
     feature_cache,
     version: int,
 ) -> tuple[list[str], list[np.ndarray]]:
-    """Collect embedding vectors for tracks that have them in the cache."""
     fps = [t.get("fingerprint") for t in track_infos]
     fp_set = [fp for fp in fps if fp]
     embeddings_map = feature_cache.get_all_embeddings(fp_set, version=version)
@@ -709,26 +438,12 @@ def _gather_composite_vecs(
     feature_mask: np.ndarray | None = None,
     features_blend: float = 0.42,
 ) -> tuple[list[str], np.ndarray, int, int, str]:
-    """Collect and concatenate vectors from multiple enabled sources.
-
-    Each source block is L2-normalized per row before concatenation so that
-    sources with different native dimensionalities contribute equally.  The
-    audio-features block is then scaled by *features_blend* (< 1 weakens its
-    influence versus CLAP / EffNet).  *feature_mask* zeros individual audio
-    dimensions before normalization (length ``AUDIO_FEATURE_DIM``).
-
-    Normalised rows are LRU-cached per fingerprint and source so changing the
-    enabled *sources* tuple reuses prepared CLAP/EffNet/feature rows.
-
-    Returns *(paths, matrix, clap_dim, clap_col_lo, composite_cache_key)*.
-    *composite_cache_key* is ``\"\"`` when *paths* is empty.
-    """
-    from backend.audio_features import EFFNET_VERSION, FEATURES_VERSION, AUDIO_FEATURE_DIM
+    from .effnet import EFFNET_VERSION
+    from .librosa_audio_features import AUDIO_FEATURE_DIM, FEATURES_VERSION
 
     fps = [t.get("fingerprint") for t in track_infos]
     fp_set = [fp for fp in fps if fp]
 
-    # Pre-fetch all requested source maps keyed by fingerprint.
     source_maps: dict[str, dict[str, np.ndarray]] = {}
     if "clap" in sources:
         source_maps["clap"] = feature_cache.get_all_embeddings(fp_set, version=EMBEDDING_VERSION)
@@ -737,7 +452,6 @@ def _gather_composite_vecs(
     if "features" in sources:
         source_maps["features"] = feature_cache.get_all_audio_features(fp_set, version=FEATURES_VERSION)
 
-    # Determine which tracks have data for ALL enabled sources.
     paths: list[str] = []
     fp_order: list[str] = []
     for t in track_infos:
@@ -766,7 +480,6 @@ def _gather_composite_vecs(
         log.debug("projection tier: composite cache hit")
         return paths, _mat, _cd, _clo, comp_key
 
-    # Build per-source matrices, normalize, and concatenate.
     blocks: list[np.ndarray] = []
     clap_dim = 0
     clap_col_lo = 0
@@ -797,7 +510,6 @@ def _gather_composite_vecs(
 
 
 def _normalise_coords(coords: np.ndarray) -> np.ndarray:
-    """Normalise an (N, 2) array to [0, 1] per axis."""
     mins = coords.min(axis=0)
     maxs = coords.max(axis=0)
     ranges = maxs - mins
@@ -810,12 +522,6 @@ _pca_ref_coords: np.ndarray | None = None
 
 
 def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
-    """Fast 2D projection via PCA (numpy SVD), Procrustes-stabilised.
-
-    Successive calls align the new projection to the previous one using
-    orthogonal Procrustes on shared points, preventing the random axis
-    flips / 90° rotations that bare SVD produces when the data changes.
-    """
     global _pca_ref_paths, _pca_ref_coords
 
     centred = mat - mat.mean(axis=0)
@@ -845,25 +551,17 @@ def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
     return coords
 
 
-# RAPIDS cuML manifolds use NVIDIA CUDA only (not Apple MPS). CLAP uses MPS on
-# Apple Silicon when ``torch.cuda`` is false; install cuML per requirements-cuda.txt
-# on Linux/WSL + NVIDIA to accelerate layout. ``TRACKSPACE_CUML=0`` forces CPU.
 _cuml_projection_enabled: bool | None = None
-
-# mlx-vis runs UMAP/t-SNE on Metal (Apple Silicon). Optional; see requirements.txt.
-# ``TRACKSPACE_MLX_VIS=0`` forces CPU after cuML check.
 _mlx_vis_projection_enabled: bool | None = None
 
 
 def reset_projection_backend_cache() -> None:
-    """Clear lazy cuML / mlx-vis detection (e.g. after changing env vars or in tests)."""
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     _cuml_projection_enabled = None
     _mlx_vis_projection_enabled = None
 
 
 def _use_cuml_projection() -> bool:
-    """True when cuML should run UMAP/t-SNE on a CUDA device."""
     global _cuml_projection_enabled
     if _cuml_projection_enabled is not None:
         return _cuml_projection_enabled
@@ -894,7 +592,6 @@ def _use_cuml_projection() -> bool:
 
 
 def _use_mlx_vis_projection() -> bool:
-    """True when mlx-vis should run UMAP/t-SNE on Apple Metal (arm64 macOS)."""
     global _mlx_vis_projection_enabled
     if _mlx_vis_projection_enabled is not None:
         return _mlx_vis_projection_enabled
@@ -916,23 +613,12 @@ def _use_mlx_vis_projection() -> bool:
 
 
 def _mlx_tsne_pca_dim(n_features: int) -> int | None:
-    """mlx-vis TSNE requires ``n_features > pca_dim`` for its PCA prep branch."""
     if n_features < 2:
         return None
     return min(50, n_features - 1)
 
 
 def _mlx_tsne_max_points() -> int:
-    """Row count above which mlx-vis t-SNE is skipped in favour of scikit-learn.
-
-    Profiled on Apple Silicon: **openTSNE** (FIt-SNE-style FFT and Barnes–Hut) is
-    CPU-only (no MPS) and was slower than both mlx-vis and sklearn for *n* from
-    hundreds through ~12k with typical embedding widths. **mlx-vis** beat sklearn
-    up to roughly 10k points then sklearn's Barnes–Hut overtook; this cap avoids
-    that regression while keeping Metal for normal library sizes.
-
-    Set ``TRACKSPACE_MLX_TSNE_MAX_POINTS=0`` to always try mlx-vis (previous behaviour).
-    """
     raw = os.environ.get("TRACKSPACE_MLX_TSNE_MAX_POINTS", "10000").strip()
     try:
         v = int(raw)
@@ -942,7 +628,6 @@ def _mlx_tsne_max_points() -> int:
 
 
 def _project_umap(mat: np.ndarray) -> np.ndarray:
-    """Full UMAP 2D projection. Higher quality but slower."""
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     if _use_cuml_projection():
         try:
@@ -989,12 +674,6 @@ def _project_umap(mat: np.ndarray) -> np.ndarray:
 
 
 def _project_tsne(mat: np.ndarray) -> np.ndarray:
-    """t-SNE 2D projection.  Better at preserving local cluster structure.
-
-    CUDA: RAPIDS cuML ``method="fft"`` when available.  Apple Silicon: mlx-vis
-    on Metal up to :func:`_mlx_tsne_max_points`, then scikit-learn (see env var
-    documented there).  Otherwise scikit-learn.
-    """
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     if _use_cuml_projection():
         try:
@@ -1053,8 +732,7 @@ def _project_tsne(mat: np.ndarray) -> np.ndarray:
 
 
 def parse_audio_feature_mask(raw: str | None) -> np.ndarray:
-    """Six ``0``/``1`` characters: tempo, key_cos, key_sin, mode, energy, dance."""
-    from backend.audio_features import AUDIO_FEATURE_DIM
+    from .librosa_audio_features import AUDIO_FEATURE_DIM
 
     if not raw or not str(raw).strip():
         return np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
@@ -1106,37 +784,6 @@ def compute_projection(
     features_blend: float = 0.42,
     layout_revision: str | None = None,
 ) -> list[dict]:
-    """Project cached embeddings to 2D positions.
-
-    *method* is ``"umap"`` (default), ``"tsne"``, or ``"pca"`` (instant,
-    good enough for live intermediate updates during generation).
-
-    *sources* selects which data to concatenate: any subset of
-    ``("clap", "effnet", "features")``.  Each source block is
-    L2-normalized before concatenation.
-
-    *context_tags* — when provided the embedding space is re-weighted before
-    projection.  Text-based directions apply only to the CLAP sub-space
-    (requires CLAP in *sources*).
-
-    Folder centroid decomposition runs when *scale_folders* is True.  Folder
-    nodes are inferred from track paths; optional *context_folders* supplies
-    an explicit seed list instead of deriving from paths.
-
-    *layout_revision* — when provided (from ``compute_layout_revision``),
-    the result is cached under this key.  Subsequent calls with the same
-    revision return the cached layout without recomputing.
-
-    Returns ``[{"path": rel, "x": float, "y": float}, ...]`` where x/y
-    are in [0, 1].  Tracks without data for every enabled source are omitted.
-
-    **Caching:** A deterministic ``layout_revision`` (SHA-256 of sorted
-    paths + all projection parameters) is the primary layout cache key.
-    Composite matrices and semantic-basis directions are still cached in
-    their own LRU tiers (keyed by path-order-dependent hashes) to avoid
-    redundant vector gathering and ``T_n`` construction on revision misses.
-    PCA skips layout caching (fast; global Procrustes reference is per-process).
-    """
     if layout_revision and method in ("umap", "tsne"):
         hit = _tier_cache_get(_revision_layout_cache, layout_revision)
         if hit is not None:
@@ -1170,7 +817,7 @@ def compute_projection(
     else:
         folder_seeds = None
 
-    needs_weight = _loaded and (bool(context_tags) or bool(folder_seeds))
+    needs_weight = is_model_ready() and (bool(context_tags) or bool(folder_seeds))
 
     t_before_weight = time.perf_counter()
     mat_proj = mat
@@ -1241,5 +888,4 @@ def compute_projection(
     return result
 
 
-# Keep old name as alias for backward compat
 compute_umap = compute_projection

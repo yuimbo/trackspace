@@ -15,11 +15,18 @@ trackspace/
     tags.py                 – ID3 tag read/write via mutagen
     cache.py                – TrackCache (path+mtime → metadata, LRU + SQLite)
     fingerprint.py          – Chromaprint audio fingerprinting (fpcalc)
-    feature_cache.py        – FeatureCache (fingerprint → CLAP embedding)
-    embeddings.py           – CLAP model loading, inference, UMAP projection
-    audio_features.py       – EffNet (ONNX) + librosa audio feature extraction
-    embedding_coverage.py   – coverage stats + generation work-list helpers
-    layout_revision.py      – deterministic layout revision hash
+    audio_features.py       – shim → ``backend.embeddings.audio_features`` (barrel module)
+    embeddings/             ← CLAP, caches, projection, classical audio features
+      __init__.py           – lazy re-exports of ``layout`` public API
+      layout.py             – composite vectors, semantic weighting, UMAP/t-SNE/PCA
+      clap.py               – Laion CLAP model (audio + text embeddings)
+      feature_cache.py      – FeatureCache (fingerprint → per-source vectors)
+      coverage.py           – coverage stats + generation work-list helpers
+      layout_revision.py    – deterministic layout revision hash
+      audio_decode.py       – resilient librosa decode (segments, seeks, metadata mismatch)
+      effnet.py             – Discogs-EffNet ONNX + Essentia-style mel / patches
+      librosa_audio_features.py – 6-D classical descriptors (tempo, key, energy, danceability)
+      audio_features.py     – re-exports decode / EffNet / librosa (imported by shim above)
     templates/partials/     – Jinja templates served by Flask (HTMX)
   frontend/                 ← Vite + TypeScript + Alpine.js + HTMX
     src/
@@ -241,7 +248,7 @@ content-addressed and versioned.
 
 ### Embedding versioning
 
-`EMBEDDING_VERSION` (int) in `backend/embeddings.py` encodes the current embedding
+`EMBEDDING_VERSION` (int) in `backend/embeddings/clap.py` encodes the current CLAP embedding
 strategy. All `FeatureCache` reads filter by version, so bumping the constant
 auto-invalidates stale entries. Old-version rows are purged on server startup.
 
@@ -269,21 +276,21 @@ not just `"fingerprint" in cached`.  If a previous run stored `null` (e.g. fpcal
 missing), the next run with fpcalc available will retry rather than serving the stale null.
 Never cache a `None` fingerprint and treat it as a permanent result.
 
-### CLAP embeddings (`backend/embeddings.py`)
+### CLAP embeddings (`backend/embeddings/clap.py`)
 
 - Model: `laion/larger_clap_music` loaded in a background thread at server startup
   (does not block Flask from accepting requests).
-- **Inference lock:** `_inference_lock` serialises all CLAP forward passes
-  (`_embed_single` for audio, `generate_text_embeddings` for text).  MPS and
-  CUDA are not safe for concurrent dispatches from multiple threads; without
-  the lock, a Flask request running semantic-weighting text inference while
-  the generation thread is producing audio embeddings would crash or hang.
-- **Projection lock sharing:** The same `_inference_lock` also wraps mlx-vis
-  (`UMAP` / `TSNE`) runs on Apple Metal.  Running PyTorch MPS (CLAP) and MLX
+- **Inference lock:** `clap.inference_lock` (imported by `embeddings` as `_inference_lock`)
+  serialises all CLAP forward passes (audio + text).  MPS and CUDA are not safe
+  for concurrent dispatches from multiple threads; without the lock, a Flask
+  request running semantic-weighting text inference while the generation thread
+  is producing audio embeddings would crash or hang.
+- **Projection lock sharing:** The same lock also wraps mlx-vis (`UMAP` / `TSNE`)
+  runs on Apple Metal in `embeddings/layout.py`.  Running PyTorch MPS (CLAP) and MLX
   command buffers concurrently from separate Flask threads can hit IOGPU
   assertion failures (e.g. `commit command buffer with uncommitted encoder`).
 - **Rule for new GPU code paths:** If a path dispatches work to MPS/Metal/CUDA
-  from request threads, either (1) guard it with `_inference_lock`, or
+  from request threads, either (1) guard it with `clap.inference_lock`, or
   (2) prove the backend is thread-safe under mixed-framework load before
   allowing concurrent execution.
 - **Rule for env-toggle tests:** Backend enable flags are cached lazily; after
@@ -318,7 +325,7 @@ projections while embeddings are being generated.
 Projection results are cached at two levels:
 
 **Server-side (revision-keyed LRU):**
-`_revision_layout_cache` in `embeddings.py` is an `OrderedDict[str, list[dict]]`
+`_revision_layout_cache` in `embeddings/layout.py` is an `OrderedDict[str, list[dict]]`
 (capped at 16 entries). The key is `layout_revision` — a deterministic SHA-256
 computed by `compute_layout_revision()` from sorted eligible paths, method,
 sources, feature mask/blend, folder/tag context, and cache version constants.
@@ -401,9 +408,9 @@ The user can activate any combination (at least one must stay on):
 
 | Source | Module | Dimensions | Model |
 |--------|--------|-----------|-------|
-| CLAP | `backend/embeddings.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
-| EffNet | `backend/audio_features.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
-| Audio features | `backend/audio_features.py` | 6 | `librosa` — no ML model needed |
+| CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
+| EffNet | `backend/embeddings/effnet.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
+| Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` — no ML model needed |
 
 **Audio feature vector (6D):**
 `[tempo_norm, key_cos, key_sin, mode, energy_norm, danceability]`
@@ -413,7 +420,7 @@ Key is encoded on the **circle of fifths as a unit circle** in 2D:
 This preserves harmonic topology — keys a fifth apart are geometrically close,
 and the circular wrap is seamless.  Mode (major=1, minor=0) is a 3rd dimension.
 
-**Composite vector construction** (`_gather_composite_vecs` in `embeddings.py`):
+**Composite vector construction** (`_gather_composite_vecs` in `embeddings/layout.py`):
 Each enabled source block is **L2-normalized across the batch** before
 concatenation so that 1280D EffNet does not dominate 6D audio features.
 A track is included only if it has data for every enabled source.
@@ -428,9 +435,9 @@ decomposition uses the **full** composite matrix.  CLAP text directions
 
 | Source | Version constant | Cache columns |
 |--------|-----------------|---------------|
-| CLAP | `EMBEDDING_VERSION` (embeddings.py) | `clap_embedding`, `version` |
-| EffNet | `EFFNET_VERSION` (audio_features.py) | `effnet_embedding`, `effnet_version` |
-| Audio features | `FEATURES_VERSION` (audio_features.py) | `features`, `features_version` |
+| CLAP | `EMBEDDING_VERSION` (`embeddings/clap.py`) | `clap_embedding`, `version` |
+| EffNet | `EFFNET_VERSION` (`embeddings/effnet.py`) | `effnet_embedding`, `effnet_version` |
+| Audio features | `FEATURES_VERSION` (`embeddings/librosa_audio_features.py`) | `features`, `features_version` |
 
 Bumping one source's version invalidates only that source's cached data.
 

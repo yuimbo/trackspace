@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from backend.embedding_coverage import eligible_paths_for_projection
-from backend.layout_revision import compute_layout_revision
+from backend.embeddings.coverage import eligible_paths_for_projection
+from backend.embeddings.layout_revision import compute_layout_revision
 
 
 def layout_revision_for_projection(

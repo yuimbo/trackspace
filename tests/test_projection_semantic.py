@@ -4,9 +4,8 @@ folder hierarchy, parsers).  Avoids CLAP model load.
 
 import numpy as np
 
-from backend.audio_features import AUDIO_FEATURE_DIM
-from backend import embeddings
-from backend.embeddings import (
+import backend.embeddings.layout as layout
+from backend.embeddings.layout import (
     _apply_low_rank_semantic_weight,
     _build_folder_directions,
     _expand_folder_nodes,
@@ -19,6 +18,7 @@ from backend.embeddings import (
     parse_folder_boost,
     parse_folder_depth_boost,
 )
+from backend.embeddings.librosa_audio_features import AUDIO_FEATURE_DIM
 
 
 class _StubFeatureCache:
@@ -77,7 +77,7 @@ def test_parse_numeric_helpers_clip():
 
 
 def test_prepared_source_row_cache_hits_on_repeat():
-    embeddings._source_row_cache.clear()
+    layout._source_row_cache.clear()
     raw = np.array([3.0, 4.0], dtype=np.float32)
     mask = np.ones(6, dtype=np.float32)
     a = _get_prepared_source_row("clap", "fp-row", raw, mask, 0.42)
@@ -86,7 +86,7 @@ def test_prepared_source_row_cache_hits_on_repeat():
 
 
 def test_composite_tier_cache_reuses_matrix():
-    embeddings._composite_cache.clear()
+    layout._composite_cache.clear()
     fp = "fpz"
     clap = np.array([1.0, 0.0], dtype=np.float32)
     feat = np.ones(6, dtype=np.float32)

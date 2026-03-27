@@ -1,12 +1,12 @@
 """Tests for embedding coverage / layout revision helpers (no heavy ML)."""
 
-from backend.embedding_coverage import (
+from backend.embeddings.coverage import (
     CachedSourceMaps,
     SourceVersions,
     coverage_payload,
     eligible_paths_for_projection,
 )
-from backend.layout_revision import compute_layout_revision
+from backend.embeddings.layout_revision import compute_layout_revision
 
 
 def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
