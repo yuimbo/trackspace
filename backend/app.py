@@ -14,7 +14,6 @@ import time
 import shutil
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
@@ -52,7 +51,13 @@ from backend.embedding_coverage import (
     coverage_payload,
 )
 from backend.services.layout_revision_for_status import layout_revision_for_projection
+from backend.services.embedding_status_cache import EmbeddingStatusCache
 from backend.services.parallel_reads import iter_parallel_reads, read_paths_parallel
+from backend.services.projection_request import (
+    ProjectionParams,
+    embedding_projection_query_fingerprint,
+    parse_projection_params,
+)
 from backend.services.track_payload import (
     build_track_list as build_track_list_service,
     track_dict_from_read as track_dict_from_read_service,
@@ -197,11 +202,7 @@ _embed_lock = threading.Lock()
 _embed_subscribers: list[queue.Queue] = []
 
 # Embedding /status caches (see api_embeddings_status).
-_TRACK_INFOS_CACHE_MAX = 8
-_track_infos_lru: OrderedDict[tuple[str, bool, str], list[dict]] = OrderedDict()
-_STATUS_COVERAGE_CACHE_MAX = 48
-_status_coverage_lru: OrderedDict[tuple[str, int, str], tuple[dict, str | None]] = OrderedDict()
-_embed_status_cache_lock = threading.Lock()
+_status_cache = EmbeddingStatusCache(track_infos_max=8, status_coverage_max=48)
 
 
 def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
@@ -220,28 +221,16 @@ def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
 
 
 def _embedding_projection_query_fingerprint(req) -> str:
-    """Stable hash of query args that affect coverage counts or layout_revision."""
-    skip = frozenset({"folder", "recursive", "models_only"})
-    parts: list[str] = []
-    for k in sorted(req.args.keys()):
-        if k in skip:
-            continue
-        parts.append(f"{k}={req.args.get(k, '')}")
-    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    return embedding_projection_query_fingerprint(req)
 
 
 def _track_infos_cached(folder_abs: str, recursive: bool, lib_sig: str) -> list[dict]:
     key = (folder_abs, recursive, lib_sig)
-    with _embed_status_cache_lock:
-        if key in _track_infos_lru:
-            _track_infos_lru.move_to_end(key)
-            return _track_infos_lru[key]
+    cached = _status_cache.get_track_infos(key)
+    if cached is not None:
+        return cached
     infos = _build_track_infos(folder_abs, recursive)
-    with _embed_status_cache_lock:
-        _track_infos_lru[key] = infos
-        _track_infos_lru.move_to_end(key)
-        while len(_track_infos_lru) > _TRACK_INFOS_CACHE_MAX:
-            _track_infos_lru.popitem(last=False)
+    _status_cache.put_track_infos(key, infos)
     return infos
 
 
@@ -822,72 +811,12 @@ def api_audio(relpath):
 # API – Embeddings
 # ---------------------------------------------------------------------------
 
-@dataclass(frozen=True)
-class _ProjectionParams:
-    method: str
-    tag_names: list[str]
-    explicit_folders: list[str]
-    scale_folders: bool
-    feature_mask: object  # np.ndarray after parse
-    features_blend: float
-    folder_boost: float
-    folder_depth_boost: float
-    sources: tuple[str, ...]
-
-
 def _parse_projection_params(
     req,
     *,
     default_when_no_method: bool = False,
-) -> _ProjectionParams | None:
-    """Parse projection query args shared by status + projection routes.
-
-    For ``/api/embeddings/status``, *default_when_no_method* is False so a
-    minimal poll URL omits ``layout_revision``.  For the projection route,
-    pass ``default_when_no_method=True`` so ``method`` defaults to umap.
-    """
-    raw_method = req.args.get("method", "")
-    if not raw_method and not default_when_no_method:
-        return None
-    method = raw_method or "umap"
-    if method not in ("umap", "pca", "tsne"):
-        method = "umap"
-
-    raw_tags = req.args.get("context_tags", "")
-    raw_folders = req.args.get("context_folders", "")
-    raw_sources = req.args.get("sources", "clap")
-    tag_names = [s.strip() for s in raw_tags.split(",") if s.strip()] if raw_tags else []
-    explicit_folders = (
-        [s.strip() for s in raw_folders.split(",") if s.strip()] if raw_folders else []
-    )
-    scale_folders = req.args.get("scale_folders", "") == "1"
-    if not scale_folders and explicit_folders:
-        scale_folders = True
-    feature_mask = embeddings.parse_audio_feature_mask(req.args.get("feature_mask"))
-    features_blend = embeddings.parse_features_blend(req.args.get("features_blend"))
-    folder_boost = embeddings.parse_folder_boost(req.args.get("folder_boost"))
-    folder_depth_boost = embeddings.parse_folder_depth_boost(
-        req.args.get("folder_depth_boost"),
-    )
-    sources = tuple(
-        s.strip()
-        for s in raw_sources.split(",")
-        if s.strip() in ("clap", "effnet", "features")
-    )
-    if not sources:
-        sources = ("clap",)
-
-    return _ProjectionParams(
-        method=method,
-        tag_names=tag_names,
-        explicit_folders=explicit_folders,
-        scale_folders=scale_folders,
-        feature_mask=feature_mask,
-        features_blend=features_blend,
-        folder_boost=folder_boost,
-        folder_depth_boost=folder_depth_boost,
-        sources=sources,
-    )
+) -> ProjectionParams | None:
+    return parse_projection_params(req, default_when_no_method=default_when_no_method)
 
 
 def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
@@ -957,13 +886,11 @@ def api_embeddings_status():
         )
     else:
         cov_key = (lib_sig, write_epoch, proj_fp)
-        with _embed_status_cache_lock:
-            if cov_key in _status_coverage_lru:
-                base, layout_revision = _status_coverage_lru[cov_key]
-                _status_coverage_lru.move_to_end(cov_key)
-                base = dict(base)
-            else:
-                base = None
+        cached_cov = _status_cache.get_status_coverage(cov_key)
+        if cached_cov is not None:
+            base, layout_revision = cached_cov
+        else:
+            base = None
         if base is None:
             fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
             maps = batch_fetch_maps(_FEATURES, fps, versions)
@@ -975,11 +902,11 @@ def api_embeddings_status():
                 proj,
                 cache_versions=(versions.clap, versions.effnet, versions.features),
             )
-            with _embed_status_cache_lock:
-                _status_coverage_lru[cov_key] = (dict(base), layout_revision)
-                _status_coverage_lru.move_to_end(cov_key)
-                while len(_status_coverage_lru) > _STATUS_COVERAGE_CACHE_MAX:
-                    _status_coverage_lru.popitem(last=False)
+            _status_cache.put_status_coverage(
+                cov_key,
+                base=base,
+                layout_revision=layout_revision,
+            )
 
     payload = {
         **base,
