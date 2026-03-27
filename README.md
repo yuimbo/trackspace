@@ -22,7 +22,7 @@ The UI is **Vite + TypeScript** with **Alpine.js** (e.g. shortcuts modal) and **
 
 ```bash
 cd frontend
-ROOT=/path/to/music npm run dev:all
+npm run dev:all
 ```
 
 Opens Vite at [http://localhost:5173](http://localhost:5173). `/api` and `/partials` are proxied to Flask on port 5111.
@@ -43,6 +43,6 @@ Then open [http://127.0.0.1:5111](http://127.0.0.1:5111).
 **Options:**
 
 ```
-python app.py /path/to/music -p 8080        # custom port
-python app.py /path/to/music --host 0.0.0.0 # expose on LAN
+python app.py -p 8080        # custom port
+python app.py --host 0.0.0.0 # expose on LAN
 ```
