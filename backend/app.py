@@ -9,7 +9,6 @@ import json as _json
 import logging
 import argparse
 import threading
-import queue
 import time
 import shutil
 from collections import OrderedDict
@@ -72,6 +71,7 @@ from backend.services.virtual_paths import (
     virtual_from_abs as virtual_from_abs_service,
 )
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
+from backend.routes.api_library import create_api_library_blueprint
 from backend.sse import sse_response
 
 log = logging.getLogger(__name__)
@@ -496,6 +496,23 @@ app.register_blueprint(
         sse_response=sse_response,
     )
 )
+app.register_blueprint(
+    create_api_library_blueprint(
+        list_mp3s=_list_mp3s,
+        cached_read_all=_cached_read_all,
+        executor=_THREAD_POOL,
+        feature_cache=_FEATURES,
+        features_version=FEATURES_VERSION,
+        audio_features_mod=audio_features,
+        read_paths_parallel=read_paths_parallel,
+        iter_parallel_reads=iter_parallel_reads,
+        track_dict_from_read_service=track_dict_from_read_service,
+        build_track_list_service=build_track_list_service,
+        emit_scan_progress_events=emit_scan_progress_events,
+        sse_response=sse_response,
+        virtual_from_abs=_virtual_from_abs,
+    )
+)
 
 
 def _dir_color(folder_path: str) -> str:
@@ -602,113 +619,6 @@ def api_roots_remove():
 # ---------------------------------------------------------------------------
 # API – Tracks
 # ---------------------------------------------------------------------------
-
-@app.route("/api/tracks")
-def api_tracks():
-    """Return tracks (with tag data) for a folder.
-
-    Query params:
-        folder    – relative path (default: root)
-        recursive – "1" to include subfolders
-    """
-    rel = request.args.get("folder", "")
-    recursive = request.args.get("recursive", "0") == "1"
-    paths = _list_mp3s(rel, recursive)
-
-    # Read each file's ID3 header once (tags + metadata) in parallel threads.
-    # _cached_read_all checks the in-memory LRU then SQLite before hitting disk.
-    results = read_paths_parallel(paths, read_fn=_cached_read_all, executor=_THREAD_POOL)
-
-    return jsonify(_build_track_list(paths, results))
-
-
-def _track_dict_from_read(
-    p: str,
-    info: dict,
-    *,
-    feat_by_fp: dict[str, object] | None = None,
-) -> dict:
-    return track_dict_from_read_service(
-        p,
-        info,
-        virtual_from_abs=_virtual_from_abs,
-        display_bpm_key=audio_features.audio_features_display_bpm_key,
-        get_audio_features=lambda fp: _FEATURES.get_audio_features(fp, FEATURES_VERSION),
-        feat_by_fp=feat_by_fp,
-    )
-
-
-def _build_track_list(paths: list[str], results: dict[str, dict]) -> list[dict]:
-    return build_track_list_service(
-        paths,
-        results,
-        track_dict_builder=_track_dict_from_read,
-        get_all_audio_features=lambda fps: _FEATURES.get_all_audio_features(fps, FEATURES_VERSION),
-    )
-
-
-@app.route("/api/library/stream")
-def api_library_stream():
-    """SSE endpoint — streams library scan progress then delivers the full track list.
-
-    Query params:
-        folder    – relative path (default: root)
-        recursive – "1" to include subfolders
-
-    Event types:
-      ``progress`` — ``{"done": N, "total": N, "path": "rel/file.mp3"}``
-      ``done``     — ``{"tracks": [...]}`` — full track list, same shape as /api/tracks
-    """
-    rel = request.args.get("folder", "")
-    recursive = request.args.get("recursive", "0") == "1"
-    paths = _list_mp3s(rel, recursive)
-    total = len(paths)
-
-    # Each SSE client gets its own queue; the scan thread fills it.
-    q: queue.Queue[dict] = queue.Queue(maxsize=total + 100)
-
-    def _scan() -> None:
-        emit_scan_progress_events(
-            paths,
-            read_fn=_cached_read_all,
-            executor=_THREAD_POOL,
-            track_from_read=_track_dict_from_read,
-            emit=q.put_nowait,
-        )
-
-    threading.Thread(target=_scan, daemon=True).start()
-
-    def generate():
-        while True:
-            try:
-                event = q.get(timeout=60)
-            except queue.Empty:
-                yield ": keepalive\n\n"
-                continue
-            etype = event.get("type", "progress")
-            yield f"event: {etype}\ndata: {_json.dumps(event)}\n\n"
-            if etype == "done":
-                break
-
-    return sse_response(generate())
-
-
-# ---------------------------------------------------------------------------
-# API – Tags
-# ---------------------------------------------------------------------------
-
-@app.route("/api/tags")
-def api_tags():
-    """Return all known tag names across currently visible tracks."""
-    rel = request.args.get("folder", "")
-    recursive = request.args.get("recursive", "1") == "1"
-    paths = _list_mp3s(rel, recursive)
-    # Use the same cached reads as api_tracks to avoid redundant disk I/O.
-    names: set[str] = set()
-    for _, info in iter_parallel_reads(paths, read_fn=_cached_read_all, executor=_THREAD_POOL):
-        names.update(info.get("tags", {}).keys())
-    return jsonify(sorted(names))
-
 
 @app.route("/api/tracks/tags", methods=["POST"])
 def api_update_tags():

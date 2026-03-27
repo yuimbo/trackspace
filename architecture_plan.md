@@ -19,11 +19,12 @@ Collapse module-level singletons (`ROOTS`, caches, executor, embed locks, observ
 
 **Why:** tests and future blueprints avoid import-order hazards and implicit globals.
 
-### 2. Blueprints for the rest of the API (besides embeddings)
+### 2. Blueprints for the rest of the API (besides embeddings + library)
 
-Embeddings live in `backend/routes/api_embeddings.py` (`/api/embeddings/*`). Still in `app.py`:
+Embeddings live in `backend/routes/api_embeddings.py` (`/api/embeddings/*`) and
+library routes live in `backend/routes/api_library.py`
+(``/api/tracks``, ``/api/library/stream``, ``/api/tags``). Still in `app.py`:
 
-- **Library:** `/api/tracks`, `/api/library/stream`, `/api/tags`
 - **Folders + HTMX:** `/partials/folder-tree`, `/api/folders*`, roots add/remove, reveal, track moves
 - **Tag mutation:** `/api/tracks/tags`, `/api/tags/*`
 - **Static:** `/`, `/assets/*`, `/api/audio/*` (or keep static/audio in a tiny blueprint)
