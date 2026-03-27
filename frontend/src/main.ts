@@ -34,6 +34,7 @@ const props = new PropertiesView(
 );
 const batch = new BatchView(model, document.getElementById("batch-list")!);
 const status = new StatusView();
+status.update(model);
 
 const ctrl = new Controller(
   model,

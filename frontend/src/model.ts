@@ -150,11 +150,22 @@ export class Model extends EventBus {
   embeddingPositions: Map<string, { x: number; y: number }> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
-  embeddingProgress: { done: number; total: number } | null = null;
+  embeddingProgress: {
+    done: number;
+    total: number;
+    lastPath?: string;
+    lastOk?: boolean;
+    lastFailures?: string[];
+  } | null = null;
   projectionPending = false;
   /** True while CLAP/EffNet are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
-  libraryLoadProgress: { done: number; total: number } | null = null;
+  libraryLoadProgress: {
+    done: number;
+    total: number;
+    lastPath?: string;
+    lastTitle?: string;
+  } | null = null;
 
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;

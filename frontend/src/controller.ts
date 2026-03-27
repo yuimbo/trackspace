@@ -876,7 +876,13 @@ export class Controller {
           track: Track;
         };
         this._libPending.push(data.track);
-        m.libraryLoadProgress = { done: data.done, total: data.total };
+        const tr = data.track;
+        m.libraryLoadProgress = {
+          done: data.done,
+          total: data.total,
+          lastPath: tr.path,
+          lastTitle: tr.title?.trim() || undefined,
+        };
         if ($progress) {
           $progress.textContent = `Loading library… ${data.done} / ${data.total}`;
         }
@@ -1113,9 +1119,17 @@ export class Controller {
         ok: boolean;
         done: number;
         total: number;
+        failures?: string[];
       };
       const m = this.model;
-      m.embeddingProgress = { done: data.done, total: data.total };
+      m.embeddingProgress = {
+        done: data.done,
+        total: data.total,
+        lastPath: data.path,
+        lastOk: data.ok,
+        lastFailures:
+          data.failures && data.failures.length ? data.failures : undefined,
+      };
       this.status.update(m);
       this.canvas.scheduleDraw();
 

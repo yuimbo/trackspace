@@ -906,6 +906,77 @@ kbd {
   background: var(--bg-side);
   border-top: 1px solid #0004;
   flex-shrink: 0;
+  position: relative;
+}
+
+#status-text {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  min-width: 0;
+}
+
+.status-hoverable {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+  color: var(--accent-hi);
+  outline: none;
+}
+.status-hoverable:focus-visible {
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px var(--accent-hi);
+}
+
+.status-detail-panel {
+  position: fixed;
+  z-index: 160;
+  min-width: 240px;
+  max-width: min(420px, calc(100vw - 16px));
+  padding: 10px 12px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--fg);
+  background: rgba(12, 18, 40, 0.95);
+  border: 1px solid rgba(180, 220, 255, 0.22);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  pointer-events: auto;
+}
+
+.status-detail-title {
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-size: 10px;
+  color: var(--accent-hi);
+  margin-bottom: 8px;
+}
+
+.status-detail-kv {
+  display: grid;
+  grid-template-columns: 7.5em 1fr;
+  gap: 6px 10px;
+  margin-bottom: 6px;
+  align-items: baseline;
+}
+.status-detail-kv span:first-child {
+  color: var(--fg-dim);
+}
+.status-detail-mono {
+  font-size: 10px;
+  word-break: break-all;
+}
+.status-detail-ok { color: #7dffb3; }
+.status-detail-bad { color: #ff8e9d; }
+
+.status-detail-note {
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  color: var(--fg-dim);
+  font-size: 10px;
 }
 
 /* ── Tooltip ──────────────────────────────────────────────── */
