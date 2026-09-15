@@ -1,0 +1,400 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { Model, type Track } from "../model";
+import type { CanvasView } from "../components";
+import {
+  CanvasInteractionController,
+  type CanvasInteractionDeps,
+} from "./canvas-interaction";
+
+// ─── Fakes ───────────────────────────────────────────────────
+
+function makeTrack(over: Partial<Track> = {}): Track {
+  return {
+    path: "a.mp3",
+    filename: "a.mp3",
+    folder: "",
+    tags: {},
+    artist: "",
+    title: "",
+    ...over,
+  };
+}
+
+interface FakeCanvas {
+  $canvas: HTMLCanvasElement;
+  $tip: HTMLElement;
+  hoveredIdx: number;
+  hoveredFolderPrefix: string | null;
+  hoveredSiblingFolder: string | null;
+  boxSel: { x0: number; y0: number; x1: number; y1: number } | null;
+  lassoPoints: [number, number][];
+  intersectMode: boolean;
+  dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null;
+  positions: { sx: number; sy: number; idx: number }[];
+  tipTimer: unknown;
+  tipReady: boolean;
+  _txWorld: { minX: number; maxX: number; minY: number; maxY: number } | null;
+  hitTest: ReturnType<typeof vi.fn>;
+  hitTestTransform: ReturnType<typeof vi.fn>;
+  s2w: ReturnType<typeof vi.fn>;
+  minZoom: ReturnType<typeof vi.fn>;
+  clearHover: ReturnType<typeof vi.fn>;
+  worldPosForTrack: ReturnType<typeof vi.fn>;
+  scheduleDraw: ReturnType<typeof vi.fn>;
+}
+
+function makeCanvas(): FakeCanvas {
+  return {
+    $canvas: document.createElement("canvas"),
+    $tip: document.createElement("div"),
+    hoveredIdx: -1,
+    hoveredFolderPrefix: null,
+    hoveredSiblingFolder: null,
+    boxSel: null,
+    lassoPoints: [],
+    intersectMode: false,
+    dragGhosts: null,
+    positions: [],
+    tipTimer: 0,
+    tipReady: false,
+    _txWorld: null,
+    hitTest: vi.fn(() => -1),
+    hitTestTransform: vi.fn(() => null),
+    // 1 px == 0.001 world units; keeps drag deltas small but > DRAG_THRESH in px.
+    s2w: vi.fn((sx: number, sy: number) => [sx / 1000, sy / 1000]),
+    minZoom: vi.fn(() => 0.1),
+    clearHover: vi.fn(),
+    worldPosForTrack: vi.fn(() => ({ wx: 0.5, wy: 0.5 })),
+    scheduleDraw: vi.fn(),
+  };
+}
+
+interface Harness {
+  model: Model;
+  canvas: FakeCanvas;
+  deps: CanvasInteractionDeps;
+  coord: CanvasInteractionController;
+}
+
+function makeHarness(): Harness {
+  const model = new Model();
+  const canvas = makeCanvas();
+  document.body.appendChild(canvas.$canvas);
+  const deps = {
+    model,
+    canvas: canvas as unknown as CanvasView,
+    status: { update: vi.fn() },
+    props: { render: vi.fn() },
+    batch: { render: vi.fn() },
+    renderTagPanels: vi.fn(),
+    queueTagWrite: vi.fn(),
+    flushTagWrites: vi.fn(),
+    moveSelectionToFolder: vi.fn(),
+    onHoverFolderChanged: vi.fn(),
+    onHoverPreview: vi.fn(),
+    stopPreview: vi.fn(),
+  } as CanvasInteractionDeps;
+  const coord = new CanvasInteractionController(deps);
+  coord.bind();
+  return { model, canvas, deps, coord };
+}
+
+// ─── Event helpers ────────────────────────────────────────────
+
+type XY = { x?: number; y?: number };
+
+function mouseEvent(
+  type: string,
+  opts: MouseEventInit & XY = {},
+): MouseEvent {
+  const { x, y, ...init } = opts;
+  const ev = new MouseEvent(type, { bubbles: true, cancelable: true, ...init });
+  if (x !== undefined) Object.defineProperty(ev, "offsetX", { value: x });
+  if (y !== undefined) Object.defineProperty(ev, "offsetY", { value: y });
+  return ev;
+}
+
+function wheelEvent(opts: WheelEventInit & XY = {}): WheelEvent {
+  const { x, y, ...init } = opts;
+  const ev = new WheelEvent("wheel", {
+    bubbles: true,
+    cancelable: true,
+    ...init,
+  });
+  if (x !== undefined) Object.defineProperty(ev, "offsetX", { value: x });
+  if (y !== undefined) Object.defineProperty(ev, "offsetY", { value: y });
+  // happy-dom does not carry modifier state through the WheelEvent init dict.
+  if (opts.ctrlKey !== undefined)
+    Object.defineProperty(ev, "ctrlKey", { value: opts.ctrlKey });
+  return ev;
+}
+
+/** Press, move and release on the canvas element. */
+function down(canvas: FakeCanvas, x: number, y: number, init: MouseEventInit = {}) {
+  canvas.$canvas.dispatchEvent(mouseEvent("mousedown", { x, y, ...init }));
+}
+function move(canvas: FakeCanvas, x: number, y: number, init: MouseEventInit = {}) {
+  canvas.$canvas.dispatchEvent(mouseEvent("mousemove", { x, y, ...init }));
+}
+function up(canvas: FakeCanvas, x: number, y: number, init: MouseEventInit = {}) {
+  canvas.$canvas.dispatchEvent(mouseEvent("mouseup", { x, y, ...init }));
+}
+
+beforeEach(() => {
+  document.body.innerHTML = `<div id="toast-container"></div>`;
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+// ─── Selection ──────────────────────────────────────────────
+
+describe("CanvasInteractionController selection", () => {
+  it("selects a single track on a plain click", () => {
+    const { model, canvas } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    canvas.hitTest.mockReturnValue(0);
+    down(canvas, 10, 10);
+    up(canvas, 10, 10);
+    expect([...model.selected]).toEqual(["a.mp3"]);
+  });
+
+  it("clears the selection when clicking empty space", () => {
+    const { model, canvas } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.selected.add("a.mp3");
+    canvas.hitTest.mockReturnValue(-1);
+    down(canvas, 10, 10);
+    up(canvas, 10, 10);
+    expect(model.selected.size).toBe(0);
+  });
+
+  it("toggles an already-selected track off with ctrl", () => {
+    const { model, canvas } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.selected.add("a.mp3");
+    canvas.hitTest.mockReturnValue(0);
+    down(canvas, 10, 10, { ctrlKey: true });
+    up(canvas, 10, 10, { ctrlKey: true });
+    expect(model.selected.size).toBe(0);
+  });
+
+  it("selects tracks inside a shift-lasso polygon", () => {
+    const { model, canvas } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "in.mp3" }),
+      makeTrack({ path: "out.mp3" }),
+    ]);
+    canvas.hitTest.mockReturnValue(-1);
+    canvas.positions = [
+      { sx: 30, sy: 30, idx: 0 },
+      { sx: 200, sy: 200, idx: 1 },
+    ];
+    down(canvas, 10, 10, { shiftKey: true });
+    move(canvas, 50, 10);
+    move(canvas, 50, 50);
+    move(canvas, 10, 50);
+    up(canvas, 10, 50);
+    expect([...model.selected]).toEqual(["in.mp3"]);
+  });
+});
+
+// ─── Tag drag ─────────────────────────────────────────────
+
+describe("CanvasInteractionController tag drag", () => {
+  it("starts a document drag past the threshold and mutates tag values", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
+    model.axisX = "tagA";
+    canvas.hitTest.mockReturnValue(0);
+
+    down(canvas, 10, 10);
+    move(canvas, 30, 30); // beyond DRAG_THRESH
+    expect(coord.isPointerBusy()).toBe(true);
+    move(canvas, 40, 40);
+    // dx in world units = (40 - 10) / 1000 = 0.03
+    expect(model.trackByPath("a.mp3")!.tags.tagA).toBeCloseTo(0.53, 5);
+  });
+
+  it("queues and flushes tag writes when a drag commits", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
+    model.axisX = "tagA";
+    canvas.hitTest.mockReturnValue(0);
+
+    down(canvas, 10, 10);
+    move(canvas, 30, 30);
+    move(canvas, 40, 40);
+    document.dispatchEvent(mouseEvent("mouseup", { x: 900, y: 900 }));
+
+    expect(deps.queueTagWrite).toHaveBeenCalledWith(
+      "a.mp3",
+      "tagA",
+      expect.closeTo(0.53, 5),
+    );
+    expect(deps.flushTagWrites).toHaveBeenCalled();
+    expect(model.suppressExplodeVisual).toBe(false);
+  });
+});
+
+// ─── Transforms ───────────────────────────────────────────
+
+describe("CanvasInteractionController transforms", () => {
+  it("scales tag values with a resize handle", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
+    model.selected.add("a.mp3");
+    model.axisX = "tagA";
+    canvas._txWorld = { minX: 0, maxX: 1, minY: 0, maxY: 1 };
+    canvas.hitTestTransform.mockReturnValue({ type: "e", cursor: "ew-resize" });
+
+    down(canvas, 10, 10);
+    // East handle anchored at minX=0, original edge maxX=1 → scale = wx.
+    move(canvas, 800, 10);
+    expect(model.trackByPath("a.mp3")!.tags.tagA).toBeCloseTo(0.4, 5);
+    up(canvas, 800, 10);
+    expect(deps.queueTagWrite).toHaveBeenCalledWith("a.mp3", "tagA", 0.4);
+    expect(deps.flushTagWrites).toHaveBeenCalled();
+  });
+});
+
+// ─── Wheel ────────────────────────────────────────────────
+
+describe("CanvasInteractionController wheel", () => {
+  it("zooms in on ctrl+wheel", () => {
+    const { model, canvas } = makeHarness();
+    model.vp = { ox: 0, oy: 0, zoom: 1 };
+    canvas.$canvas.dispatchEvent(
+      wheelEvent({ x: 10, y: 10, ctrlKey: true, deltaY: -100 }),
+    );
+    expect(model.vp.zoom).toBeGreaterThan(1);
+  });
+
+  it("clamps zoom to the canvas minimum", () => {
+    const { model, canvas } = makeHarness();
+    model.vp = { ox: 0, oy: 0, zoom: 1 };
+    canvas.$canvas.dispatchEvent(
+      wheelEvent({ x: 10, y: 10, ctrlKey: true, deltaY: 100000 }),
+    );
+    expect(model.vp.zoom).toBeCloseTo(0.1, 5);
+  });
+
+  it("adjusts explode strength while X is held", () => {
+    const { model, canvas } = makeHarness();
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    model.explodeHold = true;
+    const before = model.explodeStrength;
+    canvas.$canvas.dispatchEvent(
+      wheelEvent({ x: 10, y: 10, deltaY: -100 }),
+    );
+    expect(model.explodeStrength).toBeGreaterThan(before);
+  });
+});
+
+// ─── Folder drop ─────────────────────────────────────────
+
+describe("CanvasInteractionController folder drop", () => {
+  it("moves the selection into a dropped-on folder", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
+    model.axisX = "tagA";
+    canvas.hitTest.mockReturnValue(0);
+
+    down(canvas, 10, 10);
+    move(canvas, 30, 30);
+    move(canvas, 40, 40);
+
+    const folderLabel = document.createElement("span");
+    folderLabel.className = "folder-label";
+    folderLabel.dataset.path = "House";
+    vi.spyOn(document, "elementFromPoint").mockReturnValue(folderLabel);
+
+    document.dispatchEvent(mouseEvent("mouseup", { x: 900, y: 900 }));
+
+    // Baseline reverted before the move command fires.
+    expect(model.trackByPath("a.mp3")!.tags.tagA).toBe(0.5);
+    expect(deps.moveSelectionToFolder).toHaveBeenCalledWith("House");
+    expect(deps.flushTagWrites).not.toHaveBeenCalled();
+  });
+});
+
+// ─── Gesture cancellation / hover ─────────────────────────
+
+describe("CanvasInteractionController gesture state", () => {
+  it("reports pointer busy during a drag", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
+    model.axisX = "tagA";
+    canvas.hitTest.mockReturnValue(0);
+    expect(coord.isPointerBusy()).toBe(false);
+    down(canvas, 10, 10);
+    move(canvas, 30, 30);
+    expect(coord.isPointerBusy()).toBe(true);
+  });
+
+  it("cancels an active box selection and reports it", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.hitTest.mockReturnValue(-1);
+    down(canvas, 10, 10);
+    expect(canvas.boxSel).not.toBeNull();
+    expect(coord.cancelActiveGesture()).toBe(true);
+    expect(canvas.boxSel).toBeNull();
+  });
+
+  it("returns false from cancel when no gesture is active", () => {
+    const { coord } = makeHarness();
+    expect(coord.cancelActiveGesture()).toBe(false);
+  });
+
+  it("resyncs hover only when idle and over the canvas", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.hitTest.mockReturnValue(0);
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    coord.resyncHoverFromLastPointer();
+    expect(canvas.hoveredIdx).toBe(0);
+    expect(canvas.scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("toggles the explode hold on the X key", () => {
+    const { model } = makeHarness();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    expect(model.explodeHold).toBe(true);
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyX", bubbles: true }),
+    );
+    expect(model.explodeHold).toBe(false);
+  });
+});
+
+// ─── Fit view ───────────────────────────────────────────
+
+describe("CanvasInteractionController fit view", () => {
+  it("resets the viewport when no folder is hovered", () => {
+    const { model, coord } = makeHarness();
+    model.vp = { ox: 0.4, oy: 0.4, zoom: 2 };
+    coord.fitView();
+    expect(model.vp).toEqual({ ox: 0, oy: 0, zoom: 1 });
+  });
+
+  it("fits to the hovered folder disc", () => {
+    const { model, canvas, coord } = makeHarness();
+    canvas.hoveredFolderPrefix = "House";
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "House/b.mp3", folder: "House" }),
+    ]);
+    canvas.worldPosForTrack.mockImplementation((t: Track) => ({
+      wx: t.path.endsWith("a.mp3") ? 0.2 : 0.8,
+      wy: 0.5,
+    }));
+    model.vp = { ox: 0, oy: 0, zoom: 1 };
+    coord.fitView();
+    expect(canvas.scheduleDraw).toHaveBeenCalled();
+    expect(model.vp.zoom).not.toBe(1);
+  });
+});
