@@ -224,7 +224,10 @@ def _projection_matrix(n_rows: int, n_cols: int, seed: int = 42) -> np.ndarray:
 
 def test_profile_projection_cpu_vs_gpu(monkeypatch):
     """Compare CPU (sklearn) vs cuML or mlx-vis t-SNE when available."""
-    from backend.embeddings.layout import _project_tsne, reset_projection_backend_cache
+    from backend.embeddings.projection_backends import (
+        _project_tsne,
+        reset_projection_backend_cache,
+    )
 
     n_env = int(os.environ.get("TRACKSPACE_PROFILE_PROJECTION_N", "320"))
     d_env = int(os.environ.get("TRACKSPACE_PROFILE_PROJECTION_D", "128"))
@@ -286,7 +289,10 @@ def test_profile_projection_cpu_vs_gpu(monkeypatch):
 
 def test_profile_projection_cpu_only_quick(monkeypatch):
     """Small CPU t-SNE timing — runs everywhere."""
-    from backend.embeddings.layout import _project_tsne, reset_projection_backend_cache
+    from backend.embeddings.projection_backends import (
+        _project_tsne,
+        reset_projection_backend_cache,
+    )
 
     monkeypatch.setenv("TRACKSPACE_CUML", "0")
     monkeypatch.setenv("TRACKSPACE_MLX_VIS", "0")

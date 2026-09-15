@@ -6,10 +6,6 @@ import numpy as np
 
 import backend.embeddings.layout as layout
 from backend.embeddings.layout import (
-    _apply_low_rank_semantic_weight,
-    _build_folder_directions,
-    _expand_folder_nodes,
-    _folder_seeds_from_track_paths,
     _gather_composite_vecs,
     _get_prepared_source_row,
     compute_projection,
@@ -17,6 +13,12 @@ from backend.embeddings.layout import (
     parse_features_blend,
     parse_folder_boost,
     parse_folder_depth_boost,
+)
+from backend.embeddings.semantic_weighting import (
+    _apply_low_rank_semantic_weight,
+    _build_folder_directions,
+    _expand_folder_nodes,
+    _folder_seeds_from_track_paths,
 )
 from backend.embeddings.librosa_audio_features import AUDIO_FEATURE_DIM
 
