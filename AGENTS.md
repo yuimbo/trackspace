@@ -22,12 +22,14 @@ trackspace/
       worker.py             – JobWorker/WorkerPool: one thread per job kind
     embeddings/             ← MAEST, CLAP, caches, projection, clustering, audio features
       __init__.py           – lazy re-exports of ``layout`` public API
-      layout.py             – composite vectors, semantic weighting, UMAP/t-SNE/PCA
+      layout.py             – composite vectors + ``compute_projection`` orchestration
+      semantic_weighting.py – folder centroid decomposition + CLAP text directions
+      projection_backends.py – PCA preview + cuML / mlx-vis / sklearn t-SNE
       maest.py              – MAEST: 519 Discogs style logits + 768-D embedding
       clustering.py         – weighted distance → cosine kNN → multi-resolution Leiden
       rhythm_features.py    – 14-D rhythm/DSP descriptors for electronic microgenres
       clap.py               – Laion CLAP model (audio + text embeddings)
-      feature_cache.py      – FeatureCache (fingerprint → per-source vectors)
+      feature_cache.py      – FeatureCache (source-parameterised, fingerprint-keyed)
       coverage.py           – coverage stats + generation work-list helpers
       layout_revision.py    – deterministic layout revision hash
       audio_decode.py       – resilient librosa decode (segments, seeks, metadata mismatch)
@@ -317,12 +319,12 @@ Never cache a `None` fingerprint and treat it as a permanent result.
 
 `compute_projection()` projects cached embeddings to 2D. The method is chosen by
 the user via a toggle in the right-panel Options section and stored as
-`model.projectionMethod`.
+`model.projectionMethod`. The backends themselves live in
+`embeddings/projection_backends.py`.
 
 | Method | Backend function | Notes |
 |--------|-----------------|-------|
-| `"tsne"` (default) | `_project_tsne` (scikit-learn) | Best local cluster preservation; slower |
-| `"umap"` | `_project_umap` (umap-learn) | Good global structure; moderate speed |
+| `"tsne"` (default) | `_project_tsne` (cuML → mlx-vis → scikit-learn) | Best local cluster preservation; slower |
 | `"pca"` | `_project_pca` (numpy SVD) | Instant; used for live incremental updates during generation |
 
 PCA is never shown in the UI toggle — it is only used internally for fast intermediate
@@ -334,7 +336,7 @@ Projection results are cached at two levels:
 
 **Server-side (revision-keyed LRU):**
 `_revision_layout_cache` in `embeddings/layout.py` is an `OrderedDict[str, list[dict]]`
-(capped at 16 entries). The key is `layout_revision` — a deterministic SHA-256
+(capped at 32 entries). The key is `layout_revision` — a deterministic SHA-256
 computed by `compute_layout_revision()` from sorted eligible paths, method,
 sources, feature mask/blend, folder/tag context, and cache version constants.
 Because the key is content-addressed, row order in the input data does not
@@ -358,9 +360,6 @@ nondeterministic order, which would produce different composite cache keys, diff
 t-SNE/UMAP row ordering (and thus different layouts), and revision cache misses.
 All new code that builds track info lists must maintain this sort invariant.
 
-**UMAP reproducibility:** The `umap-learn` fallback passes `random_state=42` to
-ensure identical inputs produce identical layouts across runs.
-
 ### Semantic weighting (context-aware projection)
 
 Before projection, the embedding space can be **re-weighted** so directions
@@ -373,7 +372,8 @@ reflecting the user's folder organisation and tag names receive higher contrast.
 | Folders | Hierarchical centroid decomposition from actual track embeddings | Folders are manual curation — their tracks ARE the ground truth |
 | Tags | CLAP text embedding of tag names | Tags are labels, not track collections |
 
-**Hierarchical centroid decomposition** (`_build_folder_directions`):
+**Hierarchical centroid decomposition** (`_build_folder_directions` in
+`embeddings/semantic_weighting.py`):
 
 For each folder node the direction is
 `centroid(all tracks under node) − centroid(all tracks under parent)`.
@@ -473,9 +473,19 @@ pass produces both — `put_maest()` writes them in one statement.
 
 New columns are added via the `ALTER TABLE` migration loop in
 `FeatureCache._init_db`, so existing databases migrate in place (verified
-against the real 9.4k-row cache with no data loss). `get_all_*` chunks its
+against the real 9.4k-row cache with no data loss). All sources share one
+generic implementation driven by the `_SOURCES` registry; the public API is
+source-parameterised (`get` / `put` / `has` / `get_all` / `count` /
+`purge_old_versions(source, version)`), and `get_all` chunks its
 `WHERE fingerprint IN (...)` at 500 ids so a large library cannot exceed
 SQLite's variable limit.
+
+**Purge writes empty blobs, not NULL.** `clap_embedding` is declared `NOT NULL`,
+so a purge that set it to NULL raised `IntegrityError` — which the broad
+`except Exception` swallowed, silently making CLAP purges no-ops. Purge now
+overwrites each blob with an empty blob, and every read path uses
+`length(blob) > 0` as its presence test. Any new cache read must use the same
+empty-blob-as-absent rule or it will resurrect purged rows.
 
 ### MAEST model management
 
