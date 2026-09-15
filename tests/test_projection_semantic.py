@@ -22,7 +22,7 @@ from backend.embeddings.librosa_audio_features import AUDIO_FEATURE_DIM
 
 
 class _StubFeatureCache:
-    """Minimal cache implementing composite gather lookups."""
+    """Minimal cache implementing the generic composite gather lookup."""
 
     def __init__(
         self,
@@ -30,27 +30,18 @@ class _StubFeatureCache:
         effnet: dict[str, np.ndarray] | None = None,
         feats: dict[str, np.ndarray] | None = None,
     ) -> None:
-        self._clap = clap or {}
-        self._effnet = effnet or {}
-        self._feat = feats or {}
+        self._maps = {
+            "clap": clap or {},
+            "effnet": effnet or {},
+            "features": feats or {},
+        }
 
-    def get_all_embeddings(
-        self, fingerprints: list[str], version: int = 0,
+    def get_all(
+        self, source: str, fingerprints: list[str], version: int = 0,
     ) -> dict[str, np.ndarray]:
         del version
-        return {fp: self._clap[fp] for fp in fingerprints if fp in self._clap}
-
-    def get_all_effnet_embeddings(
-        self, fingerprints: list[str], version: int = 0,
-    ) -> dict[str, np.ndarray]:
-        del version
-        return {fp: self._effnet[fp] for fp in fingerprints if fp in self._effnet}
-
-    def get_all_audio_features(
-        self, fingerprints: list[str], version: int = 0,
-    ) -> dict[str, np.ndarray]:
-        del version
-        return {fp: self._feat[fp] for fp in fingerprints if fp in self._feat}
+        m = self._maps.get(source, {})
+        return {fp: m[fp] for fp in fingerprints if fp in m}
 
 
 def test_folder_seeds_and_expand_align_with_explicit():

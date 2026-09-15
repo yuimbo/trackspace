@@ -446,7 +446,7 @@ def _gather_vecs(
 ) -> tuple[list[str], list[np.ndarray]]:
     fps = [t.get("fingerprint") for t in track_infos]
     fp_set = [fp for fp in fps if fp]
-    embeddings_map = feature_cache.get_all_embeddings(fp_set, version=version)
+    embeddings_map = feature_cache.get_all("clap", fp_set, version=version)
 
     paths: list[str] = []
     vecs: list[np.ndarray] = []
@@ -458,33 +458,23 @@ def _gather_vecs(
     return paths, vecs
 
 
-_SOURCE_GETTER_NAMES: dict[str, str] = {
-    "clap": "get_all_embeddings",
-    "effnet": "get_all_effnet_embeddings",
-    "features": "get_all_audio_features",
-    "maest": "get_all_maest_embeddings",
-    "maest_logits": "get_all_maest_logits",
-    "rhythm": "get_all_rhythm_features",
-}
-
-
 def _fetch_source_map(
     source: str, feature_cache, fp_set: list[str]
 ) -> dict[str, np.ndarray]:
     """One batched cache read for *source*, keyed by its own version constant.
 
-    A cache object without the getter for *source* (older cache, or a test
-    stub) yields an empty map rather than raising — that source is simply
-    absent for this projection.
+    A cache object without the generic getter (older cache, or a test stub) yields
+    an empty map rather than raising — that source is simply absent for this
+    projection.
     """
     try:
-        name = _SOURCE_GETTER_NAMES[source]
+        version = _source_version(source)
     except KeyError:
         raise ValueError(f"unknown source {source!r}") from None
-    getter = getattr(feature_cache, name, None)
+    getter = getattr(feature_cache, "get_all", None)
     if getter is None:
         return {}
-    return getter(fp_set, version=_source_version(source))
+    return getter(source, fp_set, version=version)
 
 
 def _gather_composite_vecs(

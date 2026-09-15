@@ -92,13 +92,14 @@ def _purge_stale_embedding_cache_rows() -> dict[str, int]:
     any HTTP handler runs (not only when ``main()`` is invoked).
     """
     fc = state.feature_cache
-    return {
-        "clap": fc.purge_old_versions(EMBEDDING_VERSION),
-        "effnet": fc.purge_old_effnet_versions(EFFNET_VERSION),
-        "features": fc.purge_old_feature_versions(FEATURES_VERSION),
-        "maest": fc.purge_old_maest_versions(MAEST_VERSION),
-        "rhythm": fc.purge_old_rhythm_versions(RHYTHM_VERSION),
+    versions = {
+        "clap": EMBEDDING_VERSION,
+        "effnet": EFFNET_VERSION,
+        "features": FEATURES_VERSION,
+        "maest": MAEST_VERSION,
+        "rhythm": RHYTHM_VERSION,
     }
+    return {src: fc.purge_old_versions(src, ver) for src, ver in versions.items()}
 
 
 _startup_purges = _purge_stale_embedding_cache_rows()

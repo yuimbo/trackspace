@@ -181,29 +181,29 @@ def make_features_handler(deps: AnalysisDeps) -> Callable[[Sequence[Job]], dict[
             produced: list[str] = []
             failed: list[str] = []
 
-            if not deps.feature_cache.has_audio_features(fp, version=deps.features_version):
+            if not deps.feature_cache.has("features", fp, version=deps.features_version):
                 warns: dict[str, str] = {}
                 vec = deps.audio_features_mod.generate_audio_features_batch(
                     [abs_path], decode_warnings=warns
                 ).get(abs_path)
                 _relay_warnings(deps, warns)
                 if vec is not None:
-                    deps.feature_cache.put_audio_features(
-                        fp, vec, version=deps.features_version
+                    deps.feature_cache.put(
+                        "features", fp, vec, version=deps.features_version
                     )
                     produced.append("features")
                 else:
                     failed.append("features")
 
-            if not deps.feature_cache.has_rhythm_features(fp, version=deps.rhythm_version):
+            if not deps.feature_cache.has("rhythm", fp, version=deps.rhythm_version):
                 warns = {}
                 vec = deps.rhythm_mod.generate_rhythm_features_batch(
                     [abs_path], decode_warnings=warns
                 ).get(abs_path)
                 _relay_warnings(deps, warns)
                 if vec is not None:
-                    deps.feature_cache.put_rhythm_features(
-                        fp, vec, version=deps.rhythm_version
+                    deps.feature_cache.put(
+                        "rhythm", fp, vec, version=deps.rhythm_version
                     )
                     produced.append("rhythm")
                 else:
@@ -241,7 +241,7 @@ def make_maest_handler(
             if not fp:
                 out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
                 continue
-            if deps.feature_cache.has_maest_embedding(fp, version=deps.maest_version):
+            if deps.feature_cache.has("maest", fp, version=deps.maest_version):
                 out[job.id] = JobResult.success(cached=True)
                 continue
             targets.append((job, abs_path, fp))
@@ -362,12 +362,12 @@ def gather_source_blocks(
         return [], {}, None
 
     fc = deps.feature_cache
-    maest_map = fc.get_all_maest_embeddings(fps, version=deps.maest_version)
-    logits_map = fc.get_all_maest_logits(fps, version=deps.maest_version)
-    rhythm_map = fc.get_all_rhythm_features(fps, version=deps.rhythm_version)
-    feat_map = fc.get_all_audio_features(fps, version=deps.features_version)
-    clap_map = fc.get_all_embeddings(fps, version=clap_version)
-    effnet_map = fc.get_all_effnet_embeddings(fps, version=effnet_version)
+    maest_map = fc.get_all("maest", fps, version=deps.maest_version)
+    logits_map = fc.get_all("maest_logits", fps, version=deps.maest_version)
+    rhythm_map = fc.get_all("rhythm", fps, version=deps.rhythm_version)
+    feat_map = fc.get_all("features", fps, version=deps.features_version)
+    clap_map = fc.get_all("clap", fps, version=clap_version)
+    effnet_map = fc.get_all("effnet", fps, version=effnet_version)
 
     paths: list[str] = []
     picked: list[str] = []
@@ -468,17 +468,17 @@ def enqueue_library_work(
 
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
     have_maest = (
-        set(fc.get_all_maest_embeddings(fps, version=deps.maest_version))
+        set(fc.get_all("maest", fps, version=deps.maest_version))
         if KIND_MAEST in kinds
         else set()
     )
     have_rhythm = (
-        set(fc.get_all_rhythm_features(fps, version=deps.rhythm_version))
+        set(fc.get_all("rhythm", fps, version=deps.rhythm_version))
         if KIND_FEATURES in kinds
         else set()
     )
     have_feats = (
-        set(fc.get_all_audio_features(fps, version=deps.features_version))
+        set(fc.get_all("features", fps, version=deps.features_version))
         if KIND_FEATURES in kinds
         else set()
     )

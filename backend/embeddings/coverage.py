@@ -51,12 +51,14 @@ def batch_fetch_maps(
     versions: SourceVersions,
 ) -> CachedSourceMaps:
     return CachedSourceMaps(
-        clap=feature_cache.get_all_embeddings(fingerprints, version=versions.clap),
-        effnet=feature_cache.get_all_effnet_embeddings(fingerprints, version=versions.effnet),
-        features=feature_cache.get_all_audio_features(fingerprints, version=versions.features),
-        maest=feature_cache.get_all_maest_embeddings(fingerprints, version=versions.maest),
-        maest_logits=feature_cache.get_all_maest_logits(fingerprints, version=versions.maest),
-        rhythm=feature_cache.get_all_rhythm_features(fingerprints, version=versions.rhythm),
+        clap=feature_cache.get_all("clap", fingerprints, version=versions.clap),
+        effnet=feature_cache.get_all("effnet", fingerprints, version=versions.effnet),
+        features=feature_cache.get_all("features", fingerprints, version=versions.features),
+        maest=feature_cache.get_all("maest", fingerprints, version=versions.maest),
+        maest_logits=feature_cache.get_all(
+            "maest_logits", fingerprints, version=versions.maest
+        ),
+        rhythm=feature_cache.get_all("rhythm", fingerprints, version=versions.rhythm),
     )
 
 

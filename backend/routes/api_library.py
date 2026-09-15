@@ -39,7 +39,7 @@ def create_api_library_blueprint(
             info,
             virtual_from_abs=virtual_from_abs,
             display_bpm_key=audio_features_mod.audio_features_display_bpm_key,
-            get_audio_features=lambda fp: feature_cache.get_audio_features(fp, features_version),
+            get_audio_features=lambda fp: feature_cache.get("features", fp, features_version),
             feat_by_fp=feat_by_fp,
         )
 
@@ -48,7 +48,7 @@ def create_api_library_blueprint(
             paths,
             results,
             track_dict_builder=_track_dict_from_read,
-            get_all_audio_features=lambda fps: feature_cache.get_all_audio_features(fps, features_version),
+            get_all_audio_features=lambda fps: feature_cache.get_all("features", fps, features_version),
         )
 
     @bp.route("/api/tracks")

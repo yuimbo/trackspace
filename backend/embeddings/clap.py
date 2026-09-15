@@ -163,7 +163,7 @@ def batch_ensure_embeddings(
     to_generate: list[tuple[str, str]] = []
 
     fps = [t["fingerprint"] for t in track_infos if t.get("fingerprint")]
-    existing = feature_cache.get_all_embeddings(fps, version=version)
+    existing = feature_cache.get_all("clap", fps, version=version)
 
     for t in track_infos:
         fp = t.get("fingerprint")
@@ -179,7 +179,7 @@ def batch_ensure_embeddings(
     for abs_path, fp in to_generate:
         emb = generate_embedding(abs_path)
         if emb is not None:
-            feature_cache.put_embedding(fp, emb, version=version)
+            feature_cache.put("clap", fp, emb, version=version)
             rel = os.path.relpath(abs_path, music_root)
             result[rel] = True
 
