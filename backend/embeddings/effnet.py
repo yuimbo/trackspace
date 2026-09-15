@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -37,9 +38,31 @@ _EFFNET_MODEL_URL = (
 )
 _EFFNET_MODEL_NAME = "discogs-effnet-bsdynamic-1.onnx"
 _EFFNET_MODEL_MIN_BYTES = 10_000_000
+#: SHA-256 of the published model. Essentia ships no checksum in its model JSON,
+#: so this is pinned from the 18,027,718-byte file served at _EFFNET_MODEL_URL
+#: (byte count matches the server's Content-Length exactly).
+_EFFNET_MODEL_SHA256 = (
+    "a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c"
+)
 
 _DOWNLOAD_MAX_RETRIES = 3
 _DOWNLOAD_RETRY_DELAY = 5
+
+
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _verify_effnet_model(path: str) -> bool:
+    """True when *path* hashes to the pinned model checksum."""
+    try:
+        return _sha256_file(path) == _EFFNET_MODEL_SHA256
+    except OSError:
+        return False
 
 
 def _model_dir() -> str:
@@ -54,13 +77,17 @@ def _model_dir() -> str:
 def _ensure_effnet_model_file() -> str:
     path = os.path.join(_model_dir(), _EFFNET_MODEL_NAME)
     if os.path.isfile(path):
-        if os.path.getsize(path) >= _EFFNET_MODEL_MIN_BYTES:
+        if os.path.getsize(path) < _EFFNET_MODEL_MIN_BYTES:
+            log.warning(
+                "Removing truncated model file (%d bytes): %s",
+                os.path.getsize(path), path,
+            )
+            os.remove(path)
+        elif not _verify_effnet_model(path):
+            log.warning("Removing model file with checksum mismatch: %s", path)
+            os.remove(path)
+        else:
             return path
-        log.warning(
-            "Removing truncated model file (%d bytes): %s",
-            os.path.getsize(path), path,
-        )
-        os.remove(path)
 
     tmp = path + ".tmp"
     last_err: Exception | None = None
@@ -77,6 +104,11 @@ def _ensure_effnet_model_file() -> str:
                 raise OSError(
                     f"Downloaded file too small ({os.path.getsize(tmp)} bytes), "
                     f"expected ≥{_EFFNET_MODEL_MIN_BYTES}",
+                )
+            if not _verify_effnet_model(tmp):
+                raise OSError(
+                    "Downloaded model checksum mismatch "
+                    f"(expected {_EFFNET_MODEL_SHA256})",
                 )
 
             os.rename(tmp, path)

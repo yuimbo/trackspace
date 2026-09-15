@@ -208,6 +208,30 @@ def test_effnet_batch_invalid_path(effnet_loaded):
     assert results[bogus] is None
 
 
+# ── EffNet model checksum ─────────────────────────────────────
+
+def test_effnet_verifier_rejects_wrong_content(tmp_path):
+    from backend.embeddings.effnet import _verify_effnet_model
+
+    bad = tmp_path / "bad.onnx"
+    bad.write_bytes(b"not the model")
+    assert _verify_effnet_model(str(bad)) is False
+    assert _verify_effnet_model(str(tmp_path / "missing.onnx")) is False
+
+
+def test_effnet_local_model_matches_pinned_checksum():
+    from backend.embeddings.effnet import (
+        _EFFNET_MODEL_NAME,
+        _model_dir,
+        _verify_effnet_model,
+    )
+
+    path = os.path.join(_model_dir(), _EFFNET_MODEL_NAME)
+    if not os.path.isfile(path):
+        pytest.skip("EffNet model not downloaded")
+    assert _verify_effnet_model(path)
+
+
 # ── Key detection ─────────────────────────────────────────────
 
 def test_key_detection_harmonic():
