@@ -227,3 +227,37 @@ def test_compute_projection_pca_without_semantics():
     )
     assert len(out) == 2
     assert all(0 <= o["x"] <= 1 and 0 <= o["y"] <= 1 for o in out)
+
+
+def test_pca_ref_cache_is_bounded_and_counted():
+    from backend.embeddings import projection_backends as pb
+
+    pb.reset_pca_ref_cache()
+    rng = np.random.default_rng(0)
+    for i in range(pb._PCA_REF_CACHE_MAX + 3):
+        paths = [f"view{i}/t{j}.mp3" for j in range(3)]
+        mat = rng.standard_normal((3, 5)).astype(np.float32)
+        pb._project_pca(mat, paths)
+
+    assert len(pb._pca_ref_cache) <= pb._PCA_REF_CACHE_MAX
+    stats = pb.pca_ref_stats()
+    assert stats["evict"] >= 3
+    assert stats["miss"] >= pb._PCA_REF_CACHE_MAX + 3
+
+
+def test_pca_ref_aligns_revisited_view():
+    from backend.embeddings import projection_backends as pb
+
+    pb.reset_pca_ref_cache()
+    rng = np.random.default_rng(1)
+    paths_a = ["a/t0.mp3", "a/t1.mp3", "a/t2.mp3"]
+    mat_a = rng.standard_normal((3, 5)).astype(np.float32)
+    first = pb._project_pca(mat_a, paths_a).copy()
+
+    paths_b = ["b/t0.mp3", "b/t1.mp3", "b/t2.mp3"]
+    mat_b = rng.standard_normal((3, 5)).astype(np.float32)
+    pb._project_pca(mat_b, paths_b)
+
+    again = pb._project_pca(mat_a, paths_a)
+    assert np.allclose(first, again)
+    assert pb.pca_ref_stats()["hit"] == 1

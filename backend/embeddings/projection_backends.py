@@ -7,11 +7,13 @@ incremental refreshes.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import logging
 import os
 import platform
 import sys
+from collections import OrderedDict
 
 import numpy as np
 
@@ -19,37 +21,77 @@ from .clap import inference_lock as _inference_lock
 
 log = logging.getLogger(__name__)
 
-_pca_ref_paths: list[str] = []
-_pca_ref_coords: np.ndarray | None = None
+#: Bounded PCA reference-alignment LRU. Each entry is one (paths, coords)
+#: snapshot; revisiting an earlier view re-aligns to that view's own
+#: orientation instead of the last one computed.
+_PCA_REF_CACHE_MAX = 4
+_pca_ref_cache: OrderedDict[str, tuple[list[str], np.ndarray]] = OrderedDict()
+_pca_ref_stats = {"hit": 0, "miss": 0, "evict": 0}
+
+
+def _pca_ref_key(paths: list[str]) -> str:
+    return hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
+
+
+def pca_ref_stats() -> dict[str, int]:
+    """Hit / miss / eviction counters for the PCA reference-alignment cache."""
+    return dict(_pca_ref_stats)
+
+
+def reset_pca_ref_cache() -> None:
+    """Drop all PCA reference state and zero the counters (tests, config changes)."""
+    _pca_ref_cache.clear()
+    for key in _pca_ref_stats:
+        _pca_ref_stats[key] = 0
+
+
+def _pca_ref_lookup(paths: list[str]) -> tuple[list[str], np.ndarray] | None:
+    """Reference to align against: exact view if cached, else the most recent."""
+    key = _pca_ref_key(paths)
+    entry = _pca_ref_cache.get(key)
+    if entry is not None:
+        _pca_ref_cache.move_to_end(key)
+        _pca_ref_stats["hit"] += 1
+        return entry
+    _pca_ref_stats["miss"] += 1
+    if not _pca_ref_cache:
+        return None
+    return next(reversed(_pca_ref_cache.values()))
+
+
+def _pca_ref_store(paths: list[str], coords: np.ndarray) -> None:
+    key = _pca_ref_key(paths)
+    _pca_ref_cache[key] = (list(paths), coords.copy())
+    _pca_ref_cache.move_to_end(key)
+    while len(_pca_ref_cache) > _PCA_REF_CACHE_MAX:
+        _pca_ref_cache.popitem(last=False)
+        _pca_ref_stats["evict"] += 1
 
 
 def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
-    global _pca_ref_paths, _pca_ref_coords
-
     centred = mat - mat.mean(axis=0)
     _, _, Vt = np.linalg.svd(centred, full_matrices=False)
     coords = centred @ Vt[:2].T
 
-    ref = _pca_ref_coords
-    ref_paths = _pca_ref_paths
-    if paths is not None and ref is not None and len(ref_paths) >= 2:
-        ref_map = {p: i for i, p in enumerate(ref_paths)}
-        idx_new, idx_ref = [], []
-        for i, p in enumerate(paths):
-            if p in ref_map:
-                idx_new.append(i)
-                idx_ref.append(ref_map[p])
-        if len(idx_new) >= 2:
-            A = coords[idx_new]
-            B = ref[idx_ref]
-            A_mu, B_mu = A.mean(axis=0), B.mean(axis=0)
-            U, _, Vt2 = np.linalg.svd((A - A_mu).T @ (B - B_mu))
-            R = U @ Vt2
-            coords = (coords - A_mu) @ R + B_mu
-
     if paths is not None:
-        _pca_ref_paths = list(paths)
-        _pca_ref_coords = coords.copy()
+        ref_entry = _pca_ref_lookup(paths)
+        if ref_entry is not None:
+            ref_paths, ref = ref_entry
+            if len(ref_paths) >= 2:
+                ref_map = {p: i for i, p in enumerate(ref_paths)}
+                idx_new, idx_ref = [], []
+                for i, p in enumerate(paths):
+                    if p in ref_map:
+                        idx_new.append(i)
+                        idx_ref.append(ref_map[p])
+                if len(idx_new) >= 2:
+                    A = coords[idx_new]
+                    B = ref[idx_ref]
+                    A_mu, B_mu = A.mean(axis=0), B.mean(axis=0)
+                    U, _, Vt2 = np.linalg.svd((A - A_mu).T @ (B - B_mu))
+                    R = U @ Vt2
+                    coords = (coords - A_mu) @ R + B_mu
+        _pca_ref_store(paths, coords)
     return coords
 
 
