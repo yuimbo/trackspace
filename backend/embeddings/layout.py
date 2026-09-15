@@ -93,6 +93,28 @@ def _source_versions_token() -> str:
     )
 
 
+def _composite_config_token(
+    sources: tuple[str, ...],
+    mask: np.ndarray,
+    blend: float,
+    weights: dict[str, float] | None = None,
+) -> str:
+    """Vector-config identity, independent of the *set* of tracks.
+
+    The openTSNE fit cache keys on this: adding tracks must not invalidate a
+    fitted embedding, while changing sources / mask / blend / weights must.
+    """
+    wk = (
+        ",".join(f"{s}:{float(weights.get(s, 1.0)):.6g}" for s in sources)
+        if weights
+        else "-"
+    )
+    return (
+        f"{_source_versions_token()}|{','.join(sources)}|"
+        f"{mask.tobytes().hex()}|{blend:.6g}|{wk}"
+    )
+
+
 def _composite_param_key(
     paths: list[str],
     sources: tuple[str, ...],
@@ -101,15 +123,7 @@ def _composite_param_key(
     weights: dict[str, float] | None = None,
 ) -> str:
     ph = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
-    wk = (
-        ",".join(f"{s}:{float(weights.get(s, 1.0)):.6g}" for s in sources)
-        if weights
-        else "-"
-    )
-    return (
-        f"{ph}|{_source_versions_token()}|{','.join(sources)}|"
-        f"{mask.tobytes().hex()}|{blend:.6g}|{wk}"
-    )
+    return f"{ph}|{_composite_config_token(sources, mask, blend, weights)}"
 
 
 def _source_version(source: str) -> int:
@@ -228,7 +242,7 @@ def _gather_composite_vecs(
     features_blend: float = 0.42,
     source_weights: dict[str, float] | None = None,
     required_sources: tuple[str, ...] | None = None,
-) -> tuple[list[str], np.ndarray, int, int, str]:
+) -> tuple[list[str], np.ndarray, int, int, str, str]:
     """Stack cached per-source rows into one weighted matrix.
 
     A track is placed on the map when it has every *required_sources* entry;
@@ -263,7 +277,7 @@ def _gather_composite_vecs(
             fp_order.append(fp)
 
     if not paths:
-        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, ""
+        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", ""
 
     if feature_mask is None:
         mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
@@ -275,11 +289,12 @@ def _gather_composite_vecs(
     blend = float(np.clip(features_blend, 0.05, 1.0))
     weights = dict(source_weights or {})
     comp_key = _composite_param_key(paths, sources, mask, blend, weights)
+    comp_config = _composite_config_token(sources, mask, blend, weights)
     cached = _tier_cache_get(_composite_cache, comp_key)
     if cached is not None:
         _p, _mat, _cd, _clo = cached
         log.debug("projection tier: composite cache hit")
-        return paths, _mat, _cd, _clo, comp_key
+        return paths, _mat, _cd, _clo, comp_key, comp_config
 
     blocks: list[np.ndarray] = []
     clap_dim = 0
@@ -315,7 +330,7 @@ def _gather_composite_vecs(
         col += block.shape[1]
 
     if not blocks:
-        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, ""
+        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", comp_config
 
     mat = np.concatenate(blocks, axis=1).astype(np.float32)
     _tier_cache_put(
@@ -324,7 +339,7 @@ def _gather_composite_vecs(
         (list(paths), mat, clap_dim, clap_col_lo),
         _COMPOSITE_CACHE_MAX,
     )
-    return paths, mat, clap_dim, clap_col_lo, comp_key
+    return paths, mat, clap_dim, clap_col_lo, comp_key, comp_config
 
 
 def _source_block_dim(source: str, smap: dict[str, np.ndarray]) -> int:
@@ -405,7 +420,7 @@ def compute_projection(
             return hit
 
     t0 = time.perf_counter()
-    paths, mat, clap_dim, clap_col_lo, comp_key = _gather_composite_vecs(
+    paths, mat, clap_dim, clap_col_lo, comp_key, comp_config = _gather_composite_vecs(
         track_infos,
         feature_cache,
         sources=sources,
@@ -437,6 +452,7 @@ def compute_projection(
 
     t_before_weight = time.perf_counter()
     mat_proj = mat
+    basis_key = ""
     if needs_weight:
         basis_key = f"{comp_key}|{_semantic_basis_param_key(context_tags, folder_seeds)}"
         basis = _tier_cache_get(_semantic_basis_cache, basis_key)
@@ -471,7 +487,16 @@ def compute_projection(
     else:
         if method != "tsne":
             log.debug("unknown projection method %r; using t-SNE", method)
-        coords = _project_tsne(mat_proj)
+        # The fit cache keys on the vector config (not the track set), so an
+        # openTSNE embedding fitted for the same sources/mask/weighting is reused
+        # and only newly added tracks are transformed into it.
+        tsne_config = comp_config
+        if needs_weight:
+            tsne_config = (
+                f"{comp_config}|{basis_key}"
+                f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
+            )
+        coords = _project_tsne(mat_proj, paths=paths, config_key=tsne_config)
     t_after_proj = time.perf_counter()
 
     t_before_norm = time.perf_counter()

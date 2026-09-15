@@ -23,3 +23,7 @@ onnxruntime>=1.17
 
 # Apple Silicon — Metal-accelerated t-SNE (optional; ``backend.embeddings``).
 mlx-vis>=0.7.0; sys_platform == "darwin" and platform_machine == "arm64"
+
+# Optional incremental t-SNE (``TRACKSPACE_OPENTSNE=1``): fit once per vector
+# config, then transform newly added tracks instead of refitting the library.
+opentsne>=1.0

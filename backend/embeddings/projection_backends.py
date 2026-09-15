@@ -14,6 +14,7 @@ import os
 import platform
 import sys
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -97,12 +98,15 @@ def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
 
 _cuml_projection_enabled: bool | None = None
 _mlx_vis_projection_enabled: bool | None = None
+_opentsne_projection_enabled: bool | None = None
 
 
 def reset_projection_backend_cache() -> None:
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
+    global _opentsne_projection_enabled
     _cuml_projection_enabled = None
     _mlx_vis_projection_enabled = None
+    _opentsne_projection_enabled = None
 
 
 def _use_cuml_projection() -> bool:
@@ -171,7 +175,7 @@ def _mlx_tsne_max_points() -> int:
     return v
 
 
-def _project_tsne(mat: np.ndarray) -> np.ndarray:
+def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     if _use_cuml_projection():
         try:
@@ -227,3 +231,181 @@ def _project_tsne(mat: np.ndarray) -> np.ndarray:
         random_state=42,
     )
     return reducer.fit_transform(mat)
+
+
+# ─── openTSNE incremental t-SNE (prototype) ───────────────────
+#
+# openTSNE can place *new* points into an already-fitted embedding
+# (``TSNEEmbedding.transform``) instead of refitting the whole library. That
+# makes the common update — a generation batch finishes and only a few dozen
+# tracks are new — cost seconds rather than a full refit.
+#
+# Opt-in via ``TRACKSPACE_OPENTSNE=1`` (default off) so existing behaviour is
+# unchanged until the prototype has been benchmarked. Falls back to the
+# cuML / mlx-vis / sklearn chain when unavailable, above the point cap, or on
+# any error. CPU-only, so it needs no ``inference_lock`` (unlike mlx-vis).
+
+_OPENTSNE_FIT_CACHE_MAX = 4
+_tsne_fit_cache: OrderedDict[str, "_TsneFit"] = OrderedDict()
+_tsne_fit_stats = {"fit": 0, "transform": 0, "reuse": 0, "evict": 0}
+
+
+@dataclass
+class _TsneFit:
+    """A fitted openTSNE embedding plus the PCA basis that feeds it."""
+
+    paths: list[str]
+    coords: np.ndarray  # 2-D coords aligned with ``paths``
+    pca: object  # fitted sklearn PCA, for projecting new rows
+    embedding: object  # fitted openTSNE TSNEEmbedding, for .transform()
+
+
+def reset_tsne_fit_cache() -> None:
+    """Drop fitted embeddings and zero the counters (tests, config changes)."""
+    _tsne_fit_cache.clear()
+    for key in _tsne_fit_stats:
+        _tsne_fit_stats[key] = 0
+
+
+def tsne_fit_stats() -> dict[str, int]:
+    """Fit / transform / reuse / eviction counters for the openTSNE cache."""
+    return dict(_tsne_fit_stats)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    return os.environ.get(name, default).strip().lower() not in ("0", "false", "no")
+
+
+def _use_opentsne() -> bool:
+    global _opentsne_projection_enabled
+    if _opentsne_projection_enabled is not None:
+        return _opentsne_projection_enabled
+    if not _env_flag("TRACKSPACE_OPENTSNE", "0"):
+        _opentsne_projection_enabled = False
+        return False
+    if importlib.util.find_spec("openTSNE") is None:
+        _opentsne_projection_enabled = False
+        return False
+    _opentsne_projection_enabled = True
+    log.info("t-SNE: using openTSNE (incremental)")
+    return True
+
+
+def _opentsne_pca_dim(n_features: int) -> int:
+    raw = os.environ.get("TRACKSPACE_OPENTSNE_PCA_DIM", "50").strip()
+    try:
+        dim = int(raw)
+    except ValueError:
+        dim = 50
+    return max(2, min(dim, max(2, n_features - 1)))
+
+
+def _opentsne_max_points() -> int:
+    raw = os.environ.get("TRACKSPACE_OPENTSNE_MAX_POINTS", "20000").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 20_000
+
+
+def _opentsne_refit_fraction() -> float:
+    raw = os.environ.get("TRACKSPACE_OPENTSNE_REFIT_FRACTION", "0.3").strip()
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.3
+
+
+def _tsne_perplexity(n: int) -> float:
+    return min(30.0, max(5.0, (n - 1) / 3.0))
+
+
+def _pca_reduce(mat: np.ndarray, dim: int) -> tuple[np.ndarray, object]:
+    """Fit PCA to *dim* components; return (reduced, fitted PCA)."""
+    from sklearn.decomposition import PCA  # lazy — heavy import
+
+    n_samples, n_features = mat.shape
+    k = max(1, min(dim, n_features - 1, n_samples - 1))
+    pca = PCA(n_components=k, svd_solver="randomized", random_state=42)
+    return pca.fit_transform(mat), pca
+
+
+def _fit_tsne(reduced: np.ndarray) -> tuple[object, np.ndarray]:
+    from openTSNE import TSNE  # lazy — heavy import
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=_tsne_perplexity(len(reduced)),
+        random_state=42,
+        n_jobs=-1,
+        verbose=False,
+    )
+    embedding = tsne.fit(reduced)
+    return embedding, np.asarray(embedding, dtype=np.float32)
+
+
+def _fit_cache_get(key: str) -> "_TsneFit | None":
+    entry = _tsne_fit_cache.get(key)
+    if entry is not None:
+        _tsne_fit_cache.move_to_end(key)
+    return entry
+
+
+def _fit_cache_put(key: str, fit: "_TsneFit") -> None:
+    _tsne_fit_cache[key] = fit
+    _tsne_fit_cache.move_to_end(key)
+    while len(_tsne_fit_cache) > _OPENTSNE_FIT_CACHE_MAX:
+        _tsne_fit_cache.popitem(last=False)
+        _tsne_fit_stats["evict"] += 1
+
+
+def _project_tsne_incremental(
+    mat: np.ndarray,
+    paths: list[str],
+    config_key: str,
+) -> np.ndarray:
+    """Fit once per vector config, then transform only newly added tracks."""
+    fit = _fit_cache_get(config_key)
+    if fit is not None:
+        index = {p: i for i, p in enumerate(fit.paths)}
+        new_rows = [i for i, p in enumerate(paths) if p not in index]
+        if not new_rows:
+            # Same track set (e.g. a source toggle changed nothing here):
+            # slice the cached coordinates, no compute at all.
+            _tsne_fit_stats["reuse"] += 1
+            return np.asarray([fit.coords[index[p]] for p in paths], dtype=np.float32)
+        if len(new_rows) <= _opentsne_refit_fraction() * max(1, len(fit.paths)):
+            coords = np.empty((len(paths), 2), dtype=np.float32)
+            for i, p in enumerate(paths):
+                known = index.get(p)
+                if known is not None:
+                    coords[i] = fit.coords[known]
+            new_reduced = fit.pca.transform(mat[new_rows])
+            partial = fit.embedding.transform(new_reduced)
+            coords[new_rows] = np.asarray(partial, dtype=np.float32)
+            # ``transform`` recentres the fitted embedding in place; re-read it so
+            # the cached reference frame stays consistent for the next update.
+            fit.coords = np.asarray(fit.embedding, dtype=np.float32)
+            _tsne_fit_stats["transform"] += 1
+            return coords
+
+    reduced, pca = _pca_reduce(mat, _opentsne_pca_dim(mat.shape[1]))
+    embedding, coords = _fit_tsne(reduced)
+    _fit_cache_put(config_key, _TsneFit(list(paths), coords, pca, embedding))
+    _tsne_fit_stats["fit"] += 1
+    return coords
+
+
+def _project_tsne(
+    mat: np.ndarray,
+    paths: list[str] | None = None,
+    config_key: str | None = None,
+) -> np.ndarray:
+    if paths and config_key and _use_opentsne():
+        cap = _opentsne_max_points()
+        if cap <= 0 or len(mat) <= cap:
+            try:
+                return _project_tsne_incremental(mat, paths, config_key)
+            except Exception as e:
+                log.warning("openTSNE failed; using fitted-backend chain: %s", e)
+    return _project_tsne_fallback(mat)

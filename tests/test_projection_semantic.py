@@ -85,14 +85,14 @@ def test_composite_tier_cache_reuses_matrix():
     feat = np.ones(6, dtype=np.float32)
     infos = [{"path": "a/z.mp3", "fingerprint": fp}]
     cache = _StubFeatureCache(clap={fp: clap}, feats={fp: feat})
-    _, m1, _, _, k1 = _gather_composite_vecs(
+    _, m1, _, _, k1, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
         feature_mask=parse_audio_feature_mask("111111"),
         features_blend=0.5,
     )
-    _, m2, _, _, k2 = _gather_composite_vecs(
+    _, m2, _, _, k2, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
@@ -111,14 +111,14 @@ def test_gather_composite_masks_and_blend():
     cache = _StubFeatureCache(clap={fp: clap}, feats={fp: feat})
     mask = parse_audio_feature_mask("100000")
 
-    _, mat_mask, _, _, _ = _gather_composite_vecs(
+    _, mat_mask, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
         feature_mask=mask,
         features_blend=1.0,
     )
-    _, mat_no_mask, _, _, _ = _gather_composite_vecs(
+    _, mat_no_mask, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
@@ -128,14 +128,14 @@ def test_gather_composite_masks_and_blend():
     assert mat_mask.shape == mat_no_mask.shape == (1, 8)
     assert not np.allclose(mat_mask, mat_no_mask)
 
-    _, mat_weak, _, _, _ = _gather_composite_vecs(
+    _, mat_weak, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
         feature_mask=parse_audio_feature_mask("111111"),
         features_blend=0.2,
     )
-    _, mat_full, _, _, _ = _gather_composite_vecs(
+    _, mat_full, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),

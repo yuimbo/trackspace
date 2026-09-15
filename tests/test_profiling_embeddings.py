@@ -304,3 +304,52 @@ def test_profile_projection_cpu_only_quick(monkeypatch):
 
     assert out.shape == (48, 2)
     assert np.isfinite(out).all()
+
+
+def test_profile_incremental_tsne(monkeypatch):
+    """openTSNE cold fit vs transforming newly added tracks.
+
+    Reports the two numbers the incremental path is about: the one-off cost of
+    fitting an embedding, and the cost of placing ``ADDED`` new tracks into it.
+    Run with ``-s`` to see them; raise ``N`` toward the real library size
+    (~9.5k) for a representative measurement::
+
+      TRACKSPACE_PROFILE_OPENTSNE_N=9500 TRACKSPACE_PROFILE_OPENTSNE_D=50 \\
+      TRACKSPACE_PROFILE_OPENTSNE_ADDED=500 \\
+      .venv/bin/python -m pytest tests/test_profiling_embeddings.py -v -s \\
+        -k incremental_tsne
+    """
+    pytest.importorskip("openTSNE")
+    from backend.embeddings.projection_backends import (
+        _project_tsne,
+        reset_projection_backend_cache,
+        reset_tsne_fit_cache,
+        tsne_fit_stats,
+    )
+
+    n = int(os.environ.get("TRACKSPACE_PROFILE_OPENTSNE_N", "2000"))
+    d = int(os.environ.get("TRACKSPACE_PROFILE_OPENTSNE_D", "50"))
+    added = int(os.environ.get("TRACKSPACE_PROFILE_OPENTSNE_ADDED", "200"))
+
+    monkeypatch.setenv("TRACKSPACE_OPENTSNE", "1")
+    reset_projection_backend_cache()
+    reset_tsne_fit_cache()
+
+    X = _projection_matrix(n, d)
+    paths = [f"t{i}.mp3" for i in range(n)]
+    _, fit_samples = _timed_runs(
+        lambda: _project_tsne(X, paths=paths, config_key="bench"), runs=1,
+    )
+    _print_stats("tsne_opentsne_fit", fit_samples)
+
+    X2 = _projection_matrix(n + added, d, seed=7)
+    paths2 = paths + [f"n{i}.mp3" for i in range(added)]
+    out, transform_samples = _timed_runs(
+        lambda: _project_tsne(X2, paths=paths2, config_key="bench"), runs=1,
+    )
+    _print_stats(f"tsne_opentsne_+{added}", transform_samples)
+
+    assert out.shape == (n + added, 2)
+    stats = tsne_fit_stats()
+    assert stats["fit"] == 1
+    assert stats["transform"] == 1
