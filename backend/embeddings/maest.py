@@ -48,7 +48,7 @@ _model = None
 _mel = None
 _device = "cpu"
 _model_lock = threading.Lock()
-#: Serialises MAEST GPU work against CLAP/mlx-vis — see AGENTS.md.
+#: Serialises MAEST GPU work against CLAP/mlx-vis — see audio_pipeline.md.
 inference_lock = threading.Lock()
 _loaded = False
 _load_failed: str | None = None

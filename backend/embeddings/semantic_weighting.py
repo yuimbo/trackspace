@@ -5,7 +5,7 @@ node contributes a contrast direction from hierarchical centroid decomposition
 (child centroid minus parent centroid). Tags are labels rather than track collections,
 so they are projected into the CLAP text column span instead.
 
-Extracted from ``layout`` — see AGENTS.md for the design rules.
+Extracted from ``layout`` — see audio_pipeline.md for the design rules.
 """
 
 from __future__ import annotations

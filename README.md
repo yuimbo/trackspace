@@ -35,7 +35,7 @@ cd frontend && npm run build && cd ..
 
 # Run server
 source .venv/bin/activate
-python app.py /path/to/music
+python -m backend.app /path/to/music
 ```
 
 Then open [http://127.0.0.1:5111](http://127.0.0.1:5111).
@@ -43,6 +43,14 @@ Then open [http://127.0.0.1:5111](http://127.0.0.1:5111).
 **Options:**
 
 ```
-python app.py -p 8080        # custom port
-python app.py --host 0.0.0.0 # expose on LAN
+python -m backend.app -p 8080        # custom port
+python -m backend.app --host 0.0.0.0 # expose on LAN
 ```
+
+## Docs
+
+- `AGENTS.md` — entry point and core invariants (start here for contributing).
+- `architecture.md` — system structure, frontend MVC, backend packages, HTTP API.
+- `ui_conventions.md` — frontend interaction rules (canvas, tags, folders, hotkeys).
+- `audio_pipeline.md` — fingerprinting → embeddings → projection → clustering, and the job queue.
+- `TODO.md` — deferred work and the product roadmap.

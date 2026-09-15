@@ -2,7 +2,7 @@
 
 Segment decode uses `load_resilient_audio_segments` from `audio_decode`.
 `inference_lock` is shared with `layout` so mlx-vis (Metal) never runs
-concurrently with PyTorch CLAP on another thread — see `AGENTS.md`.
+concurrently with PyTorch CLAP on another thread — see `audio_pipeline.md`.
 """
 
 from __future__ import annotations
