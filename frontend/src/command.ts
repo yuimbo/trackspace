@@ -1,5 +1,6 @@
 import type { Model } from "./model";
 import { toast } from "./lib/toast";
+import { postJSON } from "./lib/api";
 
 // ─── Types ───────────────────────────────────────────────────
 export type PostEffect = "change" | "tags-dirty" | "change+htmx";
@@ -11,28 +12,6 @@ export interface Command {
   undo(m: Model): void;
   commit(): Promise<void>;
   undoCommit?(): Promise<void>;
-}
-
-// ─── API helper (mirrors controller's postJSON) ──────────────
-async function postJSON<T = unknown>(url: string, body: unknown): Promise<T> {
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    // The backend returns {"ok": false, "error": "..."} for every failure.
-    let detail = `${r.status} ${r.statusText}`;
-    try {
-      const parsed = (await r.json()) as { error?: unknown };
-      if (parsed && typeof parsed.error === "string" && parsed.error)
-        detail = parsed.error;
-    } catch {
-      /* non-JSON error body; keep the status line */
-    }
-    throw new Error(detail);
-  }
-  return r.json();
 }
 
 // ─── CommandManager ──────────────────────────────────────────
@@ -115,21 +94,29 @@ export class RenameTagCommand implements Command {
   }
 
   async commit(): Promise<void> {
-    const res = await postJSON<{ ok: boolean }>("/api/tags/rename", {
-      old: this.oldName,
-      new: this.newName,
-      folder: "",
-      recursive: true,
-    });
+    const res = await postJSON<{ ok: boolean }>(
+      "/api/tags/rename",
+      {
+        old: this.oldName,
+        new: this.newName,
+        folder: "",
+        recursive: true,
+      },
+      true,
+    );
     if (!res.ok) throw new Error("Tag rename rejected by server");
   }
   async undoCommit(): Promise<void> {
-    await postJSON("/api/tags/rename", {
-      old: this.newName,
-      new: this.oldName,
-      folder: "",
-      recursive: true,
-    });
+    await postJSON(
+      "/api/tags/rename",
+      {
+        old: this.newName,
+        new: this.oldName,
+        folder: "",
+        recursive: true,
+      },
+      true,
+    );
   }
 }
 
@@ -173,10 +160,14 @@ export class RenameFolderCommand implements Command {
     const oldName = this.oldRel.includes("/")
       ? this.oldRel.slice(this.oldRel.lastIndexOf("/") + 1)
       : this.oldRel;
-    await postJSON("/api/folders/rename", {
-      path: this.serverNewRel,
-      name: oldName,
-    });
+    await postJSON(
+      "/api/folders/rename",
+      {
+        path: this.serverNewRel,
+        name: oldName,
+      },
+      true,
+    );
   }
 }
 
@@ -243,7 +234,7 @@ export class MoveTracksCommand implements Command {
       byFolder.set(origFolder, arr);
     }
     for (const [folder, paths] of byFolder) {
-      await postJSON("/api/tracks/move", { paths, dest: folder });
+      await postJSON("/api/tracks/move", { paths, dest: folder }, true);
     }
   }
 }

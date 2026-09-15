@@ -27,9 +27,12 @@ backend/
     feature_cache.py      content-addressed SQLite cache (6 vector sources)
     ...                   effnet, audio_decode, librosa features, coverage, revision
 frontend/src/
-  controller.ts           orchestration: events, API calls, queue/SSE, clusters
+  controller.ts           orchestration: events, API calls, canvas, folders
   model.ts                single source of truth (EventBus)
+  coordinators/           controller fragments
+    analysis-coordinator.ts  queue SSE + status polling + microgenre cluster panel
   components/             one view per file (canvas, tags, properties, batch, status)
+  lib/api.ts              centralised fetch / postJSON
 ```
 
 ## Scale snapshot (indicative)
@@ -46,7 +49,8 @@ frontend/src/
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
 | Feature cache | `backend/embeddings/feature_cache.py` | ~365 | One generic `_SOURCES` registry |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
-| Frontend orchestration | `frontend/src/controller.ts` | ~3140 | **Largest remaining refactor target** |
+| Frontend orchestration | `frontend/src/controller.ts` | ~2870 | **Largest remaining refactor target** |
+| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~310 | Queue SSE + clusters (extracted) |
 | Canvas view | `frontend/src/components/canvas-view.ts` | ~1010 | |
 | State | `frontend/src/model.ts` | ~730 | Optional persistence / EventBus split |
 
@@ -66,15 +70,19 @@ frontend/src/
 `controller.ts` is the largest file and the main target. The seams, in the order
 they are worth extracting:
 
-- **`AnalysisCoordinator`** — job-queue SSE stream, status polling, cluster fetch
-  and the cluster panel. This is the newest and most self-contained block.
+- ✅ **`AnalysisCoordinator`** — job-queue SSE stream, status polling, cluster
+  fetch and the cluster panel. Extracted to `coordinators/analysis-coordinator.ts`,
+  with vitest coverage (`npm test`). Deps are minimal structural interfaces
+  (`{ model, status: { update }, scheduleDraw }`) so it is testable without the
+  DOM-heavy views.
+- ✅ **`lib/api.ts`** — centralised `fetch` / `postJSON`; the controller stays the
+  caller. Pulled forward so the coordinator could import it without a circular
+  dependency (`command.ts` now shares it, passing `silent` where its manager toasts).
 - **`EmbeddingCoordinator`** — layout cache, embedding SSE, projection polling,
   embedding-mode animations.
 - **`FolderTreeCoordinator`** — HTMX refresh/bind and tree-only UX.
 - **`CanvasInteractionController`** — pointer handling + transforms.
 - **`OptionsPanelBinder`** — right-column controls that change with server flags.
-- **`lib/api.ts`** — centralise `fetch` / `postJSON` and URL constants; the
-  controller stays the caller.
 - Optional: `lib/event-bus.ts`, `model/persistence.ts`, `api/types.ts`.
 
 ## Product roadmap (analysis)

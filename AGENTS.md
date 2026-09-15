@@ -45,8 +45,10 @@ trackspace/
       controller.ts         – Controller (events, API calls, mouse/keyboard)
       hotkeys.ts            – HotkeyManager + key binding definitions
       command.ts            – Command pattern (optimistic UI + undo)
+      coordinators/         – controller fragments (analysis-coordinator: queue SSE + clusters)
       components/           – one View per file (canvas, tags, properties, batch, status)
       lib/toast.ts          – shared DOM helpers
+      lib/api.ts            – shared fetch / postJSON
     index.html
     vite.config.ts
     package.json
@@ -66,6 +68,10 @@ trackspace/
 
 **Running tests:**  `.venv/bin/python -m pytest tests/ -v`
   or standalone:  `.venv/bin/python -m tests.test_embeddings`
+
+**Running frontend tests:**  from `frontend/`: `npm test` (vitest + happy-dom).
+  Vitest picks up `src/**/*.test.ts`; `EventSource` and `fetch` are stubbed with
+  `vi.stubGlobal` because the DOM environment implements neither.
 
 ---
 
