@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, type QueueKindStatus, type QueueStatus } from "../model";
+import {
+  Model,
+  DEFAULT_CLUSTER_WEIGHTS,
+  type QueueKindStatus,
+  type QueueStatus,
+} from "../model";
 import { AnalysisCoordinator } from "./analysis-coordinator";
 
 // ─── Fakes ───────────────────────────────────────────────────
@@ -70,6 +75,10 @@ const PANEL_HTML = `
   <ul id="cluster-list"></ul>
   <input id="cluster-color-toggle" type="checkbox" />
   <input id="cluster-resolution-range" type="range" />
+  <div id="cluster-weights"></div>
+  <p id="cluster-weights-note"></p>
+  <button id="btn-apply-weights"></button>
+  <button id="btn-reset-weights"></button>
   <button id="btn-rebuild-clusters"></button>
 `;
 
@@ -77,6 +86,7 @@ interface Harness {
   model: Model;
   update: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
+  refreshProjection: ReturnType<typeof vi.fn>;
   coord: AnalysisCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
 }
@@ -86,16 +96,18 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const model = new Model();
   const update = vi.fn();
   const scheduleDraw = vi.fn();
+  const refreshProjection = vi.fn();
   const coord = new AnalysisCoordinator({
     model,
     status: { update },
     scheduleDraw,
+    refreshProjection,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
     Promise.resolve(jsonResponse(routes(String(input)))),
   );
   vi.stubGlobal("fetch", fetchSpy);
-  return { model, update, scheduleDraw, coord, fetchSpy };
+  return { model, update, scheduleDraw, refreshProjection, coord, fetchSpy };
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -375,5 +387,100 @@ describe("AnalysisCoordinator panel bindings", () => {
         (init as RequestInit | undefined)?.method === "POST",
     );
     expect(post).toBeDefined();
+  });
+});
+
+// ─── Source weights ────────────────────────────────────────
+
+/** The POST body of the last `/api/clusters/rebuild` call. */
+function rebuildBody(fetchSpy: ReturnType<typeof vi.fn>): unknown {
+  const post = fetchSpy.mock.calls.find(
+    ([u, init]) =>
+      String(u) === "/api/clusters/rebuild" &&
+      (init as RequestInit | undefined)?.method === "POST",
+  );
+  expect(post).toBeDefined();
+  return JSON.parse(String((post![1] as RequestInit).body));
+}
+
+describe("AnalysisCoordinator source weights", () => {
+  it("renders one slider per source, initialised to the defaults", () => {
+    const { model, coord } = makeHarness();
+    coord.bindPanel();
+    const inputs = document.querySelectorAll<HTMLInputElement>(
+      "#cluster-weights input[type='range']",
+    );
+    expect(inputs).toHaveLength(Object.keys(DEFAULT_CLUSTER_WEIGHTS).length);
+    const bySource = Object.fromEntries(
+      [...inputs].map((i) => [i.dataset.source, i.valueAsNumber]),
+    );
+    expect(bySource).toEqual(DEFAULT_CLUSTER_WEIGHTS);
+    expect(model.clusterWeights).toEqual(DEFAULT_CLUSTER_WEIGHTS);
+  });
+
+  it("posts the live slider values and refreshes the layout on Apply", async () => {
+    const { model, coord, fetchSpy, refreshProjection } = makeHarness();
+    coord.bindPanel();
+    const $rhythm = document.querySelector<HTMLInputElement>(
+      "#cluster-weights input[data-source='rhythm']",
+    )!;
+    $rhythm.value = "0.5";
+    $rhythm.dispatchEvent(new Event("input"));
+    document.getElementById("btn-apply-weights")!.click();
+    await flush();
+
+    expect(model.clusterWeights.rhythm).toBe(0.5);
+    expect(rebuildBody(fetchSpy)).toEqual({ weights: model.clusterWeights });
+    expect(refreshProjection).toHaveBeenCalled();
+  });
+
+  it("restores the defaults on Reset", async () => {
+    const { model, coord, fetchSpy } = makeHarness();
+    model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.9 };
+    coord.bindPanel();
+    document.getElementById("btn-reset-weights")!.click();
+    await flush();
+
+    expect(model.clusterWeights).toEqual(DEFAULT_CLUSTER_WEIGHTS);
+    expect(rebuildBody(fetchSpy)).toEqual({ weights: DEFAULT_CLUSTER_WEIGHTS });
+  });
+
+  it("disables Apply while a cluster job is outstanding", async () => {
+    const { coord } = makeHarness();
+    coord.bindPanel();
+    const $apply = document.getElementById(
+      "btn-apply-weights",
+    ) as HTMLButtonElement;
+    expect($apply.disabled).toBe(false);
+
+    const es = await startSettled(coord);
+    es.emit(
+      "snapshot",
+      makeQueueStatus({
+        kinds: { cluster: makeKind({ pending: 1, outstanding: 1 }) },
+      }),
+    );
+    expect($apply.disabled).toBe(true);
+  });
+
+  it("flags a requested source that has no cached vectors", async () => {
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/clusters")
+        ? {
+            available: true,
+            revision: "r",
+            resolution: 1.5,
+            resolutions: [1.5],
+            assignments: {},
+            names: {},
+            sizes: {},
+            sources_used: ["maest_logits", "maest"],
+          }
+        : {},
+    );
+    await coord.fetchClusters();
+    const note = document.getElementById("cluster-weights-note")!.textContent!;
+    expect(note).toContain("Rhythm");
+    expect(note).not.toContain("Genre");
   });
 });

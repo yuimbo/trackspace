@@ -1,11 +1,13 @@
-"""Single frozen recipe for embedding-space layout (no UI toggles).
+"""Default embedding-space layout recipe (weights are client-overridable).
 
-Changing weights, sources, or the audio-feature mask is done here; bump
-``PROJECTION_RECIPE_VERSION`` in ``layout_revision`` consumers when the recipe
-changes so layout caches invalidate cleanly.
+``FROZEN_SOURCE_WEIGHTS`` is the *default* recipe: what the map uses when the
+client sends no weights. The UI can override the source weights per request (the
+``w=`` query param), and the effective weights are part of ``layout_revision``, so
+each configuration caches its own coordinates. Sources and the audio-feature mask
+remain fixed here.
 
-The source set follows the microgenre attack plan: MAEST's Discogs style logits
-carry the genre signal, its hidden embedding carries audio semantics, and the
+The default source set follows the microgenre attack plan: MAEST's Discogs style
+logits carry the genre signal, its hidden embedding carries audio semantics, and the
 rhythm block carries the electronic-music groove distinctions that learned
 semantic embeddings tend to blur. CLAP is retained at low weight because it is
 the only source with a *text* encoder — the semantic folder/tag weighting in
@@ -19,7 +21,7 @@ import numpy as np
 from .librosa_audio_features import AUDIO_FEATURE_DIM
 
 # Bump in layout_revision.compute_layout_revision payload when this recipe changes.
-PROJECTION_RECIPE_VERSION = 2
+PROJECTION_RECIPE_VERSION = 3
 
 FROZEN_SOURCES: tuple[str, ...] = (
     "maest_logits",

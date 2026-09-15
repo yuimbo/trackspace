@@ -15,7 +15,7 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model } from "../model";
+import { type Model, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight } from "../model";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 
@@ -25,6 +25,21 @@ type EmbeddingLayoutStatusHint = {
 };
 
 const LAYOUT_CACHE_MAX = 8;
+
+/** True when *w* equals the frozen defaults, so the default query key is unchanged. */
+function _weightsAreDefault(w: Record<string, number>): boolean {
+  for (const [k, def] of Object.entries(DEFAULT_CLUSTER_WEIGHTS)) {
+    if (Math.abs((w[k] ?? NaN) - def) > 1e-9) return false;
+  }
+  return true;
+}
+
+/** ``maest_logits:0.45,maest:0.25,…`` in canonical source order. */
+function _encodeWeights(w: Record<string, number>): string {
+  return Object.keys(DEFAULT_CLUSTER_WEIGHTS)
+    .map((k) => `${k}:${formatSourceWeight(w[k] ?? 0)}`)
+    .join(",");
+}
 
 interface CachedLayout {
   revision: string;
@@ -71,6 +86,8 @@ export class EmbeddingCoordinator {
   private _layoutCache = new Map<string, CachedLayout>();
 
   private _animFrame = 0;
+  /** Monotonic request id; a slow projection must not overwrite a newer one. */
+  private _projectionReqSeq = 0;
 
   constructor(private deps: EmbeddingDeps) {}
 
@@ -90,6 +107,17 @@ export class EmbeddingCoordinator {
   /** Drop all cached layouts (e.g. after a full library reload). */
   invalidateLayoutCache(): void {
     this._layoutCache.clear();
+  }
+
+  /** Refetch the layout after a weight change (the query string carries them).
+   *
+   *  Safe to call from any view mode: when the map has never been drawn there is
+   *  nothing to refresh (the next entry fetches with the new weights), and when it
+   *  has, the new positions are stored so switching to the map animates to them.
+   */
+  refreshProjection(): void {
+    if (!this.deps.model.embeddingsReady) return;
+    void this._fetchProjection();
   }
 
   /** LRU bump + cap for _layoutCache. */
@@ -194,7 +222,6 @@ export class EmbeddingCoordinator {
     clearTimeout(this._embedPollTimer);
     this._embedPollTimer = setTimeout(async () => {
       try {
-        const m = this.deps.model;
         const status = await api<{
           model_ready: boolean;
           effnet_model_ready: boolean;
@@ -292,7 +319,11 @@ export class EmbeddingCoordinator {
 
   private _projectionQueryString(methodOverride?: string): string {
     const method = methodOverride ?? "tsne";
-    return `folder=&recursive=1&method=${method}`;
+    const base = `folder=&recursive=1&method=${method}`;
+    // Only append weights when they differ from the defaults: the default query
+    // key must stay stable so existing cached layouts remain valid.
+    const w = this.deps.model.clusterWeights;
+    return _weightsAreDefault(w) ? base : `${base}&w=${_encodeWeights(w)}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.
@@ -399,6 +430,7 @@ export class EmbeddingCoordinator {
   }): Promise<void> {
     const m = this.deps.model;
     const qs = this._projectionQueryString();
+    const reqSeq = ++this._projectionReqSeq;
 
     // --- Client-side cache check ---
     const cached = this._layoutCache.get(qs);
@@ -422,7 +454,7 @@ export class EmbeddingCoordinator {
         }
       }
       if (rev != null && rev === cached.revision) {
-        this._applyPositions(cached.positions);
+        if (reqSeq === this._projectionReqSeq) this._applyPositions(cached.positions);
         return;
       }
     }
@@ -434,6 +466,9 @@ export class EmbeddingCoordinator {
       const raw = await api<unknown>(
         `/api/embeddings/projection?${qs}`,
       );
+      // A newer projection was requested while this one was in flight (a refit
+      // takes seconds); its response must win, not this stale one.
+      if (reqSeq !== this._projectionReqSeq) return;
       const { positions, revision } = parseProjectionResponse(raw);
       const newPositions = new Map<string, { x: number; y: number }>();
       for (const p of positions) {
@@ -447,8 +482,10 @@ export class EmbeddingCoordinator {
     } catch {
       /* api() already toasted */
     } finally {
-      m.projectionPending = false;
-      this.deps.canvas.scheduleDraw();
+      if (reqSeq === this._projectionReqSeq) {
+        m.projectionPending = false;
+        this.deps.canvas.scheduleDraw();
+      }
     }
   }
 

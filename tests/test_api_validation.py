@@ -372,3 +372,206 @@ def test_projection_method_accepted(raw, expected):
 def test_projection_method_unknown_is_400():
     with pytest.raises(ApiValidationError):
         parse_projection_params(_Req({"method": "bogus"}))
+
+
+# ─── source weights ────────────────────────────────────────
+
+
+def test_weight_map_fills_unspecified_from_defaults():
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.services.request_validation import weight_map
+
+    out = weight_map(
+        {"rhythm": 0.5}, allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS
+    )
+    assert out["rhythm"] == 0.5
+    assert out["maest_logits"] == DEFAULT_WEIGHTS["maest_logits"]
+    assert set(out) == set(DEFAULT_WEIGHTS)
+
+
+def test_weight_map_rejects_unknown_source():
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.services.request_validation import weight_map
+
+    with pytest.raises(ApiValidationError):
+        weight_map({"bogus": 1.0}, allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS)
+
+
+@pytest.mark.parametrize("value", [-0.1, 1.5])
+def test_weight_map_rejects_out_of_range(value):
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.services.request_validation import weight_map
+
+    with pytest.raises(ApiValidationError):
+        weight_map(
+            {"rhythm": value}, allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS
+        )
+
+
+def test_weight_map_rejects_non_number():
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.services.request_validation import weight_map
+
+    with pytest.raises(ApiValidationError):
+        weight_map(
+            {"rhythm": "loud"}, allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS
+        )
+
+
+def test_weight_map_rejects_non_mapping():
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.services.request_validation import weight_map
+
+    with pytest.raises(ApiValidationError):
+        weight_map([1, 2], allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS)
+
+
+def test_weight_map_rejects_all_zero():
+    """An all-zero map leaves no feature block: clustering returns nothing and the
+    layout would index an empty matrix."""
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.services.request_validation import weight_map
+
+    with pytest.raises(ApiValidationError):
+        weight_map(
+            {k: 0.0 for k in DEFAULT_WEIGHTS},
+            allowed=DEFAULT_WEIGHTS,
+            defaults=DEFAULT_WEIGHTS,
+        )
+
+
+def test_projection_all_zero_weights_is_400():
+    from backend.embeddings.projection_config import FROZEN_SOURCE_WEIGHTS
+
+    spec = ",".join(f"{k}:0" for k in FROZEN_SOURCE_WEIGHTS)
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"w": spec}))
+
+
+def test_projection_weight_spec_parsed():
+    from backend.embeddings.projection_config import FROZEN_SOURCE_WEIGHTS
+
+    p = parse_projection_params(_Req({"w": "maest_logits:0.5,rhythm:0.2"}))
+    assert p.source_weights is not None
+    assert p.source_weights["maest_logits"] == 0.5
+    assert p.source_weights["rhythm"] == 0.2
+    # Unlisted sources keep their frozen default.
+    assert p.source_weights["maest"] == FROZEN_SOURCE_WEIGHTS["maest"]
+
+
+def test_projection_without_weights_is_none():
+    assert parse_projection_params(_Req({})).source_weights is None
+
+
+def test_projection_weight_spec_unknown_source_is_400():
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"w": "bogus:0.5"}))
+
+
+def test_projection_weight_spec_malformed_is_400():
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"w": "maest"}))
+
+
+def test_projection_weight_spec_out_of_range_is_400():
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"w": "rhythm:2"}))
+
+
+# ─── clusters rebuild: source weights ──────────────────────
+
+
+class _FakeClusters:
+    """Minimal ClusterStore stand-in for the rebuild route."""
+
+    def __init__(self):
+        self._weights: dict[str, float] | None = None
+
+    def set_weights(self, weights):
+        self._weights = dict(weights) if weights else None
+
+    def weights(self):
+        return self._weights
+
+    def get(self):
+        return None
+
+    def revision(self):
+        return None
+
+    def summary(self):
+        return {"available": False, "requested_weights": self._weights}
+
+
+@pytest.fixture
+def rebuild_client():
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+
+    clusters = _FakeClusters()
+    enqueued: list[dict] = []
+
+    def _enqueue_clustering(queue, *, reason="library-change"):
+        enqueued.append({"queue": queue, "reason": reason})
+        return 1
+
+    bp = create_api_jobs_blueprint(
+        job_queue=_FakeQueue(),
+        workers=_FakeWorkers(),
+        clusters=clusters,
+        build_track_infos_fn=lambda folder, recursive: [],
+        enqueue_library_work=lambda *a, **k: {},
+        enqueue_clustering=_enqueue_clustering,
+        analysis_deps=None,
+        broadcaster=None,
+        sse_response=None,
+        maest_mod=None,
+    )
+    return _app(bp).test_client(), clusters, enqueued, DEFAULT_WEIGHTS
+
+
+def test_rebuild_without_weights_keeps_current(rebuild_client):
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={})
+    assert r.status_code == 200
+    # Untouched: the worker falls back to the frozen defaults.
+    assert clusters.weights() is None
+    assert len(enqueued) == 1
+
+
+def test_rebuild_with_weights_stores_and_queues(rebuild_client):
+    client, clusters, enqueued, defaults = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={"weights": {"rhythm": 0.5}})
+    assert r.status_code == 200
+    stored = clusters.weights()
+    assert stored is not None
+    assert stored["rhythm"] == 0.5
+    assert stored["maest_logits"] == defaults["maest_logits"]
+    assert r.get_json()["weights"] == stored
+    assert len(enqueued) == 1
+
+
+def test_rebuild_unknown_source_is_400(rebuild_client):
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={"weights": {"bogus": 0.5}})
+    assert r.status_code == 400
+    assert "bogus" in r.get_json()["error"]
+    assert enqueued == []
+    assert clusters.weights() is None
+
+
+def test_rebuild_out_of_range_weight_is_400(rebuild_client):
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={"weights": {"rhythm": 3.0}})
+    assert r.status_code == 400
+    assert enqueued == []
+
+
+def test_rebuild_all_zero_weights_is_400(rebuild_client):
+    client, clusters, enqueued, defaults = rebuild_client
+    r = client.post(
+        "/api/clusters/rebuild", json={"weights": {k: 0 for k in defaults}}
+    )
+    assert r.status_code == 400
+    assert "positive weight" in r.get_json()["error"]
+    assert enqueued == []
+    assert clusters.weights() is None

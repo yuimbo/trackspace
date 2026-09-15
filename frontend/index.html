@@ -93,6 +93,23 @@
         title="Leiden resolution: left = broad genres, right = microgenres"
       />
     </label>
+    <details id="cluster-weights-details">
+      <summary>Source weights</summary>
+      <div id="cluster-weights"></div>
+      <p id="cluster-weights-note" class="cluster-weights-note"></p>
+      <div class="cluster-weight-actions">
+        <button
+          id="btn-apply-weights"
+          type="button"
+          title="Re-cluster and re-layout with these weights"
+        >
+          Apply
+        </button>
+        <button id="btn-reset-weights" type="button" title="Restore default weights">
+          Reset
+        </button>
+      </div>
+    </details>
     <div id="cluster-meta" class="cluster-meta"></div>
     <ul id="cluster-list" class="cluster-list"></ul>
     <button id="btn-rebuild-clusters" type="button" title="Recompute clusters">

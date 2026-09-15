@@ -241,7 +241,7 @@ def create_api_embeddings_blueprint(
             feature_mask=proj.feature_mask,
             features_blend=proj.features_blend,
             layout_revision=revision,
-            source_weights=FROZEN_SOURCE_WEIGHTS,
+            source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
             required_sources=REQUIRED_SOURCES,
         )
 

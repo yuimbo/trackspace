@@ -73,3 +73,20 @@ def test_layout_revision_changes_when_recipe_version_changes():
         **{**kw, "projection_recipe_version": PROJECTION_RECIPE_VERSION + 1},
     )
     assert r_a != r_b
+
+
+def test_layout_revision_changes_with_source_weights():
+    """A re-weighting must invalidate position caches, or the revision-keyed
+    layout cache would serve one configuration's coordinates for another."""
+    kw = _base_revision_kwargs()
+    r_default = compute_layout_revision(**kw)
+    r_custom = compute_layout_revision(**{**kw, "weights": {"rhythm": 0.5}})
+    assert r_default != r_custom
+
+
+def test_layout_revision_stable_for_equivalent_weights():
+    kw = _base_revision_kwargs()
+    r_a = compute_layout_revision(**{**kw, "weights": {"rhythm": 0.5, "maest": 0.25}})
+    # Key order and float repr noise must not fork the revision.
+    r_b = compute_layout_revision(**{**kw, "weights": {"maest": 0.25, "rhythm": 0.5000000001}})
+    assert r_a == r_b

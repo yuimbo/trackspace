@@ -61,12 +61,18 @@ class ClusterStore:
     Kept in memory rather than SQLite: a full re-cluster of the real library
     takes a few seconds, so persistence would buy little and add an
     invalidation problem. The revision guards staleness.
+
+    The store also owns the *requested* source weights (``None`` = frozen
+    defaults). Weights are a setting, not a per-job argument, because re-clusters are
+    also triggered automatically when an analysis stage drains; a per-job payload
+    would let those automatic runs silently revert to the defaults.
     """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._result: ClusterResult | None = None
         self._computed_at: float = 0.0
+        self._weights: dict[str, float] | None = None
 
     def set(self, result: ClusterResult | None) -> None:
         with self._lock:
@@ -85,6 +91,15 @@ class ClusterStore:
         with self._lock:
             return self._computed_at
 
+    def set_weights(self, weights: dict[str, float] | None) -> None:
+        """Set the requested source weights (``None`` restores the defaults)."""
+        with self._lock:
+            self._weights = dict(weights) if weights else None
+
+    def weights(self) -> dict[str, float] | None:
+        with self._lock:
+            return dict(self._weights) if self._weights else None
+
     def assignments_for(self, resolution: float) -> dict[str, int]:
         """path → cluster id at the nearest available resolution."""
         with self._lock:
@@ -97,12 +112,18 @@ class ClusterStore:
         return {p: int(level.labels[i]) for i, p in enumerate(res.paths)}
 
     def summary(self) -> dict[str, Any]:
+        requested = self.weights()
         with self._lock:
             res = self._result
             at = self._computed_at
         if res is None:
-            return {"available": False}
-        return {"available": True, "computed_at": at, **res.as_dict()}
+            return {"available": False, "requested_weights": requested}
+        return {
+            "available": True,
+            "computed_at": at,
+            "requested_weights": requested,
+            **res.as_dict(),
+        }
 
 
 # ──────────────────────────────────────────────────────────────
@@ -309,6 +330,11 @@ def make_cluster_handler(
     Cluster jobs are library-wide singletons: the queue's ``(kind, dedupe_key)``
     uniqueness means many "library changed" signals collapse into at most one
     pending re-cluster, which is exactly the desired coalescing behaviour.
+
+    Source weights come from *store* (the current requested setting), falling back to
+    the *weights* argument fixed at wiring time. Reading them at run time — rather
+    than from the job payload — keeps user-chosen weights applied to the automatic
+    re-clusters that follow an analysis drain.
     """
 
     def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
@@ -316,9 +342,10 @@ def make_cluster_handler(
         if not jobs:
             return out
 
+        effective_weights = store.weights() or weights
         try:
             result = run_clustering(
-                deps, build_track_infos=build_track_infos, weights=weights
+                deps, build_track_infos=build_track_infos, weights=effective_weights
             )
         except Exception as e:
             log.exception("Clustering failed")

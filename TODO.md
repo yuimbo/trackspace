@@ -15,11 +15,8 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 - [ ] **Optional: `lib/event-bus.ts`, `model/persistence.ts`, `api/types.ts`.**
       Extract the EventBus base, localStorage persistence, and shared API response
       types out of `model.ts` / `lib/api.ts`.
-- [ ] **Pre-existing: unused locals under strict tsc.** `--noUnusedLocals` flags an
-      unused `m` in `coordinators/embedding-coordinator.ts:197` and an unused `model`
-      in `embedding-coordinator.test.ts:288`. Remove.
-- [ ] **Nit:** `clamp` is duplicated in `coordinators/options-panel.ts` and
-      `coordinators/canvas-interaction.ts`.
+- [ ] **Nit:** `clamp` is duplicated in `coordinators/options-panel.ts`,
+      `coordinators/canvas-interaction.ts`, and `coordinators/analysis-coordinator.ts`.
 
 ### Backend
 
@@ -39,8 +36,6 @@ none require re-running an encoder over the library.
   genre-spanning tracks (intro vs drop) with no new inference.
 - **Text search.** CLAP's text encoder already produces the semantic directions used
   for weighting; a query box could reuse it for retrieval.
-- **Interactive weights.** `cluster_tracks` already accepts a weights dict, so exposing
-  sliders re-runs only the kNN/Leiden layer.
 - **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
   6-genre validation it reached 96.6% purity.
 - **Persist cluster results.** `ClusterStore` is in-memory; a restart recomputes in

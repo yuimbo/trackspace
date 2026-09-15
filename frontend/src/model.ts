@@ -98,6 +98,48 @@ const _LIBROSA_AXIS_DISPLAY: Record<string, string> = {
   danceability: "Dance",
 };
 
+/**
+ * Default per-source weights for clustering **and** the 2-D layout. Mirrors the
+ * server's ``clustering.DEFAULT_WEIGHTS`` / ``projection_config.FROZEN_SOURCE_WEIGHTS``
+ * — the map and the clusters must describe the same space, so one user-controlled
+ * vector drives both. Persisted; "Reset" restores these values.
+ */
+export const DEFAULT_CLUSTER_WEIGHTS: Record<string, number> = {
+  maest_logits: 0.45,
+  maest: 0.25,
+  rhythm: 0.15,
+  clap: 0.1,
+  effnet: 0.05,
+  features: 0,
+};
+
+/** Slider labels, keyed by source name (insertion order = display order). */
+export const CLUSTER_WEIGHT_LABELS: Record<string, string> = {
+  maest_logits: "Genre",
+  maest: "MAEST",
+  rhythm: "Rhythm",
+  clap: "CLAP",
+  effnet: "EffNet",
+  features: "Audio",
+};
+
+function _migrateClusterWeights(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = { ...DEFAULT_CLUSTER_WEIGHTS };
+  if (raw && typeof raw === "object") {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (!(k in out)) continue;
+      const n = Number(v);
+      if (Number.isFinite(n)) out[k] = Math.min(1, Math.max(0, n));
+    }
+  }
+  return out;
+}
+
+/** Compact display / query-string form for a source weight (drops trailing zeros). */
+export function formatSourceWeight(v: number): string {
+  return Number(v.toFixed(4)).toString();
+}
+
 export function isAudioFeatureAxisId(tag: string): boolean {
   return _LIBROSA_FEATURE_SET.has(tag);
 }
@@ -203,6 +245,11 @@ export class Model extends EventBus {
   clusterResolution = 1.5;
   /** Colour dots by cluster instead of by folder; persisted. */
   colorByCluster = false;
+  /**
+   * Per-source weights for clustering and the layout; persisted. One vector drives
+   * both pipelines so the map and cluster assignments describe the same space.
+   */
+  clusterWeights: Record<string, number> = { ...DEFAULT_CLUSTER_WEIGHTS };
   clusterRevision: string | null = null;
   clustersAvailable = false;
 
@@ -687,6 +734,7 @@ export class Model extends EventBus {
         explodeStrength: this.explodeStrength,
         clusterResolution: this.clusterResolution,
         colorByCluster: this.colorByCluster,
+        clusterWeights: this.clusterWeights,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -718,6 +766,9 @@ export class Model extends EventBus {
         this.clusterResolution = Number.isFinite(cr) && cr > 0 ? cr : 1.5;
         this.colorByCluster = Boolean(
           (d as { colorByCluster?: boolean }).colorByCluster,
+        );
+        this.clusterWeights = _migrateClusterWeights(
+          (d as { clusterWeights?: unknown }).clusterWeights,
         );
       }
     } catch {

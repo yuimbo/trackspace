@@ -15,12 +15,16 @@ def layout_revision_for_projection(
     *,
     cache_versions: Sequence[int],
 ) -> str | None:
-    """Compute layout revision (frozen sources; *proj* may be None — ignored)."""
-    del proj
+    """Compute layout revision for the projection slice.
+
+    *proj* carries the client's source weights (``None`` = frozen defaults), which
+    are part of the revision so a re-weighting invalidates position caches.
+    """
     eligible = eligible_paths_for_projection(
         infos, maps, FROZEN_SOURCES, REQUIRED_SOURCES
     )
     return compute_layout_revision(
         eligible_paths=eligible,
         cache_versions=tuple(cache_versions),
+        weights=getattr(proj, "source_weights", None),
     )

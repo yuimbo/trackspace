@@ -229,6 +229,27 @@ def test_compute_projection_pca_without_semantics():
     assert all(0 <= o["x"] <= 1 and 0 <= o["y"] <= 1 for o in out)
 
 
+def test_compute_projection_all_zero_weights_is_safe():
+    """All-zero weights leave no feature block. The HTTP routes reject that vector,
+    but the function must not index an empty matrix if it is ever reached."""
+    fp = "x"
+    infos = [
+        {"path": "a/t0.mp3", "fingerprint": fp},
+        {"path": "b/t1.mp3", "fingerprint": fp},
+    ]
+    cache = _StubFeatureCache(clap={fp: np.ones(3, dtype=np.float32)})
+    out = compute_projection(
+        infos,
+        cache,
+        method="pca",
+        scale_folders=False,
+        sources=("clap",),
+        source_weights={"clap": 0.0},
+    )
+    assert len(out) == 2
+    assert all(o["x"] == 0.5 and o["y"] == 0.5 for o in out)
+
+
 def test_pca_ref_cache_is_bounded_and_counted():
     from backend.embeddings import projection_backends as pb
 

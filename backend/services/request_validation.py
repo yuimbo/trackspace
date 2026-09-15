@@ -213,3 +213,79 @@ def one_of(value: Any, allowed: Iterable[Any], *, field: str) -> Any:
             f"field {field!r} must be one of: {options} (got {value!r})"
         )
     return value
+
+
+def _coerce_weight(value: Any, source: str, *, lo: float, hi: float) -> float:
+    if isinstance(value, bool):
+        raise ApiValidationError(f"weight for {source!r} must be a number")
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str):
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            raise ApiValidationError(f"weight for {source!r} must be a number") from None
+    else:
+        raise ApiValidationError(f"weight for {source!r} must be a number")
+    if parsed < lo or parsed > hi:
+        raise ApiValidationError(
+            f"weight for {source!r} must be between {lo} and {hi}"
+        )
+    return parsed
+
+
+def weight_map(
+    value: Any,
+    *,
+    allowed: Iterable[str],
+    defaults: Mapping[str, float] | None = None,
+    lo: float = 0.0,
+    hi: float = 1.0,
+    field: str = "weights",
+) -> dict[str, float]:
+    """Validate a ``{source: weight}`` mapping and fill unspecified sources.
+
+    Unknown sources and out-of-range values raise :class:`ApiValidationError` with a
+    client-safe message. Sources absent from *value* are filled from *defaults* (or
+    ``0.0``), so clustering and projection both receive the same complete, aligned
+    weight vector. *allowed* may be the defaults dict itself — its keys are the
+    accepted source names.
+
+    An all-zero map is rejected: it leaves no feature block to cluster or project,
+    which would collapse clustering to "no result" and crash the layout.
+    """
+    if not isinstance(value, Mapping):
+        raise ApiValidationError(
+            f"field {field!r} must be an object of source weights"
+        )
+    allowed_t = tuple(allowed)
+    base = defaults or {}
+    out = {name: float(base.get(name, 0.0)) for name in allowed_t}
+    for name, raw in value.items():
+        if name not in allowed_t:
+            raise ApiValidationError(
+                f"field {field!r} has unknown source {name!r} "
+                f"(allowed: {', '.join(allowed_t)})"
+            )
+        out[name] = _coerce_weight(raw, name, lo=lo, hi=hi)
+    if not any(w > 0.0 for w in out.values()):
+        raise ApiValidationError(
+            f"field {field!r} must leave at least one source with a positive weight"
+        )
+    return out
+
+
+def opt_weight_map(
+    data: Mapping[str, Any],
+    key: str,
+    *,
+    allowed: Iterable[str],
+    defaults: Mapping[str, float] | None = None,
+    lo: float = 0.0,
+    hi: float = 1.0,
+) -> dict[str, float] | None:
+    """Optional ``{source: weight}`` field; ``None`` when absent or null."""
+    value = data.get(key, _MISSING)
+    if value is _MISSING or value is None:
+        return None
+    return weight_map(value, allowed=allowed, defaults=defaults, lo=lo, hi=hi, field=key)

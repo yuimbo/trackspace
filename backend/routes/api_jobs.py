@@ -15,6 +15,7 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from backend.embeddings.clustering import DEFAULT_WEIGHTS
 from backend.jobs import JOB_KINDS, KIND_CLUSTER, KIND_FEATURES, KIND_MAEST, kind_label
 from backend.services.request_validation import (
     one_of,
@@ -22,6 +23,7 @@ from backend.services.request_validation import (
     opt_int,
     opt_str,
     opt_str_list,
+    opt_weight_map,
     parse_json_body,
 )
 
@@ -199,9 +201,21 @@ def create_api_jobs_blueprint(
 
     @bp.route("/api/clusters/rebuild", methods=["POST"])
     def api_clusters_rebuild():
+        """Queue a re-cluster, optionally changing the source weights.
+
+        An absent ``weights`` field keeps the current setting (defaults on a fresh
+        server), so the plain "rebuild" button stays a re-run rather than a reset.
+        A supplied map is validated, stored, and applied by the worker when it runs.
+        """
+        data = parse_json_body(required=False)
+        weights = opt_weight_map(
+            data, "weights", allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS
+        )
+        if weights is not None:
+            clusters.set_weights(weights)
         n = enqueue_clustering(job_queue, reason="manual")
         workers.wake(KIND_CLUSTER)
-        return jsonify({"ok": True, "queued": n})
+        return jsonify({"ok": True, "queued": n, "weights": clusters.weights()})
 
     @bp.route("/api/clusters/track")
     def api_clusters_track():

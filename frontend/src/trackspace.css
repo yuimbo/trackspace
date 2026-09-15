@@ -1230,5 +1230,54 @@ kbd {
 
 #btn-rebuild-clusters { margin-top: 6px; }
 
+/* ── Source-weight editor (cluster section) ─────────────────── */
+#cluster-weights-details { margin-top: 6px; }
+#cluster-weights-details summary {
+  font-size: 11px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+#cluster-weights { margin-top: 4px; }
+
+.cluster-weight-row {
+  display: grid;
+  grid-template-columns: 64px 1fr 28px;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.cluster-weight-name {
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cluster-weight-row input[type="range"] {
+  width: 100%;
+  margin: 0;
+}
+.cluster-weight-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-dim);
+}
+
+.cluster-weights-note {
+  margin: 4px 0 0;
+  font-size: 10px;
+  color: var(--fg-dim);
+  opacity: 0.85;
+}
+.cluster-weights-note:empty { display: none; }
+
+.cluster-weight-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.cluster-weight-actions button { flex: 1; }
+#btn-apply-weights:disabled { opacity: 0.5; cursor: default; }
+
 /* ── Hidden utility ───────────────────────────────────────── */
 .hidden { display: none !important; }

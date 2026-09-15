@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model } from "../model";
+import { Model, DEFAULT_CLUSTER_WEIGHTS } from "../model";
 import { EmbeddingCoordinator } from "./embedding-coordinator";
 
 // ─── Fakes ───────────────────────────────────────────────────
@@ -177,6 +177,41 @@ describe("EmbeddingCoordinator projection fetch", () => {
     await coord.ensureAndProject();
     expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(2);
   });
+
+  it("omits the weight param when weights are at their defaults", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    expect(String(call![0])).not.toContain("w=");
+  });
+
+  it("encodes non-default weights into the layout query", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    const url = String(call![0]);
+    expect(url).toContain("w=maest_logits:0.45,maest:0.25,rhythm:0.5");
+  });
+
+  it("refreshes the layout in place when weights change", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    const before = fetchCalls(fetchSpy, "/api/embeddings/projection");
+
+    model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
+    coord.refreshProjection();
+    await flush();
+
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(before + 1);
+  });
 });
 
 // ─── Generation stream ───────────────────────────────────────
@@ -285,7 +320,7 @@ describe("EmbeddingCoordinator position animations", () => {
   });
 
   it("cancels the in-flight frame on cancelAnimation", () => {
-    const { model, coord } = makeHarness();
+    const { coord } = makeHarness();
     coord.animateAxisChange("axisX", "mood");
     const frameId = [...raf.pending.keys()][0];
     coord.cancelAnimation();

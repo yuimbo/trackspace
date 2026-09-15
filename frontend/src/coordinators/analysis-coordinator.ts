@@ -8,7 +8,13 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model, type QueueStatus } from "../model";
+import {
+  type Model,
+  type QueueStatus,
+  DEFAULT_CLUSTER_WEIGHTS,
+  CLUSTER_WEIGHT_LABELS,
+  formatSourceWeight,
+} from "../model";
 import { toast, clusterColor } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 
@@ -20,6 +26,8 @@ export interface AnalysisDeps {
   status: { update(m: Model): void };
   /** Repaint the canvas after cluster assignments change. */
   scheduleDraw(): void;
+  /** Refetch the embedding layout after a weight change (optional in tests). */
+  refreshProjection?(): void;
 }
 
 /** Shape of ``GET /api/clusters``. */
@@ -33,6 +41,8 @@ interface ClusterResponse {
   names?: Record<string, string>;
   sizes?: Record<string, number>;
   modularity?: number | null;
+  /** Sources that actually contributed vectors (nonzero weight + cached rows). */
+  sources_used?: string[];
 }
 
 export class AnalysisCoordinator {
@@ -99,6 +109,112 @@ export class AnalysisCoordinator {
         }
       });
     }
+
+    this._renderWeightSliders();
+
+    const $apply = document.getElementById("btn-apply-weights");
+    if ($apply) {
+      $apply.addEventListener("click", () => void this._applyWeights());
+    }
+
+    const $reset = document.getElementById("btn-reset-weights");
+    if ($reset) {
+      $reset.addEventListener("click", () => {
+        this.deps.model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS };
+        this._syncWeightSliders();
+        void this._applyWeights();
+      });
+    }
+
+    this._syncApplyEnabled();
+  }
+
+  /** Build one weight row per source, from the shared default/label maps. */
+  private _renderWeightSliders(): void {
+    const host = document.getElementById("cluster-weights");
+    if (!host) return;
+    host.replaceChildren();
+    for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
+      const row = document.createElement("label");
+      row.className = "cluster-weight-row";
+
+      const name = document.createElement("span");
+      name.className = "cluster-weight-name";
+      name.textContent = CLUSTER_WEIGHT_LABELS[source] ?? source;
+
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = "0";
+      input.max = "1";
+      input.step = "0.05";
+      input.dataset.source = source;
+      input.value = String(this.deps.model.clusterWeights[source] ?? 0);
+      input.title = `Relative influence of the ${source} source`;
+
+      const value = document.createElement("span");
+      value.className = "cluster-weight-value";
+      value.textContent = formatSourceWeight(input.valueAsNumber);
+
+      input.addEventListener("input", () => {
+        value.textContent = formatSourceWeight(input.valueAsNumber);
+      });
+
+      row.append(name, input, value);
+      host.appendChild(row);
+    }
+  }
+
+  /** Mirror the model's weight vector onto the sliders (e.g. after Reset). */
+  private _syncWeightSliders(): void {
+    const w = this.deps.model.clusterWeights;
+    for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
+      const input = document.querySelector<HTMLInputElement>(
+        `#cluster-weights input[data-source="${source}"]`,
+      );
+      if (input) input.value = String(w[source] ?? 0);
+      const readout = input?.nextElementSibling;
+      if (readout) readout.textContent = formatSourceWeight(w[source] ?? 0);
+    }
+  }
+
+  /** Read the live slider values into the model and re-cluster + re-layout. */
+  private async _applyWeights(): Promise<void> {
+    const m = this.deps.model;
+    const weights: Record<string, number> = {};
+    for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
+      const input = document.querySelector<HTMLInputElement>(
+        `#cluster-weights input[data-source="${source}"]`,
+      );
+      weights[source] = input
+        ? clamp(input.valueAsNumber, 0, 1)
+        : m.clusterWeights[source] ?? 0;
+    }
+    m.clusterWeights = weights;
+    m.saveLS();
+    try {
+      await postJSON("/api/clusters/rebuild", { weights });
+      toast("Re-clustering with new weights…", "ok");
+      // The layout is re-weighted independently of the cluster job, so refresh on
+      // success only — a rejected vector would fail the projection the same way.
+      this.deps.refreshProjection?.();
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  /** Disable Apply while a cluster job is outstanding: the queue's single
+   *  ``"library"`` dedupe key would coalesce the request into the running one. */
+  private _syncApplyEnabled(): void {
+    const $apply = document.getElementById(
+      "btn-apply-weights",
+    ) as HTMLButtonElement | null;
+    if (!$apply) return;
+    const busy =
+      (this.deps.model.queueStatus?.kinds?.cluster?.outstanding ?? 0) > 0;
+    $apply.disabled = busy;
+    $apply.title = busy
+      ? "A cluster job is already queued — it will use the current weights"
+      : "Re-cluster and re-layout with these weights";
   }
 
   /** Flip cluster colouring; shared by the panel checkbox and the hotkey. */
@@ -135,6 +251,7 @@ export class AnalysisCoordinator {
     const applySnapshot = (data: QueueStatus) => {
       this.deps.model.queueStatus = data;
       this.deps.status.update(this.deps.model);
+      this._syncApplyEnabled();
     };
 
     es.addEventListener("snapshot", ((e: MessageEvent) => {
@@ -169,6 +286,7 @@ export class AnalysisCoordinator {
           at: Date.now() / 1000,
         };
         this.deps.status.update(m);
+        this._syncApplyEnabled();
       }
     }) as EventListener);
 
@@ -197,6 +315,7 @@ export class AnalysisCoordinator {
       const prevRevision = m.clusterRevision;
       m.queueStatus = st;
       this.deps.status.update(m);
+      this._syncApplyEnabled();
       // Clustering finished or changed → refresh assignments.
       const rev = st.clusters?.revision ?? null;
       if (rev && rev !== prevRevision) {
@@ -222,6 +341,7 @@ export class AnalysisCoordinator {
         m.clusterAssignments = new Map();
         m.clusterNames = new Map();
         m.clusterSizes = new Map();
+        this._renderWeightsNote(null);
         this._renderClusterPanel();
         return;
       }
@@ -237,6 +357,7 @@ export class AnalysisCoordinator {
       m.clusterSizes = new Map(
         Object.entries(d.sizes ?? {}).map(([k, v]) => [Number(k), v]),
       );
+      this._renderWeightsNote(d);
       this._renderClusterPanel();
       this.deps.scheduleDraw();
     } catch {
@@ -244,6 +365,26 @@ export class AnalysisCoordinator {
     } finally {
       this._clusterFetchPending = false;
     }
+  }
+
+  /** Flag requested-but-unavailable sources (a nonzero weight that did nothing). */
+  private _renderWeightsNote(d: ClusterResponse | null): void {
+    const note = document.getElementById("cluster-weights-note");
+    if (!note) return;
+    if (!d) {
+      note.textContent = "";
+      return;
+    }
+    const used = new Set(d.sources_used ?? []);
+    const requested = this.deps.model.clusterWeights;
+    const dropped = Object.keys(DEFAULT_CLUSTER_WEIGHTS).filter(
+      (s) => (requested[s] ?? 0) > 0 && !used.has(s),
+    );
+    note.textContent = dropped.length
+      ? `No cached vectors for ${dropped
+          .map((s) => CLUSTER_WEIGHT_LABELS[s] ?? s)
+          .join(", ")} — weight ignored`
+      : "";
   }
 
   /** Render the microgenre list (largest clusters first). */

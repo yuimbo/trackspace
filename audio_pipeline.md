@@ -463,6 +463,29 @@ and every resolution returned the same 9 clusters.
 deliberately: a 2-D map that disagreed with the cluster assignments would be
 actively misleading. **Keep them in sync.**
 
+### Interactive weights
+
+The defaults above are overridable per request. The Options panel exposes one slider
+per source; **Apply** sends the vector to both pipelines, so the map and the clusters
+keep describing the same space:
+
+- `POST /api/clusters/rebuild` with `{"weights": {...}}` stores the requested
+  vector on `ClusterStore` and queues a re-cluster. Weights live on the store rather
+  than in the job payload because re-clusters also fire automatically when an analysis
+  stage drains — a per-job payload would let those runs silently revert to the defaults.
+  An absent `weights` field keeps the current setting (defaults on a fresh server), so
+  the plain "Rebuild clusters" button is a re-run, not a reset.
+- `GET /api/embeddings/projection?w=maest_logits:0.45,maest:0.25,…` applies the
+  same vector to the layout. Unlisted sources fall back to their frozen default;
+  unknown sources and out-of-range values are a structured 400.
+- **Source weights are part of `compute_layout_revision`.** Without that, two weight
+  configurations would hash identically and the revision-keyed position caches would
+  serve one configuration's coordinates for the other. The `w=` param is omitted when
+  the weights equal the defaults, so default query keys stay stable.
+- Applying a new vector costs a full t-SNE refit (~12–20 s at 9.5k tracks), so the UI
+  commits on an explicit Apply rather than on every slider release; the cluster
+  re-run itself is a few seconds.
+
 CLAP is retained at low weight because semantic folder/tag weighting in
 `layout.py` projects *text* directions into the CLAP column span — dropping
 CLAP would remove that capability.

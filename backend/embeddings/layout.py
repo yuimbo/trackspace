@@ -431,7 +431,10 @@ def compute_projection(
     )
     t_after_gather = time.perf_counter()
 
-    if len(paths) < 2:
+    # `mat.shape[0] < 2` guards the degenerate all-zero-weight case, where every
+    # source block is dropped and no row can be projected. The HTTP routes reject
+    # that vector before reaching here; this keeps the function safe regardless.
+    if len(paths) < 2 or mat.shape[0] < 2:
         if log.isEnabledFor(logging.DEBUG):
             log.debug(
                 "compute_projection method=%s n=%d gather=%.1fms (short-circuit)",
