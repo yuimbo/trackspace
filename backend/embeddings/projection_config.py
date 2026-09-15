@@ -49,7 +49,8 @@ REQUIRED_SOURCES: tuple[str, ...] = ("maest_logits", "maest")
 FROZEN_FEATURE_MASK = np.array([1, 0, 0, 0, 1, 1], dtype=np.float32)
 assert int(FROZEN_FEATURE_MASK.size) == AUDIO_FEATURE_DIM
 
-FROZEN_FEATURES_BLEND = 0.42
+# The audio-feature blend (``FROZEN_FEATURES_BLEND``) lives in ``backend.tuning``
+# alongside the other tunable thresholds — see that module for the single reference.
 # Former UI slider maxima ("folder contrast" 0–6, "depth emphasis" 1–3).
 FROZEN_FOLDER_BOOST = 6.0
 FROZEN_FOLDER_DEPTH_BOOST = 3.0

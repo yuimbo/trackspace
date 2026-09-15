@@ -9,6 +9,28 @@ from typing import Any
 
 from flask import Blueprint, abort, jsonify, render_template, request
 
+from backend.services.request_validation import (
+    ApiValidationError,
+    opt_str,
+    parse_json_body,
+    require_str,
+    require_str_list,
+)
+
+
+def _safe_leaf_name(name: str) -> str:
+    """Validate a user-supplied single path component.
+
+    Rejects empty names, ``.`` / ``..``, and anything containing a path
+    separator so a crafted name cannot escape its parent directory.
+    """
+    stripped = name.strip()
+    if stripped in ("", ".", ".."):
+        raise ApiValidationError("field 'name' must be a valid directory name")
+    if "/" in stripped or "\\" in stripped or os.sep in stripped:
+        raise ApiValidationError("field 'name' must not contain a path separator")
+    return stripped
+
 
 def create_api_folders_blueprint(
     *,
@@ -57,10 +79,8 @@ def create_api_folders_blueprint(
 
     @bp.route("/api/roots/add", methods=["POST"])
     def api_roots_add():
-        data = request.get_json(force=True)
-        path = (data.get("path") or "").strip()
-        if not path:
-            abort(400)
+        data = parse_json_body()
+        path = require_str(data, "path").strip()
         abs_path = os.path.abspath(path)
         if not os.path.isdir(abs_path):
             return jsonify({"ok": False, "error": "Directory not found"})
@@ -76,10 +96,8 @@ def create_api_folders_blueprint(
 
     @bp.route("/api/roots/remove", methods=["POST"])
     def api_roots_remove():
-        data = request.get_json(force=True)
-        root_id = (data.get("root_id") or "").strip()
-        if not root_id:
-            abort(400)
+        data = parse_json_body()
+        root_id = require_str(data, "root_id").strip()
         if not remove_root(root_id):
             return jsonify({"ok": False, "error": "Unknown root"})
         unschedule_root_watch(root_id)
@@ -92,8 +110,8 @@ def create_api_folders_blueprint(
 
         Body: {"path": "rel/path/to/folder"}
         """
-        data = request.get_json(force=True)
-        abs_path = resolve_virtual_path(data.get("path", ""))
+        data = parse_json_body()
+        abs_path = resolve_virtual_path(opt_str(data, "path", ""))
         if not os.path.isdir(abs_path):
             abort(404)
         if sys.platform == "darwin":
@@ -110,11 +128,9 @@ def create_api_folders_blueprint(
 
         Body: {"parent": "rel/path", "name": "new_dir"}
         """
-        data = request.get_json(force=True)
-        parent = resolve_virtual_path(data.get("parent", ""))
-        name = os.path.basename(data.get("name", "").strip())
-        if not name:
-            abort(400)
+        data = parse_json_body()
+        parent = resolve_virtual_path(opt_str(data, "parent", ""))
+        name = _safe_leaf_name(require_str(data, "name"))
         new_dir = os.path.join(parent, name)
         if os.path.exists(new_dir):
             return jsonify({"ok": False, "error": "Already exists"})
@@ -127,11 +143,9 @@ def create_api_folders_blueprint(
 
         Body: {"path": "rel/path/to/folder", "name": "new_name"}
         """
-        data = request.get_json(force=True)
-        old_abs = resolve_virtual_path(data.get("path", ""))
-        new_name = os.path.basename(data.get("name", "").strip())
-        if not new_name:
-            abort(400)
+        data = parse_json_body()
+        old_abs = resolve_virtual_path(opt_str(data, "path", ""))
+        new_name = _safe_leaf_name(require_str(data, "name"))
         if not os.path.isdir(old_abs):
             abort(404)
         new_abs = os.path.join(os.path.dirname(old_abs), new_name)
@@ -147,28 +161,32 @@ def create_api_folders_blueprint(
 
         Body: {"paths": ["rel/file.mp3", ...], "dest": "rel/dest/folder"}
         """
-        data = request.get_json(force=True)
-        dest_abs = resolve_virtual_path(data.get("dest", ""))
+        data = parse_json_body()
+        dest_abs = resolve_virtual_path(opt_str(data, "dest", ""))
         if not os.path.isdir(dest_abs):
             abort(400)
+        paths = require_str_list(data, "paths")
         moved, errors = 0, []
-        for rel in data.get("paths", []):
-            src = resolve_virtual_path(rel)
-            if not os.path.isfile(src):
-                errors.append(f"Not found: {rel}")
-                continue
-            dst = os.path.join(dest_abs, os.path.basename(src))
-            if src == dst:
-                continue
-            if os.path.exists(dst):
-                errors.append(f"Already exists: {os.path.basename(src)}")
-                continue
+        for rel in paths:
             try:
-                os.rename(src, dst)
-            except OSError:
-                shutil.move(src, dst)
-            track_cache.remap(src, dst)
-            moved += 1
+                src = resolve_virtual_path(rel)
+                if not os.path.isfile(src):
+                    errors.append(f"Not found: {rel}")
+                    continue
+                dst = os.path.join(dest_abs, os.path.basename(src))
+                if src == dst:
+                    continue
+                if os.path.exists(dst):
+                    errors.append(f"Already exists: {os.path.basename(src)}")
+                    continue
+                try:
+                    os.rename(src, dst)
+                except OSError:
+                    shutil.move(src, dst)
+                track_cache.remap(src, dst)
+                moved += 1
+            except Exception as exc:
+                errors.append(f"Failed: {rel} ({exc})")
         return jsonify({"ok": True, "moved": moved, "errors": errors})
 
     return bp

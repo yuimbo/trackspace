@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable, MutableMapping
 from concurrent.futures import Executor
 from dataclasses import dataclass
 from typing import Any
 
-from flask import Flask
+from flask import Flask, jsonify, request
+from werkzeug.exceptions import HTTPException
 
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
@@ -16,6 +18,37 @@ from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
 from backend.routes.api_tags import create_api_tags_blueprint
 from backend.routes.static_audio import create_static_audio_blueprint
+from backend.services.request_validation import ApiValidationError
+
+log = logging.getLogger(__name__)
+
+
+def _register_error_handlers(app: Flask) -> None:
+    """Return every failure as a structured JSON body.
+
+    Without these, ``abort(400)`` and the path helpers' ``BadRequest`` /
+    ``NotFound`` / ``Forbidden`` render Werkzeug's HTML pages, and an uncaught
+    ``KeyError`` or filesystem ``OSError`` becomes an opaque 500. The frontend's
+    ``api()`` helper reads the ``error`` field to show a useful toast.
+    """
+
+    @app.errorhandler(ApiValidationError)
+    def _handle_validation_error(exc: ApiValidationError):
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    @app.errorhandler(HTTPException)
+    def _handle_http_error(exc: HTTPException):
+        return jsonify({"ok": False, "error": exc.description}), exc.code or 500
+
+    @app.errorhandler(OSError)
+    def _handle_os_error(exc: OSError):
+        log.exception("Filesystem error in %s", request.path)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+    @app.errorhandler(Exception)
+    def _handle_unexpected_error(exc: Exception):
+        log.exception("Unhandled error in %s", request.path)
+        return jsonify({"ok": False, "error": "Internal server error"}), 500
 
 
 @dataclass
@@ -81,6 +114,7 @@ class TrackspaceBlueprintDeps:
 
 def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
     app = Flask(__name__, static_folder=None, template_folder=template_folder)
+    _register_error_handlers(app)
     app.register_blueprint(
         create_api_embeddings_blueprint(
             embeddings_mod=deps.embeddings_mod,

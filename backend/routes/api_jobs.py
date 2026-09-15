@@ -16,6 +16,14 @@ from typing import Any
 from flask import Blueprint, jsonify, request
 
 from backend.jobs import JOB_KINDS, KIND_CLUSTER, KIND_FEATURES, KIND_MAEST, kind_label
+from backend.services.request_validation import (
+    one_of,
+    opt_bool,
+    opt_int,
+    opt_str,
+    opt_str_list,
+    parse_json_body,
+)
 
 log = logging.getLogger(__name__)
 
@@ -80,18 +88,22 @@ def create_api_jobs_blueprint(
     @bp.route("/api/jobs/failures")
     def api_jobs_failures():
         kind = request.args.get("kind") or None
-        limit = min(200, max(1, int(request.args.get("limit", 50))))
+        if kind is not None:
+            one_of(kind, JOB_KINDS, field="kind")
+        limit = opt_int(request.args, "limit", 50, lo=1, hi=200)
         return jsonify({"failures": job_queue.failures(kind, limit=limit)})
 
     @bp.route("/api/jobs/enqueue", methods=["POST"])
     def api_jobs_enqueue():
         """Queue outstanding analysis for the library (idempotent)."""
-        data = request.get_json(silent=True) or {}
-        folder = data.get("folder", "")
-        recursive = bool(data.get("recursive", True))
-        force = bool(data.get("force", False))
-        priority_paths = data.get("priority_paths") or []
-        kinds = data.get("kinds") or [KIND_FEATURES, KIND_MAEST]
+        data = parse_json_body(required=False)
+        folder = opt_str(data, "folder", "")
+        recursive = opt_bool(data, "recursive", True)
+        force = opt_bool(data, "force", False)
+        priority_paths = opt_str_list(data, "priority_paths")
+        kinds = opt_str_list(data, "kinds", [KIND_FEATURES, KIND_MAEST])
+        for kind in kinds:
+            one_of(kind, JOB_KINDS, field="kinds")
 
         infos = build_track_infos_fn(folder, recursive)
         queued = enqueue_library_work(
@@ -107,8 +119,10 @@ def create_api_jobs_blueprint(
 
     @bp.route("/api/jobs/retry", methods=["POST"])
     def api_jobs_retry():
-        data = request.get_json(silent=True) or {}
+        data = parse_json_body(required=False)
         kind = data.get("kind") or None
+        if kind is not None:
+            one_of(kind, JOB_KINDS, field="kind")
         n = job_queue.retry_failed(kind)
         workers.wake(kind)
         return jsonify({"ok": True, "retried": n, "queue": _queue_payload()})

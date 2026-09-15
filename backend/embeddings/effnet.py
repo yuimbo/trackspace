@@ -9,11 +9,13 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 
 import librosa
 import numpy as np
 
 from .audio_decode import load_resilient_audio_segments
+from backend.tuning import EFFNET_DOWNLOAD_MAX_RETRIES, EFFNET_MODEL_MIN_BYTES
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +39,6 @@ _EFFNET_MODEL_URL = (
     "discogs-effnet-bsdynamic-1.onnx"
 )
 _EFFNET_MODEL_NAME = "discogs-effnet-bsdynamic-1.onnx"
-_EFFNET_MODEL_MIN_BYTES = 10_000_000
 #: SHA-256 of the published model. Essentia ships no checksum in its model JSON,
 #: so this is pinned from the 18,027,718-byte file served at _EFFNET_MODEL_URL
 #: (byte count matches the server's Content-Length exactly).
@@ -45,7 +46,6 @@ _EFFNET_MODEL_SHA256 = (
     "a280825b334797cf677939db8cd5762c0392aedd0ca6415dbc1cd083f045e43c"
 )
 
-_DOWNLOAD_MAX_RETRIES = 3
 _DOWNLOAD_RETRY_DELAY = 5
 
 
@@ -77,7 +77,7 @@ def _model_dir() -> str:
 def _ensure_effnet_model_file() -> str:
     path = os.path.join(_model_dir(), _EFFNET_MODEL_NAME)
     if os.path.isfile(path):
-        if os.path.getsize(path) < _EFFNET_MODEL_MIN_BYTES:
+        if os.path.getsize(path) < EFFNET_MODEL_MIN_BYTES:
             log.warning(
                 "Removing truncated model file (%d bytes): %s",
                 os.path.getsize(path), path,
@@ -92,18 +92,18 @@ def _ensure_effnet_model_file() -> str:
     tmp = path + ".tmp"
     last_err: Exception | None = None
 
-    for attempt in range(1, _DOWNLOAD_MAX_RETRIES + 1):
+    for attempt in range(1, EFFNET_DOWNLOAD_MAX_RETRIES + 1):
         try:
             log.info(
                 "Downloading %s (attempt %d/%d) …",
-                _EFFNET_MODEL_URL, attempt, _DOWNLOAD_MAX_RETRIES,
+                _EFFNET_MODEL_URL, attempt, EFFNET_DOWNLOAD_MAX_RETRIES,
             )
             urllib.request.urlretrieve(_EFFNET_MODEL_URL, tmp)
 
-            if os.path.getsize(tmp) < _EFFNET_MODEL_MIN_BYTES:
+            if os.path.getsize(tmp) < EFFNET_MODEL_MIN_BYTES:
                 raise OSError(
                     f"Downloaded file too small ({os.path.getsize(tmp)} bytes), "
-                    f"expected ≥{_EFFNET_MODEL_MIN_BYTES}",
+                    f"expected ≥{EFFNET_MODEL_MIN_BYTES}",
                 )
             if not _verify_effnet_model(tmp):
                 raise OSError(
@@ -120,13 +120,13 @@ def _ensure_effnet_model_file() -> str:
             log.warning("Download attempt %d failed: %s", attempt, e)
             if os.path.isfile(tmp):
                 os.remove(tmp)
-            if attempt < _DOWNLOAD_MAX_RETRIES:
+            if attempt < EFFNET_DOWNLOAD_MAX_RETRIES:
                 delay = _DOWNLOAD_RETRY_DELAY * (2 ** (attempt - 1))
                 log.info("Retrying in %ds …", delay)
                 time.sleep(delay)
 
     raise RuntimeError(
-        f"Failed to download EffNet model after {_DOWNLOAD_MAX_RETRIES} attempts: {last_err}",
+        f"Failed to download EffNet model after {EFFNET_DOWNLOAD_MAX_RETRIES} attempts: {last_err}",
     )
 
 
@@ -250,7 +250,13 @@ def generate_effnet_embedding(path: str) -> np.ndarray | None:
 def generate_effnet_embeddings_batch(
     paths: list[str],
     decode_warnings: dict[str, str] | None = None,
+    progress_cb: Callable[[int, int], None] | None = None,
 ) -> dict[str, np.ndarray | None]:
+    """Embed a batch of tracks, reporting per-track progress as it goes.
+
+    ``progress_cb(done, total)`` fires after each track's (decode-dominated)
+    preprocessing step, so a caller can stream status during a long batch.
+    """
     if not paths:
         return {}
     if not _effnet_loaded:
@@ -261,7 +267,8 @@ def generate_effnet_embeddings_batch(
     valid_paths: list[str] = []
     all_patches: list[np.ndarray] = []
     patch_counts: list[int] = []
-    for path in paths:
+    total = len(paths)
+    for done, path in enumerate(paths, start=1):
         patches, dwarn = _preprocess_effnet(path)
         if dwarn and decode_warnings is not None:
             decode_warnings[path] = dwarn
@@ -269,6 +276,8 @@ def generate_effnet_embeddings_batch(
             valid_paths.append(path)
             all_patches.append(patches)
             patch_counts.append(len(patches))
+        if progress_cb is not None:
+            progress_cb(done, total)
 
     results: dict[str, np.ndarray | None] = {p: None for p in paths}
     if not all_patches:

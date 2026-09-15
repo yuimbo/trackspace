@@ -15,6 +15,7 @@ from .audio_decode import (
 )
 from . import madmom_tempo
 from backend.decode_stderr import librosa_get_duration
+from backend.tuning import BPM_HI, BPM_LO
 
 log = logging.getLogger(__name__)
 
@@ -39,8 +40,6 @@ _MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53,
 _PITCH_CLASSES = ["C", "C#", "D", "D#", "E", "F",
                   "F#", "G", "G#", "A", "A#", "B"]
 
-_BPM_LO = 60.0
-_BPM_HI = 200.0
 # 22.05 kHz keeps librosa STFT/onset/chroma cheap; madmom upsamples its copy to 44.1 kHz.
 _FEATURE_SR = 22050
 _FEATURE_EXCERPT_SECONDS = 20.0
@@ -166,7 +165,7 @@ def extract_audio_features_and_warning(
         madmom_bpm = madmom_tempo.estimate_tempo_bpm(audio, sr)
         if madmom_bpm is not None:
             tempo = madmom_bpm
-        tempo_norm = float(np.clip((tempo - _BPM_LO) / (_BPM_HI - _BPM_LO), 0.0, 1.0))
+        tempo_norm = float(np.clip((tempo - BPM_LO) / (BPM_HI - BPM_LO), 0.0, 1.0))
 
         key_str, scale_str = detect_key(audio, sr)
         fifths_pos = _KEY_TO_FIFTHS.get(key_str, 0)
@@ -209,7 +208,7 @@ def audio_features_display_bpm_key(vec: np.ndarray | None) -> tuple[int | None, 
     if vec is None or int(vec.size) < AUDIO_FEATURE_DIM:
         return None, None
     tnorm = float(np.clip(float(vec[0]), 0.0, 1.0))
-    bpm_f = tnorm * (_BPM_HI - _BPM_LO) + _BPM_LO
+    bpm_f = tnorm * (BPM_HI - BPM_LO) + BPM_LO
     bpm = int(round(bpm_f))
     key_cos = float(vec[1])
     key_sin = float(vec[2])

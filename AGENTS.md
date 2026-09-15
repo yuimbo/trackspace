@@ -722,6 +722,23 @@ Principles that emerged from consolidating the embedding / audio-feature stack i
   when nothing references them.
 
 
+## HTTP API: validation and error shape
+
+- **Every request is validated in one place.**  `backend/services/request_validation.py`
+  holds `ApiValidationError` plus helpers (`parse_json_body`, `require_str`,
+  `opt_int`, `one_of`, …). Routes parse, validate, and hand plain values to the domain
+  layer — never index a payload (`data["path"]`) or coerce with bare `int()`.
+- **Every failure is JSON.**  `factory._register_error_handlers` maps
+  `ApiValidationError` → 400, `HTTPException` → its status, `OSError` → 500, and any
+  other exception → 500, always as `{"ok": false, "error": "…"}`.  Do not add
+  per-route HTML error paths; raise (or `abort`) and let the handler shape it.
+- **Batch IO keeps partial success.**  A per-file failure (unwritable ID3 frame, missing
+  file) is collected in an `errors` array and the rest of the batch still commits —
+  see `/api/tracks/tags` and `/api/tracks/move`.  The frontend's `api()` /
+  `postJSON` read `error` from the JSON body into the toast, so messages must stay
+  client-safe (never include a traceback or absolute paths).
+
+
 # Continuous improvement
 After any major session, ask yourself:
 

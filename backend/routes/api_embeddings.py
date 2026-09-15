@@ -15,6 +15,12 @@ from backend.embeddings.projection_config import (
 )
 from backend.jobs import KIND_FEATURES, KIND_MAEST
 from backend.services.embedding_status_cache import EmbeddingStatusCache
+from backend.services.request_validation import (
+    opt_bool,
+    opt_str,
+    opt_str_list,
+    parse_json_body,
+)
 
 log = logging.getLogger(__name__)
 
@@ -192,16 +198,16 @@ def create_api_embeddings_blueprint(
         an idempotent "make sure this work is scheduled" request rather than a
         "start a background thread" one. Repeated calls are harmless.
         """
-        data = request.get_json(silent=True) or {}
-        folder = data.get("folder", "")
-        recursive = bool(data.get("recursive", True))
-        priority_paths: list[str] = data.get("priority_paths", []) or []
+        data = parse_json_body(required=False)
+        folder = opt_str(data, "folder", "")
+        recursive = opt_bool(data, "recursive", True)
+        priority_paths = opt_str_list(data, "priority_paths")
 
         infos = build_track_infos_fn(folder, recursive)
         queued = enqueue_analysis(
             infos=infos,
             priority_paths=priority_paths,
-            force=bool(data.get("force", False)),
+            force=opt_bool(data, "force", False),
         )
         return jsonify({"ok": True, "queued": queued})
 

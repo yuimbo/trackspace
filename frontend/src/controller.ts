@@ -68,9 +68,17 @@ function pointInPoly(
 async function api<T = unknown>(url: string, opts?: RequestInit): Promise<T> {
   const res = await fetch(url, opts);
   if (!res.ok) {
-    const t = `${res.status} ${res.statusText}`;
-    toast(t, "error");
-    throw new Error(t);
+    // The backend returns {"ok": false, "error": "..."} for every failure.
+    // Surface that message instead of a bare status line.
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { error?: unknown };
+      if (body && typeof body.error === "string" && body.error) detail = body.error;
+    } catch {
+      /* non-JSON error body; keep the status line */
+    }
+    toast(detail, "error");
+    throw new Error(detail);
   }
   return res.json();
 }
@@ -2238,8 +2246,18 @@ export class Controller {
     this.pending.clear();
     if (!updates.length) return;
     try {
-      await postJSON("/api/tracks/tags", { updates });
-      toast(`Saved ${updates.length} tag values`, "ok");
+      const res = await postJSON<{
+        count?: number;
+        errors?: { path: string; error: string }[];
+      }>("/api/tracks/tags", { updates });
+      if (res?.errors?.length) {
+        toast(
+          `Saved ${res.count ?? updates.length} of ${updates.length} tag values; ${res.errors.length} failed`,
+          "error",
+        );
+      } else {
+        toast(`Saved ${updates.length} tag values`, "ok");
+      }
     } catch {
       /* api() already toasted */
     }

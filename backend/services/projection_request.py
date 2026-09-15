@@ -6,12 +6,16 @@ from typing import Any
 
 from backend.embeddings.projection_config import (
     FROZEN_FEATURE_MASK,
-    FROZEN_FEATURES_BLEND,
     FROZEN_FOLDER_BOOST,
     FROZEN_FOLDER_DEPTH_BOOST,
     FROZEN_SCALE_FOLDERS,
     FROZEN_SOURCES,
 )
+from backend.services.request_validation import one_of
+from backend.tuning import FROZEN_FEATURES_BLEND
+
+#: Accepted projection methods. ``umap`` is the legacy alias for ``tsne``.
+_METHODS: tuple[str, ...] = ("tsne", "pca", "umap")
 
 
 @dataclass(frozen=True)
@@ -46,13 +50,18 @@ def parse_projection_params(
     *,
     default_when_no_method: bool = False,
 ) -> ProjectionParams:
-    """Parse method (``pca`` preview vs ``tsne``); all other fields are frozen."""
+    """Parse method (``pca`` preview vs ``tsne``); all other fields are frozen.
+
+    An unknown ``method`` is rejected with a structured 400 rather than silently
+    falling back to t-SNE, so client bugs surface instead of being masked.
+    """
     del default_when_no_method
     raw_method = (req.args.get("method") or "").strip().lower()
-    if raw_method == "pca":
-        method = "pca"
-    else:
+    if not raw_method:
         method = "tsne"
+    else:
+        one_of(raw_method, _METHODS, field="method")
+        method = "tsne" if raw_method == "umap" else raw_method
 
     return ProjectionParams(
         method=method,

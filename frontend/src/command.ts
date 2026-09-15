@@ -14,15 +14,25 @@ export interface Command {
 }
 
 // ─── API helper (mirrors controller's postJSON) ──────────────
-function postJSON<T = unknown>(url: string, body: unknown): Promise<T> {
-  return fetch(url, {
+async function postJSON<T = unknown>(url: string, body: unknown): Promise<T> {
+  const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  }).then((r) => {
-    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
-    return r.json();
   });
+  if (!r.ok) {
+    // The backend returns {"ok": false, "error": "..."} for every failure.
+    let detail = `${r.status} ${r.statusText}`;
+    try {
+      const parsed = (await r.json()) as { error?: unknown };
+      if (parsed && typeof parsed.error === "string" && parsed.error)
+        detail = parsed.error;
+    } catch {
+      /* non-JSON error body; keep the status line */
+    }
+    throw new Error(detail);
+  }
+  return r.json();
 }
 
 // ─── CommandManager ──────────────────────────────────────────
@@ -50,11 +60,12 @@ export class CommandManager {
     this._committing = true;
     try {
       await cmd.commit();
-    } catch {
+    } catch (err) {
       cmd.undo(m);
       this._stack.pop();
       this._afterEffect(cmd.effect);
-      toast("Action failed — reverted", "error");
+      const detail = err instanceof Error && err.message ? ` — ${err.message}` : "";
+      toast(`Action failed${detail} — reverted`, "error");
     } finally {
       this._committing = false;
     }

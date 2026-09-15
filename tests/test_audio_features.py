@@ -193,6 +193,44 @@ def test_effnet_batch_empty():
     assert generate_effnet_embeddings_batch([]) == {}
 
 
+def test_effnet_batch_progress_callback(monkeypatch):
+    """progress_cb fires per track with (done, total) as preprocessing proceeds."""
+    from backend.embeddings import effnet
+
+    monkeypatch.setattr(effnet, "_effnet_loaded", True)
+    monkeypatch.setattr(effnet, "_effnet_session", object())
+    monkeypatch.setattr(
+        effnet,
+        "_preprocess_effnet",
+        lambda _path: (np.ones((3, 4), dtype=np.float32), None),
+    )
+    monkeypatch.setattr(
+        effnet,
+        "_run_effnet_batched",
+        lambda patches: np.ones((len(patches), 4), dtype=np.float32),
+    )
+
+    calls: list[tuple[int, int]] = []
+    results = effnet.generate_effnet_embeddings_batch(
+        ["a.mp3", "b.mp3"], progress_cb=lambda done, total: calls.append((done, total))
+    )
+
+    assert calls == [(1, 2), (2, 2)]
+    assert set(results) == {"a.mp3", "b.mp3"}
+    assert results["a.mp3"] is not None
+
+
+def test_effnet_batch_progress_callback_empty():
+    """An empty batch returns early and never invokes progress_cb."""
+    from backend.embeddings.effnet import generate_effnet_embeddings_batch
+
+    calls: list[tuple[int, int]] = []
+    assert generate_effnet_embeddings_batch(
+        [], progress_cb=lambda done, total: calls.append((done, total))
+    ) == {}
+    assert calls == []
+
+
 def test_effnet_batch_invalid_path(effnet_loaded):
     """Invalid paths should map to None, valid paths should still succeed."""
     if not effnet_loaded:
