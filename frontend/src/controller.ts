@@ -1,4 +1,9 @@
-import { type Model, type Track, isAudioFeatureAxisId } from "./model";
+import {
+  type Model,
+  type QueueStatus,
+  type Track,
+  isAudioFeatureAxisId,
+} from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -7,7 +12,7 @@ import type {
   StatusView,
   TxHandle,
 } from "./components";
-import { toast, showLoad, hideLoad, dirColor } from "./lib/toast";
+import { toast, showLoad, hideLoad, dirColor, clusterColor } from "./lib/toast";
 import { displayFolderLeaf, displayFolderPath } from "./lib/path-presenter";
 import {
   CommandManager,
@@ -292,6 +297,8 @@ export class Controller {
     if ($vm) $vm.checked = isEmbed;
     const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
     if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
+    const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
+    if ($pv) $pv.value = String(m.previewVolume);
   }
 
   /* ── View callbacks ─────────────────────────────────────── */
@@ -867,6 +874,12 @@ export class Controller {
     this.canvas.scheduleDraw();
     this.status.update(this.model);
 
+    // Queue stream + clusters are independent of view mode: analysis runs in
+    // the background regardless of what the user is currently looking at.
+    this._listenJobStream();
+    void this._refreshQueueStatus();
+    void this._fetchClusters();
+
     if (this.model.viewMode === "embeddings") {
       void this._ensureEmbeddingsAndProject();
     }
@@ -928,6 +941,11 @@ export class Controller {
         effnet_embedded: number;
         effnet_pending: number;
         effnet_model_ready: boolean;
+        maest_model_ready?: boolean;
+        maest_error?: string | null;
+        tracks_with_maest?: number;
+        tracks_pending_maest?: number;
+        tracks_pending_rhythm?: number;
         features_extracted: number;
         features_pending: number;
         generating: boolean;
@@ -935,14 +953,14 @@ export class Controller {
         layout_revision?: string;
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
-      const modelsBlocked = !status.model_ready || !status.effnet_model_ready;
+      // Only MAEST gates the map: it is the required source (see the backend's
+      // REQUIRED_SOURCES). CLAP/EffNet are optional low-weight blocks, so a
+      // server started with --no-clap/--no-effnet must still render — blocking
+      // on them left the canvas stuck on "loading models…" forever.
+      const modelsBlocked = status.maest_model_ready === false;
       m.embeddingModelsLoading = modelsBlocked;
       if (modelsBlocked) {
-        if (!status.model_ready) {
-          toast("CLAP model loading…", "ok");
-        } else if (!status.effnet_model_ready) {
-          toast("EffNet model loading…", "ok");
-        }
+        toast(status.maest_error || "MAEST model loading…", "ok");
         this._pollModelReady();
         this.canvas.scheduleDraw();
         return;
@@ -950,26 +968,18 @@ export class Controller {
 
       m.embeddingModelsLoading = false;
 
-      const sourcesNeeded: string[] = [];
-      if (status.pending > 0) sourcesNeeded.push("clap");
-      if (status.effnet_pending > 0) sourcesNeeded.push("effnet");
-      if (status.features_pending > 0) sourcesNeeded.push("features");
+      const maestPending = status.tracks_pending_maest ?? 0;
+      const rhythmPending = status.tracks_pending_rhythm ?? 0;
+      const needsWork = maestPending > 0 || rhythmPending > 0;
 
-      if (sourcesNeeded.length > 0 && !status.generating) {
-        const total = Math.max(
-          status.pending,
-          status.effnet_pending,
-          status.features_pending,
-        );
+      if (needsWork && !status.generating) {
+        const total = Math.max(maestPending, rhythmPending);
         const workParts: string[] = [];
-        if (status.pending > 0) workParts.push(`${status.pending} CLAP`);
-        if (status.effnet_pending > 0)
-          workParts.push(`${status.effnet_pending} EffNet`);
-        if (status.features_pending > 0)
-          workParts.push(`${status.features_pending} audio features`);
+        if (maestPending > 0) workParts.push(`${maestPending} MAEST`);
+        if (rhythmPending > 0) workParts.push(`${rhythmPending} rhythm`);
         const detail =
           workParts.length > 1 ? ` (${workParts.join(", ")})` : "";
-        toast(`Generating embeddings for ${total} tracks${detail}…`, "ok");
+        toast(`Analysing ${total} tracks${detail}…`, "ok");
         m.embeddingsGenerating = true;
         this.canvas.scheduleDraw();
 
@@ -1014,8 +1024,9 @@ export class Controller {
         const status = await api<{
           model_ready: boolean;
           effnet_model_ready: boolean;
+          maest_model_ready?: boolean;
         }>("/api/embeddings/status?folder=&recursive=1&models_only=1");
-        if (status.model_ready && status.effnet_model_ready) {
+        if (status.maest_model_ready !== false) {
           toast("Models ready", "ok");
           await this._ensureEmbeddingsAndProject();
         } else {
@@ -2365,6 +2376,7 @@ export class Controller {
   private _startPreview(track: Track): void {
     if (!track || this.previewPath === track.path) return;
     this.previewPath = track.path;
+    this.$audio.volume = this.model.previewVolume;
     this.$audio.src = `/api/audio/${encodeURIComponent(track.path)}`;
     this.$audio.onloadedmetadata = () => {
       this.$audio.currentTime = this.$audio.duration * 0.4;
@@ -2378,6 +2390,204 @@ export class Controller {
     this.$audio.pause();
     this.$audio.removeAttribute("src");
     this.$audio.load();
+  }
+
+  /* ── Analysis queue + clustering ────────────────────────── */
+
+  private _jobsEventSource: EventSource | null = null;
+  private _clusterFetchPending = false;
+
+  /** Subscribe to queue progress.
+   *
+   * The server opens the stream with a full snapshot, so a client that
+   * connects late (or reloads mid-run) immediately renders correct totals
+   * rather than inferring them from subsequent events.
+   */
+  private _listenJobStream(): void {
+    this._closeJobStream();
+    const es = new EventSource("/api/jobs/stream");
+    this._jobsEventSource = es;
+
+    const applySnapshot = (data: QueueStatus) => {
+      this.model.queueStatus = data;
+      this.status.update(this.model);
+    };
+
+    es.addEventListener("snapshot", ((e: MessageEvent) => {
+      applySnapshot(JSON.parse(e.data) as QueueStatus);
+    }) as EventListener);
+
+    es.addEventListener("stats", (() => {
+      void this._refreshQueueStatus();
+    }) as EventListener);
+
+    es.addEventListener("progress", ((e: MessageEvent) => {
+      const d = JSON.parse(e.data) as {
+        kind: string;
+        path?: string;
+        ok?: boolean;
+      };
+      const m = this.model;
+      const q = m.queueStatus;
+      if (q && q.kinds[d.kind]) {
+        // Optimistic local increment keeps the counter smooth between the
+        // periodic authoritative refreshes below.
+        const k = q.kinds[d.kind];
+        if (d.ok) k.done++;
+        else k.failed++;
+        if (k.pending > 0) k.pending--;
+        k.finished = k.done + k.failed;
+        k.outstanding = k.pending + k.running;
+        k.last = {
+          path: d.path ?? null,
+          ok: d.ok ?? null,
+          detail: {},
+          at: Date.now() / 1000,
+        };
+        this.status.update(m);
+      }
+    }) as EventListener);
+
+    es.addEventListener("drained", (() => {
+      void this._refreshQueueStatus();
+      toast("Analysis stage complete", "ok");
+    }) as EventListener);
+
+    es.onerror = () => {
+      // Browser auto-reconnects EventSource; nothing to do but stop shouting.
+    };
+  }
+
+  private _closeJobStream(): void {
+    if (this._jobsEventSource) {
+      this._jobsEventSource.close();
+      this._jobsEventSource = null;
+    }
+  }
+
+  /** Pull authoritative queue counts (SQL aggregates on the server). */
+  private async _refreshQueueStatus(): Promise<void> {
+    try {
+      const st = await api<QueueStatus>("/api/jobs/status");
+      const m = this.model;
+      const prevRevision = m.clusterRevision;
+      m.queueStatus = st;
+      this.status.update(m);
+      // Clustering finished or changed → refresh assignments.
+      const rev = st.clusters?.revision ?? null;
+      if (rev && rev !== prevRevision) {
+        await this._fetchClusters();
+      }
+    } catch {
+      /* transient; next tick retries */
+    }
+  }
+
+  /** Fetch cluster assignments at the selected resolution. */
+  private async _fetchClusters(): Promise<void> {
+    if (this._clusterFetchPending) return;
+    this._clusterFetchPending = true;
+    const m = this.model;
+    try {
+      const d = await api<{
+        available: boolean;
+        revision?: string;
+        resolution?: number;
+        resolutions?: number[];
+        n_clusters?: number;
+        assignments?: Record<string, number>;
+        names?: Record<string, string>;
+        sizes?: Record<string, number>;
+        modularity?: number | null;
+      }>(`/api/clusters?resolution=${m.clusterResolution}`);
+
+      if (!d.available) {
+        m.clustersAvailable = false;
+        m.clusterAssignments = new Map();
+        m.clusterNames = new Map();
+        m.clusterSizes = new Map();
+        this._renderClusterPanel();
+        return;
+      }
+
+      m.clustersAvailable = true;
+      m.clusterRevision = d.revision ?? null;
+      m.clusterResolutions = d.resolutions ?? [];
+      if (typeof d.resolution === "number") m.clusterResolution = d.resolution;
+      m.clusterAssignments = new Map(Object.entries(d.assignments ?? {}));
+      m.clusterNames = new Map(
+        Object.entries(d.names ?? {}).map(([k, v]) => [Number(k), v]),
+      );
+      m.clusterSizes = new Map(
+        Object.entries(d.sizes ?? {}).map(([k, v]) => [Number(k), v]),
+      );
+      this._renderClusterPanel();
+      this.canvas.scheduleDraw();
+    } catch {
+      /* api() already toasted */
+    } finally {
+      this._clusterFetchPending = false;
+    }
+  }
+
+  /** Render the microgenre list (largest clusters first). */
+  private _renderClusterPanel(): void {
+    const m = this.model;
+    const $meta = document.getElementById("cluster-meta");
+    const $list = document.getElementById("cluster-list");
+    if (!$meta || !$list) return;
+
+    if (!m.clustersAvailable) {
+      $meta.textContent = m.queueStatus?.models?.maest_ready
+        ? "No clusters yet — run analysis."
+        : "Waiting for MAEST model…";
+      $list.replaceChildren();
+      return;
+    }
+
+    const n = m.clusterNames.size || m.clusterSizes.size;
+    $meta.textContent = `${n} clusters at resolution ${m.clusterResolution}`;
+
+    const entries = [...m.clusterSizes.entries()].sort((a, b) => b[1] - a[1]);
+    $list.replaceChildren();
+    for (const [cid, size] of entries) {
+      const li = document.createElement("li");
+      li.className = "cluster-item";
+      li.dataset.cluster = String(cid);
+
+      const sw = document.createElement("span");
+      sw.className = "cluster-swatch";
+      sw.style.background = clusterColor(cid);
+
+      const label = document.createElement("span");
+      label.className = "cluster-name";
+      label.textContent = m.clusterNames.get(cid) || `Cluster ${cid}`;
+
+      const count = document.createElement("span");
+      count.className = "cluster-count";
+      count.textContent = String(size);
+
+      li.append(sw, label, count);
+      // Click a cluster to select its tracks — the main way to act on a
+      // discovered microgenre (move to a folder, tag it, audition it).
+      li.addEventListener("click", () => this._selectCluster(cid));
+      $list.appendChild(li);
+    }
+  }
+
+  private _selectCluster(cid: number): void {
+    const m = this.model;
+    m.selected.clear();
+    for (const [path, id] of m.clusterAssignments) {
+      if (id === cid) m.selected.add(path);
+    }
+    m.emit("change");
+    toast(
+      `Selected ${m.selected.size} tracks in ${
+        m.clusterNames.get(cid) || `cluster ${cid}`
+      }`,
+      "ok",
+    );
   }
 
   /* ── Sidebar controls ───────────────────────────────────── */
@@ -2399,6 +2609,20 @@ export class Controller {
       m.saveLS();
     });
 
+    const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
+    if ($pv) {
+      $pv.value = String(m.previewVolume);
+      this.$audio.volume = m.previewVolume;
+      $pv.addEventListener("input", () => {
+        m.previewVolume = clamp(parseFloat($pv.value) || 0, 0, 1);
+        this.$audio.volume = m.previewVolume;
+      });
+      $pv.addEventListener("change", () => {
+        m.previewVolume = clamp(parseFloat($pv.value) || 0, 0, 1);
+        m.saveLS();
+      });
+    }
+
     $vm.checked = m.viewMode === "embeddings";
     $vm.addEventListener("change", () => void this._toggleViewMode());
 
@@ -2412,6 +2636,55 @@ export class Controller {
       $ex.addEventListener("change", () => {
         m.explodeStrength = clamp(parseFloat($ex.value) || 0.1, 0.05, 0.2);
         m.saveLS();
+      });
+    }
+
+    const $cc = document.getElementById(
+      "cluster-color-toggle",
+    ) as HTMLInputElement | null;
+    if ($cc) {
+      $cc.checked = m.colorByCluster;
+      $cc.addEventListener("change", () => {
+        m.colorByCluster = $cc.checked;
+        m.saveLS();
+        if (m.colorByCluster && !m.clustersAvailable) void this._fetchClusters();
+        this.canvas.scheduleDraw();
+      });
+    }
+
+    const $cr = document.getElementById(
+      "cluster-resolution-range",
+    ) as HTMLInputElement | null;
+    if ($cr) {
+      // The slider indexes the server's resolution list rather than carrying
+      // raw values — the set of resolutions is a server-side decision.
+      const syncSlider = () => {
+        const list = m.clusterResolutions;
+        if (!list.length) return;
+        $cr.max = String(list.length - 1);
+        const idx = list.indexOf(m.clusterResolution);
+        $cr.value = String(idx >= 0 ? idx : Math.floor(list.length / 2));
+      };
+      syncSlider();
+      $cr.addEventListener("change", () => {
+        const list = m.clusterResolutions;
+        if (!list.length) return;
+        const idx = clamp(parseInt($cr.value, 10) || 0, 0, list.length - 1);
+        m.clusterResolution = list[idx];
+        m.saveLS();
+        void this._fetchClusters();
+      });
+    }
+
+    const $rebuild = document.getElementById("btn-rebuild-clusters");
+    if ($rebuild) {
+      $rebuild.addEventListener("click", async () => {
+        try {
+          await postJSON("/api/clusters/rebuild", {});
+          toast("Clustering queued…", "ok");
+        } catch {
+          /* api() already toasted */
+        }
       });
     }
 
@@ -2608,6 +2881,22 @@ export class Controller {
     hk.on("undo", () => void this.cmdMgr.undo(m));
 
     hk.on("toggle-view", () => void this._toggleViewMode());
+
+    hk.on("toggle-clusters", () => {
+      const m = this.model;
+      m.colorByCluster = !m.colorByCluster;
+      const $cc = document.getElementById(
+        "cluster-color-toggle",
+      ) as HTMLInputElement | null;
+      if ($cc) $cc.checked = m.colorByCluster;
+      m.saveLS();
+      if (m.colorByCluster && !m.clustersAvailable) void this._fetchClusters();
+      toast(
+        m.colorByCluster ? "Colouring by cluster" : "Colouring by folder",
+        "ok",
+      );
+      this.canvas.scheduleDraw();
+    });
 
     hk.on("deselect", () => {
       const cv = this.canvas;

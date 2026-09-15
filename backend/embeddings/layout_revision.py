@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Sequence
 from typing import Any
 
 from .projection_config import PROJECTION_RECIPE_VERSION
@@ -19,7 +20,7 @@ FOLDER_SEMANTIC_BASIS_VERSION = 1
 def compute_layout_revision(
     *,
     eligible_paths: list[str],
-    cache_versions: tuple[int, int, int],
+    cache_versions: Sequence[int],
     folder_semantic_basis_version: int = FOLDER_SEMANTIC_BASIS_VERSION,
     projection_recipe_version: int = PROJECTION_RECIPE_VERSION,
 ) -> str:

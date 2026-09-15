@@ -3,8 +3,17 @@ mutagen>=1.47
 python-dotenv>=1.0
 numpy>=1.24
 torch>=2.0
+torchaudio>=2.0
 transformers>=4.40
 librosa>=0.10
+
+# MAEST — primary genre model (519 Discogs style logits + 768-D embedding).
+# Checkpoint auto-downloads to ~/.cache/torch/hub/checkpoints on first use.
+maest-infer>=0.2.0
+
+# Multi-resolution Leiden community detection over the cosine kNN graph.
+leidenalg>=0.10
+igraph>=0.11
 # madmom builds from source unless a wheel exists; if pip fails: ``pip install cython && pip install madmom --no-build-isolation``
 cython>=3.0.10
 madmom>=0.16.1

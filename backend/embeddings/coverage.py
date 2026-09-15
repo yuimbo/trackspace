@@ -6,7 +6,8 @@ Cache rows are keyed by *fingerprint*; API stats and job queues are defined in
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -18,15 +19,30 @@ class SourceVersions:
     clap: int
     effnet: int
     features: int
+    maest: int = 0
+    rhythm: int = 0
 
 
 @dataclass(frozen=True)
 class CachedSourceMaps:
     """Fingerprint → row maps from one batch read per source."""
 
-    clap: dict[str, object]
-    effnet: dict[str, object]
-    features: dict[str, object]
+    clap: Mapping[str, object]
+    effnet: Mapping[str, object]
+    features: Mapping[str, object]
+    maest: Mapping[str, object] = field(default_factory=dict)
+    maest_logits: Mapping[str, object] = field(default_factory=dict)
+    rhythm: Mapping[str, object] = field(default_factory=dict)
+
+    def for_source(self, source: str) -> Mapping[str, object]:
+        return {
+            "clap": self.clap,
+            "effnet": self.effnet,
+            "features": self.features,
+            "maest": self.maest,
+            "maest_logits": self.maest_logits,
+            "rhythm": self.rhythm,
+        }[source]
 
 
 def batch_fetch_maps(
@@ -38,6 +54,9 @@ def batch_fetch_maps(
         clap=feature_cache.get_all_embeddings(fingerprints, version=versions.clap),
         effnet=feature_cache.get_all_effnet_embeddings(fingerprints, version=versions.effnet),
         features=feature_cache.get_all_audio_features(fingerprints, version=versions.features),
+        maest=feature_cache.get_all_maest_embeddings(fingerprints, version=versions.maest),
+        maest_logits=feature_cache.get_all_maest_logits(fingerprints, version=versions.maest),
+        rhythm=feature_cache.get_all_rhythm_features(fingerprints, version=versions.rhythm),
     )
 
 
@@ -46,8 +65,7 @@ def tracks_with_fp_in_maps(
     maps: CachedSourceMaps,
     source: str,
 ) -> int:
-    key = {"clap": maps.clap, "effnet": maps.effnet, "features": maps.features}[source]
-    have = frozenset(key.keys())
+    have = frozenset(maps.for_source(source).keys())
     return sum(1 for t in infos if t.get("fingerprint") and t["fingerprint"] in have)
 
 
@@ -62,20 +80,22 @@ def eligible_paths_for_projection(
     infos: list[dict],
     maps: CachedSourceMaps,
     sources: tuple[str, ...],
+    required: tuple[str, ...] | None = None,
 ) -> list[str]:
-    """Paths that have cache data for every enabled *sources* entry."""
+    """Paths that can be placed on the map.
+
+    A track needs cache data for every *required* source (defaulting to all of
+    *sources*). Optional sources contribute a neutral zero row when missing, so
+    demanding all of them would needlessly hide partially analysed tracks.
+    """
+    need = tuple(s for s in (required if required is not None else sources) if s in sources)
     out: list[str] = []
     for t in infos:
         fp = t.get("fingerprint")
         if not fp:
             continue
-        if "clap" in sources and fp not in maps.clap:
-            continue
-        if "effnet" in sources and fp not in maps.effnet:
-            continue
-        if "features" in sources and fp not in maps.features:
-            continue
-        out.append(t["path"])
+        if all(fp in maps.for_source(s) for s in need):
+            out.append(t["path"])
     out.sort()
     return out
 
@@ -86,23 +106,24 @@ def build_generation_work(
     sources: list[str],
     versions: SourceVersions,
 ) -> list[tuple[dict, list[str]]]:
-    """(track_info, needed_source_names) for tracks missing at least one source."""
+    """(track_info, needed_source_names) for tracks missing at least one source.
+
+    Uses one batched read per source rather than a ``has_*`` call per track per
+    source — at ~7.4k tracks the per-track form issued tens of thousands of
+    SQLite round-trips just to decide what to queue.
+    """
+    fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
+    maps = batch_fetch_maps(feature_cache, fps, versions)
+
+    # "maest_logits" rides along with "maest" — one model pass produces both.
+    checkable = [s for s in sources if s in ("clap", "effnet", "features", "maest", "rhythm")]
+
     work: list[tuple[dict, list[str]]] = []
     for t in infos:
         fp = t.get("fingerprint")
         if not fp:
             continue
-        needed: list[str] = []
-        if "clap" in sources and not feature_cache.has_embedding(fp, version=versions.clap):
-            needed.append("clap")
-        if "effnet" in sources and not feature_cache.has_effnet_embedding(
-            fp, version=versions.effnet
-        ):
-            needed.append("effnet")
-        if "features" in sources and not feature_cache.has_audio_features(
-            fp, version=versions.features
-        ):
-            needed.append("features")
+        needed = [s for s in checkable if fp not in maps.for_source(s)]
         if needed:
             work.append((t, needed))
     return work
@@ -120,10 +141,14 @@ def coverage_payload(
     tracks_with_clap = tracks_with_fp_in_maps(infos, maps, "clap")
     tracks_with_effnet = tracks_with_fp_in_maps(infos, maps, "effnet")
     tracks_with_features = tracks_with_fp_in_maps(infos, maps, "features")
+    tracks_with_maest = tracks_with_fp_in_maps(infos, maps, "maest")
+    tracks_with_rhythm = tracks_with_fp_in_maps(infos, maps, "rhythm")
 
     pending_clap = pending_tracks_for_source(fingerprinted, tracks_with_clap)
     pending_effnet = pending_tracks_for_source(fingerprinted, tracks_with_effnet)
     pending_features = pending_tracks_for_source(fingerprinted, tracks_with_features)
+    pending_maest = pending_tracks_for_source(fingerprinted, tracks_with_maest)
+    pending_rhythm = pending_tracks_for_source(fingerprinted, tracks_with_rhythm)
 
     return {
         "tracks_total": total,
@@ -134,10 +159,16 @@ def coverage_payload(
         "tracks_pending_effnet": pending_effnet,
         "tracks_with_audio_features": tracks_with_features,
         "tracks_pending_audio_features": pending_features,
+        "tracks_with_maest": tracks_with_maest,
+        "tracks_pending_maest": pending_maest,
+        "tracks_with_rhythm": tracks_with_rhythm,
+        "tracks_pending_rhythm": pending_rhythm,
         "cache_versions": {
             "clap": versions.clap,
             "effnet": versions.effnet,
             "audio_features": versions.features,
+            "maest": versions.maest,
+            "rhythm": versions.rhythm,
         },
         # Legacy names (same values as track-space counts above)
         "total": total,

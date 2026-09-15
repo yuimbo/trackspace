@@ -12,6 +12,7 @@ from flask import Flask
 
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
+from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
 from backend.routes.api_tags import create_api_tags_blueprint
 from backend.routes.static_audio import create_static_audio_blueprint
@@ -30,11 +31,8 @@ class TrackspaceBlueprintDeps:
     feature_cache: Any
     source_versions_cls: type
     batch_fetch_maps: Callable[..., Any]
-    build_generation_work: Callable[..., Any]
     coverage_payload: Callable[..., Any]
     layout_revision_for_projection: Callable[..., Any]
-    embed_lock: threading.Lock
-    embed_status: dict[str, Any]
     status_cache: Any
     library_mtime_signature: Callable[[str, bool], str]
     track_infos_cached: Callable[[str, bool, str], list[dict[str, Any]]]
@@ -44,7 +42,6 @@ class TrackspaceBlueprintDeps:
     broadcast_embed_event: Callable[[dict[str, Any]], None]
     emit_decode_warning_once: Callable[[str, str, set[str]], None]
     broadcaster: Any
-    is_generating: Callable[[], bool]
     sse_response: Callable[[Any], Any]
     # Library
     list_mp3s: Callable[[str, bool], list[str]]
@@ -70,6 +67,16 @@ class TrackspaceBlueprintDeps:
     virtual_from_abs: Callable[[str], str]
     # Static / audio
     dist_dir: str
+    # Analysis queue / clustering
+    job_queue: Any
+    workers: Any
+    clusters: Any
+    enqueue_library_work: Callable[..., dict[str, int]]
+    enqueue_clustering: Callable[..., int]
+    enqueue_analysis: Callable[..., dict[str, int]]
+    analysis_deps: Any
+    maest_mod: Any
+    rhythm_version: int
 
 
 def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
@@ -84,11 +91,8 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             feature_cache=deps.feature_cache,
             source_versions_cls=deps.source_versions_cls,
             batch_fetch_maps=deps.batch_fetch_maps,
-            build_generation_work=deps.build_generation_work,
             coverage_payload=deps.coverage_payload,
             layout_revision_for_projection=deps.layout_revision_for_projection,
-            embed_lock=deps.embed_lock,
-            embed_status=deps.embed_status,
             status_cache=deps.status_cache,
             library_mtime_signature=deps.library_mtime_signature,
             track_infos_cached=deps.track_infos_cached,
@@ -100,8 +104,11 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             broadcast_embed_event=deps.broadcast_embed_event,
             emit_decode_warning_once=deps.emit_decode_warning_once,
             broadcaster=deps.broadcaster,
-            is_generating=deps.is_generating,
             sse_response=deps.sse_response,
+            enqueue_analysis=deps.enqueue_analysis,
+            job_queue=deps.job_queue,
+            maest_mod=deps.maest_mod,
+            rhythm_version=deps.rhythm_version,
         )
     )
     app.register_blueprint(
@@ -140,6 +147,20 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
         create_api_tags_blueprint(
             list_mp3s=deps.list_mp3s,
             resolve_virtual_path=deps.resolve_virtual_path,
+        )
+    )
+    app.register_blueprint(
+        create_api_jobs_blueprint(
+            job_queue=deps.job_queue,
+            workers=deps.workers,
+            clusters=deps.clusters,
+            build_track_infos_fn=deps.build_track_infos_fn,
+            enqueue_library_work=deps.enqueue_library_work,
+            enqueue_clustering=deps.enqueue_clustering,
+            analysis_deps=deps.analysis_deps,
+            broadcaster=deps.broadcaster,
+            sse_response=deps.sse_response,
+            maest_mod=deps.maest_mod,
         )
     )
     app.register_blueprint(

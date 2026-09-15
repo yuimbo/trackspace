@@ -1,4 +1,4 @@
-import type { Model } from "../model";
+import type { Model, QueueStatus } from "../model";
 
 const PANEL_HIDE_MS = 140;
 
@@ -35,12 +35,16 @@ export class StatusView {
       if (this._hoverAnchor === el) return;
       this._hoverAnchor = el;
       this._clearHideTimer();
-      const kind = el.dataset.detailKind as "library" | "embed" | undefined;
+      const kind = el.dataset.detailKind as
+        | "library"
+        | "embed"
+        | "queue"
+        | undefined;
       if (!kind) return;
-      const html =
-        kind === "library"
-          ? this._libraryPanelHtml(this._model)
-          : this._embedPanelHtml(this._model);
+      let html: string;
+      if (kind === "library") html = this._libraryPanelHtml(this._model);
+      else if (kind === "embed") html = this._embedPanelHtml(this._model);
+      else html = this._queuePanelHtml(this._model);
       this._showPanel(el, html, kind);
     });
 
@@ -61,13 +65,17 @@ export class StatusView {
       );
       if (!el || !this.$el.contains(el)) return;
       this._clearHideTimer();
-      const kind = el.dataset.detailKind as "library" | "embed" | undefined;
+      const kind = el.dataset.detailKind as
+        | "library"
+        | "embed"
+        | "queue"
+        | undefined;
       if (!kind) return;
       this._hoverAnchor = el;
-      const html =
-        kind === "library"
-          ? this._libraryPanelHtml(this._model)
-          : this._embedPanelHtml(this._model);
+      let html: string;
+      if (kind === "library") html = this._libraryPanelHtml(this._model);
+      else if (kind === "embed") html = this._embedPanelHtml(this._model);
+      else html = this._queuePanelHtml(this._model);
       this._showPanel(el, html, kind);
     });
 
@@ -172,7 +180,7 @@ ${last}
     const p = model.embeddingProgress!;
     const pct =
       p.total > 0 ? Math.round((100 * p.done) / p.total) : 0;
-    const srcs = "CLAP, EffNet, audio features (tempo·energy·dance)";
+    const srcs = "MAEST genre logits, MAEST embedding, rhythm, CLAP, EffNet";
     let last = "";
     if (p.lastPath) {
       const ok =
@@ -191,6 +199,48 @@ ${last}
 <div class="status-detail-kv"><span>Active sources</span><span>${esc(srcs)}</span></div>
 ${last}
 <div class="status-detail-note">The server runs CLAP per track and batches EffNet and classical features. The UI refreshes the projection periodically (PCA) while generation continues.</div>`;
+  }
+
+  private _queuePanelHtml(model: Model): string {
+    const q: QueueStatus | null = model.queueStatus;
+    if (!q) {
+      return `
+<div class="status-detail-title">Analysis queue</div>
+<div class="status-detail-note">No analysis queued.</div>`;
+    }
+    const rows: string[] = [];
+    for (const kind of q.order) {
+      const k = q.kinds[kind];
+      if (!k || k.total === 0) continue;
+      const pct = Math.round((100 * k.done) / k.total);
+      const failed =
+        k.failed > 0
+          ? ` · <span class="status-detail-bad">${k.failed} failed</span>`
+          : "";
+      rows.push(
+        `<div class="status-detail-kv"><span>${esc(k.label)}</span><span>${k.done} / ${k.total} (${pct}%)${failed}</span></div>`,
+      );
+    }
+    let newest: { path: string; at: number } | null = null;
+    for (const kind of q.order) {
+      const last = q.kinds[kind]?.last;
+      if (!last || !last.path) continue;
+      if (!newest || last.at > newest.at) {
+        newest = { path: last.path, at: last.at };
+      }
+    }
+    const lastRow = newest
+      ? `<div class="status-detail-kv"><span>Last</span><span class="status-detail-mono">${esc(newest.path)}</span></div>`
+      : "";
+    const maestError = q.models?.maest_error
+      ? `<div class="status-detail-kv"><span>MAEST</span><span class="status-detail-bad">${esc(q.models.maest_error)}</span></div>`
+      : "";
+    return `
+<div class="status-detail-title">Analysis queue</div>
+${rows.join("\n")}
+${lastRow}
+${maestError}
+<div class="status-detail-note">Analysis work is persisted in a SQLite queue, so progress survives a restart and interrupted jobs resume automatically. Failed jobs are retried a few times before being listed.</div>`;
   }
 
   update(model: Model): void {
@@ -231,7 +281,7 @@ ${last}
     if (model.viewMode === "embeddings") {
       addSep();
       const mode = document.createElement("span");
-      mode.textContent = "Embedding Space (t-SNE) — CLAP+EffNet+audio";
+      mode.textContent = "Embedding Space (t-SNE) — MAEST+rhythm";
       this.$el.appendChild(mode);
     }
 
@@ -245,6 +295,32 @@ ${last}
       const ep = model.embeddingProgress;
       a.textContent = `generating ${ep.done}/${ep.total}`;
       this.$el.appendChild(a);
+    }
+
+    if (model.queueStatus && model.queueStatus.outstanding > 0) {
+      const qs = model.queueStatus;
+      let label = "";
+      let finished = 0;
+      let total = 0;
+      for (const kind of qs.order) {
+        const k = qs.kinds[kind];
+        if (k && k.outstanding > 0) {
+          label = k.label;
+          finished = k.finished;
+          total = k.total;
+          break;
+        }
+      }
+      if (label) {
+        addSep();
+        const a = document.createElement("span");
+        a.className = "status-hoverable";
+        a.dataset.detailKind = "queue";
+        a.tabIndex = 0;
+        a.setAttribute("aria-describedby", "status-detail-panel");
+        a.textContent = `${label.charAt(0).toLowerCase()}${label.slice(1)} ${finished}/${total}`;
+        this.$el.appendChild(a);
+      }
     }
 
     if (reopenKind === "library" && model.libraryLoadProgress) {
@@ -262,6 +338,15 @@ ${last}
         '[data-detail-kind="embed"]',
       ) as HTMLElement | null;
       if (el) this._showPanel(el, this._embedPanelHtml(model), "embed");
+    } else if (
+      reopenKind === "queue" &&
+      model.queueStatus &&
+      model.queueStatus.outstanding > 0
+    ) {
+      const el = this.$el.querySelector(
+        '[data-detail-kind="queue"]',
+      ) as HTMLElement | null;
+      if (el) this._showPanel(el, this._queuePanelHtml(model), "queue");
     } else if (reopenKind) {
       this._panel.hidden = true;
       delete this._panel.dataset.openKind;

@@ -8,6 +8,37 @@ export interface TrackAudioFeatures {
   danceability: number;
 }
 
+/** Counts for one job kind, as reported by ``/api/jobs/status``. */
+export interface QueueKindStatus {
+  label: string;
+  pending: number;
+  running: number;
+  done: number;
+  failed: number;
+  total: number;
+  finished: number;
+  outstanding: number;
+  last?: {
+    path: string | null;
+    ok: boolean | null;
+    detail: Record<string, unknown>;
+    at: number;
+  };
+}
+
+/** Whole-queue snapshot; ``order`` lists kinds in pipeline order. */
+export interface QueueStatus {
+  kinds: Record<string, QueueKindStatus>;
+  order: string[];
+  outstanding: number;
+  total: number;
+  finished: number;
+  active: boolean;
+  epoch: number;
+  models?: { maest_ready: boolean; maest_error: string | null };
+  clusters?: { available: boolean; revision: string | null };
+}
+
 export interface Track {
   path: string;
   filename: string;
@@ -116,6 +147,8 @@ export class Model extends EventBus {
   filterRanges: Record<string, [number, number]> = {};
   selected = new Set<string>();
   hoverPreview = false;
+  /** Hover preview playback level [0, 1]. */
+  previewVolume = 1;
   vp: Viewport = { ox: 0, oy: 0, zoom: 1 };
   _knownTags: string[] = [];
 
@@ -148,6 +181,30 @@ export class Model extends EventBus {
     lastPath?: string;
     lastTitle?: string;
   } | null = null;
+
+  /* ── Analysis queue ─────────────────────────────────────────
+   * Mirrors ``/api/jobs/status``. Counts come from SQL aggregates on the
+   * server, so they stay correct across restarts — the UI never has to
+   * reconstruct progress from a stream of events it may have missed.
+   */
+  queueStatus: QueueStatus | null = null;
+
+  /* ── Clustering ─────────────────────────────────────────────
+   * ``clusterAssignments`` maps track path → cluster id at the currently
+   * selected resolution; ``clusterNames`` labels those ids. Colouring by
+   * cluster is what makes the microgenre structure legible on the map.
+   */
+  clusterAssignments: Map<string, number> = new Map();
+  clusterNames: Map<number, string> = new Map();
+  clusterSizes: Map<number, number> = new Map();
+  /** Available Leiden resolutions (coarse → fine), from the server. */
+  clusterResolutions: number[] = [];
+  /** Currently displayed resolution; persisted. */
+  clusterResolution = 1.5;
+  /** Colour dots by cluster instead of by folder; persisted. */
+  colorByCluster = false;
+  clusterRevision: string | null = null;
+  clustersAvailable = false;
 
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
@@ -625,8 +682,11 @@ export class Model extends EventBus {
         axisY: this.axisY,
         filterRanges: this.filterRanges,
         hoverPreview: this.hoverPreview,
+        previewVolume: this.previewVolume,
         viewMode: this.viewMode,
         explodeStrength: this.explodeStrength,
+        clusterResolution: this.clusterResolution,
+        colorByCluster: this.colorByCluster,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -645,11 +705,20 @@ export class Model extends EventBus {
         this.axisY = _migrateLibrosaAxisId(d.axisY ?? null);
         this.filterRanges = _migrateFilterRanges(d.filterRanges);
         this.hoverPreview = d.hoverPreview ?? false;
+        const pv = Number((d as { previewVolume?: number }).previewVolume);
+        this.previewVolume = Number.isFinite(pv)
+          ? Math.min(1, Math.max(0, pv))
+          : 1;
         this.viewMode = d.viewMode ?? "tags";
         const ex = Number((d as { explodeStrength?: number }).explodeStrength);
         this.explodeStrength = Number.isFinite(ex)
           ? Math.min(0.2, Math.max(0.05, ex))
           : 0.1;
+        const cr = Number((d as { clusterResolution?: number }).clusterResolution);
+        this.clusterResolution = Number.isFinite(cr) && cr > 0 ? cr : 1.5;
+        this.colorByCluster = Boolean(
+          (d as { colorByCluster?: boolean }).colorByCluster,
+        );
       }
     } catch {
       /* start fresh */

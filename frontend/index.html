@@ -48,7 +48,19 @@
 
   <section id="options-section" x-data>
     <h2>Options</h2>
-    <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
+    <div class="option-row hover-preview-row">
+      <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
+      <input
+        type="range"
+        id="hover-preview-volume"
+        min="0"
+        max="1"
+        step="0.01"
+        value="1"
+        title="Preview volume"
+        aria-label="Hover preview volume"
+      />
+    </div>
     <label><input type="checkbox" id="view-mode-toggle" /> Embedding space <kbd>E</kbd></label>
     <label class="folder-tune">
       <span>Explode <kbd>X</kbd> + scroll</span>
@@ -61,6 +73,31 @@
         value="0.10"
       />
     </label>
+  </section>
+
+  <section id="cluster-section" x-data>
+    <h2>Microgenres</h2>
+    <label>
+      <input type="checkbox" id="cluster-color-toggle" /> Colour by cluster
+      <kbd>C</kbd>
+    </label>
+    <label class="folder-tune">
+      <span>Granularity</span>
+      <input
+        type="range"
+        id="cluster-resolution-range"
+        min="0"
+        max="5"
+        step="1"
+        value="3"
+        title="Leiden resolution: left = broad genres, right = microgenres"
+      />
+    </label>
+    <div id="cluster-meta" class="cluster-meta"></div>
+    <ul id="cluster-list" class="cluster-list"></ul>
+    <button id="btn-rebuild-clusters" type="button" title="Recompute clusters">
+      Rebuild clusters
+    </button>
   </section>
 
   <section id="features-section" x-data>

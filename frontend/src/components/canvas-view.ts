@@ -1,6 +1,6 @@
 import type { Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
-import { dirColor } from "../lib/toast";
+import { clusterColor, dirColor } from "../lib/toast";
 import { displayFolderPath } from "../lib/path-presenter";
 
 
@@ -282,6 +282,8 @@ export class CanvasView {
     ctx.lineWidth = 1;
     ctx.strokeRect(sLeft, sTop, sRight - sLeft, sBottom - sTop);
 
+    this._drawAxisBackgroundLabels(w, h, sLeft, sRight, sTop, sBottom);
+
     const pickStep = (worldRange: number, pxRange: number): number => {
       const ideal = (worldRange / pxRange) * 60;
       const steps = [0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1];
@@ -376,22 +378,64 @@ export class CanvasView {
       ctx.fillText(v.toFixed(stepY < 0.1 ? 2 : 1), 32, sy);
     }
 
-    // Axis names
+    // Embedding mode caption (tag axes use large background labels only)
     ctx.fillStyle = "rgba(255,255,255,0.25)";
     ctx.font = "10px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
     if (m.viewMode === "embeddings") {
       ctx.fillText("Embedding Space", w / 2, h - 2);
-    } else {
-      if (m.axisX) ctx.fillText(m.axisDisplayName(m.axisX), w / 2, h - 2);
-      if (m.axisY) {
-        ctx.save();
-        ctx.translate(8, h / 2);
-        ctx.rotate(-Math.PI / 2);
-        ctx.fillText(m.axisDisplayName(m.axisY), 0, 0);
-        ctx.restore();
-      }
+    }
+
+    ctx.restore();
+  }
+
+  /**
+   * Large watermark-style axis titles at the plot edges (tag mode only).
+   * Drawn behind grid lines and points so they read as canvas background.
+   */
+  private _drawAxisBackgroundLabels(
+    w: number,
+    h: number,
+    sLeft: number,
+    sRight: number,
+    sTop: number,
+    sBottom: number,
+  ): void {
+    const m = this.model;
+    if (m.viewMode === "embeddings") return;
+
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.fillStyle = "rgba(255,255,255,0.13)";
+    ctx.font = "600 28px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.textBaseline = "middle";
+
+    if (m.axisX) {
+      const cx = (sLeft + sRight) / 2;
+      const tickRowTop = h - 14;
+      const band = tickRowTop - sBottom;
+      const cy =
+        band > 6
+          ? sBottom + band * 0.48
+          : Math.min(sBottom + 18, h - 22);
+      ctx.textAlign = "center";
+      ctx.fillText(m.axisDisplayName(m.axisX), cx, cy);
+    }
+
+    if (m.axisY) {
+      const cy = (sTop + sBottom) / 2;
+      const idealX = sLeft - 22;
+      const cx =
+        sLeft > w - 20
+          ? 24
+          : Math.max(24, Math.min(idealX, w - 24));
+      ctx.textAlign = "center";
+      ctx.save();
+      ctx.translate(cx, cy);
+      ctx.rotate(-Math.PI / 2);
+      ctx.fillText(m.axisDisplayName(m.axisY), 0, 0);
+      ctx.restore();
     }
 
     ctx.restore();
@@ -577,7 +621,7 @@ export class CanvasView {
       if (!this._inFolderGlow(track)) continue;
       gc.beginPath();
       gc.arc(pos.sx, pos.sy, DOT_R + 6, 0, Math.PI * 2);
-      gc.fillStyle = dirColor(track.folder ?? "");
+      gc.fillStyle = this.trackColor(track);
       gc.fill();
     }
     gc.globalAlpha = 1;
@@ -615,6 +659,21 @@ export class CanvasView {
     ctx.restore();
   }
 
+  /** Base colour for a track: cluster hue when enabled, else folder hue.
+   *
+   * Falls back to the folder colour whenever the track has no cluster yet
+   * (still being analysed), so partially analysed libraries never render as a
+   * field of grey dots.
+   */
+  trackColor(track: Track): string {
+    const m = this.model;
+    if (m.colorByCluster && m.clusterAssignments.size > 0) {
+      const cid = m.clusterAssignments.get(track.path);
+      if (cid !== undefined) return clusterColor(cid);
+    }
+    return dirColor(track.folder ?? "");
+  }
+
   /* ── Single dot ─────────────────────────────────────────── */
 
   private _dot(sx: number, sy: number, track: Track, idx: number): void {
@@ -626,7 +685,7 @@ export class CanvasView {
     let color: string;
     if (sel) color = "#ffdd57";
     else if (hov) color = "#ff7eb3";
-    else color = dirColor(track.folder ?? "");
+    else color = this.trackColor(track);
 
     ctx.beginPath();
     ctx.arc(sx, sy, r, 0, Math.PI * 2);

@@ -9,7 +9,11 @@ from typing import Any, Protocol
 
 from flask import Blueprint, jsonify, request
 
-from backend.embeddings.projection_config import FROZEN_SOURCES
+from backend.embeddings.projection_config import (
+    FROZEN_SOURCE_WEIGHTS,
+    REQUIRED_SOURCES,
+)
+from backend.jobs import KIND_FEATURES, KIND_MAEST
 from backend.services.embedding_status_cache import EmbeddingStatusCache
 
 log = logging.getLogger(__name__)
@@ -30,11 +34,8 @@ def create_api_embeddings_blueprint(
     feature_cache: Any,
     source_versions_cls: type,
     batch_fetch_maps: Callable[..., Any],
-    build_generation_work: Callable[..., Any],
     coverage_payload: Callable[..., Any],
     layout_revision_for_projection: Callable[..., str | None],
-    embed_lock: threading.Lock,
-    embed_status: dict[str, Any],
     status_cache: EmbeddingStatusCache,
     library_mtime_signature: Callable[[str, bool], str],
     track_infos_cached: Callable[[str, bool, str], list[dict[str, Any]]],
@@ -46,8 +47,11 @@ def create_api_embeddings_blueprint(
     broadcast_embed_event: Callable[[dict[str, Any]], None],
     emit_decode_warning_once: Callable[[str, str, set[str]], None],
     broadcaster: _Broadcaster,
-    is_generating: Callable[[], bool],
     sse_response: Callable[[Any], Any],
+    enqueue_analysis: Callable[..., dict[str, int]],
+    job_queue: Any,
+    maest_mod: Any,
+    rhythm_version: int,
 ) -> Blueprint:
     bp = Blueprint("api_embeddings", __name__)
 
@@ -57,7 +61,8 @@ def create_api_embeddings_blueprint(
 
         def generate():
             try:
-                if not is_generating():
+                # "Is work running" is now a queue question, not a process flag.
+                if not _analysis_progress()[0]:
                     yield "event: done\ndata: {}\n\n"
                     return
                 while True:
@@ -75,18 +80,56 @@ def create_api_embeddings_blueprint(
 
         return sse_response(generate())
 
+    def _versions() -> Any:
+        return source_versions_cls(
+            embedding_version,
+            effnet_version,
+            features_version,
+            maest_mod.MAEST_VERSION,
+            rhythm_version,
+        )
+
+    def _version_tuple(versions: Any) -> tuple[int, ...]:
+        """Cache generations that feed the layout revision hash."""
+        return (
+            versions.clap,
+            versions.effnet,
+            versions.features,
+            versions.maest,
+            versions.rhythm,
+        )
+
+    def _analysis_progress() -> tuple[bool, dict[str, int] | None]:
+        """Generation state derived from the queue, not an in-process flag.
+
+        Counting rows means the answer survives restarts and cannot get stuck
+        ``True`` if a worker dies mid-batch.
+        """
+        by_kind = job_queue.stats_by_kind()
+        done = 0
+        total = 0
+        for kind in (KIND_FEATURES, KIND_MAEST):
+            st = by_kind.get(kind)
+            if st is None:
+                continue
+            done += st.finished
+            total += st.total
+        running = any(
+            (by_kind.get(k).outstanding if by_kind.get(k) else 0) > 0
+            for k in (KIND_FEATURES, KIND_MAEST)
+        )
+        return running, ({"done": done, "total": total} if total else None)
+
     @bp.route("/api/embeddings/status")
     def api_embeddings_status():
         if request.args.get("models_only") == "1":
-            with embed_lock:
-                running = embed_status["running"]
-                progress_done = embed_status["done"]
-                progress_total = embed_status["total"]
+            running, progress = _analysis_progress()
             return jsonify({
                 "model_ready": embeddings_mod.is_model_ready(),
                 "effnet_model_ready": audio_features_mod.is_effnet_ready(),
+                "maest_model_ready": maest_mod.is_model_ready(),
                 "generating": running,
-                "progress": {"done": progress_done, "total": progress_total} if running else None,
+                "progress": progress if running else None,
             })
 
         rel = request.args.get("folder", "")
@@ -94,57 +137,47 @@ def create_api_embeddings_blueprint(
         lib_sig = library_mtime_signature(rel, recursive)
         infos = track_infos_cached(rel, recursive, lib_sig)
 
-        versions = source_versions_cls(embedding_version, effnet_version, features_version)
+        versions = _versions()
         write_epoch = feature_cache.write_epoch()
         proj_fp = projection_query_fingerprint(request)
 
-        with embed_lock:
-            running = embed_status["running"]
-            progress_done = embed_status["done"]
-            progress_total = embed_status["total"]
+        running, progress = _analysis_progress()
+
+        def _compute() -> tuple[dict[str, Any], str | None]:
+            fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
+            maps = batch_fetch_maps(feature_cache, fps, versions)
+            proj = parse_projection_params_fn(request, default_when_no_method=False)
+            return (
+                coverage_payload(infos, maps, versions),
+                layout_revision_for_projection(
+                    infos, maps, proj, cache_versions=_version_tuple(versions)
+                ),
+            )
 
         layout_revision: str | None = None
         if running:
-            fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-            maps = batch_fetch_maps(feature_cache, fps, versions)
-            base = coverage_payload(infos, maps, versions)
-            proj = parse_projection_params_fn(request, default_when_no_method=False)
-            layout_revision = layout_revision_for_projection(
-                infos,
-                maps,
-                proj,
-                cache_versions=(versions.clap, versions.effnet, versions.features),
-            )
+            # Coverage moves constantly during a run; caching it would serve
+            # numbers that are already wrong by the time they are rendered.
+            base, layout_revision = _compute()
         else:
             cov_key = (lib_sig, write_epoch, proj_fp)
             cached_cov = status_cache.get_status_coverage(cov_key)
             if cached_cov is not None:
                 base, layout_revision = cached_cov
             else:
-                base = None
-            if base is None:
-                fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-                maps = batch_fetch_maps(feature_cache, fps, versions)
-                base = coverage_payload(infos, maps, versions)
-                proj = parse_projection_params_fn(request, default_when_no_method=False)
-                layout_revision = layout_revision_for_projection(
-                    infos,
-                    maps,
-                    proj,
-                    cache_versions=(versions.clap, versions.effnet, versions.features),
-                )
+                base, layout_revision = _compute()
                 status_cache.put_status_coverage(
-                    cov_key,
-                    base=base,
-                    layout_revision=layout_revision,
+                    cov_key, base=base, layout_revision=layout_revision
                 )
 
         payload = {
             **base,
             "model_ready": embeddings_mod.is_model_ready(),
             "effnet_model_ready": audio_features_mod.is_effnet_ready(),
+            "maest_model_ready": maest_mod.is_model_ready(),
+            "maest_error": maest_mod.load_error(),
             "generating": running,
-            "progress": {"done": progress_done, "total": progress_total} if running else None,
+            "progress": progress if running else None,
         }
         if layout_revision is not None:
             payload["layout_revision"] = layout_revision
@@ -152,153 +185,25 @@ def create_api_embeddings_blueprint(
 
     @bp.route("/api/embeddings/generate", methods=["POST"])
     def api_embeddings_generate():
-        data = request.get_json(force=True)
-        rel = data.get("folder", "")
-        recursive = data.get("recursive", True)
-        priority_paths: list[str] = data.get("priority_paths", [])
-        sources: list[str] = list(FROZEN_SOURCES)
-        folder = rel
+        """Queue outstanding analysis work.
 
-        if "clap" in sources and not embeddings_mod.is_model_ready():
-            return jsonify({"ok": False, "error": "CLAP model still loading, try again shortly"})
-        if "effnet" in sources and not audio_features_mod.is_effnet_ready():
-            return jsonify({"ok": False, "error": "EffNet model still loading, try again shortly"})
+        Kept for backward compatibility with the existing frontend call site;
+        the actual execution is owned by the durable job queue, so this is now
+        an idempotent "make sure this work is scheduled" request rather than a
+        "start a background thread" one. Repeated calls are harmless.
+        """
+        data = request.get_json(silent=True) or {}
+        folder = data.get("folder", "")
+        recursive = bool(data.get("recursive", True))
+        priority_paths: list[str] = data.get("priority_paths", []) or []
 
-        with embed_lock:
-            if embed_status["running"]:
-                return jsonify({"ok": False, "error": "Generation already in progress"})
-            embed_status["running"] = True
-            embed_status["done"] = 0
-            embed_status["total"] = 0
-            embed_status["error"] = None
-
-        def _run():
-            try:
-                decode_warn_seen: set[str] = set()
-
-                def _note_decode(rel_path: str, msg: str) -> None:
-                    emit_decode_warning_once(rel_path, msg, decode_warn_seen)
-
-                infos = build_track_infos_fn(folder, recursive)
-                vers = source_versions_cls(embedding_version, effnet_version, features_version)
-                work = build_generation_work(infos, feature_cache, sources, vers)
-
-                if priority_paths:
-                    pset = set(priority_paths)
-                    deprioritized = any(w[0]["path"] not in pset for w in work)
-                    if deprioritized:
-                        work.sort(key=lambda w: (0 if w[0]["path"] in pset else 1, w[0]["path"]))
-                    else:
-                        work.sort(key=lambda w: w[0]["path"])
-                else:
-                    work.sort(key=lambda w: w[0]["path"])
-
-                with embed_lock:
-                    embed_status["total"] = len(work)
-
-                _EFFNET_CHUNK = 8
-                done = 0
-                for chunk_start in range(0, max(len(work), 1), _EFFNET_CHUNK):
-                    chunk = work[chunk_start:chunk_start + _EFFNET_CHUNK]
-                    if not chunk:
-                        break
-
-                    effnet_paths = [
-                        resolve_virtual_path(t["path"])
-                        for t, needed in chunk if "effnet" in needed
-                    ]
-                    effnet_decode_warns: dict[str, str] = {}
-                    effnet_results = (
-                        audio_features_mod.generate_effnet_embeddings_batch(
-                            effnet_paths,
-                            decode_warnings=effnet_decode_warns,
-                        )
-                        if effnet_paths
-                        else {}
-                    )
-                    for abs_p, msg in effnet_decode_warns.items():
-                        _note_decode(virtual_from_abs_path(abs_p), msg)
-                    feature_paths = [
-                        resolve_virtual_path(t["path"])
-                        for t, needed in chunk if "features" in needed
-                    ]
-                    feat_decode_warns: dict[str, str] = {}
-                    feature_results = (
-                        audio_features_mod.generate_audio_features_batch(
-                            feature_paths,
-                            decode_warnings=feat_decode_warns,
-                        )
-                        if feature_paths
-                        else {}
-                    )
-                    for abs_p, msg in feat_decode_warns.items():
-                        _note_decode(virtual_from_abs_path(abs_p), msg)
-
-                    for t, needed in chunk:
-                        abs_path = resolve_virtual_path(t["path"])
-                        fp = t["fingerprint"]
-                        ok = True
-                        failures: list[str] = []
-
-                        if "clap" in needed:
-                            track_rel = t["path"]
-                            emb = embeddings_mod.generate_embedding(
-                                abs_path,
-                                on_decode_warning=lambda m, rp=track_rel: _note_decode(rp, m),
-                            )
-                            if emb is not None:
-                                feature_cache.put_embedding(fp, emb, version=embedding_version)
-                            else:
-                                ok = False
-                                failures.append("clap")
-
-                        if "effnet" in needed:
-                            emb = effnet_results.get(abs_path)
-                            if emb is not None:
-                                feature_cache.put_effnet_embedding(fp, emb, version=effnet_version)
-                            else:
-                                ok = False
-                                failures.append("effnet")
-
-                        if "features" in needed:
-                            feat = feature_results.get(abs_path)
-                            if feat is not None:
-                                feature_cache.put_audio_features(fp, feat, version=features_version)
-                            else:
-                                ok = False
-                                failures.append("features")
-
-                        done += 1
-                        with embed_lock:
-                            embed_status["done"] = done
-                        prog_evt: dict[str, Any] = {
-                            "type": "progress",
-                            "path": t["path"],
-                            "ok": ok,
-                            "done": done,
-                            "total": len(work),
-                        }
-                        if failures:
-                            prog_evt["failures"] = failures
-                            log.warning(
-                                "Embedding incomplete for %s (%s)",
-                                t["path"],
-                                ", ".join(failures),
-                            )
-                        broadcast_embed_event(prog_evt)
-
-            except Exception as e:
-                log.exception("Embedding generation failed")
-                with embed_lock:
-                    embed_status["error"] = str(e)
-                broadcast_embed_event({"type": "error", "error": str(e)})
-            finally:
-                with embed_lock:
-                    embed_status["running"] = False
-                broadcast_embed_event({"type": "done"})
-
-        threading.Thread(target=_run, daemon=True).start()
-        return jsonify({"ok": True})
+        infos = build_track_infos_fn(folder, recursive)
+        queued = enqueue_analysis(
+            infos=infos,
+            priority_paths=priority_paths,
+            force=bool(data.get("force", False)),
+        )
+        return jsonify({"ok": True, "queued": queued})
 
     @bp.route("/api/embeddings/projection")
     @bp.route("/api/embeddings/umap")  # backward compat alias
@@ -310,13 +215,10 @@ def create_api_embeddings_blueprint(
         proj = parse_projection_params_fn(request, default_when_no_method=True)
 
         fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-        pversions = source_versions_cls(embedding_version, effnet_version, features_version)
+        pversions = _versions()
         maps = batch_fetch_maps(feature_cache, fps, pversions)
         revision = layout_revision_for_projection(
-            infos,
-            maps,
-            proj,
-            cache_versions=(pversions.clap, pversions.effnet, pversions.features),
+            infos, maps, proj, cache_versions=_version_tuple(pversions)
         )
 
         positions = embeddings_mod.compute_projection(
@@ -333,6 +235,8 @@ def create_api_embeddings_blueprint(
             feature_mask=proj.feature_mask,
             features_blend=proj.features_blend,
             layout_revision=revision,
+            source_weights=FROZEN_SOURCE_WEIGHTS,
+            required_sources=REQUIRED_SOURCES,
         )
 
         return jsonify({"positions": positions, "revision": revision})

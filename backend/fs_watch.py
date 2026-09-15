@@ -21,13 +21,11 @@ class FilesystemWatchDeps:
     cached_read_all: Callable[[str], dict[str, Any]]
     virtual_from_abs: Callable[[str], str]
     is_mp3_path: Callable[[str], bool]
-    embeddings_mod: Any
-    embedding_version: int
-    feature_cache: Any
-    embed_lock: threading.Lock
-    embed_status: dict[str, Any]
-    broadcast_embed_event: Callable[[dict[str, Any]], None]
-    emit_decode_warning_once: Callable[[str, str, set[str]], None]
+    #: Queue analysis for one newly-seen virtual path (durable; see backend.jobs).
+    #: Model handles, cache versions, and the old embed_status flag are gone —
+    #: the watcher only reports *that* a file appeared; the queue decides what
+    #: to do about it and when.
+    enqueue_track: Callable[[str], None] | None = None
 
 
 class TrackspaceFilesystemHandler(FileSystemEventHandler):
@@ -88,49 +86,15 @@ class TrackspaceFilesystemHandler(FileSystemEventHandler):
         rel_path = d.virtual_from_abs(abs_path)
         log.info("Watchdog: ingested %s", rel_path)
 
-        fp = data.get("fingerprint")
-        if not fp or not d.embeddings_mod.is_model_ready():
-            return
-        if d.feature_cache.has_embedding(fp, version=d.embedding_version):
+        if not data.get("fingerprint"):
             return
 
-        with d.embed_lock:
-            if d.embed_status["running"]:
-                return
-            d.embed_status.update({"running": True, "done": 0, "total": 1, "error": None})
-
-        def _run() -> None:
+        # Hand the work to the durable queue rather than spawning an analysis
+        # thread here. A burst of file events therefore produces queued jobs
+        # (deduped, resumable, retried) instead of racing threads guarded by a
+        # single global "running" flag that dropped work when it was set.
+        if d.enqueue_track is not None:
             try:
-                warn_seen: set[str] = set()
-                emb = d.embeddings_mod.generate_embedding(
-                    abs_path,
-                    on_decode_warning=lambda m: d.emit_decode_warning_once(
-                        rel_path, m, warn_seen,
-                    ),
-                )
-                ok = emb is not None
-                if ok:
-                    d.feature_cache.put_embedding(fp, emb, version=d.embedding_version)
-                evt: dict[str, Any] = {
-                    "type": "progress",
-                    "path": rel_path,
-                    "ok": ok,
-                    "done": 1,
-                    "total": 1,
-                }
-                if not ok:
-                    evt["failures"] = ["clap"]
-                    log.warning("Watchdog: CLAP embedding failed for %s", rel_path)
-                d.broadcast_embed_event(evt)
-                log.info("Watchdog: embedding %s for %s", "ok" if ok else "failed", rel_path)
-            except Exception as e:
-                log.exception("Watchdog: embedding generation failed for %s", rel_path)
-                with d.embed_lock:
-                    d.embed_status["error"] = str(e)
-                d.broadcast_embed_event({"type": "error", "error": str(e)})
-            finally:
-                with d.embed_lock:
-                    d.embed_status["running"] = False
-                d.broadcast_embed_event({"type": "done"})
-
-        threading.Thread(target=_run, daemon=True).start()
+                d.enqueue_track(rel_path)
+            except Exception:
+                log.exception("Watchdog: failed to queue analysis for %s", rel_path)

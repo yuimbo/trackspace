@@ -1,18 +1,18 @@
-"""Process-wide Trackspace runtime: caches, roots, embedding/SSE state, thread pool."""
+"""Process-wide Trackspace runtime: caches, roots, analysis queue, SSE, thread pool."""
 
 from __future__ import annotations
 
 import os
-import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any
 
 from watchdog.observers import Observer
 
 from backend.cache import TrackCache
 from backend.embeddings.feature_cache import FeatureCache
+from backend.jobs import JobQueue, WorkerPool
+from backend.services.analysis_pipeline import ClusterStore
 from backend.services.embedding_broadcaster import EmbeddingBroadcaster
 from backend.services.embedding_status_cache import EmbeddingStatusCache
 
@@ -29,27 +29,31 @@ class TrackspaceState:
     thread_pool: ThreadPoolExecutor
     track_cache: TrackCache
     feature_cache: FeatureCache
-    embed_status: dict[str, Any]
-    embed_lock: threading.Lock
     embed_broadcaster: EmbeddingBroadcaster
     status_cache: EmbeddingStatusCache
     roots: OrderedDict[str, str]
     roots_state_path: str
+    #: Durable analysis queue — survives restarts, so work resumes where it stopped.
+    job_queue: JobQueue
+    #: Background workers, one per job kind.
+    workers: WorkerPool
+    #: Latest multi-resolution clustering of the library.
+    clusters: ClusterStore
     observer: Observer | None = None
     root_watches: dict[str, object] = field(default_factory=dict)
     music_root: str = ""
 
     @classmethod
-    def create(cls) -> TrackspaceState:
-        data_dir = os.path.join(PROJECT_DIR, "data")
+    def create(cls, data_dir: str | None = None) -> TrackspaceState:
+        # ``TRACKSPACE_DATA_DIR`` lets tests and throwaway runs point caches,
+        # roots, and the job queue at a scratch directory instead of the real one.
+        data_dir = (
+            data_dir
+            or os.environ.get("TRACKSPACE_DATA_DIR")
+            or os.path.join(PROJECT_DIR, "data")
+        )
         os.makedirs(data_dir, exist_ok=True)
         dist_dir = os.path.join(PROJECT_DIR, "frontend", "dist")
-        embed_status: dict[str, Any] = {
-            "running": False,
-            "done": 0,
-            "total": 0,
-            "error": None,
-        }
         return cls(
             data_dir=data_dir,
             dist_dir=dist_dir,
@@ -58,8 +62,6 @@ class TrackspaceState:
             ),
             track_cache=TrackCache(os.path.join(data_dir, "track_cache.db")),
             feature_cache=FeatureCache(os.path.join(data_dir, "audio_features.db")),
-            embed_status=embed_status,
-            embed_lock=threading.Lock(),
             embed_broadcaster=EmbeddingBroadcaster(),
             status_cache=EmbeddingStatusCache(
                 track_infos_max=8,
@@ -67,4 +69,7 @@ class TrackspaceState:
             ),
             roots=OrderedDict(),
             roots_state_path=os.path.join(data_dir, "roots.json"),
+            job_queue=JobQueue(os.path.join(data_dir, "jobs.db")),
+            workers=WorkerPool(),
+            clusters=ClusterStore(),
         )

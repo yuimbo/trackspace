@@ -23,6 +23,7 @@ export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "undo",            key: "z",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}Z`,         description: "Undo last action" },
   { action: "deselect",        key: "Escape", mod: false, shift: false, alt: false, label: "Esc",                    description: "Deselect / cancel" },
   { action: "toggle-view",     key: "e",      mod: false, shift: false, alt: false, label: "E",                      description: "Toggle Embedding Space" },
+  { action: "toggle-clusters", key: "c",      mod: false, shift: false, alt: false, label: "C",                      description: "Colour dots by microgenre cluster" },
 ];
 
 export type HotkeyAction = (typeof HOTKEY_MAP)[number]["action"];

@@ -22,14 +22,33 @@ from backend.tags import read_all
 from backend.fingerprint import compute_fingerprint
 from backend import audio_features
 from backend import embeddings
+from backend.embeddings import maest as maest_mod
+from backend.embeddings import rhythm_features as rhythm_mod
 from backend.embeddings.clap import EMBEDDING_VERSION
 from backend.embeddings.effnet import EFFNET_VERSION
 from backend.embeddings.librosa_audio_features import FEATURES_VERSION
+from backend.embeddings.maest import MAEST_VERSION
+from backend.embeddings.rhythm_features import RHYTHM_VERSION
 from backend.embeddings.coverage import (
     SourceVersions,
     batch_fetch_maps,
-    build_generation_work,
     coverage_payload,
+)
+from backend.jobs import (
+    JobWorker,
+    KIND_CLUSTER,
+    KIND_FEATURES,
+    KIND_MAEST,
+    KIND_SCAN,
+)
+from backend.services.analysis_pipeline import (
+    AnalysisDeps,
+    enqueue_clustering,
+    enqueue_library_work,
+    make_cluster_handler,
+    make_features_handler,
+    make_maest_handler,
+    make_scan_handler,
 )
 from backend.services.layout_revision_for_status import layout_revision_for_projection
 from backend.services.library_scan import emit_scan_progress_events
@@ -66,21 +85,23 @@ log = logging.getLogger(__name__)
 state = TrackspaceState.create()
 
 
-def _purge_stale_embedding_cache_rows() -> tuple[int, int, int]:
+def _purge_stale_embedding_cache_rows() -> dict[str, int]:
     """NULL out cached blobs older than current version constants.
 
     Runs once when ``backend.app`` is imported so stale rows are cleared before
     any HTTP handler runs (not only when ``main()`` is invoked).
     """
     fc = state.feature_cache
-    return (
-        fc.purge_old_versions(EMBEDDING_VERSION),
-        fc.purge_old_effnet_versions(EFFNET_VERSION),
-        fc.purge_old_feature_versions(FEATURES_VERSION),
-    )
+    return {
+        "clap": fc.purge_old_versions(EMBEDDING_VERSION),
+        "effnet": fc.purge_old_effnet_versions(EFFNET_VERSION),
+        "features": fc.purge_old_feature_versions(FEATURES_VERSION),
+        "maest": fc.purge_old_maest_versions(MAEST_VERSION),
+        "rhythm": fc.purge_old_rhythm_versions(RHYTHM_VERSION),
+    }
 
 
-_startup_purge_clap, _startup_purge_effnet, _startup_purge_feat = _purge_stale_embedding_cache_rows()
+_startup_purges = _purge_stale_embedding_cache_rows()
 
 
 def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
@@ -114,11 +135,6 @@ def _track_infos_cached(folder_abs: str, recursive: bool, lib_sig: str) -> list[
 
 def _broadcast_embed_event(event: dict) -> None:
     state.embed_broadcaster.publish(event)
-
-
-def _embed_is_running() -> bool:
-    with state.embed_lock:
-        return bool(state.embed_status["running"])
 
 
 def _emit_decode_warning_once(rel_path: str, message: str, seen_paths: set[str]) -> None:
@@ -266,18 +282,25 @@ def _cached_read_all(path: str) -> dict:
     return data
 
 
+def _queue_track_analysis(rel_path: str) -> None:
+    """Queue analysis for one track discovered by the filesystem watcher."""
+    info = {"path": rel_path, "fingerprint": None}
+    try:
+        info["fingerprint"] = _cached_read_all(_resolve(rel_path)).get("fingerprint")
+    except Exception:
+        log.debug("watch enqueue: could not read %s", rel_path)
+        return
+    if not info["fingerprint"]:
+        return
+    _enqueue_analysis(infos=[info])
+
+
 FILESYSTEM_WATCH_DEPS = FilesystemWatchDeps(
     track_cache=state.track_cache,
     cached_read_all=_cached_read_all,
     virtual_from_abs=_virtual_from_abs,
     is_mp3_path=_is_mp3,
-    embeddings_mod=embeddings,
-    embedding_version=EMBEDDING_VERSION,
-    feature_cache=state.feature_cache,
-    embed_lock=state.embed_lock,
-    embed_status=state.embed_status,
-    broadcast_embed_event=_broadcast_embed_event,
-    emit_decode_warning_once=_emit_decode_warning_once,
+    enqueue_track=_queue_track_analysis,
 )
 
 
@@ -310,6 +333,121 @@ def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
     return infos
 
 
+# ---------------------------------------------------------------------------
+# Analysis pipeline — durable queue + background workers
+# ---------------------------------------------------------------------------
+
+ANALYSIS_DEPS = AnalysisDeps(
+    feature_cache=state.feature_cache,
+    track_cache=state.track_cache,
+    cached_read_all=_cached_read_all,
+    resolve_virtual_path=_resolve,
+    virtual_from_abs=_virtual_from_abs,
+    list_mp3s=_list_mp3s,
+    maest_mod=maest_mod,
+    rhythm_mod=rhythm_mod,
+    audio_features_mod=audio_features,
+    maest_version=MAEST_VERSION,
+    rhythm_version=RHYTHM_VERSION,
+    features_version=FEATURES_VERSION,
+    clap_version=EMBEDDING_VERSION,
+    effnet_version=EFFNET_VERSION,
+    emit_decode_warning=lambda rel, msg: _broadcast_embed_event(
+        {"type": "decode_warning", "path": rel, "message": msg}
+    ),
+)
+
+
+def _on_job_event(event: dict) -> None:
+    """Relay worker events to SSE subscribers."""
+    state.embed_broadcaster.publish(event)
+
+
+def _after_cluster_inputs_changed(event: dict) -> None:
+    """Queue a re-cluster once a per-track stage finishes its backlog.
+
+    Clustering is library-wide, so it is pointless to run it per track — it is
+    triggered when a stage drains, and the queue's dedupe key collapses repeats.
+    """
+    if event.get("type") == "drained":
+        enqueue_clustering(state.job_queue, reason=f"{event.get('kind')}-drained")
+        state.workers.wake(KIND_CLUSTER)
+
+
+def _job_event_sink(event: dict) -> None:
+    _on_job_event(event)
+    _after_cluster_inputs_changed(event)
+
+
+def _enqueue_analysis(
+    *,
+    infos: list[dict],
+    priority_paths: list[str] | None = None,
+    force: bool = False,
+) -> dict[str, int]:
+    """Queue per-track analysis and wake the workers."""
+    queued = enqueue_library_work(
+        state.job_queue,
+        infos,
+        deps=ANALYSIS_DEPS,
+        kinds=(KIND_FEATURES, KIND_MAEST),
+        priority_paths=priority_paths or [],
+        force=force,
+    )
+    state.workers.wake()
+    return queued
+
+
+def _register_workers() -> None:
+    """Create one worker per pipeline stage (threads start in ``main()``)."""
+    state.workers.add(
+        JobWorker(
+            state.job_queue,
+            KIND_SCAN,
+            make_scan_handler(ANALYSIS_DEPS),
+            batch_size=8,
+            on_event=_job_event_sink,
+        )
+    )
+    state.workers.add(
+        JobWorker(
+            state.job_queue,
+            KIND_FEATURES,
+            make_features_handler(ANALYSIS_DEPS),
+            batch_size=2,
+            on_event=_job_event_sink,
+        )
+    )
+    state.workers.add(
+        JobWorker(
+            state.job_queue,
+            KIND_MAEST,
+            make_maest_handler(ANALYSIS_DEPS, batch_size=4),
+            batch_size=4,
+            on_event=_job_event_sink,
+            # Idle until the model has finished loading rather than failing
+            # every claimed job during the first minute after startup.
+            gate=maest_mod.is_model_ready,
+        )
+    )
+    state.workers.add(
+        JobWorker(
+            state.job_queue,
+            KIND_CLUSTER,
+            make_cluster_handler(
+                ANALYSIS_DEPS,
+                state.clusters,
+                build_track_infos=_build_track_infos,
+            ),
+            batch_size=1,
+            on_event=_on_job_event,
+        )
+    )
+
+
+_register_workers()
+
+
 app = create_app(
     template_folder=os.path.join(PKG_DIR, "templates"),
     deps=TrackspaceBlueprintDeps(
@@ -321,11 +459,8 @@ app = create_app(
         feature_cache=state.feature_cache,
         source_versions_cls=SourceVersions,
         batch_fetch_maps=batch_fetch_maps,
-        build_generation_work=build_generation_work,
         coverage_payload=coverage_payload,
         layout_revision_for_projection=layout_revision_for_projection,
-        embed_lock=state.embed_lock,
-        embed_status=state.embed_status,
         status_cache=state.status_cache,
         library_mtime_signature=_library_mtime_signature,
         track_infos_cached=_track_infos_cached,
@@ -335,7 +470,6 @@ app = create_app(
         broadcast_embed_event=_broadcast_embed_event,
         emit_decode_warning_once=_emit_decode_warning_once,
         broadcaster=state.embed_broadcaster,
-        is_generating=_embed_is_running,
         sse_response=sse_response,
         list_mp3s=_list_mp3s,
         cached_read_all=_cached_read_all,
@@ -357,6 +491,15 @@ app = create_app(
         resolve_virtual_path=_resolve,
         virtual_from_abs=_virtual_from_abs,
         dist_dir=state.dist_dir,
+        job_queue=state.job_queue,
+        workers=state.workers,
+        clusters=state.clusters,
+        enqueue_library_work=enqueue_library_work,
+        enqueue_clustering=enqueue_clustering,
+        enqueue_analysis=_enqueue_analysis,
+        analysis_deps=ANALYSIS_DEPS,
+        maest_mod=maest_mod,
+        rhythm_version=RHYTHM_VERSION,
     ),
 )
 app.extensions["trackspace_state"] = state
@@ -395,6 +538,8 @@ def main():
                         help="Skip eager CLAP model loading at startup")
     parser.add_argument("--no-effnet", action="store_true",
                         help="Skip eager EffNet model loading at startup")
+    parser.add_argument("--no-maest", action="store_true",
+                        help="Skip eager MAEST model loading at startup")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
@@ -424,22 +569,35 @@ def main():
     pruned = state.track_cache.prune_missing()
     if pruned:
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
-    if _startup_purge_clap:
-        print(
-            f"CLAP: purged {_startup_purge_clap} stale v<{EMBEDDING_VERSION} "
-            f"entr{'y' if _startup_purge_clap == 1 else 'ies'} (on load)"
-        )
-    if _startup_purge_effnet:
-        print(
-            f"EffNet: purged {_startup_purge_effnet} stale v<{EFFNET_VERSION} "
-            f"entr{'y' if _startup_purge_effnet == 1 else 'ies'} (on load)"
-        )
-    if _startup_purge_feat:
-        print(
-            f"Features: purged {_startup_purge_feat} stale v<{FEATURES_VERSION} "
-            f"entr{'y' if _startup_purge_feat == 1 else 'ies'} (on load)"
-        )
-    print(f"Versions: CLAP={EMBEDDING_VERSION} EffNet={EFFNET_VERSION} Features={FEATURES_VERSION}")
+    _version_labels = {
+        "clap": EMBEDDING_VERSION,
+        "effnet": EFFNET_VERSION,
+        "features": FEATURES_VERSION,
+        "maest": MAEST_VERSION,
+        "rhythm": RHYTHM_VERSION,
+    }
+    for name, n in _startup_purges.items():
+        if n:
+            print(
+                f"{name}: purged {n} stale v<{_version_labels[name]} "
+                f"entr{'y' if n == 1 else 'ies'} (on load)"
+            )
+    print(
+        f"Versions: CLAP={EMBEDDING_VERSION} EffNet={EFFNET_VERSION} "
+        f"Features={FEATURES_VERSION} MAEST={MAEST_VERSION} Rhythm={RHYTHM_VERSION}"
+    )
+
+    # Any jobs left 'running' by a previous process are reclaimed so the queue
+    # resumes instead of stalling on leases owned by a dead worker.
+    reclaimed = state.job_queue.reclaim_expired()
+    if reclaimed:
+        print(f"Queue: reclaimed {reclaimed} interrupted job(s) from a previous run")
+    q_stats = state.job_queue.stats()
+    if q_stats.outstanding:
+        print(f"Queue: resuming {q_stats.outstanding} outstanding job(s)")
+
+    state.workers.start_all()
+
     if not args.no_clap:
         def _bg_load_clap():
             print("Loading CLAP model in background (this may take a moment on first run)…")
@@ -455,12 +613,27 @@ def main():
             else:
                 print("EffNet model not available (essentia-tensorflow may not be installed).")
         threading.Thread(target=_bg_load_effnet, daemon=True).start()
+    if not args.no_maest:
+        def _bg_load_maest():
+            print("Loading MAEST model in background…")
+            maest_mod.load_model()
+            if maest_mod.is_model_ready():
+                maest_mod.warmup()
+                print("MAEST model ready.")
+            else:
+                print(f"MAEST not available: {maest_mod.load_error()}")
+            # Workers gate on model readiness; nudge them once it flips.
+            state.workers.wake(KIND_MAEST)
+        threading.Thread(target=_bg_load_maest, daemon=True).start()
+
     def _bg_warm_audio_features():
         print("Warming audio feature pipeline…")
         audio_features.warmup_audio_features()
+        rhythm_mod.warmup_rhythm_features()
         print("Audio feature pipeline warm.")
     threading.Thread(target=_bg_warm_audio_features, daemon=True).start()
-    app.run(host=args.host, port=args.port, debug=True)
+
+    app.run(host=args.host, port=args.port, debug=True, use_reloader=False)
 
 
 if __name__ == "__main__":

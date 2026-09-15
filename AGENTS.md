@@ -15,10 +15,17 @@ trackspace/
     tags.py                 – ID3 tag read/write via mutagen
     cache.py                – TrackCache (path+mtime → metadata, LRU + SQLite)
     fingerprint.py          – Chromaprint audio fingerprinting (fpcalc)
-    audio_features.py       – shim → ``backend.embeddings.audio_features`` (barrel module)
-    embeddings/             ← CLAP, caches, projection, classical audio features
+    audio_features.py     – shim → ``backend.embeddings.audio_features`` (barrel module)
+    jobs/                   ← durable analysis queue (SQLite) + background workers
+      kinds.py              – canonical job-kind names (scan/features/maest/cluster)
+      queue.py              – JobQueue: leases, retries, dedupe, resumability
+      worker.py             – JobWorker/WorkerPool: one thread per job kind
+    embeddings/             ← MAEST, CLAP, caches, projection, clustering, audio features
       __init__.py           – lazy re-exports of ``layout`` public API
       layout.py             – composite vectors, semantic weighting, UMAP/t-SNE/PCA
+      maest.py              – MAEST: 519 Discogs style logits + 768-D embedding
+      clustering.py         – weighted distance → cosine kNN → multi-resolution Leiden
+      rhythm_features.py    – 14-D rhythm/DSP descriptors for electronic microgenres
       clap.py               – Laion CLAP model (audio + text embeddings)
       feature_cache.py      – FeatureCache (fingerprint → per-source vectors)
       coverage.py           – coverage stats + generation work-list helpers
@@ -409,9 +416,20 @@ The user can activate any combination (at least one must stay on):
 
 | Source | Module | Dimensions | Model |
 |--------|--------|-----------|-------|
+| MAEST logits | `backend/embeddings/maest.py` | 519 | `discogs-maest-30s-pw-129e-519l` (primary genre signal) |
+| MAEST embedding | `backend/embeddings/maest.py` | 768 | same model pass |
+| Rhythm | `backend/embeddings/rhythm_features.py` | 14 | `librosa` DSP (plan §7) |
 | CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
 | EffNet | `backend/embeddings/effnet.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
 | Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
+
+**Rhythm vector (14-D)** — `onset_density`, `onset_strength_mean/std`,
+`beat_confidence`, `pulse_clarity`, `syncopation`, `kick_periodicity`,
+`bass_ratio`, `spectral_centroid_norm`, `spectral_rolloff_norm`,
+`spectral_flux`, `dynamic_range`, `loudness`, `rhythmic_complexity`. All
+normalised to [0,1]; the STFT / onset envelope / beat track are computed once
+and reused across dimensions. This block is what separates rhythmically
+distinct neighbouring genres (plan §7 / Phase 2).
 
 **Audio feature vector (6D):**
 `[tempo_norm, key_cos, key_sin, mode, energy_norm, danceability]`
@@ -422,9 +440,16 @@ This preserves harmonic topology — keys a fifth apart are geometrically close,
 and the circular wrap is seamless.  Mode (major=1, minor=0) is a 3rd dimension.
 
 **Composite vector construction** (`_gather_composite_vecs` in `embeddings/layout.py`):
-Each enabled source block is **L2-normalized across the batch** before
-concatenation so that 1280D EffNet does not dominate 6D audio features.
-A track is included only if it has data for every enabled source.
+Each enabled source block is **L2-normalized per row** before concatenation so
+that 1280-D EffNet does not dominate 14-D rhythm through dimensionality, then
+scaled by `sqrt(weight)` from `FROZEN_SOURCE_WEIGHTS` so relative influence is
+set explicitly (same algebra as the clustering pipeline — see *Microgenre
+clustering*).
+
+A track is included when it has every **required** source (`REQUIRED_SOURCES`,
+i.e. MAEST); optional sources it lacks contribute a zero row. Requiring *all*
+enabled sources would hide every track until the slowest model had run over the
+whole library.
 
 **Semantic weighting with composite vectors:** Folder centroid
 decomposition uses the **full** composite matrix.  CLAP text directions
@@ -439,8 +464,40 @@ decomposition uses the **full** composite matrix.  CLAP text directions
 | CLAP | `EMBEDDING_VERSION` (`embeddings/clap.py`) | `clap_embedding`, `version` |
 | EffNet | `EFFNET_VERSION` (`embeddings/effnet.py`) | `effnet_embedding`, `effnet_version` |
 | Audio features | `FEATURES_VERSION` (`embeddings/librosa_audio_features.py`) | `features`, `features_version` |
+| MAEST | `MAEST_VERSION` (`embeddings/maest.py`) | `maest_embedding` + `maest_logits`, `maest_version` |
+| Rhythm | `RHYTHM_VERSION` (`embeddings/rhythm_features.py`) | `rhythm`, `rhythm_version` |
 
 Bumping one source's version invalidates only that source's cached data.
+MAEST's embedding and logits share one version column because a single model
+pass produces both — `put_maest()` writes them in one statement.
+
+New columns are added via the `ALTER TABLE` migration loop in
+`FeatureCache._init_db`, so existing databases migrate in place (verified
+against the real 9.4k-row cache with no data loss). `get_all_*` chunks its
+`WHERE fingerprint IN (...)` at 500 ids so a large library cannot exceed
+SQLite's variable limit.
+
+### MAEST model management
+
+MAEST (`discogs-maest-30s-pw-129e-519l`) is the **primary genre model**: it was
+trained on a Discogs style taxonomy, so its 519 logits already describe a track
+as a fuzzy point in genre space — frequently more useful for microgenre
+clustering than the hidden embedding. Checkpoints auto-download to
+`~/.cache/torch/hub/checkpoints/` on first use.
+
+**The mel front end must run on CPU.** `torchaudio`'s STFT requires input and
+window on the same device, and `model.to("mps")` drags the window onto the GPU,
+producing `stft input and window must be on the same device`. `load_model()`
+therefore detaches `model.melspectrogram`, forces it back to CPU, and sets the
+attribute to `None` so no code path can re-enter a GPU mel. Inference then runs
+`model(mel, melspectrogram_input=True)`.
+
+Batching matters: mel-on-CPU + batched transformer inference measured
+**~0.11 s/excerpt** on MPS versus ~1.0 s/excerpt unbatched on CPU (~9×).
+
+Three 30 s excerpts at 20/50/80 % are embedded as one batch and mean-pooled
+(plan §2/§4). Per-excerpt vectors are returned in `MaestAnalysis` so future
+work can detect genre-spanning tracks without re-running inference.
 
 ### EffNet model management
 
@@ -486,6 +543,139 @@ equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
 - Switching projection method or source checkboxes re-fetches positions from the
   backend and animates the transition.
 
+
+## Analysis pipeline: durable job queue
+
+All expensive analysis runs through a **durable SQLite-backed job queue**
+(`backend/jobs/`). This replaced an in-process `embed_status` dict guarded by a
+global "running" flag. The change matters for correctness, not just tidiness:
+
+| Old behaviour | Queue behaviour |
+|---|---|
+| Progress lived in RAM — a restart lost it | State is SQL rows; restart resumes |
+| One global `running` flag; concurrent requests were dropped | Per-job leases; work is never silently discarded |
+| A crash left `running = True` forever | Expired leases are reclaimed to `pending` |
+| Duplicate triggers queued duplicate work | `(kind, dedupe_key)` is UNIQUE — enqueue is idempotent |
+| A transient decode error lost the track | Retry budget (`max_attempts`, default 3) |
+| Counts were hand-maintained counters that could drift | `stats()` aggregates the table — cannot drift |
+
+### Job kinds (pipeline order)
+
+```
+scan      → ID3 tags + Chromaprint fingerprint   (CPU, batch 8)
+features  → classical 6-D + rhythm 14-D          (CPU, batch 2)
+maest     → MAEST embedding + 519 style logits   (GPU, batch 4, gated on model)
+cluster   → kNN graph + multi-resolution Leiden  (whole-library singleton)
+```
+
+Names live in `backend/jobs/kinds.py` so enqueuers, workers, and routes cannot
+drift apart.
+
+### Rules when adding a stage
+
+1. **Never raise for one bad track.** Return `JobResult.failure(...)`; the rest
+   of the batch still commits and the queue owns the retry decision.
+2. **Use `retry=False` for permanent errors** (missing file, unsupported codec)
+   so a dead track does not consume three attempts *and* three model runs.
+3. **Batch only at the GPU boundary.** MAEST batches across tracks; CPU stages
+   stay per-track so one slow decode cannot stall a whole batch.
+4. **Filter against the cache before enqueueing**, so the queue reflects
+   *outstanding* work. This is what makes the progress numbers meaningful.
+5. **Gate on model readiness** with `JobWorker(gate=...)` rather than letting
+   the worker claim jobs and fail them while a model is still loading.
+6. **Library-wide work uses one dedupe key** (`"library"` for clustering), so a
+   burst of filesystem events collapses into at most one pending re-run.
+
+`--no-maest` / `--no-clap` / `--no-effnet` skip eager model loading. Flask runs
+with `use_reloader=False`: the reloader would fork a second set of worker
+threads competing for the same queue.
+
+---
+
+## Microgenre clustering
+
+Implements the attack plan in `music_microgenre_clustering_attack_plan.md`.
+Pipeline (`backend/embeddings/clustering.py`):
+
+```
+per-source blocks
+   ↓  standardize + L2-normalise per block, scale by sqrt(weight)
+weighted matrix
+   ↓  PCA → ≤128 dims
+reduced
+   ↓  cosine kNN (k=20), bridged into one connected component
+graph
+   ↓  Leiden at 6 resolutions
+multi-resolution cluster hierarchy
+```
+
+### Three decisions that are easy to get wrong
+
+**Cluster in feature space, never in t-SNE/UMAP space.** 2-D projections
+distort global geometry; they are for *looking at*, not grouping by.
+
+**`sqrt(weight)` per block, not blind concatenation.** Squared Euclidean
+distance is additive over concatenated blocks, so scaling a block by `sqrt(w)`
+makes it contribute exactly `w ×` its distance. The plan's weighted-distance
+formula therefore falls out of ordinary PCA/kNN — no custom metric needed.
+
+**The kNN graph must be connected.** Leiden cannot merge vertices with no path
+between them, so a fragmented graph pins the cluster count to the component
+count and makes the resolution parameter *silently inert* — the whole
+multi-resolution hierarchy collapses to one granularity. `build_knn_graph`
+bridges components via their strongest cross-pair edge. This was found by
+testing: with tight clusters and k=20 the graph fragmented into 9 components
+and every resolution returned the same 9 clusters.
+
+### Weights (plan §8) — `DEFAULT_WEIGHTS` / `FROZEN_SOURCE_WEIGHTS`
+
+| Source | Weight | Role |
+|---|---|---|
+| `maest_logits` | 0.45 | Discogs genre/style space — the primary signal |
+| `maest` | 0.25 | Audio semantics from the hidden embedding |
+| `rhythm` | 0.15 | Groove/BPM distinctions between neighbouring genres |
+| `clap` | 0.10 | Complementary texture **+ the only text encoder** |
+| `effnet` | 0.05 | Complementary texture |
+| `features` | 0.00 | Off by default (subsumed by `rhythm`) |
+
+`projection_config.FROZEN_SOURCE_WEIGHTS` mirrors `clustering.DEFAULT_WEIGHTS`
+deliberately: a 2-D map that disagreed with the cluster assignments would be
+actively misleading. **Keep them in sync.**
+
+CLAP is retained at low weight because semantic folder/tag weighting in
+`layout.py` projects *text* directions into the CLAP column span — dropping
+CLAP would remove that capability.
+
+### Required vs optional sources
+
+`REQUIRED_SOURCES = ("maest_logits", "maest")`. A track needs MAEST to be
+placed; optional sources contribute a neutral zero row when missing, so a
+partially analysed library still renders instead of hiding tracks until every
+model has run. The frontend gates the embedding view on **MAEST only** — gating
+on CLAP/EffNet left the canvas stuck on "loading models…" under `--no-clap`.
+
+### Resolutions
+
+`DEFAULT_RESOLUTIONS = (0.15, 0.4, 0.8, 1.5, 3.0, 6.0)`, calibrated against the
+real library (~9.5k tracks, k=20) → roughly 2 / 3 / 6 / 12 / 25 / 60 clusters.
+Below ~0.1 everything collapses to one cluster. **Validate resolution ranges
+against real embeddings, not synthetic blobs** — synthetic Gaussians are far
+more separable than real music and make the sweep look broken.
+
+### Cluster naming
+
+`name_clusters` names a cluster by *contrast*: its mean logit per style minus
+the library-wide mean. Without the subtraction every cluster in an electronic
+library is named "Electronic---Techno"; with it, clusters come out as
+"Drum n Bass / Jungle", "Dubstep / Grime", "Psy-Trance / Progressive Trance".
+
+### Validated behaviour
+
+On 150 tracks drawn from 6 hand-curated genre folders, resolution 1.5 produced
+6 clusters matching the folders at 148/150, with correct generated names, and
+the clusters appear as spatially separated regions in the t-SNE layout.
+
+---
 
 ## Backend: packages, imports, and refactors
 

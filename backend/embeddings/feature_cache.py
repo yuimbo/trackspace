@@ -1,5 +1,6 @@
 """Content-addressed cache for audio features (CLAP embeddings, EffNet
-embeddings, and extracted audio features).
+embeddings, MAEST embeddings/style logits, rhythm features, and extracted
+audio features).
 
 Keyed by chromaprint fingerprint hash so identical audio content shares
 one entry regardless of filename or location.
@@ -68,6 +69,11 @@ class FeatureCache:
                 ("effnet_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("features", "BLOB"),
                 ("features_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("maest_embedding", "BLOB"),
+                ("maest_logits", "BLOB"),
+                ("maest_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("rhythm", "BLOB"),
+                ("rhythm_version", "INTEGER NOT NULL DEFAULT 0"),
             ]:
                 try:
                     conn.execute(
@@ -83,7 +89,8 @@ class FeatureCache:
 
     # ── Memory LRU ────────────────────────────────────────────
     # Keys are prefixed: bare fp for CLAP, "effnet:fp" for EffNet,
-    # "feat:fp" for audio features.
+    # "feat:fp" for audio features, "maest:fp" for MAEST embeddings,
+    # "maestlog:fp" for MAEST style logits, "rhythm:fp" for rhythm features.
 
     def _lru_put(self, key: str, data: np.ndarray) -> None:
         self._mem[key] = data
@@ -452,4 +459,329 @@ class FeatureCache:
             with self._lock:
                 self._write_epoch += 1
                 self._evict_mem_keys_with_prefix_unlocked("feat:")
+        return n
+
+    # ------------------------------------------------------------------
+    # MAEST embeddings + style logits (one model pass, shared version)
+    # ------------------------------------------------------------------
+
+    def get_maest_embedding(self, fingerprint: str, version: int = 0) -> np.ndarray | None:
+        key = f"maest:{fingerprint}"
+        with self._lock:
+            if key in self._mem:
+                self._mem.move_to_end(key)
+                return self._mem[key]
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT maest_embedding FROM audio_features WHERE fingerprint=? AND maest_version=?",
+                    (fingerprint, version),
+                ).fetchone()
+        except Exception:
+            return None
+        if row is None or row[0] is None:
+            return None
+        arr = np.frombuffer(row[0], dtype=np.float32).copy()
+        with self._lock:
+            self._lru_put(key, arr)
+        return arr
+
+    def put_maest_embedding(self, fingerprint: str, embedding: np.ndarray, version: int = 0) -> None:
+        blob = embedding.astype(np.float32).tobytes()
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO audio_features (fingerprint, clap_embedding, maest_embedding, maest_version)
+                       VALUES (?, X'', ?, ?)
+                       ON CONFLICT(fingerprint) DO UPDATE SET maest_embedding=excluded.maest_embedding, maest_version=excluded.maest_version""",
+                    (fingerprint, blob, version),
+                )
+        except Exception:
+            return
+        with self._lock:
+            self._write_epoch += 1
+            self._lru_put(f"maest:{fingerprint}", embedding.astype(np.float32))
+
+    def has_maest_embedding(self, fingerprint: str, version: int = 0) -> bool:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM audio_features WHERE fingerprint=? AND maest_version=? AND maest_embedding IS NOT NULL",
+                    (fingerprint, version),
+                ).fetchone()
+                return row is not None
+        except Exception:
+            return False
+
+    def get_all_maest_embeddings(self, fingerprints: list[str], version: int = 0) -> dict[str, np.ndarray]:
+        result: dict[str, np.ndarray] = {}
+        missing: list[str] = []
+        with self._lock:
+            for fp in fingerprints:
+                key = f"maest:{fp}"
+                if key in self._mem:
+                    self._mem.move_to_end(key)
+                    result[fp] = self._mem[key]
+                else:
+                    missing.append(fp)
+        if missing:
+            try:
+                with self._conn() as conn:
+                    for i in range(0, len(missing), 500):
+                        batch = missing[i : i + 500]
+                        placeholders = ",".join("?" for _ in batch)
+                        rows = conn.execute(
+                            f"SELECT fingerprint, maest_embedding FROM audio_features "
+                            f"WHERE fingerprint IN ({placeholders}) AND maest_version=? AND maest_embedding IS NOT NULL",
+                            [*batch, version],
+                        ).fetchall()
+                        for fp, blob in rows:
+                            if blob is None:
+                                continue
+                            arr = np.frombuffer(blob, dtype=np.float32).copy()
+                            result[fp] = arr
+                            with self._lock:
+                                self._lru_put(f"maest:{fp}", arr)
+            except Exception:
+                pass
+        return result
+
+    def count_maest(self, version: int | None = None) -> int:
+        try:
+            with self._conn() as conn:
+                if version is not None:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM audio_features WHERE maest_version=? AND (maest_embedding IS NOT NULL OR maest_logits IS NOT NULL)",
+                        (version,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM audio_features WHERE maest_embedding IS NOT NULL OR maest_logits IS NOT NULL"
+                    ).fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def purge_old_maest_versions(self, current_version: int) -> int:
+        try:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE audio_features SET maest_embedding=NULL, maest_logits=NULL "
+                    "WHERE maest_version < ? AND (maest_embedding IS NOT NULL OR maest_logits IS NOT NULL)",
+                    (current_version,),
+                )
+                n = cursor.rowcount or 0
+        except Exception:
+            return 0
+        if n:
+            with self._lock:
+                self._write_epoch += 1
+                self._evict_mem_keys_with_prefix_unlocked("maest:")
+                self._evict_mem_keys_with_prefix_unlocked("maestlog:")
+        return n
+
+    def get_maest_logits(self, fingerprint: str, version: int = 0) -> np.ndarray | None:
+        key = f"maestlog:{fingerprint}"
+        with self._lock:
+            if key in self._mem:
+                self._mem.move_to_end(key)
+                return self._mem[key]
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT maest_logits FROM audio_features WHERE fingerprint=? AND maest_version=?",
+                    (fingerprint, version),
+                ).fetchone()
+        except Exception:
+            return None
+        if row is None or row[0] is None:
+            return None
+        arr = np.frombuffer(row[0], dtype=np.float32).copy()
+        with self._lock:
+            self._lru_put(key, arr)
+        return arr
+
+    def put_maest_logits(self, fingerprint: str, logits: np.ndarray, version: int = 0) -> None:
+        blob = logits.astype(np.float32).tobytes()
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO audio_features (fingerprint, clap_embedding, maest_logits, maest_version)
+                       VALUES (?, X'', ?, ?)
+                       ON CONFLICT(fingerprint) DO UPDATE SET maest_logits=excluded.maest_logits, maest_version=excluded.maest_version""",
+                    (fingerprint, blob, version),
+                )
+        except Exception:
+            return
+        with self._lock:
+            self._write_epoch += 1
+            self._lru_put(f"maestlog:{fingerprint}", logits.astype(np.float32))
+
+    def get_all_maest_logits(self, fingerprints: list[str], version: int = 0) -> dict[str, np.ndarray]:
+        result: dict[str, np.ndarray] = {}
+        missing: list[str] = []
+        with self._lock:
+            for fp in fingerprints:
+                key = f"maestlog:{fp}"
+                if key in self._mem:
+                    self._mem.move_to_end(key)
+                    result[fp] = self._mem[key]
+                else:
+                    missing.append(fp)
+        if missing:
+            try:
+                with self._conn() as conn:
+                    for i in range(0, len(missing), 500):
+                        batch = missing[i : i + 500]
+                        placeholders = ",".join("?" for _ in batch)
+                        rows = conn.execute(
+                            f"SELECT fingerprint, maest_logits FROM audio_features "
+                            f"WHERE fingerprint IN ({placeholders}) AND maest_version=? AND maest_logits IS NOT NULL",
+                            [*batch, version],
+                        ).fetchall()
+                        for fp, blob in rows:
+                            if blob is None:
+                                continue
+                            arr = np.frombuffer(blob, dtype=np.float32).copy()
+                            result[fp] = arr
+                            with self._lock:
+                                self._lru_put(f"maestlog:{fp}", arr)
+            except Exception:
+                pass
+        return result
+
+    def put_maest(self, fingerprint: str, embedding: np.ndarray, logits: np.ndarray, version: int = 0) -> None:
+        """Write MAEST embedding + style logits and their shared version in one round-trip."""
+        emb_blob = embedding.astype(np.float32).tobytes()
+        log_blob = logits.astype(np.float32).tobytes()
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO audio_features (fingerprint, clap_embedding, maest_embedding, maest_logits, maest_version)
+                       VALUES (?, X'', ?, ?, ?)
+                       ON CONFLICT(fingerprint) DO UPDATE SET maest_embedding=excluded.maest_embedding, maest_logits=excluded.maest_logits, maest_version=excluded.maest_version""",
+                    (fingerprint, emb_blob, log_blob, version),
+                )
+        except Exception:
+            return
+        with self._lock:
+            self._write_epoch += 1
+            self._lru_put(f"maest:{fingerprint}", embedding.astype(np.float32))
+            self._lru_put(f"maestlog:{fingerprint}", logits.astype(np.float32))
+
+    # ------------------------------------------------------------------
+    # Rhythm features
+    # ------------------------------------------------------------------
+
+    def get_rhythm_features(self, fingerprint: str, version: int = 0) -> np.ndarray | None:
+        key = f"rhythm:{fingerprint}"
+        with self._lock:
+            if key in self._mem:
+                self._mem.move_to_end(key)
+                return self._mem[key]
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT rhythm FROM audio_features WHERE fingerprint=? AND rhythm_version=?",
+                    (fingerprint, version),
+                ).fetchone()
+        except Exception:
+            return None
+        if row is None or row[0] is None:
+            return None
+        arr = np.frombuffer(row[0], dtype=np.float32).copy()
+        with self._lock:
+            self._lru_put(key, arr)
+        return arr
+
+    def put_rhythm_features(self, fingerprint: str, features: np.ndarray, version: int = 0) -> None:
+        blob = features.astype(np.float32).tobytes()
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    """INSERT INTO audio_features (fingerprint, clap_embedding, rhythm, rhythm_version)
+                       VALUES (?, X'', ?, ?)
+                       ON CONFLICT(fingerprint) DO UPDATE SET rhythm=excluded.rhythm, rhythm_version=excluded.rhythm_version""",
+                    (fingerprint, blob, version),
+                )
+        except Exception:
+            return
+        with self._lock:
+            self._write_epoch += 1
+            self._lru_put(f"rhythm:{fingerprint}", features.astype(np.float32))
+
+    def has_rhythm_features(self, fingerprint: str, version: int = 0) -> bool:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM audio_features WHERE fingerprint=? AND rhythm_version=? AND rhythm IS NOT NULL",
+                    (fingerprint, version),
+                ).fetchone()
+                return row is not None
+        except Exception:
+            return False
+
+    def get_all_rhythm_features(self, fingerprints: list[str], version: int = 0) -> dict[str, np.ndarray]:
+        result: dict[str, np.ndarray] = {}
+        missing: list[str] = []
+        with self._lock:
+            for fp in fingerprints:
+                key = f"rhythm:{fp}"
+                if key in self._mem:
+                    self._mem.move_to_end(key)
+                    result[fp] = self._mem[key]
+                else:
+                    missing.append(fp)
+        if missing:
+            try:
+                with self._conn() as conn:
+                    for i in range(0, len(missing), 500):
+                        batch = missing[i : i + 500]
+                        placeholders = ",".join("?" for _ in batch)
+                        rows = conn.execute(
+                            f"SELECT fingerprint, rhythm FROM audio_features "
+                            f"WHERE fingerprint IN ({placeholders}) AND rhythm_version=? AND rhythm IS NOT NULL",
+                            [*batch, version],
+                        ).fetchall()
+                        for fp, blob in rows:
+                            if blob is None:
+                                continue
+                            arr = np.frombuffer(blob, dtype=np.float32).copy()
+                            result[fp] = arr
+                            with self._lock:
+                                self._lru_put(f"rhythm:{fp}", arr)
+            except Exception:
+                pass
+        return result
+
+    def count_rhythm(self, version: int | None = None) -> int:
+        try:
+            with self._conn() as conn:
+                if version is not None:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM audio_features WHERE rhythm_version=? AND rhythm IS NOT NULL",
+                        (version,),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM audio_features WHERE rhythm IS NOT NULL"
+                    ).fetchone()
+                return row[0] if row else 0
+        except Exception:
+            return 0
+
+    def purge_old_rhythm_versions(self, current_version: int) -> int:
+        try:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE audio_features SET rhythm=NULL WHERE rhythm_version < ? AND rhythm IS NOT NULL",
+                    (current_version,),
+                )
+                n = cursor.rowcount or 0
+        except Exception:
+            return 0
+        if n:
+            with self._lock:
+                self._write_epoch += 1
+                self._evict_mem_keys_with_prefix_unlocked("rhythm:")
         return n

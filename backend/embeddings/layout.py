@@ -83,8 +83,13 @@ def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
 def _source_versions_token() -> str:
     from .effnet import EFFNET_VERSION
     from .librosa_audio_features import FEATURES_VERSION
+    from .maest import MAEST_VERSION
+    from .rhythm_features import RHYTHM_VERSION
 
-    return f"C{EMBEDDING_VERSION}E{EFFNET_VERSION}F{FEATURES_VERSION}"
+    return (
+        f"C{EMBEDDING_VERSION}E{EFFNET_VERSION}F{FEATURES_VERSION}"
+        f"M{MAEST_VERSION}R{RHYTHM_VERSION}"
+    )
 
 
 def _composite_param_key(
@@ -92,12 +97,35 @@ def _composite_param_key(
     sources: tuple[str, ...],
     mask: np.ndarray,
     blend: float,
+    weights: dict[str, float] | None = None,
 ) -> str:
     ph = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
+    wk = (
+        ",".join(f"{s}:{float(weights.get(s, 1.0)):.6g}" for s in sources)
+        if weights
+        else "-"
+    )
     return (
         f"{ph}|{_source_versions_token()}|{','.join(sources)}|"
-        f"{mask.tobytes().hex()}|{blend:.6g}"
+        f"{mask.tobytes().hex()}|{blend:.6g}|{wk}"
     )
+
+
+def _source_version(source: str) -> int:
+    """Cache-version constant for one source (used in row-cache keys)."""
+    from .effnet import EFFNET_VERSION
+    from .librosa_audio_features import FEATURES_VERSION
+    from .maest import MAEST_VERSION
+    from .rhythm_features import RHYTHM_VERSION
+
+    return {
+        "clap": EMBEDDING_VERSION,
+        "effnet": EFFNET_VERSION,
+        "features": FEATURES_VERSION,
+        "maest": MAEST_VERSION,
+        "maest_logits": MAEST_VERSION,
+        "rhythm": RHYTHM_VERSION,
+    }[source]
 
 
 def _get_prepared_source_row(
@@ -107,39 +135,24 @@ def _get_prepared_source_row(
     feature_mask: np.ndarray,
     features_blend: float,
 ) -> np.ndarray:
-    """Return one track row for *source* with the same preprocessing as composite gather."""
-    from .effnet import EFFNET_VERSION
-    from .librosa_audio_features import FEATURES_VERSION
+    """Return one track row for *source* with the same preprocessing as composite gather.
 
+    Every source is L2-normalised so a high-dimensional block (1280-D EffNet)
+    cannot dominate a low-dimensional one (14-D rhythm) through sheer length.
+    Relative influence is then set explicitly by the per-source weights applied
+    in :func:`_gather_composite_vecs`, not by dimensionality.
+    """
     raw = np.asarray(raw, dtype=np.float32).reshape(-1)
-
-    if source == "clap":
-        key = ("clap", fp, EMBEDDING_VERSION)
-        hit = _source_row_cache_get(key)
-        if hit is not None:
-            return hit
-        n = float(np.linalg.norm(raw))
-        if n < 1e-9:
-            n = 1.0
-        v = (raw / n).astype(np.float32)
-        _source_row_cache_put(key, v)
-        return v
-
-    if source == "effnet":
-        key = ("effnet", fp, EFFNET_VERSION)
-        hit = _source_row_cache_get(key)
-        if hit is not None:
-            return hit
-        n = float(np.linalg.norm(raw))
-        if n < 1e-9:
-            n = 1.0
-        v = (raw / n).astype(np.float32)
-        _source_row_cache_put(key, v)
-        return v
 
     if source == "features":
         b = float(np.clip(features_blend, 0.05, 1.0))
-        key = ("features", fp, FEATURES_VERSION, feature_mask.tobytes(), round(b, 9))
+        key = (
+            "features",
+            fp,
+            _source_version(source),
+            feature_mask.tobytes(),
+            round(b, 9),
+        )
         hit = _source_row_cache_get(key)
         if hit is not None:
             return hit
@@ -151,7 +164,21 @@ def _get_prepared_source_row(
         _source_row_cache_put(key, v)
         return v
 
-    raise ValueError(f"unknown source {source!r}")
+    try:
+        version = _source_version(source)
+    except KeyError:
+        raise ValueError(f"unknown source {source!r}") from None
+
+    key = (source, fp, version)
+    hit = _source_row_cache_get(key)
+    if hit is not None:
+        return hit
+    n = float(np.linalg.norm(raw))
+    if n < 1e-9:
+        n = 1.0
+    v = (raw / n).astype(np.float32)
+    _source_row_cache_put(key, v)
+    return v
 
 
 def _semantic_basis_param_key(
@@ -431,26 +458,66 @@ def _gather_vecs(
     return paths, vecs
 
 
+_SOURCE_GETTER_NAMES: dict[str, str] = {
+    "clap": "get_all_embeddings",
+    "effnet": "get_all_effnet_embeddings",
+    "features": "get_all_audio_features",
+    "maest": "get_all_maest_embeddings",
+    "maest_logits": "get_all_maest_logits",
+    "rhythm": "get_all_rhythm_features",
+}
+
+
+def _fetch_source_map(
+    source: str, feature_cache, fp_set: list[str]
+) -> dict[str, np.ndarray]:
+    """One batched cache read for *source*, keyed by its own version constant.
+
+    A cache object without the getter for *source* (older cache, or a test
+    stub) yields an empty map rather than raising — that source is simply
+    absent for this projection.
+    """
+    try:
+        name = _SOURCE_GETTER_NAMES[source]
+    except KeyError:
+        raise ValueError(f"unknown source {source!r}") from None
+    getter = getattr(feature_cache, name, None)
+    if getter is None:
+        return {}
+    return getter(fp_set, version=_source_version(source))
+
+
 def _gather_composite_vecs(
     track_infos: list[dict],
     feature_cache,
     sources: tuple[str, ...] = ("clap",),
     feature_mask: np.ndarray | None = None,
     features_blend: float = 0.42,
+    source_weights: dict[str, float] | None = None,
+    required_sources: tuple[str, ...] | None = None,
 ) -> tuple[list[str], np.ndarray, int, int, str]:
-    from .effnet import EFFNET_VERSION
-    from .librosa_audio_features import AUDIO_FEATURE_DIM, FEATURES_VERSION
+    """Stack cached per-source rows into one weighted matrix.
+
+    A track is placed on the map when it has every *required_sources* entry;
+    optional sources it lacks contribute a zero row, so partially analysed
+    libraries still render instead of hiding tracks until every model has run.
+
+    Per-source weights are applied as ``sqrt(w)`` because squared Euclidean
+    distance is additive across the concatenated blocks — scaling a block by
+    ``sqrt(w)`` makes it contribute exactly ``w ×`` its distance (plan §8).
+    """
+    from .librosa_audio_features import AUDIO_FEATURE_DIM
 
     fps = [t.get("fingerprint") for t in track_infos]
     fp_set = [fp for fp in fps if fp]
 
-    source_maps: dict[str, dict[str, np.ndarray]] = {}
-    if "clap" in sources:
-        source_maps["clap"] = feature_cache.get_all_embeddings(fp_set, version=EMBEDDING_VERSION)
-    if "effnet" in sources:
-        source_maps["effnet"] = feature_cache.get_all_effnet_embeddings(fp_set, version=EFFNET_VERSION)
-    if "features" in sources:
-        source_maps["features"] = feature_cache.get_all_audio_features(fp_set, version=FEATURES_VERSION)
+    source_maps: dict[str, dict[str, np.ndarray]] = {
+        s: _fetch_source_map(s, feature_cache, fp_set) for s in sources
+    }
+
+    required = tuple(required_sources) if required_sources else tuple(sources)
+    # Only require sources that are actually enabled for this projection.
+    required = tuple(s for s in required if s in sources)
 
     paths: list[str] = []
     fp_order: list[str] = []
@@ -458,7 +525,7 @@ def _gather_composite_vecs(
         fp = t.get("fingerprint")
         if not fp:
             continue
-        if all(fp in source_maps.get(s, {}) for s in sources):
+        if all(fp in source_maps.get(s, {}) for s in required):
             paths.append(t["path"])
             fp_order.append(fp)
 
@@ -473,7 +540,8 @@ def _gather_composite_vecs(
             mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
 
     blend = float(np.clip(features_blend, 0.05, 1.0))
-    comp_key = _composite_param_key(paths, sources, mask, blend)
+    weights = dict(source_weights or {})
+    comp_key = _composite_param_key(paths, sources, mask, blend, weights)
     cached = _tier_cache_get(_composite_cache, comp_key)
     if cached is not None:
         _p, _mat, _cd, _clo = cached
@@ -485,19 +553,36 @@ def _gather_composite_vecs(
     clap_col_lo = 0
     col = 0
     for s in sources:
-        smap = source_maps[s]
-        block = np.stack(
-            [
-                _get_prepared_source_row(s, fp, smap[fp], mask, blend)
-                for fp in fp_order
-            ],
-            axis=0,
-        )
+        smap = source_maps.get(s, {})
+        if not smap:
+            continue
+        weight = float(weights.get(s, 1.0)) if weights else 1.0
+        if weight <= 0.0:
+            continue
+
+        dim = _source_block_dim(s, smap)
+        if dim <= 0:
+            continue
+        zero = np.zeros(dim, dtype=np.float32)
+        rows = []
+        for fp in fp_order:
+            raw = smap.get(fp)
+            if raw is None:
+                rows.append(zero)
+            else:
+                rows.append(_get_prepared_source_row(s, fp, raw, mask, blend))
+        block = np.stack(rows, axis=0)
+        if weight != 1.0:
+            block = (block * float(np.sqrt(weight))).astype(np.float32)
+
         if s == "clap":
             clap_dim = block.shape[1]
             clap_col_lo = col
         blocks.append(block)
         col += block.shape[1]
+
+    if not blocks:
+        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, ""
 
     mat = np.concatenate(blocks, axis=1).astype(np.float32)
     _tier_cache_put(
@@ -507,6 +592,14 @@ def _gather_composite_vecs(
         _COMPOSITE_CACHE_MAX,
     )
     return paths, mat, clap_dim, clap_col_lo, comp_key
+
+
+def _source_block_dim(source: str, smap: dict[str, np.ndarray]) -> int:
+    """Width of one source block, taken from the first cached row."""
+    for v in smap.values():
+        if v is not None:
+            return int(np.asarray(v).reshape(-1).size)
+    return 0
 
 
 def _normalise_coords(coords: np.ndarray) -> np.ndarray:
@@ -737,6 +830,8 @@ def compute_projection(
     feature_mask: np.ndarray | None = None,
     features_blend: float = 0.42,
     layout_revision: str | None = None,
+    source_weights: dict[str, float] | None = None,
+    required_sources: tuple[str, ...] | None = None,
 ) -> list[dict]:
     if layout_revision and method == "tsne":
         hit = _tier_cache_get(_revision_layout_cache, layout_revision)
@@ -751,6 +846,8 @@ def compute_projection(
         sources=sources,
         feature_mask=feature_mask,
         features_blend=features_blend,
+        source_weights=source_weights,
+        required_sources=required_sources,
     )
     t_after_gather = time.perf_counter()
 
