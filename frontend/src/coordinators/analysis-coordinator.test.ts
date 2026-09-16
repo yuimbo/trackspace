@@ -86,6 +86,7 @@ const PANEL_HTML = `
   <p id="cluster-weights-note"></p>
   <button id="btn-apply-weights"></button>
   <button id="btn-reset-weights"></button>
+  <button id="btn-default-weights"></button>
   <button id="btn-rebuild-clusters"></button>
   <button id="btn-train-supervised"></button>
 `;
@@ -95,6 +96,7 @@ interface Harness {
   update: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   refreshProjection: ReturnType<typeof vi.fn>;
+  applyApproximateWeights: ReturnType<typeof vi.fn>;
   canvas: { hoverTarget: HoverTarget | null };
   coord: AnalysisCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
@@ -106,6 +108,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const update = vi.fn();
   const scheduleDraw = vi.fn();
   const refreshProjection = vi.fn();
+  const applyApproximateWeights = vi.fn(() => true);
   const canvas = { hoverTarget: null as HoverTarget | null };
   const coord = new AnalysisCoordinator({
     model,
@@ -113,12 +116,22 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     scheduleDraw,
     canvas,
     refreshProjection,
+    applyApproximateWeights,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
     Promise.resolve(jsonResponse(routes(String(input)))),
   );
   vi.stubGlobal("fetch", fetchSpy);
-  return { model, update, scheduleDraw, refreshProjection, canvas, coord, fetchSpy };
+  return {
+    model,
+    update,
+    scheduleDraw,
+    refreshProjection,
+    applyApproximateWeights,
+    canvas,
+    coord,
+    fetchSpy,
+  };
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -528,6 +541,15 @@ function rebuildBody(fetchSpy: ReturnType<typeof vi.fn>): unknown {
   return JSON.parse(String((post![1] as RequestInit).body));
 }
 
+/** Whether a `/api/clusters/rebuild` POST was made at all. */
+function didRebuild(fetchSpy: ReturnType<typeof vi.fn>): boolean {
+  return fetchSpy.mock.calls.some(
+    ([u, init]) =>
+      String(u) === "/api/clusters/rebuild" &&
+      (init as RequestInit | undefined)?.method === "POST",
+  );
+}
+
 describe("AnalysisCoordinator source weights", () => {
   it("renders one slider per source, initialised to the defaults", () => {
     const { model, coord } = makeHarness();
@@ -559,11 +581,30 @@ describe("AnalysisCoordinator source weights", () => {
     expect(refreshProjection).toHaveBeenCalled();
   });
 
-  it("restores the defaults on Reset", async () => {
+  it("undoes slider drags on Reset without a server round-trip", async () => {
+    const { model, coord, fetchSpy, applyApproximateWeights } = makeHarness();
+    model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.9 };
+    coord.bindPanel();
+    const $rhythm = document.querySelector<HTMLInputElement>(
+      "#cluster-weights input[data-source='rhythm']",
+    )!;
+    $rhythm.value = "0.5";
+    $rhythm.dispatchEvent(new Event("input"));
+    document.getElementById("btn-reset-weights")!.click();
+    await flush();
+
+    // Sliders snap back to the applied vector and the map is restored locally.
+    expect($rhythm.valueAsNumber).toBeCloseTo(0.9);
+    expect(model.clusterWeights.rhythm).toBe(0.9);
+    expect(applyApproximateWeights).toHaveBeenCalledWith(model.clusterWeights);
+    expect(didRebuild(fetchSpy)).toBe(false);
+  });
+
+  it("loads and applies the defaults on Defaults", async () => {
     const { model, coord, fetchSpy } = makeHarness();
     model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.9 };
     coord.bindPanel();
-    document.getElementById("btn-reset-weights")!.click();
+    document.getElementById("btn-default-weights")!.click();
     await flush();
 
     expect(model.clusterWeights).toEqual(DEFAULT_CLUSTER_WEIGHTS);

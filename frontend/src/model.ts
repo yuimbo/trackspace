@@ -146,6 +146,23 @@ export const CLUSTER_WEIGHT_LABELS: Record<string, string> = {
   features: "Audio",
 };
 
+/**
+ * What each source actually encodes, for the slider hover help. Keep the wording
+ * about *information*, not the model name: the sliders are the only place a user
+ * sees the sources, and "MAEST" alone says nothing about what it contributes.
+ */
+export const CLUSTER_WEIGHT_DESCRIPTIONS: Record<string, string> = {
+  maest_logits:
+    "Discogs style/genre logits (519-D) — the primary genre signal; sparse, near one-hot",
+  maest: "MAEST hidden embedding (768-D) — audio semantics",
+  rhythm: "librosa/madmom DSP (14-D) — groove, tempo and onset",
+  clap: "CLAP audio embedding (512-D) — text-aligned semantics; the only block with a text tower",
+  supervised:
+    "Folder-supervised head output (128-D) — your own folder organisation; derived, not an encoder",
+  features:
+    "Audio descriptors (tempo, energy, danceability) — the other three are masked out",
+};
+
 function _migrateClusterWeights(raw: unknown): Record<string, number> {
   const out: Record<string, number> = { ...DEFAULT_CLUSTER_WEIGHTS };
   if (raw && typeof raw === "object") {

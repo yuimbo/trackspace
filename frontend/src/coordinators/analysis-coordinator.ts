@@ -14,6 +14,7 @@ import {
   type QueueStatus,
   DEFAULT_CLUSTER_WEIGHTS,
   CLUSTER_WEIGHT_LABELS,
+  CLUSTER_WEIGHT_DESCRIPTIONS,
   formatSourceWeight,
 } from "../model";
 import { toast, clusterColor } from "../lib/toast";
@@ -173,7 +174,18 @@ export class AnalysisCoordinator {
     const $reset = document.getElementById("btn-reset-weights");
     if ($reset) {
       $reset.addEventListener("click", () => {
-        this.deps.model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS };
+        // Undo slider drags only: back to the *applied* vector, and restore the
+        // map to the base layout the Jacobian was evaluated at (dw = 0, exact).
+        // No server round-trip — the applied layout is already cached.
+        this._syncWeightSliders();
+        this.deps.applyApproximateWeights?.(m.clusterWeights);
+      });
+    }
+
+    const $defaults = document.getElementById("btn-default-weights");
+    if ($defaults) {
+      $defaults.addEventListener("click", () => {
+        m.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS };
         this._syncWeightSliders();
         void this._applyWeights();
       });
@@ -202,7 +214,9 @@ export class AnalysisCoordinator {
       input.step = "0.05";
       input.dataset.source = source;
       input.value = String(this.deps.model.clusterWeights[source] ?? 0);
-      input.title = `Relative influence of the ${source} source`;
+      input.title =
+        CLUSTER_WEIGHT_DESCRIPTIONS[source] ??
+        `Relative influence of the ${source} source`;
 
       const value = document.createElement("span");
       value.className = "cluster-weight-value";

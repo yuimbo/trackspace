@@ -29,15 +29,70 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
   `buildTooltip` is pure; the canvas renders it. The flag is excerpt dispersion
   (intro vs drop ≥ 0.25), not cluster-centroid distance — the badge's hover text says so.
 
-- [ ] Whacko idea! Allow exporting / importing / comparing the trained folder heads between directory trees.
-  Think being able to "steal" someones organization system, and imprint it on a new unsorted set of tracks
-  Even have a feature where you point it at a huge folder and then automatically fan out all the tracks inside to their corresponding folder path in the trained head
+- ✅ **Head bundles + folder fan-out.** The head stores per-folder centroids in the
+  128-D space, so it exports/imports as a self-describing bundle, compares by
+  centroid cosine, and fans a folder out into the head's folder subfolders
+  (`POST /api/supervised/fanout`, dry-run by default). See `audio_pipeline.md` →
+  *Head bundles*. Open follow-ups: fan-out has no undo, and an imported head does
+  not check `source_versions`.
 
-- [ ] "Source weights"
-  Show more info around the underlying models (what kind of information do they encode?) when hovering them
-  If the sliders have moved, allow resetting them (separate "Reset" from "Load default config")
-  The models might have different "global" behaviour overall? Should we maybe somehow "normalize" them first? So they have matching distirbutions or something, and better "co-correlate" in a shared space? Is this something normal to do in AI/ML when merging embedding spaces? ((in that case what is it called so i can learn more about it?))
-  
+- ✅ **Source weights panel: hover help + Reset split.** Each slider now carries a
+  hover description of what the source encodes
+  (`CLUSTER_WEIGHT_DESCRIPTIONS`), **Reset** undoes slider drags back to the
+  *applied* vector (local, no server round-trip), and **Defaults** loads
+  `DEFAULT_CLUSTER_WEIGHTS` and applies.
+
+### Source-weight comparability (normalising the source blocks)
+
+The six source blocks have very different global geometry (a 519-D near-one-hot
+logit block vs a 14-D DSP block vs a 512-D CLAP embedding), so a weight of `0.5`
+does not mean the same thing per source. That is a plausible reason a slider can
+look inert: it is moving a block whose distances are already tiny (or huge) relative
+to the others.
+
+The layout currently only L2-normalises each row and scales by `sqrt(w)`; the
+clustering path additionally standardises each column first
+(`clustering.build_weighted_matrix`). The layout deliberately omits standardisation
+because column statistics depend on the current track set — a *stateful* recipe makes a
+track's projection drift as the library grows (see the `layout.py` docstring).
+
+- [ ] **Frozen reference normalisation.** Fit the per-source transform once on a
+  **frozen reference set** and cache it in a chart artifact, then apply it
+  statelessly. That gives distribution matching without the drift. This is the same
+  `chart_revision` split the landmark extension needs — do both together, and bump
+  `PROJECTION_RECIPE_VERSION`.
+- [ ] **Pick the technique and measure it.** Cheapest first: per-source z-score
+  (`clustering._standardize`); **whitening** (ZCA/PCA) to equalise covariance;
+  **CORAL** to align second-order statistics; **CCA / Deep CCA** for a shared
+  maximally-correlated subspace; **optimal transport** (Wasserstein /
+  Gromov-Wasserstein) which needs no shared space at all. Note the codebase already
+  uses Procrustes, but only for PCA *orientation* stability
+  (`projection_backends._pca_ref_lookup`), not for cross-source alignment.
+- [ ] **Do not whiten blindly.** Whitening decorrelates dimensions and can destroy
+  the cosine geometry the clustering relies on (`build_weighted_matrix` L2-normalises
+  rows because cosine kNN assumes it). Validate with the landmark fidelity harness
+  below — neighbourhood recall / trustworthiness, not cluster count.
+- [ ] **Reading list for the write-up.** The relevant names to search:
+  *distribution matching*, *standardisation / z-scoring*, *whitening (ZCA)*, *CORAL*,
+  *canonical correlation analysis (CCA / Deep CCA)*, *Procrustes alignment* (MUSE,
+  VecMap), *optimal transport / Wasserstein / Gromov-Wasserstein*, *the modality gap*
+  (Liang et al. 2022 — directly relevant, CLAP is CLIP-style), *alignment &
+  uniformity* (Wang & Isola 2020), *multi-view / multi-modal representation
+  learning*, *domain adaptation*. Document whatever is chosen in
+  `audio_pipeline.md` → *Embedding sources*.
+- [ ] **Landmark 2-D fidelity is unmeasured.** The landmark extension's derivative
+  is exact (checked against central differences of the same `g`), but whether its 2-D
+  layout tracks the *real* t-SNE chart across the weight range is empirical. The naive
+  comparison is confounded — a refit is not a smooth function, so Procrustes cannot
+  align its cluster rearrangements — so measure against a *fixed* chart instead. Tune
+  `n_landmarks` (default 128) and `tau` (median of `D²`) on the real library.
+- [ ] **One fidelity harness for both.** Build the researcher's §8 evaluation once and
+  reuse it for the normalisation choice and the landmark fidelity: neighbourhood
+  recall / trustworthiness at k=10/30/100; weight hold-out generalization (hold out
+  *weight combinations*, not just tracks — a stationary map is perfectly smooth and
+  fails this); derivative correctness (`J·Δw` against the *same frozen mapping* at
+  decreasing step sizes, expecting a quadratic residual); and operational checks
+  (10k/20k, insertion batches, row permutations, old-coordinate byte-stability).
 
 ## Deferred / optional
 
@@ -57,12 +112,12 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       rejection). Unreproduced in headless Chromium, so unconfirmed: if a user reports a
       silent first hover after a reload, catch `NotAllowedError` and show a one-time
       "click to enable preview audio" hint, then retry on the next gesture.
-- [ ] **Projection refit progress.** The t-SNE/UMAP refit is still opaque: the
-      canvas shows a static "Computing layout…" pill (`canvas-view.ts`,
-      `_embeddingWaitLabel`) while `/api/embeddings/projection` runs for seconds.
-      openTSNE exposes iteration callbacks; a phase/percent on the same
-      `stage_progress` channel would cover it. Only worth it if the refit is a
-      visible fraction of a first run.
+- [ ] **Projection refit progress is phase-level only.** The layout streams its
+      phase as `layout_progress` (`compute_projection`'s `on_progress`), so the pill
+      and status bar show "laying out" → "landmarks" → "Jacobian" instead of a static
+      "Computing layout…". The base `layout` phase itself is still one opaque step:
+      neither the sklearn fallback nor mlx-vis exposes iteration callbacks, so a percent
+      needs a custom optimize loop (openTSNE's `optimize` is a generator).
 
 - [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1040 lines, the
       largest frontend file). The ~200 lines of fit-view math (`_vpFromWorldBounds`,
