@@ -559,8 +559,9 @@ Names live in `backend/jobs/kinds.py` so enqueuers, workers, and routes cannot
 drift apart.
 
 `clap` sits after `maest` so the primary genre signal lands first and the map
-renders while the (decode-dominated) CLAP backfill continues; its drain triggers a
-re-cluster like any other per-track stage.
+renders while the CLAP backfill continues; its drain triggers a re-cluster like any
+other per-track stage. (CLAP is not the long pole: measured ~0.14 s/track, one of the
+fastest stages — see *Per-stage throughput*.)
 
 **Progress is reported per job and per phase.** Each completed per-track job emits a
 `progress` event on `/api/jobs/stream`; the two library-wide singletons instead
@@ -586,6 +587,39 @@ Consequently `_DECODE_LOCK` is per-process, and the madmom processors are
 per-thread inside each process (`backend/embeddings/madmom_tempo.py`) — the BLSTM
 layers carry hidden state across frames, so a shared processor corrupts tempo
 values. `warm()` in the child module builds each child's processors on start.
+
+### Per-stage throughput
+
+`tests/profile_pipeline.py` drives the real handlers through the durable queue over a
+deterministic sample and reports s/track and tracks/min per stage, so changes here are
+comparable. It shares one feature cache across the stages of a repeat (so `supervise` /
+`cluster` see the per-track rows) and rebuilds it per repeat (so each stage redoes its
+work), while the `features` process pool and the MAEST/CLAP models survive across
+repeats. Run it on an **idle machine**: under load the run-to-run spread is larger than
+the effect being measured.
+
+Indicative best-run numbers (64-track sample, Apple Silicon; the machine was busy, so treat
+them as relative, not absolute):
+
+| Stage | s/track | tracks/min | Notes |
+|---|---|---|---|
+| scan | 0.156 | 385 | ID3 + fpcalc |
+| features | 0.387 | 155 | 4-process pool, warm |
+| structure | 0.117 | 512 | 4-thread pool, whole-track decode |
+| maest | 0.388–0.43 | 139–155 | **slowest per-track stage** |
+| clap | 0.135 | 446 | 3 × 15 s decode + one batched forward |
+| supervise | — | — | whole-library, seconds (skips without MAEST rows) |
+| cluster | — | — | whole-library, seconds |
+
+Two conclusions worth keeping in mind before optimising:
+
+- **Decode is cheap.** A 15 s / 48 kHz segment decodes in ~14 ms and a whole 6-minute
+  track at 2205 Hz in ~300–450 ms, so `_DECODE_LOCK` contention is not a material
+  fraction of any stage, and CLAP's "decode-dominated" label was wrong — CLAP is one of
+  the *fast* stages. The decode lock's cost is the SIGBUS it prevents, not throughput.
+- **MAEST is the per-track bottleneck** (~0.4 s/track, ≈4× CLAP). Its transformer
+  forward, not decode, is where the end-to-end time goes; the batch-size default and
+  `torch.compile` / `inference_mode` are therefore the highest-leverage levers.
 
 ### Rules when adding a stage
 

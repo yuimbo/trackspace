@@ -112,14 +112,11 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
   1/2/4/8 processes (`tests/profile_features_workers.py`). The pool uses `spawn`
   (not `fork`) because the parent is multi-threaded, and each child re-imports
   `backend.app` (~3.5 s, once, parallel) before `warm()` builds its processors.
-- [ ] **Measure `_DECODE_LOCK` contention.** The decode lock serialises every
-  native MP3 open, and now also covers CLAP's 48 kHz decodes alongside
-  `features` / `maest`. It is per-process, so the features pool does not share it;
-  within a process, `librosa_get_duration` holds it across the whole call and a VBR
-  MP3 with no Xing header costs a ~1.2 s whole-file scan on the first probe
-  (measured; librosa caches it after). Instrument the wait time in
-  `decode_stderr.librosa_load`; if it is a material fraction of the stage wall
-  time, prioritise the torchaudio-decode item under *Acceleration*.
+- [x] **`_DECODE_LOCK` contention is not material — measured.** Decode is ~14 ms
+  per 15 s / 48 kHz segment and ~300–450 ms for a whole 6-minute track at 2205 Hz,
+  so even a fully serialised open is a small fraction of every stage (MAEST is
+  ~0.4 s/track, CLAP ~0.14). Do not instrument it; the lock's cost is the SIGBUS
+  it prevents, not throughput. See `audio_pipeline.md` → *Per-stage throughput*.
 - [ ] **Features process pool: cut child startup.** Each spawned child re-imports
   `backend.app` (hence torch, ~3.5 s) before `warm()` builds its madmom
   processors. A `forkserver` pool with a lightweight preload, or a dedicated
@@ -138,15 +135,20 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 ### Acceleration
 
-- [ ] **Stop using libsndfile for MP3.** It is the SIGBUS source
-      (`audio_pipeline.md` → *Audio decoding*) and forces the open lock. `torchaudio`
-      is already a dependency and decodes MP3 via ffmpeg/sox without mpg123's global
-      init, which would let opens run unlocked. Prototype behind an env flag, A/B the
-      embeddings on a fixed sample, then flip the default and drop `_DECODE_LOCK`.
-- [ ] **MAEST: `torch.compile` / `torch.inference_mode`.** The batched transformer
-      is the per-track GPU bottleneck. Try `torch.compile` on the model (or at least
-      `inference_mode()` instead of `no_grad()`) and measure cold-start vs steady-state
-      on MPS before enabling.
+- [ ] **Stop using libsndfile for MP3 (correctness, not speed).** It is the SIGBUS
+      source (`audio_pipeline.md` → *Audio decoding*) and forces the open lock.
+      **The original `torchaudio` plan is stale:** on torchaudio 2.11 the sox/ffmpeg
+      file backends are gone — `torchaudio.load` raises `ImportError: TorchCodec is
+      required` (torchcodec is not installed). So this now means adding torchcodec +
+      FFmpeg shared libs, or shelling out to the `ffmpeg` already on PATH.
+      Measured: an `ffmpeg` subprocess is *not* faster (equal on whole tracks,
+      ~2.7× slower per 15 s segment from process spawn), so the only win is
+      dropping `_DECODE_LOCK` for the SIGBUS invariant.
+- [ ] **MAEST: `torch.compile` / `torch.inference_mode` — now the top item.** The
+      batched transformer is the measured per-track bottleneck (~0.4 s/track vs CLAP's
+      ~0.14; see *Per-stage throughput*). Try `inference_mode()` instead of
+      `no_grad()` (safe, tiny) and `torch.compile` on the model, measuring
+      cold-start vs steady-state on MPS on a quiet machine before enabling.
 - [ ] **MAEST mel front end.** The mel runs on CPU per excerpt; check whether the
       three excerpts can share one batched `torchaudio` transform instead of three
       separate calls.
@@ -194,26 +196,38 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 ### Profiling & benchmarks
 
-- [ ] **Per-stage throughput harness.** `tests/test_profiling_embeddings.py` and
-      `tests/profile_madmom_tempo.py` are ad-hoc. Add one script that reports
-      tracks/min and s/track per stage (scan/features/structure/maest/clap/supervise/cluster)
-      on a fixed sample, so every change here is comparable.
-- [ ] **CLAP stage throughput.** The stage is decode-dominated (3 × 15 s at 48 kHz)
-      with one batched forward per track. Measure tracks/min on the real library and
-      sweep `max_batch` (the handler passes `batch_size=4` → 12 segments) against
-      MPS memory, then pick a default the way MAEST did.
+- ✅ **Per-stage throughput harness.** `tests/profile_pipeline.py` drives the real
+      handlers through the durable queue over a deterministic sample and reports
+      s/track + tracks/min per stage, with a best-run summary, skip reasons, and a
+      non-destructive scratch-cache design. Baseline (busy machine, relative only):
+      scan 0.16, features 0.39, structure 0.12, **maest 0.39–0.43**, clap 0.14
+      s/track. Recorded in `audio_pipeline.md` → *Per-stage throughput*.
+- [ ] **CLAP `max_batch` sweep.** Measured ~0.14 s/track (~446 tracks/min) at the
+      default `batch_size=4` → 12 segments, so CLAP is *not* decode-dominated and
+      is one of the fastest stages. Low priority; sweep `max_batch` vs MPS memory
+      only if a profile ever puts CLAP near the top.
 - [ ] **Purge leftover EffNet cache rows.** `data/audio_features.db` still holds
       `effnet_embedding` / `effnet_version` columns and rows from before the source
       was deleted (~48 MB at 9.5k tracks), and `data/models/discogs-effnet-*.onnx`
       is still on disk. `data/` is gitignored and nothing reads them, so this is
       only worth doing if the disk footprint matters.
-- [ ] **Cold vs warm end-to-end run.** Record wall-clock for a full `force` re-analysis
-      and a no-op re-run; that is the number the parallelism work must move.
-- [ ] **MAEST batch-size sweep.** The handler passes `max_batch=12` (4 tracks × 3
-      excerpts). Sweep batch vs throughput vs MPS memory and pick a default.
+- [ ] **Cold vs warm end-to-end run.** The harness gives the warm per-track sum
+      (~1.18 s/track across scan+features+structure+maest+clap ≈ 51 tracks/min, so
+      ~3.5 h for 10.8k tracks), but a full `force` re-analysis wall-clock and a
+      no-op re-run are still unrecorded; capture both.
+- [ ] **MAEST batch-size sweep — the top per-track lever.** MAEST is the slowest
+      stage (~0.4 s/track), so its batch/compile choices matter most. A sweep on a
+      **quiet** machine was inconclusive under load (batch 1/2/4/8/16 spread
+      ~70–150 tracks/min with no clean winner; the loaded machine's run-to-run
+      spread exceeded the effect). Re-run
+      `tests/profile_pipeline.py --stages maest --maest-batch N --repeat 3` when idle
+      and pair it with the `inference_mode` / `torch.compile` item under
+      *Acceleration*.
 - [ ] **Peak RSS / GPU memory.** No memory baseline exists; capture peak RSS and MPS
       allocation per stage before adding workers or batches.
-- [ ] **Decode cost breakdown.** Time open vs read vs resample inside `librosa_load`;
-      this decides whether the decode lock actually costs anything.
+- ✅ **Decode cost breakdown.** ~14 ms per 15 s/48 kHz segment and ~300–450 ms for
+      a whole 6-minute track at 2205 Hz; an `ffmpeg` subprocess is equal on whole
+      tracks but ~2.7× slower per segment (process spawn). Decode is not the
+      bottleneck. See *Per-stage throughput* in `audio_pipeline.md`.
 - [ ] **Cluster/projection timing at scale.** `DEFAULT_RESOLUTIONS` and k=20 were
       calibrated at ~9.5k tracks; re-measure once the library doubles.
