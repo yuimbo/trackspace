@@ -48,6 +48,9 @@ const PHASE_LABELS: Record<string, string> = {
   training: "training",
   projecting: "projecting rows",
   done: "done",
+  // Layout phases (streamed as `layout_progress`, not a queued job).
+  layout: "laying out",
+  jacobian: "Jacobian",
 };
 
 /** Kinds that produce the per-track embeddings the map is built from. */

@@ -393,37 +393,48 @@ def _normalise_coords(coords: np.ndarray) -> np.ndarray:
 
 
 def _weight_jacobian(
-    project_fn: Callable[[dict[str, float]], tuple],
+    project_fn: Callable[..., tuple],
     base_weights: dict[str, float],
     sources: tuple[str, ...],
     *,
     delta: float = 1e-3,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Finite-difference ``d(2-D coords) / d(source weight)`` at *base_weights*.
 
-    *project_fn(weights)* returns ``(result, normed, spans)`` for one weight
-    vector — :func:`compute_projection`'s own inner pipeline. One projection is
-    run per source, so the caller must compute this once (on drag start) and apply
-    it linearly for the small deltas of the drag; it is never a substitute for
-    the full recompute on release.
+    *project_fn(weights, cache_fit=…)* returns ``(result, normed, spans)`` for one
+    weight vector — :func:`compute_projection`'s own inner pipeline. One
+    projection is run per source, so the caller must compute this once (on drag
+    start) and apply it linearly for the small deltas of the drag; it is never a
+    substitute for the full recompute on release.
+
+    The perturbation fits are thrown away (*cache_fit=False*): their one-off configs
+    would otherwise evict the live fit the base layout reuses. *on_progress* is
+    called as ``(done, total)`` per source, for a determinate progress UI.
 
     A source already at weight 0 has no block, so it has no derivative and is
     skipped — raising its weight from 0 is a step the linearisation cannot describe.
     """
     _base, base_normed, _spans = project_fn(base_weights)
     out: dict[str, np.ndarray] = {}
+    total = len(sources)
     if base_normed.shape[0] < 2:
         return out
+    done = 0
     for s in sources:
+        done += 1
         weight = float(base_weights.get(s, 1.0))
         if weight <= 0.0:
+            if on_progress is not None:
+                on_progress(done, total)
             continue
         stepped = dict(base_weights)
         stepped[s] = weight + float(delta)
-        _res, moved, _sp = project_fn(stepped)
-        if moved.shape != base_normed.shape:
-            continue
-        out[s] = ((moved - base_normed) / float(delta)).astype(np.float32)
+        _res, moved, _sp = project_fn(stepped, cache_fit=False)
+        if moved.shape == base_normed.shape:
+            out[s] = ((moved - base_normed) / float(delta)).astype(np.float32)
+        if on_progress is not None:
+            on_progress(done, total)
     return out
 
 
@@ -482,6 +493,7 @@ def compute_projection(
     source_weights: dict[str, float] | None = None,
     required_sources: tuple[str, ...] | None = None,
     with_jacobian: bool = False,
+    on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[dict] | tuple[list[dict], dict[str, np.ndarray]]:
     if layout_revision and method == "tsne":
         hit = _tier_cache_get(_revision_layout_cache, layout_revision)
@@ -491,7 +503,7 @@ def compute_projection(
 
     weights0 = dict(source_weights or {})
 
-    def _project_at(w: dict[str, float]):
+    def _project_at(w: dict[str, float], *, cache_fit: bool = True):
         """Gather → weight → project → normalise for one weight vector.
 
         Returns ``(result, normed, spans)``. The composite gather is keyed on
@@ -562,7 +574,9 @@ def compute_projection(
                     f"{comp_config}|{basis_key}"
                     f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
                 )
-            coords = _project_tsne(mat_proj, paths=paths, config_key=tsne_config)
+            coords = _project_tsne(
+                mat_proj, paths=paths, config_key=tsne_config, cache_fit=cache_fit
+            )
 
         normed = _normalise_coords(coords)
         result = [
@@ -571,6 +585,11 @@ def compute_projection(
         ]
         return result, normed, spans
 
+    # The base layout is the whole of the *visible* work, so it is reported
+    # first and on its own; the Jacobian that follows is a separate, slower pass
+    # whose per-source progress the frontend renders in the background.
+    if on_progress is not None:
+        on_progress("layout", 0, 0)
     result, _normed, _spans = _project_at(weights0)
 
     if layout_revision and method == "tsne":
@@ -579,6 +598,15 @@ def compute_projection(
         )
 
     if with_jacobian:
-        jacobian = _weight_jacobian(_project_at, weights0, sources)
+        jacobian = _weight_jacobian(
+            _project_at,
+            weights0,
+            sources,
+            on_progress=(
+                (lambda done, total: on_progress("jacobian", done, total))
+                if on_progress is not None
+                else None
+            ),
+        )
         return result, jacobian
     return result

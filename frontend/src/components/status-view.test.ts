@@ -103,6 +103,15 @@ describe("StatusView analysis progress", () => {
     expect(statusText()).not.toContain("%");
   });
 
+  it("shows the layout phase while a projection is in flight", () => {
+    const view = new StatusView();
+    const model = new Model();
+    model.projectionPending = true;
+    model.layoutProgress = { phase: "jacobian", done: 2, total: 5 };
+    view.update(model);
+    expect(statusText()).toContain("Layout: Jacobian 2 / 5");
+  });
+
   it("shows no analysis segment when the queue is idle", () => {
     const view = new StatusView();
     const model = new Model();

@@ -92,6 +92,8 @@ export class EmbeddingCoordinator {
 
   /** Source-weight Jacobian at the last fetched weights, for live drags. */
   private _weightJacobian: WeightJacobian | null = null;
+  /** Query string the cached Jacobian was evaluated at (empty = none). */
+  private _jacobianKey = "";
 
   private _animFrame = 0;
   /** Monotonic request id; a slow projection must not overwrite a newer one. */
@@ -123,26 +125,37 @@ export class EmbeddingCoordinator {
    *  nothing to refresh (the next entry fetches with the new weights), and when it
    *  has, the new positions are stored so switching to the map animates to them.
    */
-  refreshProjection(): void {
-    if (!this.deps.model.embeddingsReady) return;
-    void this._fetchProjection();
+  refreshProjection(): Promise<void> {
+    if (!this.deps.model.embeddingsReady) return Promise.resolve();
+    return this._fetchProjection();
   }
 
-  /** Fetch the source-weight Jacobian at the current weights and cache it.
+  /** Fetch the source-weight Jacobian at the current weights, once per weights.
    *
    *  The server evaluates it at the weights it is queried with, so the base
-   *  vector must match the one the drag starts from. A failed fetch leaves the
-   *  approximation unavailable and the drag falls back to the full recompute.
+   *  vector must match the one the drag starts from. It costs one projection per
+   *  source, so the result is cached by the query string: reopening the panel or
+   *  dragging back to the same weights must not recompute it. A failed fetch
+   *  leaves the approximation unavailable and the drag falls back to the full
+   *  recompute.
    */
   async fetchWeightJacobian(): Promise<void> {
-    if (!this.deps.model.embeddingsReady) return;
+    const m = this.deps.model;
+    if (!m.embeddingsReady) return;
+    const qs = this._projectionQueryString();
+    if (this._weightJacobian && this._jacobianKey === qs) return;
     try {
       const raw = await api<unknown>(
-        `/api/embeddings/projection?${this._projectionQueryString()}&jacobian=1`,
+        `/api/embeddings/projection?${qs}&jacobian=1`,
       );
-      this._weightJacobian = parseWeightJacobian(raw);
+      const jac = parseWeightJacobian(raw);
+      if (jac) {
+        this._weightJacobian = jac;
+        this._jacobianKey = qs;
+      }
     } catch {
       this._weightJacobian = null;
+      this._jacobianKey = "";
     }
   }
 
@@ -397,6 +410,7 @@ export class EmbeddingCoordinator {
     } finally {
       this._projectionFetchPending = false;
       m.projectionPending = false;
+      m.layoutProgress = null;
       this.deps.canvas.scheduleDraw();
     }
   }
@@ -519,6 +533,7 @@ export class EmbeddingCoordinator {
     } finally {
       if (reqSeq === this._projectionReqSeq) {
         m.projectionPending = false;
+        m.layoutProgress = null;
         this.deps.canvas.scheduleDraw();
       }
     }

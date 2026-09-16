@@ -237,6 +237,17 @@ def create_api_embeddings_blueprint(
         )
 
         with_jacobian = request.args.get("jacobian", "") == "1"
+
+        def _layout_progress(phase: str, done: int = 0, total: int = 0) -> None:
+            # The layout is a plain request, not a queued job, so its phases ride
+            # the embed stream rather than the queue's stage_progress.
+            broadcast_embed_event({
+                "type": "layout_progress",
+                "phase": phase,
+                "done": int(done),
+                "total": int(total),
+            })
+
         result = embeddings_mod.compute_projection(
             infos,
             feature_cache,
@@ -254,6 +265,7 @@ def create_api_embeddings_blueprint(
             source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
             required_sources=REQUIRED_SOURCES,
             with_jacobian=with_jacobian,
+            on_progress=_layout_progress,
         )
 
         if with_jacobian:

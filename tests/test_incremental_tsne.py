@@ -100,6 +100,23 @@ def test_fit_cache_evicts_past_cap():
     assert len(pb._tsne_fit_cache) == pb._OPENTSNE_FIT_CACHE_MAX
 
 
+def test_uncached_fits_do_not_evict_the_live_fit():
+    """The Jacobian's throwaway fits must not evict the map's own fit.
+
+    Each perturbation is a one-off config; caching it would evict the base fit past
+    the LRU cap and make the next real layout a full refit.
+    """
+    mat = _matrix(120)
+    pb._project_tsne(mat, paths=_paths(120), config_key="base")
+    for i in range(pb._OPENTSNE_FIT_CACHE_MAX + 2):
+        pb._project_tsne(
+            mat, paths=_paths(120), config_key=f"pert-{i}", cache_fit=False
+        )
+    assert pb.tsne_fit_stats()["evict"] == 0
+    pb._project_tsne(mat, paths=_paths(120), config_key="base")
+    assert pb.tsne_fit_stats()["reuse"] == 1
+
+
 def test_disabled_flag_uses_fallback(monkeypatch):
     monkeypatch.setenv("TRACKSPACE_OPENTSNE", "0")
     pb.reset_projection_backend_cache()

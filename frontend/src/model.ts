@@ -269,6 +269,12 @@ export class Model extends EventBus {
     lastFailures?: string[];
   } | null = null;
   projectionPending = false;
+  /**
+   * In-flight phase of a layout request, streamed on `/api/embeddings/stream`.
+   * The layout is a plain request rather than a queued job, so it carries its own
+   * phase here instead of riding `queueStatus`.
+   */
+  layoutProgress: { phase: string; done: number; total: number } | null = null;
   /** True while the required models are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
   /**

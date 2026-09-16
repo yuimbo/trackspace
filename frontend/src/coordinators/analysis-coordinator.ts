@@ -30,7 +30,7 @@ export interface AnalysisDeps {
   /** Canvas hover state — hovering a cluster row glows its member points. */
   canvas: { hoverTarget: HoverTarget | null };
   /** Refetch the embedding layout after a weight change (optional in tests). */
-  refreshProjection?(): void;
+  refreshProjection?(): Promise<void> | void;
   /** Approximate the layout for a live slider drag (optional in tests). */
   applyApproximateWeights?(weights: Record<string, number>): boolean;
   /** Fetch the source-weight Jacobian the approximation needs (optional). */
@@ -259,7 +259,9 @@ export class AnalysisCoordinator {
       toast("Re-clustering with new weights…", "ok");
       // The layout is re-weighted independently of the cluster job, so refresh on
       // success only — a rejected vector would fail the projection the same way.
-      this.deps.refreshProjection?.();
+      // Await it before the Jacobian: the base pass must land first for the map
+      // to respond, and the Jacobian's S+1 fits must not contend with it.
+      await this.deps.refreshProjection?.();
       // The Jacobian was evaluated at the *old* weights, so the next drag would
       // step from a stale base; refetch it at the applied weights.
       this.deps.fetchWeightJacobian?.();
@@ -506,6 +508,25 @@ export class AnalysisCoordinator {
         done: d.done ?? 0,
         total: d.total ?? 0,
         at: Date.now() / 1000,
+      };
+      this.deps.status.update(m);
+      this.deps.scheduleDraw();
+    }) as EventListener);
+
+    es.addEventListener("layout_progress", ((e: MessageEvent) => {
+      // A layout request is not a queued job, so its phase rides its own event
+      // instead of `stage_progress`. The canvas pill and status bar render it
+      // while the projection is pending.
+      const d = JSON.parse(e.data) as {
+        phase: string;
+        done?: number;
+        total?: number;
+      };
+      const m = this.deps.model;
+      m.layoutProgress = {
+        phase: d.phase,
+        done: d.done ?? 0,
+        total: d.total ?? 0,
       };
       this.deps.status.update(m);
       this.deps.scheduleDraw();

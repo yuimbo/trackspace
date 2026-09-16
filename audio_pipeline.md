@@ -562,11 +562,19 @@ The layout is a non-linear function of the source weights, so a slider drag cann
 re-project without a full t-SNE refit. `compute_projection(..., with_jacobian=True)`
 returns a first-order finite-difference Jacobian `d(position)/d(weight)` around the
 current weights (`_weight_jacobian`: one projection per source). The *Source weights*
-panel fetches it once when opened and applies it linearly while a slider moves; the full
-re-cluster + refit still runs on **Apply**. The approximation is only valid for the
-small deltas of a drag — the sign and direction are right, the magnitude only to first
-order — and a source already at weight 0 has no derivative, so raising it from 0 is a step
-the linearisation cannot describe.
+panel fetches it once per weight vector when opened and applies it linearly while a
+slider moves; the full re-cluster + refit still runs on **Apply**, and the base layout
+is fetched and drawn first so the Jacobian's S+1 fits never contend with it.
+
+The perturbation fits are uncached (`cache_fit=False`): their one-off weight configs
+would otherwise evict the live fit the base layout reuses, turning the *next* layout
+into a full refit. `compute_projection` also reports phases (`on_progress`): the base
+layout first, then the Jacobian per source, streamed as `layout_progress` (the layout is
+a plain request, not a queued job) so the canvas pill and status bar show progress.
+
+The approximation is only valid for the small deltas of a drag — the sign and direction
+are right, the magnitude only to first order — and a source already at weight 0 has no
+derivative, so raising it from 0 is a step the linearisation cannot describe.
 
 ---
 

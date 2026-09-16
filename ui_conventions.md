@@ -178,8 +178,11 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   approximation of the layout from the server's cached Jacobian
   (`EmbeddingCoordinator.applyApproximateWeights`) so the map responds without a
   refit; the full re-cluster + re-layout runs only on **Apply**. The Jacobian is
-  fetched once when the panel is opened (`toggle` on `#cluster-weights-details`), not
-  per drag frame, and a missing Jacobian falls back to the full recompute.
+  fetched once per weight vector (cached by the query string) and only after the base
+  layout has landed (`_applyWeights` awaits `refreshProjection` first), so its S+1
+  fits never contend with the base pass; a missing Jacobian falls back to the full
+  recompute. The base layout streams its phase as `layout_progress`, rendered by the
+  canvas pill and status bar (`model.layoutProgress`).
 
 ---
 

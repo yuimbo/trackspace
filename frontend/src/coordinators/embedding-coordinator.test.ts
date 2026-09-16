@@ -209,6 +209,32 @@ describe("EmbeddingCoordinator projection fetch", () => {
 
     expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(before + 1);
   });
+
+  it("fetches the weight Jacobian once per weight vector", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: { maest: [[0.01, 0.02]] },
+          }
+        : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "r" },
+    );
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    const jacCalls = () =>
+      fetchSpy.mock.calls.filter(([u]) =>
+        String(u).includes("jacobian=1"),
+      ).length;
+
+    await coord.fetchWeightJacobian();
+    await coord.fetchWeightJacobian();
+    expect(jacCalls()).toBe(1);
+
+    model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
+    await coord.fetchWeightJacobian();
+    expect(jacCalls()).toBe(2);
+  });
 });
 
 // ─── Generation stream ───────────────────────────────────────

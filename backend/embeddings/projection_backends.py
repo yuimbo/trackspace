@@ -363,8 +363,14 @@ def _project_tsne_incremental(
     mat: np.ndarray,
     paths: list[str],
     config_key: str,
+    *,
+    cache_fit: bool = True,
 ) -> np.ndarray:
-    """Fit once per vector config, then transform only newly added tracks."""
+    """Fit once per vector config, then transform only newly added tracks.
+
+    *cache_fit* is False for the throwaway fits of the weight Jacobian, whose
+    one-off configs would otherwise evict the live fit the map needs.
+    """
     fit = _fit_cache_get(config_key)
     if fit is not None:
         index = {p: i for i, p in enumerate(fit.paths)}
@@ -391,7 +397,8 @@ def _project_tsne_incremental(
 
     reduced, pca = _pca_reduce(mat, _opentsne_pca_dim(mat.shape[1]))
     embedding, coords = _fit_tsne(reduced)
-    _fit_cache_put(config_key, _TsneFit(list(paths), coords, pca, embedding))
+    if cache_fit:
+        _fit_cache_put(config_key, _TsneFit(list(paths), coords, pca, embedding))
     _tsne_fit_stats["fit"] += 1
     return coords
 
@@ -400,12 +407,16 @@ def _project_tsne(
     mat: np.ndarray,
     paths: list[str] | None = None,
     config_key: str | None = None,
+    *,
+    cache_fit: bool = True,
 ) -> np.ndarray:
     if paths and config_key and _use_opentsne():
         cap = _opentsne_max_points()
         if cap <= 0 or len(mat) <= cap:
             try:
-                return _project_tsne_incremental(mat, paths, config_key)
+                return _project_tsne_incremental(
+                    mat, paths, config_key, cache_fit=cache_fit
+                )
             except Exception as e:
                 log.warning("openTSNE failed; using fitted-backend chain: %s", e)
     return _project_tsne_fallback(mat)

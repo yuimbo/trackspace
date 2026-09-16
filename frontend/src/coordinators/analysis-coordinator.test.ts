@@ -227,6 +227,19 @@ describe("AnalysisCoordinator queue stream", () => {
     expect(model.queueStatus.kinds.bogus).toBeUndefined();
   });
 
+  it("records a layout phase that is not a queued job", async () => {
+    const { model, update, scheduleDraw, coord } = makeHarness();
+    const es = await startSettled(coord);
+    es.emit("layout_progress", { phase: "jacobian", done: 2, total: 5 });
+    expect(model.layoutProgress).toMatchObject({
+      phase: "jacobian",
+      done: 2,
+      total: 5,
+    });
+    expect(update).toHaveBeenCalledWith(model);
+    expect(scheduleDraw).toHaveBeenCalled();
+  });
+
   it("toasts analysis complete only once the whole queue drains", async () => {
     const { model, coord } = makeHarness((url) =>
       url.startsWith("/api/jobs/status")

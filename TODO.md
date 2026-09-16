@@ -62,12 +62,12 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       rejection). Unreproduced in headless Chromium, so unconfirmed: if a user reports a
       silent first hover after a reload, catch `NotAllowedError` and show a one-time
       "click to enable preview audio" hint, then retry on the next gesture.
-- [ ] **Projection refit progress.** The t-SNE/UMAP refit is still opaque: the
-      canvas shows a static "Computing layout…" pill (`canvas-view.ts`,
-      `_embeddingWaitLabel`) while `/api/embeddings/projection` runs for seconds.
-      openTSNE exposes iteration callbacks; a phase/percent on the same
-      `stage_progress` channel would cover it. Only worth it if the refit is a
-      visible fraction of a first run.
+- [ ] **Projection refit progress is phase-level only.** The layout now streams
+      its phase on `layout_progress` (`compute_projection`'s `on_progress`), so the
+      pill and status bar show "laying out" / "Jacobian k / S" instead of a static
+      "Computing layout…". The base `layout` phase itself is still one opaque step:
+      neither the sklearn fallback nor mlx-vis exposes iteration callbacks, so a
+      percent needs a custom optimize loop (openTSNE's `optimize` is a generator).
 
 - [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1040 lines, the
       largest frontend file). The ~200 lines of fit-view math (`_vpFromWorldBounds`,
@@ -107,11 +107,14 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       feeds the layout revision hash, where a metadata-only source must not appear).
       Add a separate count if the status UI ever needs it.
 - [ ] **Jacobian cost for t-SNE.** `_weight_jacobian` runs one projection per
-      source, and with the default backend each perturbation is a *full refit*
-      (`_project_tsne`'s fit cache keys on the weight config), so a 5-source drag
-      start can take minutes at library scale. Reuse the fitted openTSNE embedding's
-      `transform` for the perturbations (guarding its in-place recentring) so the
-      Jacobian is S+1 cheap transforms; PCA is already cheap.
+      source, and with the fallback backend each perturbation is a *full refit*
+      (`_project_tsne`'s fit cache keys on the weight config). The perturbation
+      fits are now uncached (`cache_fit=False`) so they no longer evict the live
+      fit, and the frontend caches the result per weight vector and runs it after
+      the base layout; the remaining cost is the S+1 refits themselves. Reuse the
+      fitted openTSNE embedding's `transform` for the perturbations (guarding its
+      in-place recentring) so the Jacobian is S+1 cheap transforms; PCA is already
+      cheap.
 - [ ] **Imported heads do not check `source_versions`.** `project_supervised_missing`
       refuses on `input_sources`/`in_dim` mismatch but not on a different
       `source_versions` (e.g. a head trained before a CLAP checkpoint switch, same

@@ -344,3 +344,25 @@ def test_weight_jacobian_skips_zero_weight_source():
     # A zero-weight source contributes no block, so it has no derivative.
     assert "features" not in jac
     assert "clap" in jac
+
+
+def test_weight_jacobian_reports_layout_and_per_source_progress():
+    rng = np.random.default_rng(9)
+    n = 12
+    clap, feats, infos = {}, {}, []
+    for i in range(n):
+        fp = f"p{i}"
+        clap[fp] = rng.standard_normal(4).astype(np.float32)
+        feats[fp] = rng.standard_normal(6).astype(np.float32)
+        infos.append({"path": f"a/t{i}.mp3", "fingerprint": fp})
+    cache = _StubFeatureCache(clap=clap, feats=feats)
+    seen: list[tuple[str, int, int]] = []
+    compute_projection(
+        infos, cache, method="pca", sources=("clap", "features"),
+        feature_mask=parse_audio_feature_mask("111111"), features_blend=0.5,
+        source_weights={"clap": 0.5, "features": 0.5}, with_jacobian=True,
+        on_progress=lambda phase, done, total: seen.append((phase, done, total)),
+    )
+    # The base layout lands first, then the Jacobian reports per source.
+    assert ("layout", 0, 0) in seen
+    assert seen[-1] == ("jacobian", 2, 2)

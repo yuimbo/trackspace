@@ -1,5 +1,5 @@
 import type { Model, QueueStatus } from "../model";
-import { pipelineProgress, stageDetail } from "../lib/pipeline";
+import { pipelineProgress, phaseLabel, stageDetail } from "../lib/pipeline";
 
 const PANEL_HIDE_MS = 140;
 
@@ -273,6 +273,18 @@ ${maestError}
         ? `${prog.label} ${prog.detail}`
         : `${prog.label} ${prog.detail} · ${Math.round(prog.fraction * 100)}%`;
       this.$el.appendChild(a);
+    }
+
+    // A layout request is not a queued job, so its phase is not in `queueStatus`;
+    // show it while the projection is in flight so "Computing layout" is not silent.
+    if (model.projectionPending) {
+      addSep();
+      const p = model.layoutProgress;
+      const phase = p ? phaseLabel(p.phase) : "computing";
+      const counts = p && p.total > 1 ? ` ${p.done} / ${p.total}` : "";
+      const span = document.createElement("span");
+      span.textContent = `Layout: ${phase}${counts}`;
+      this.$el.appendChild(span);
     }
 
     if (reopenKind === "library" && model.libraryLoadProgress) {

@@ -1,7 +1,7 @@
 import type { HoverTarget, Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/toast";
-import { pipelineProgress, type PipelineProgress } from "../lib/pipeline";
+import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
 import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
 
 
@@ -865,7 +865,14 @@ export class CanvasView {
     if (m.viewMode !== "embeddings") return null;
     // The analysis pipeline owns its own progress pill (see _drawPipelinePill), so
     // these fallbacks only cover states the queue cannot describe.
-    if (m.projectionPending) return "Computing layout…";
+    if (m.projectionPending) {
+      const p = m.layoutProgress;
+      if (!p) return "Computing layout…";
+      const phase = phaseLabel(p.phase);
+      return p.total > 1
+        ? `Computing layout… ${phase} ${p.done} / ${p.total}`
+        : `Computing layout… ${phase}`;
+    }
     if (m.embeddingPositions.size > 0) return null;
     if (m.embeddingsReady) return null;
     if (m.embeddingModelsLoading) return "loading models…";
