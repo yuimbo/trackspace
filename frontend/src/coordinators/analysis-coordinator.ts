@@ -26,6 +26,8 @@ export interface AnalysisDeps {
   status: { update(m: Model): void };
   /** Repaint the canvas after cluster assignments change. */
   scheduleDraw(): void;
+  /** Canvas hover state — hovering a cluster row glows its member points. */
+  canvas: { hoveredClusterId: number | null };
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): void;
 }
@@ -420,6 +422,13 @@ export class AnalysisCoordinator {
     const $list = document.getElementById("cluster-list");
     if (!$meta || !$list) return;
 
+    // Rows are recreated below, so no mouseleave fires for a row that was
+    // hovered across a re-render; drop the stale highlight explicitly.
+    if (this.deps.canvas.hoveredClusterId !== null) {
+      this.deps.canvas.hoveredClusterId = null;
+      this.deps.scheduleDraw();
+    }
+
     if (!m.clustersAvailable) {
       $meta.textContent = m.queueStatus?.models?.maest_ready
         ? "No clusters yet — run analysis."
@@ -451,6 +460,18 @@ export class AnalysisCoordinator {
       count.textContent = String(size);
 
       li.append(sw, label, count);
+      // Hover glows the cluster's points on the canvas; click selects them. The
+      // highlight is purely visual, so it lives on the canvas view (no model event).
+      li.addEventListener("mouseenter", () => {
+        this.deps.canvas.hoveredClusterId = cid;
+        this.deps.scheduleDraw();
+      });
+      li.addEventListener("mouseleave", () => {
+        if (this.deps.canvas.hoveredClusterId === cid) {
+          this.deps.canvas.hoveredClusterId = null;
+          this.deps.scheduleDraw();
+        }
+      });
       // Click a cluster to select its tracks — the main way to act on a
       // discovered microgenre (move to a folder, tag it, audition it).
       li.addEventListener("click", () => this._selectCluster(cid));

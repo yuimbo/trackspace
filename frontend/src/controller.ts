@@ -110,6 +110,7 @@ export class Controller {
     this.analysis = new AnalysisCoordinator({
       model,
       status: statusView,
+      canvas: canvasView,
       scheduleDraw: () => this.canvas.scheduleDraw(),
       // Deferred: `embedding` is constructed just below. Applying weights
       // re-clusters on the server *and* refits the 2-D layout.

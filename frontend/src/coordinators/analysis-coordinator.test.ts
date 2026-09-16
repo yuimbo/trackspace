@@ -88,6 +88,7 @@ interface Harness {
   update: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   refreshProjection: ReturnType<typeof vi.fn>;
+  canvas: { hoveredClusterId: number | null };
   coord: AnalysisCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
 }
@@ -98,17 +99,19 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const update = vi.fn();
   const scheduleDraw = vi.fn();
   const refreshProjection = vi.fn();
+  const canvas = { hoveredClusterId: null as number | null };
   const coord = new AnalysisCoordinator({
     model,
     status: { update },
     scheduleDraw,
+    canvas,
     refreshProjection,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
     Promise.resolve(jsonResponse(routes(String(input)))),
   );
   vi.stubGlobal("fetch", fetchSpy);
-  return { model, update, scheduleDraw, refreshProjection, coord, fetchSpy };
+  return { model, update, scheduleDraw, refreshProjection, canvas, coord, fetchSpy };
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -294,6 +297,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
       model,
       status: { update: vi.fn() },
       scheduleDraw: vi.fn(),
+      canvas: { hoveredClusterId: null },
     });
     const p1 = coord.fetchClusters();
     const p2 = coord.fetchClusters();
@@ -326,6 +330,55 @@ describe("AnalysisCoordinator cluster fetch", () => {
     items[0].click();
     expect([...model.selected].sort()).toEqual(["a.mp3", "b.mp3"]);
     expect(change).toHaveBeenCalled();
+  });
+
+  it("glows a cluster's points on row hover and clears on leave", async () => {
+    const { coord, canvas, scheduleDraw } = makeHarness((url) =>
+      url.startsWith("/api/clusters")
+        ? {
+            available: true,
+            revision: "r",
+            resolution: 1.5,
+            resolutions: [1.5],
+            assignments: { "a.mp3": 7, "b.mp3": 7, "c.mp3": 9 },
+            names: { "7": "Techno" },
+            sizes: { "7": 2, "9": 1 },
+          }
+        : {},
+    );
+    await coord.fetchClusters();
+    const items = document.querySelectorAll<HTMLElement>(
+      "#cluster-list .cluster-item",
+    );
+    items[0].dispatchEvent(new Event("mouseenter"));
+    expect(canvas.hoveredClusterId).toBe(7);
+    expect(scheduleDraw).toHaveBeenCalled();
+
+    scheduleDraw.mockClear();
+    items[0].dispatchEvent(new Event("mouseleave"));
+    expect(canvas.hoveredClusterId).toBeNull();
+    expect(scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("drops a stale cluster hover when the panel re-renders", async () => {
+    const { coord, canvas, scheduleDraw } = makeHarness((url) =>
+      url.startsWith("/api/clusters")
+        ? {
+            available: true,
+            revision: "r",
+            resolution: 1.5,
+            resolutions: [1.5],
+            assignments: { "a.mp3": 7 },
+            names: { "7": "Techno" },
+            sizes: { "7": 1 },
+          }
+        : {},
+    );
+    await coord.fetchClusters();
+    canvas.hoveredClusterId = 7;
+    await coord.fetchClusters();
+    expect(canvas.hoveredClusterId).toBeNull();
+    expect(scheduleDraw).toHaveBeenCalled();
   });
 });
 

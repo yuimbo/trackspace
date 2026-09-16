@@ -59,6 +59,8 @@ export class CanvasView {
   hoveredFolderPrefix: string | null = null;
   /** Exact folder path (``""`` = library root): glow siblings while hovering a dot. */
   hoveredSiblingFolder: string | null = null;
+  /** Cluster id whose panel row is hovered: glow its member points. */
+  hoveredClusterId: number | null = null;
   tipReady = false;
   tipTimer = 0;
   lassoPoints: [number, number][] = [];
@@ -557,7 +559,7 @@ export class CanvasView {
     }
   }
 
-  /* ── Folder-hover glow pass ────────────────────────────── */
+  /* ── Hover glow pass (folders + clusters) ──────────────── */
 
   private _inHoveredFolder(track: Track): boolean {
     const prefix = this.hoveredFolderPrefix;
@@ -573,6 +575,12 @@ export class CanvasView {
     const sib = this.hoveredSiblingFolder;
     if (sib === null) return false;
     return (track.folder ?? "") === sib;
+  }
+
+  /** Track is a member of the cluster whose panel row is hovered. */
+  private _inHoveredCluster(track: Track): boolean {
+    if (this.hoveredClusterId === null) return false;
+    return this.model.clusterAssignments.get(track.path) === this.hoveredClusterId;
   }
 
   /**
@@ -597,15 +605,20 @@ export class CanvasView {
   }
 
   /**
-   * Renders the folder-hover glow as a single screen-pass blur instead of
-   * N individual ctx.shadowBlur draws.
+   * Renders the hover glow (folder subtree/siblings, or a hovered cluster's
+   * members) as a single screen-pass blur instead of N individual
+   * ctx.shadowBlur draws.
    *
    * All glowing dots are painted (without shadow) onto an offscreen render
    * texture, then the texture is blitted to the main canvas with a single
    * ctx.filter = 'blur()' — one GPU compositing pass for all dots.
    */
   private _drawFolderGlow(tracks: Track[]): void {
-    if (this.hoveredFolderPrefix === null && this.hoveredSiblingFolder === null)
+    if (
+      this.hoveredFolderPrefix === null &&
+      this.hoveredSiblingFolder === null &&
+      this.hoveredClusterId === null
+    )
       return;
 
     const w = this.$canvas.clientWidth;
@@ -618,10 +631,16 @@ export class CanvasView {
     gc.globalAlpha = 0.85;
     for (const pos of this.positions) {
       const track = tracks[pos.idx];
-      if (!this._inFolderGlow(track)) continue;
+      const inCluster = this._inHoveredCluster(track);
+      if (!inCluster && !this._inFolderGlow(track)) continue;
       gc.beginPath();
       gc.arc(pos.sx, pos.sy, DOT_R + 6, 0, Math.PI * 2);
-      gc.fillStyle = this.trackColor(track);
+      // A hovered cluster glows in its own swatch colour (matching the panel
+      // row), independent of the current dot colouring mode.
+      gc.fillStyle =
+        inCluster && this.hoveredClusterId !== null
+          ? clusterColor(this.hoveredClusterId)
+          : this.trackColor(track);
       gc.fill();
     }
     gc.globalAlpha = 1;
@@ -976,24 +995,7 @@ export class CanvasView {
       return;
     }
 
-    const folderLine = displayFolderPath(track.folder || "");
-    const ar = (track.artist || "").trim();
-    const ti = (track.title || "").trim();
-    const titleLine =
-      ar && ti ? `${ar} — ${ti}` : ti || ar || track.filename;
-    const audioParts: string[] = [];
-    if (track.bpm != null && Number.isFinite(track.bpm))
-      audioParts.push(`${Math.round(track.bpm)} BPM`);
-    if (track.musical_key) audioParts.push(track.musical_key);
-    const audioLine = audioParts.join(" · ");
-
-    const tagStr = Object.entries(track.tags)
-      .map(([k, v]) => `${k}: ${v.toFixed(2)}`)
-      .join("  ");
-    const lines = [folderLine, titleLine];
-    if (audioLine) lines.push(audioLine);
-    if (tagStr) lines.push(tagStr);
-    this.$tip.textContent = lines.join("\n");
+    this.$tip.textContent = tooltipLines(track, this.model).join("\n");
     this.$tip.classList.remove("hidden");
 
     const r = this.$canvas.getBoundingClientRect();
@@ -1011,4 +1013,30 @@ export class CanvasView {
     this.hoveredSiblingFolder = null;
     this.$tip.classList.add("hidden");
   }
+}
+
+/** Build the hover-tooltip lines for a track (pure; exported for tests). */
+export function tooltipLines(track: Track, m: Model): string[] {
+  const folderLine = displayFolderPath(track.folder || "");
+  const ar = (track.artist || "").trim();
+  const ti = (track.title || "").trim();
+  const titleLine = ar && ti ? `${ar} — ${ti}` : ti || ar || track.filename;
+
+  const lines = [folderLine, titleLine];
+
+  const audioParts: string[] = [];
+  if (track.bpm != null && Number.isFinite(track.bpm))
+    audioParts.push(`${Math.round(track.bpm)} BPM`);
+  if (track.musical_key) audioParts.push(track.musical_key);
+  if (audioParts.length) lines.push(audioParts.join(" · "));
+
+  const cid = m.clusterAssignments.get(track.path);
+  if (cid !== undefined) lines.push(m.clusterNames.get(cid) || `Cluster ${cid}`);
+
+  const tagStr = Object.entries(track.tags)
+    .map(([k, v]) => `${k}: ${v.toFixed(2)}`)
+    .join("  ");
+  if (tagStr) lines.push(tagStr);
+
+  return lines;
 }
