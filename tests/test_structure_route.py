@@ -47,7 +47,13 @@ _INFOS = {
 
 _STRUCTURES = {
     "fp-a": encode_structure(
-        TrackStructure(intro_end=32.0, peak_start=64.0, peak_end=94.0, break_start=192.0)
+        TrackStructure(
+            intro_start=8.0,
+            intro_end=32.0,
+            peak_start=64.0,
+            peak_end=94.0,
+            break_start=192.0,
+        )
     ),
 }
 
@@ -72,6 +78,7 @@ def test_structure_returns_cached_sections():
     assert body["tracks"] == [
         {
             "path": "a.mp3",
+            "intro_start": 8.0,
             "intro_end": 32.0,
             "peak_start": 64.0,
             "peak_end": 94.0,

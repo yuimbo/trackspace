@@ -4,6 +4,9 @@ A whole-track mono decode at a low sample rate yields an RMS envelope; smoothing
 and thresholding against its own 95th-percentile level gives three coarse section
 markers:
 
+* **intro start** — first sustained crossing of ``INTRO_START_LEVEL_FRACTION`` of the
+  track's peak level, i.e. where the audio actually begins after any lead-in silence;
+  ``0`` when the track starts immediately.
 * **intro end** — first sustained crossing of ``INTRO_LEVEL_FRACTION`` of the track's
   peak level (where the track "gets going"); ``0`` when it starts loud.
 * **drop (peak)** — the start of the highest-energy ``PEAK_WINDOW_SECONDS`` window,
@@ -12,7 +15,7 @@ markers:
   level that returns to full energy afterwards; absent on tracks with no breakdown.
 
 This is deliberately cheap DSP, not a model: it decodes the file once (the cost is the
-decode, not the arithmetic) and caches five timestamps.  It is **not** an embedding
+decode, not the arithmetic) and caches six timestamps.  It is **not** an embedding
 source — the result never feeds projection or clustering — so it is kept out of
 ``FROZEN_SOURCES`` and only appears in the feature cache as its own versioned blob.
 Absent sections are stored as ``NaN`` and surface as ``null`` over the API.
@@ -33,7 +36,8 @@ from backend.decode_stderr import librosa_load
 log = logging.getLogger(__name__)
 
 #: Bump when the envelope, thresholds, or windowing change.
-STRUCTURE_VERSION = 1
+#: 2 — added ``intro_start`` (lead-in-silence skip); old blobs are purged and refilled.
+STRUCTURE_VERSION = 2
 
 #: Low sample rate: RMS needs no bandwidth, and a low rate keeps the resample cheap.
 STRUCTURE_SR = 2205
@@ -50,6 +54,12 @@ PEAK_WINDOW_SECONDS = 30.0
 #: Fraction of the peak level the intro must reach to be considered "started".
 INTRO_LEVEL_FRACTION = 0.8
 
+#: Fraction of the peak level above which the audio counts as "not lead-in silence".
+INTRO_START_LEVEL_FRACTION = 0.05
+
+#: How long the level must stay above the silence bar to mark the intro start, in seconds.
+INTRO_START_HOLD_SECONDS = 1.0
+
 #: Fraction of the peak level below which a sustained stretch counts as a break.
 BREAK_LEVEL_FRACTION = 0.6
 
@@ -61,6 +71,7 @@ _ABSENT = float("nan")
 
 #: Blob slot order; the reader owns the layout (the blob carries no header).
 STRUCTURE_FIELDS: tuple[str, ...] = (
+    "intro_start",
     "intro_end",
     "peak_start",
     "peak_end",
@@ -73,6 +84,7 @@ STRUCTURE_FIELDS: tuple[str, ...] = (
 class TrackStructure:
     """Coarse section timestamps in seconds; ``None`` when a section is absent."""
 
+    intro_start: float | None = None
     intro_end: float | None = None
     peak_start: float | None = None
     peak_end: float | None = None
@@ -200,6 +212,19 @@ def detect_sections(envelope: np.ndarray, frame_rate: float) -> TrackStructure:
         else max(0.0, intro_idx / float(frame_rate) - half_lag)
     )
 
+    # ── Intro start: first sustained non-silence, so lead-in silence is skipped ──
+    start_hold = max(1, int(round(INTRO_START_HOLD_SECONDS * frame_rate)))
+    start_idx = _first_sustained(
+        level >= INTRO_START_LEVEL_FRACTION * peak_level, start_hold
+    )
+    intro_start = (
+        None
+        if start_idx is None
+        else max(0.0, start_idx / float(frame_rate) - half_lag)
+    )
+    if intro_start is not None and intro_end is not None:
+        intro_start = min(intro_start, intro_end)
+
     # ── Break: longest interior sustained dip that returns to energy ──
     dip = _longest_dip(
         level <= BREAK_LEVEL_FRACTION * peak_level,
@@ -216,6 +241,7 @@ def detect_sections(envelope: np.ndarray, frame_rate: float) -> TrackStructure:
             break_start, break_end = start, end
 
     return TrackStructure(
+        intro_start=intro_start,
         intro_end=intro_end,
         peak_start=peak_start,
         peak_end=peak_end,

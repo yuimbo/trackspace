@@ -57,6 +57,7 @@ def test_detects_intro_drop_and_break():
     env = _envelope([(30, 0.05), (60, 0.9), (20, 0.08), (90, 0.85)])
     s = detect_sections(env, FRAME_RATE)
 
+    assert s.intro_start == pytest.approx(0, abs=2)
     assert s.intro_end == pytest.approx(30, abs=4)
     assert s.peak_start == pytest.approx(30, abs=8)
     assert s.break_start is not None and s.break_end is not None
@@ -64,9 +65,25 @@ def test_detects_intro_drop_and_break():
     assert 106 <= s.break_end <= 112
 
 
+def test_intro_start_skips_lead_in_silence():
+    # 12 s of near-silence before the music: the intro starts there, not at 0.
+    env = _envelope([(12, 0.0005), (40, 0.8), (20, 0.01), (40, 0.75)])
+    s = detect_sections(env, FRAME_RATE)
+
+    assert s.intro_start == pytest.approx(12, abs=3)
+    assert s.intro_end is not None
+    assert s.intro_start is not None and s.intro_start <= s.intro_end
+
+
+def test_intro_start_is_zero_when_the_track_starts_immediately():
+    s = detect_sections(np.full(100, 0.5), FRAME_RATE)
+    assert s.intro_start == 0.0
+
+
 def test_track_with_no_drop_has_no_break():
     # Steady energy: no intro, no interior dip, peak is the whole track.
     s = detect_sections(np.full(100, 0.5), FRAME_RATE)
+    assert s.intro_start == 0.0
     assert s.intro_end == 0.0
     assert s.peak_start == 0.0
     assert s.peak_end == pytest.approx(25.0)
@@ -94,12 +111,18 @@ def test_trailing_fade_is_not_a_break():
 
 def test_blob_round_trip_preserves_values_and_absences():
     s = TrackStructure(
-        intro_end=12.5, peak_start=40.0, peak_end=70.0, break_start=None, break_end=None
+        intro_start=5.0,
+        intro_end=12.5,
+        peak_start=40.0,
+        peak_end=70.0,
+        break_start=None,
+        break_end=None,
     )
     blob = encode_structure(s)
     assert blob.dtype == np.float32
     assert blob.shape == (len(STRUCTURE_FIELDS),)
     assert decode_structure(blob) == {
+        "intro_start": 5.0,
         "intro_end": 12.5,
         "peak_start": 40.0,
         "peak_end": 70.0,
@@ -195,7 +218,12 @@ def test_structure_handler_writes_blob_then_serves_cache(tmp_path):
 
     def compute(path: str) -> dict:
         calls.append(path)
-        return {"structure": encode_structure(TrackStructure(1.0, 2.0, 3.0)), "error": None}
+        return {
+            "structure": encode_structure(
+                TrackStructure(intro_end=1.0, peak_start=2.0, peak_end=3.0)
+            ),
+            "error": None,
+        }
 
     handler = make_structure_handler(_deps(tmp_path, fc), compute_fn=compute)
     out = handler([_job()])

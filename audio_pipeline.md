@@ -105,7 +105,7 @@ slider per source, and **Apply** sends the vector to both the map and the cluste
 | Supervised | `backend/embeddings/supervised.py` | 128 | folder-labelled projection head over the cached blocks (no encoder) |
 
 `structure` is cached alongside the vector sources but is **not one of them**: it is
-per-track metadata (five timestamps), never a projection or clustering block, so it
+per-track metadata (six timestamps), never a projection or clustering block, so it
 is absent from `FROZEN_SOURCES` and from the source-weight sliders.
 
 ### Independent versioning per source
@@ -288,9 +288,12 @@ distinct neighbouring genres.
 ## Track structure (`backend/embeddings/structure.py`)
 
 Cheap DSP, not a model: a whole-track mono decode at **2205 Hz** yields an RMS
-envelope (~4 Hz frames, ~3 s moving average), and three coarse sections are read
+envelope (~4 Hz frames, ~3 s moving average), and four coarse sections are read
 off it by thresholding against the track's own 95th-percentile level:
 
+- **intro start** — first *sustained* crossing of 5 % of the peak level (≥ 1 s), so
+  lead-in silence is skipped; 0 when the track starts immediately. The hover
+  preview seeks here when cycling to the intro.
 - **intro end** — first *sustained* crossing of 80 % of the peak level (0 when the
   track starts loud).
 - **drop (peak)** — the start of the highest-energy 30 s window; this is what the
@@ -303,7 +306,8 @@ The detector (`detect_sections`) is a pure function over the envelope, so it is
 unit-tested without audio. Boundaries are compensated for the half-window smoothing
 lag, and the first window at the maximum energy wins (not an arbitrary later
 equal-energy window). Absent sections are stored as `NaN` and surface as `null` over
-the API.
+the API. `STRUCTURE_VERSION` is **2** (was 1) since `intro_start` was added; old
+blobs are purged on startup and refilled by the queue.
 
 **Decode dominates the cost, and it is cache-backed.** A six-minute MP3 is ~0.3–0.4 s
 warm; the stage runs in a **thread** pool (`TRACKSPACE_STRUCTURE_WORKERS`, default
@@ -315,7 +319,7 @@ warm; the stage runs in a **thread** pool (`TRACKSPACE_STRUCTURE_WORKERS`, defau
 supervision) give a second, free signal: `supervised.is_genre_spanning` flags a track
 whose excerpts disagree (mean pairwise cosine dispersion ≥
 `SPANNING_DISPERSION_THRESHOLD`), i.e. intro and drop sit in different corners of
-the space. The route `/api/tracks/structure` returns the five timestamps plus this
+the space. The route `/api/tracks/structure` returns the six timestamps plus this
 flag, read-only over `FeatureCache` — no audio is decoded on a request thread.
 
 ---
