@@ -9,6 +9,7 @@
 // coordinator is unit-testable without the DOM-heavy component classes.
 
 import {
+  type HoverTarget,
   type Model,
   type QueueStatus,
   DEFAULT_CLUSTER_WEIGHTS,
@@ -27,7 +28,7 @@ export interface AnalysisDeps {
   /** Repaint the canvas after cluster assignments change. */
   scheduleDraw(): void;
   /** Canvas hover state — hovering a cluster row glows its member points. */
-  canvas: { hoveredClusterId: number | null };
+  canvas: { hoverTarget: HoverTarget | null };
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): void;
 }
@@ -455,8 +456,8 @@ export class AnalysisCoordinator {
 
     // Rows are recreated below, so no mouseleave fires for a row that was
     // hovered across a re-render; drop the stale highlight explicitly.
-    if (this.deps.canvas.hoveredClusterId !== null) {
-      this.deps.canvas.hoveredClusterId = null;
+    if (this.deps.canvas.hoverTarget?.kind === "cluster") {
+      this.deps.canvas.hoverTarget = null;
       this.deps.scheduleDraw();
     }
 
@@ -494,12 +495,12 @@ export class AnalysisCoordinator {
       // Hover glows the cluster's points on the canvas; click selects them. The
       // highlight is purely visual, so it lives on the canvas view (no model event).
       li.addEventListener("mouseenter", () => {
-        this.deps.canvas.hoveredClusterId = cid;
+        this.deps.canvas.hoverTarget = { kind: "cluster", id: cid };
         this.deps.scheduleDraw();
       });
       li.addEventListener("mouseleave", () => {
-        if (this.deps.canvas.hoveredClusterId === cid) {
-          this.deps.canvas.hoveredClusterId = null;
+        if (this.deps.canvas.hoverTarget?.kind === "cluster" && this.deps.canvas.hoverTarget.id === cid) {
+          this.deps.canvas.hoverTarget = null;
           this.deps.scheduleDraw();
         }
       });

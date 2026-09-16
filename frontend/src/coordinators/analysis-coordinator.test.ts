@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   Model,
   DEFAULT_CLUSTER_WEIGHTS,
+  type HoverTarget,
   type QueueKindStatus,
   type QueueStatus,
 } from "../model";
@@ -94,7 +95,7 @@ interface Harness {
   update: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   refreshProjection: ReturnType<typeof vi.fn>;
-  canvas: { hoveredClusterId: number | null };
+  canvas: { hoverTarget: HoverTarget | null };
   coord: AnalysisCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
 }
@@ -105,7 +106,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const update = vi.fn();
   const scheduleDraw = vi.fn();
   const refreshProjection = vi.fn();
-  const canvas = { hoveredClusterId: null as number | null };
+  const canvas = { hoverTarget: null as HoverTarget | null };
   const coord = new AnalysisCoordinator({
     model,
     status: { update },
@@ -354,7 +355,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
       model,
       status: { update: vi.fn() },
       scheduleDraw: vi.fn(),
-      canvas: { hoveredClusterId: null },
+      canvas: { hoverTarget: null },
     });
     const p1 = coord.fetchClusters();
     const p2 = coord.fetchClusters();
@@ -408,12 +409,12 @@ describe("AnalysisCoordinator cluster fetch", () => {
       "#cluster-list .cluster-item",
     );
     items[0].dispatchEvent(new Event("mouseenter"));
-    expect(canvas.hoveredClusterId).toBe(7);
+    expect(canvas.hoverTarget).toEqual({ kind: "cluster", id: 7 });
     expect(scheduleDraw).toHaveBeenCalled();
 
     scheduleDraw.mockClear();
     items[0].dispatchEvent(new Event("mouseleave"));
-    expect(canvas.hoveredClusterId).toBeNull();
+    expect(canvas.hoverTarget).toBeNull();
     expect(scheduleDraw).toHaveBeenCalled();
   });
 
@@ -432,9 +433,9 @@ describe("AnalysisCoordinator cluster fetch", () => {
         : {},
     );
     await coord.fetchClusters();
-    canvas.hoveredClusterId = 7;
+    canvas.hoverTarget = { kind: "cluster", id: 7 };
     await coord.fetchClusters();
-    expect(canvas.hoveredClusterId).toBeNull();
+    expect(canvas.hoverTarget).toBeNull();
     expect(scheduleDraw).toHaveBeenCalled();
   });
 });

@@ -71,7 +71,7 @@ describe("CanvasView cluster hover glow", () => {
   it("glows a hovered cluster's members in its swatch colour", () => {
     const cv = makeCanvas();
     cv.model.clusterAssignments = new Map([["a.mp3", 2]]);
-    cv.hoveredClusterId = 2;
+    cv.hoverTarget = { kind: "cluster", id: 2 };
     cv.draw();
     expect(fills).toContain(clusterColor(2));
   });
@@ -81,5 +81,37 @@ describe("CanvasView cluster hover glow", () => {
     cv.model.clusterAssignments = new Map([["a.mp3", 2]]);
     cv.draw();
     expect(fills).not.toContain(clusterColor(2));
+  });
+
+  it("sets and clears the hover target from a card element", () => {
+    const cv = makeCanvas();
+    vi.spyOn(cv, "scheduleDraw").mockImplementation(() => {});
+    const target = document.createElement("div");
+    target.dataset.hoverTarget = JSON.stringify({ kind: "bpm", value: 128 });
+    cv.$tip.appendChild(target);
+
+    target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    expect(cv.hoverTarget).toEqual({ kind: "bpm", value: 128 });
+
+    target.dispatchEvent(
+      new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }),
+    );
+    expect(cv.hoverTarget).toBeNull();
+  });
+
+  it("ignores moves between children of the same card target", () => {
+    const cv = makeCanvas();
+    vi.spyOn(cv, "scheduleDraw").mockImplementation(() => {});
+    const target = document.createElement("div");
+    target.dataset.hoverTarget = JSON.stringify({ kind: "key", value: "Am" });
+    const child = document.createElement("span");
+    target.appendChild(child);
+    cv.$tip.appendChild(target);
+
+    target.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    child.dispatchEvent(
+      new MouseEvent("mouseout", { bubbles: true, relatedTarget: target }),
+    );
+    expect(cv.hoverTarget).toEqual({ kind: "key", value: "Am" });
   });
 });

@@ -1245,6 +1245,20 @@ kbd {
   border-color: #ffffff3d;
 }
 
+/* Navigation targets inside the card: same affordance as sidebar rows. */
+.tt-target {
+  cursor: pointer;
+  border-radius: 3px;
+  margin-left: -3px;
+  margin-right: -3px;
+  padding-left: 3px;
+  padding-right: 3px;
+}
+
+.tt-target:hover {
+  background: #ffffff1f;
+}
+
 .tt-inspect-head {
   display: flex;
   align-items: center;

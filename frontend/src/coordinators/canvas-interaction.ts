@@ -9,7 +9,7 @@
 // Deps are structural interfaces so the gesture state machine is unit-testable with
 // a fake canvas and without the DOM-heavy component classes.
 
-import { type Model, type Track, isAudioFeatureAxisId } from "../model";
+import { type HoverTarget, type Model, type Track, isAudioFeatureAxisId } from "../model";
 import type { CanvasView, TxHandle } from "../components";
 
 const DRAG_THRESH = 4;
@@ -902,64 +902,39 @@ export class CanvasInteractionController {
     Object.assign(m.vp, this._vpFromWorldBounds(minX, maxX, minY, maxY));
   }
 
-  /** Fit viewport to an 80th-percentile disc around the centroid (folder/track folder hover + H). */
-  private _fitViewToFolderPercentile(prefixNorm: string): void {
-    const m = this.deps.model;
-    const subset: Track[] = [];
-    for (const t of m.allTracks) {
-      if (!m.trackInViewUnion(t) || m.isTrackHidden(t)) continue;
-      if (!m.passesFilter(t)) continue;
-      const tf = t.folder ?? "";
-      if (prefixNorm !== "") {
-        if (tf !== prefixNorm && !tf.startsWith(prefixNorm + "/")) continue;
-      }
-      subset.push(t);
-    }
-    this._fitViewToTracksPercentile(subset);
-  }
-
-  /** Fit viewport to the visible members of a hovered cluster (80th-percentile disc). */
-  private _fitViewToClusterPercentile(cid: number): void {
-    const m = this.deps.model;
-    const keep = m.clusterPaths(cid);
-    if (keep.size === 0) return;
-    this._fitViewToTracksPercentile(
-      m.tracks.filter((t) => keep.has(t.path) && m.passesFilter(t)),
-    );
-  }
-
   private _fitViewToTracks(): void {
     const target = this._computeFitVP();
     Object.assign(this.deps.model.vp, target);
   }
 
   /**
-   * Folder prefix for H / S hotkeys: sidebar folder-row hover wins;
-   * otherwise the hovered canvas track's folder (Library root = ``""``).
+   * The navigation element under the pointer: a card/sidebar hover target wins,
+   * otherwise the hovered canvas dot's folder (Library root = ``""``).
    */
-  effectiveHoveredFolderPrefix(): string | null {
+  effectiveHoverTarget(): HoverTarget | null {
     const cv = this.deps.canvas;
-    if (cv.hoveredFolderPrefix !== null) return cv.hoveredFolderPrefix;
+    if (cv.hoverTarget) return cv.hoverTarget;
     if (cv.hoveredIdx >= 0) {
       const t = this.deps.model.tracks[cv.hoveredIdx];
-      if (t) return t.folder ?? "";
+      if (t) return { kind: "folder", prefix: t.folder ?? "" };
     }
     return null;
   }
 
-  /** Fit-view hotkey (H): hovered cluster/folder 80th-percentile disc, else full view toggle. */
+  /** Visible, unfiltered tracks belonging to *target* (the fit/solo working set). */
+  private _targetTracks(target: HoverTarget): Track[] {
+    const m = this.deps.model;
+    return m.tracks.filter(
+      (t) => m.trackMatchesHoverTarget(t, target) && m.passesFilter(t),
+    );
+  }
+
+  /** Fit-view hotkey (H): hovered target 80th-percentile disc, else full view toggle. */
   fitView(): void {
     const m = this.deps.model;
-    const cid = this.deps.canvas.hoveredClusterId;
-    if (cid !== null && m.clusterPaths(cid).size > 0) {
-      this._fitViewToClusterPercentile(cid);
-      this.deps.canvas.scheduleDraw();
-      m.saveLS();
-      return;
-    }
-    const hp = this.effectiveHoveredFolderPrefix();
-    if (hp !== null) {
-      this._fitViewToFolderPercentile(hp);
+    const target = this.effectiveHoverTarget();
+    if (target) {
+      this._fitViewToTracksPercentile(this._targetTracks(target));
       this.deps.canvas.scheduleDraw();
       m.saveLS();
       return;
@@ -982,35 +957,21 @@ export class CanvasInteractionController {
   }
 
   /**
-   * Isolate hotkey (S): hovered cluster → hovered folder → selection → everything.
-   *
-   * A second press on an already-isolated target clears the exclusions (show all);
-   * with nothing hovered and no selection it also shows all.
+   * Isolate hotkey (S): the hovered navigation element, else the selection, else
+   * everything. A second press on an already-isolated target clears the exclusions
+   * (show all); with nothing hovered and no selection it also shows all.
    */
   solo(): void {
     const m = this.deps.model;
 
-    const cid = this.deps.canvas.hoveredClusterId;
-    if (cid !== null) {
-      const keep = m.clusterPaths(cid);
+    const target = this.effectiveHoverTarget();
+    if (target) {
+      const keep = m.hoverTargetPaths(target);
       if (keep.size === 0) return;
       if (m.pathsFullyHidden(keep)) {
         m.revealThenFocusPaths(keep);
       } else if (m.hasVisibleTracksOutside(keep)) {
         m.focusPaths(keep);
-      } else {
-        m.clearExclusions();
-      }
-      m.saveLS();
-      return;
-    }
-
-    const hp = this.effectiveHoveredFolderPrefix();
-    if (hp !== null) {
-      if (m.folderSubtreeFullyExcluded(hp)) {
-        m.revealThenFocusFolderSubtree(hp);
-      } else if (m.hasVisibleTracksOutside(m.pathsUnderPrefix(hp))) {
-        m.focusFolderSubtree(hp);
       } else {
         m.clearExclusions();
       }

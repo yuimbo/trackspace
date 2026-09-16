@@ -9,7 +9,7 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model } from "../model";
+import { type HoverTarget, type Model } from "../model";
 import { toast, dirColor } from "../lib/toast";
 import { postJSON } from "../lib/api";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
@@ -19,7 +19,7 @@ export interface FolderTreeDeps {
   model: Model;
   canvas: {
     hoveredIdx: number;
-    hoveredFolderPrefix: string | null;
+    hoverTarget: HoverTarget | null;
     hoveredSiblingFolder: string | null;
     scheduleDraw(): void;
   };
@@ -74,7 +74,7 @@ export class FolderTreeCoordinator {
     );
     this.$folderTree.addEventListener("mouseleave", () => {
       if (this.deps.isPointerBusy()) return;
-      this.deps.canvas.hoveredFolderPrefix = null;
+      this.deps.canvas.hoverTarget = null;
       this.deps.canvas.scheduleDraw();
     });
   }
@@ -92,7 +92,7 @@ export class FolderTreeCoordinator {
     });
     $overlay?.addEventListener("mouseleave", () => {
       if (this.deps.isPointerBusy()) return;
-      this.deps.canvas.hoveredFolderPrefix = null;
+      this.deps.canvas.hoverTarget = null;
       this.deps.canvas.scheduleDraw();
     });
   }
@@ -103,12 +103,15 @@ export class FolderTreeCoordinator {
         const path = row.getAttribute("data-folder-path");
         if (path == null) return;
         this.deps.canvas.hoveredSiblingFolder = null;
-        this.deps.canvas.hoveredFolderPrefix = path === "." ? "" : path;
+        this.deps.canvas.hoverTarget = {
+          kind: "folder",
+          prefix: path === "." ? "" : path,
+        };
         this.deps.canvas.scheduleDraw();
       });
       row.addEventListener("mouseleave", () => {
         if (this.deps.isPointerBusy()) return;
-        this.deps.canvas.hoveredFolderPrefix = null;
+        this.deps.canvas.hoverTarget = null;
         this.deps.canvas.scheduleDraw();
       });
     }
@@ -643,13 +646,13 @@ export class FolderTreeCoordinator {
       row.addEventListener("mouseenter", () => {
         row.classList.add("folder-hover");
         this.deps.canvas.hoveredSiblingFolder = null;
-        this.deps.canvas.hoveredFolderPrefix = folder;
+        this.deps.canvas.hoverTarget = { kind: "folder", prefix: folder };
         this.deps.canvas.scheduleDraw();
       });
       row.addEventListener("mouseleave", () => {
         row.classList.remove("folder-hover");
         if (this.deps.isPointerBusy()) return;
-        this.deps.canvas.hoveredFolderPrefix = null;
+        this.deps.canvas.hoverTarget = null;
         this.deps.canvas.scheduleDraw();
       });
       const arrow = document.createElement("span");

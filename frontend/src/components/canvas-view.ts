@@ -1,4 +1,4 @@
-import type { Model, Track } from "../model";
+import type { HoverTarget, Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/toast";
 import { pipelineProgress, type PipelineProgress } from "../lib/pipeline";
@@ -49,6 +49,9 @@ const CLUSTER_CELL = 16;
 const TX_PAD = 14;
 const TX_KNOB_HIT = 9;
 
+/** Halo colour for a key/BPM hover target (folders/clusters use their own colours). */
+const TARGET_GLOW_COLOR = "#8e9bff";
+
 export class CanvasView {
   model: Model;
   $canvas: HTMLCanvasElement;
@@ -57,11 +60,15 @@ export class CanvasView {
 
   positions: DotPosition[] = [];
   hoveredIdx = -1;
-  hoveredFolderPrefix: string | null = null;
+  /**
+   * Hovered navigation element — a folder row, cluster row, or card chip (key/BPM).
+   * Owned by whichever list renders it (sidebar tree, cluster panel, inspect card);
+   * the canvas only reads it to glow matching dots. Purely visual, so it lives here
+   * rather than on the model (see `ui_conventions.md` → *Adding new interaction surfaces*).
+   */
+  hoverTarget: HoverTarget | null = null;
   /** Exact folder path (``""`` = library root): glow siblings while hovering a dot. */
   hoveredSiblingFolder: string | null = null;
-  /** Cluster id whose panel row is hovered: glow its member points. */
-  hoveredClusterId: number | null = null;
   tipReady = false;
   tipTimer = 0;
   /** Identity of the rendered tooltip card, so pan/zoom frames do not rebuild it. */
@@ -104,6 +111,8 @@ export class CanvasView {
     this.ctx = this.$canvas.getContext("2d")!;
     this.$tip = document.getElementById("tooltip")!;
     this.$tip.addEventListener("click", (e) => this._onTipClick(e));
+    this.$tip.addEventListener("mouseover", (e) => this._onTipOver(e));
+    this.$tip.addEventListener("mouseout", (e) => this._onTipOut(e));
   }
 
   /* ── Coordinate transforms ──────────────────────────────── */
@@ -572,28 +581,23 @@ export class CanvasView {
     }
   }
 
-  /* ── Hover glow pass (folders + clusters) ──────────────── */
+  /* ── Hover glow pass (navigation targets + sibling folder) ── */
 
-  private _inHoveredFolder(track: Track): boolean {
-    const prefix = this.hoveredFolderPrefix;
-    if (prefix === null) return false;
-    const f = track.folder ?? "";
-    if (prefix === "") return true;
-    return f === prefix || f.startsWith(prefix + "/");
-  }
-
-  /** Tracks that get the folder-style halo: sidebar subtree or canvas sibling folder. */
-  private _inFolderGlow(track: Track): boolean {
-    if (this.hoveredFolderPrefix !== null) return this._inHoveredFolder(track);
+  /** Tracks that get the navigation-target halo: sidebar/card hover, or dot sibling folder. */
+  private _inHoverGlow(track: Track): boolean {
+    if (this.hoverTarget !== null)
+      return this.model.trackMatchesHoverTarget(track, this.hoverTarget);
     const sib = this.hoveredSiblingFolder;
     if (sib === null) return false;
     return (track.folder ?? "") === sib;
   }
 
-  /** Track is a member of the cluster whose panel row is hovered. */
-  private _inHoveredCluster(track: Track): boolean {
-    if (this.hoveredClusterId === null) return false;
-    return this.model.clusterAssignments.get(track.path) === this.hoveredClusterId;
+  /** Halo colour: cluster swatch, folder colour, or the neutral accent for key/BPM. */
+  private _hoverGlowColor(track: Track): string {
+    const t = this.hoverTarget;
+    if (t?.kind === "cluster") return clusterColor(t.id);
+    if (t?.kind === "key" || t?.kind === "bpm") return TARGET_GLOW_COLOR;
+    return this.trackColor(track);
   }
 
   /**
@@ -618,8 +622,8 @@ export class CanvasView {
   }
 
   /**
-   * Renders the hover glow (folder subtree/siblings, or a hovered cluster's
-   * members) as a single screen-pass blur instead of N individual
+   * Renders the hover glow (navigation-target matches, or a hovered dot's sibling
+   * folder) as a single screen-pass blur instead of N individual
    * ctx.shadowBlur draws.
    *
    * All glowing dots are painted (without shadow) onto an offscreen render
@@ -627,12 +631,7 @@ export class CanvasView {
    * ctx.filter = 'blur()' — one GPU compositing pass for all dots.
    */
   private _drawFolderGlow(tracks: Track[]): void {
-    if (
-      this.hoveredFolderPrefix === null &&
-      this.hoveredSiblingFolder === null &&
-      this.hoveredClusterId === null
-    )
-      return;
+    if (this.hoverTarget === null && this.hoveredSiblingFolder === null) return;
 
     const w = this.$canvas.clientWidth;
     const h = this.$canvas.clientHeight;
@@ -644,16 +643,10 @@ export class CanvasView {
     gc.globalAlpha = 0.85;
     for (const pos of this.positions) {
       const track = tracks[pos.idx];
-      const inCluster = this._inHoveredCluster(track);
-      if (!inCluster && !this._inFolderGlow(track)) continue;
+      if (!this._inHoverGlow(track)) continue;
       gc.beginPath();
       gc.arc(pos.sx, pos.sy, DOT_R + 6, 0, Math.PI * 2);
-      // A hovered cluster glows in its own swatch colour (matching the panel
-      // row), independent of the current dot colouring mode.
-      gc.fillStyle =
-        inCluster && this.hoveredClusterId !== null
-          ? clusterColor(this.hoveredClusterId)
-          : this.trackColor(track);
+      gc.fillStyle = this._hoverGlowColor(track);
       gc.fill();
     }
     gc.globalAlpha = 1;
@@ -1074,6 +1067,8 @@ export class CanvasView {
     if (card.key !== this._tipKey) {
       this._tipKey = card.key;
       renderTooltip(this.$tip, card);
+      // The old target elements are gone; a stale hover would keep glowing.
+      this.hoverTarget = null;
     }
     this.$tip.classList.toggle("pinned", pinned);
     this.$tip.classList.remove("hidden");
@@ -1116,6 +1111,7 @@ export class CanvasView {
     this.inspect = null;
     this._pinPos = null;
     this._tipKey = "";
+    this.hoverTarget = null;
     this.$tip.classList.remove("pinned");
     this.scheduleDraw();
     return true;
@@ -1154,6 +1150,38 @@ export class CanvasView {
         this.inspect?.path ?? "",
       );
     }
+  }
+
+  /**
+   * Card navigation-target hover: the card's folder/cluster/key/BPM elements set
+   * the same `hoverTarget` a sidebar row would, so the glow and S/H agree.
+   */
+  private _onTipOver(e: MouseEvent): void {
+    const el = (e.target as HTMLElement).closest<HTMLElement>(
+      "[data-hover-target]",
+    );
+    const raw = el?.dataset.hoverTarget;
+    if (!raw) return;
+    try {
+      this.hoverTarget = JSON.parse(raw) as HoverTarget;
+      this.scheduleDraw();
+    } catch {
+      /* malformed attribute; ignore */
+    }
+  }
+
+  private _onTipOut(e: MouseEvent): void {
+    const el = (e.target as HTMLElement).closest<HTMLElement>(
+      "[data-hover-target]",
+    );
+    if (!el) return;
+    // Moving between the target's own children is not a leave.
+    const to = (e.relatedTarget as HTMLElement | null)?.closest?.(
+      "[data-hover-target]",
+    );
+    if (to === el) return;
+    this.hoverTarget = null;
+    this.scheduleDraw();
   }
 
   clearHover(): void {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, type Track } from "../model";
+import { Model, type HoverTarget, type Track } from "../model";
 import { FolderTreeCoordinator } from "./folder-tree-coordinator";
 
 vi.mock("htmx.org", () => ({ default: { ajax: vi.fn() } }));
@@ -75,7 +75,7 @@ interface Harness {
 function makeCanvas() {
   return {
     hoveredIdx: -1,
-    hoveredFolderPrefix: null as string | null,
+    hoverTarget: null as HoverTarget | null,
     hoveredSiblingFolder: null as string | null,
     scheduleDraw: vi.fn(),
   };
@@ -175,10 +175,10 @@ describe("FolderTreeCoordinator refresh", () => {
     const { canvas, coord } = makeHarness();
     await coord.refresh();
     mouseenter(row("House"));
-    expect(canvas.hoveredFolderPrefix).toBe("House");
+    expect(canvas.hoverTarget).toEqual({ kind: "folder", prefix: "House" });
     expect(canvas.scheduleDraw).toHaveBeenCalled();
     mouseleave(row("House"));
-    expect(canvas.hoveredFolderPrefix).toBeNull();
+    expect(canvas.hoverTarget).toBeNull();
   });
 
   it("restores manually opened folders after a swap", async () => {
@@ -444,9 +444,9 @@ describe("FolderTreeCoordinator hover", () => {
     const { canvas, coord } = makeHarness();
     await coord.refresh();
     mouseenter(row("House"));
-    expect(canvas.hoveredFolderPrefix).toBe("House");
+    expect(canvas.hoverTarget).toEqual({ kind: "folder", prefix: "House" });
     mouseleave(row("House"));
-    expect(canvas.hoveredFolderPrefix).toBeNull();
+    expect(canvas.hoverTarget).toBeNull();
   });
 
   it("keeps the hover while a canvas drag is active", async () => {
@@ -454,9 +454,9 @@ describe("FolderTreeCoordinator hover", () => {
     await coord.refresh();
     isPointerBusy.mockReturnValue(true);
     mouseenter(row("House"));
-    canvas.hoveredFolderPrefix = "House";
+    canvas.hoverTarget = { kind: "folder", prefix: "House" };
     mouseleave(row("House"));
-    expect(canvas.hoveredFolderPrefix).toBe("House");
+    expect(canvas.hoverTarget).toEqual({ kind: "folder", prefix: "House" });
   });
 });
 

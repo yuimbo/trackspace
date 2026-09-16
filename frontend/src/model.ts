@@ -172,6 +172,21 @@ export type ViewMode = "tags" | "embeddings";
 /** Hover-preview audition section; cycled with **D** and highlighted in the tooltip. */
 export type PreviewSection = "intro" | "drop" | "break";
 
+/**
+ * A list-like navigation element under the pointer: a folder row, a cluster row, or a
+ * card chip (key / BPM). One concept so the glow, **s** (solo), **h** (fit), **f**
+ * (select) and **Shift+s** (exclude) affordances behave the same wherever the element
+ * is rendered. See `design-patterns.md` → *Navigation targets*.
+ */
+export type HoverTarget =
+  | { kind: "folder"; prefix: string }
+  | { kind: "cluster"; id: number }
+  | { kind: "key"; value: string }
+  | { kind: "bpm"; value: number };
+
+/** BPM window that counts as "the same tempo" for the BPM chip's hover target. */
+export const BPM_MATCH_TOLERANCE = 2;
+
 export interface Viewport {
   ox: number;
   oy: number;
@@ -528,32 +543,51 @@ export class Model extends EventBus {
     return any;
   }
 
-  /** Hide every visible tracks not under ``prefixNorm``; same idea as ``focusSelection`` for a hovered folder row. */
-  focusFolderSubtree(prefixNorm: string): void {
-    this.focusPaths(this.pathsUnderPrefix(prefixNorm));
+  /* ── Hover targets ────────────────────────────────────────── */
+
+  /** True when *track* belongs to the hovered navigation element. */
+  trackMatchesHoverTarget(track: Track, target: HoverTarget | null): boolean {
+    if (!target) return false;
+    switch (target.kind) {
+      case "folder": {
+        const f = track.folder ?? "";
+        return (
+          target.prefix === "" ||
+          f === target.prefix ||
+          f.startsWith(target.prefix + "/")
+        );
+      }
+      case "cluster":
+        return this.clusterAssignments.get(track.path) === target.id;
+      case "key":
+        return target.value !== "" && (track.musical_key ?? "") === target.value;
+      case "bpm":
+        return (
+          track.bpm != null &&
+          Number.isFinite(track.bpm) &&
+          Math.abs(track.bpm - target.value) <= BPM_MATCH_TOLERANCE
+        );
+    }
   }
 
-  /** All known track paths under ``prefixNorm`` (``""`` = library root), hidden or not. */
-  pathsUnderPrefix(prefixNorm: string): Set<string> {
+  /** Known paths belonging to *target*, hidden or not (the solo/fit keep-set). */
+  hoverTargetPaths(target: HoverTarget | null): Set<string> {
     const out = new Set<string>();
+    if (!target) return out;
     for (const t of this.allTracks) {
-      const tf = t.folder ?? "";
-      const under =
-        prefixNorm === "" ||
-        tf === prefixNorm ||
-        tf.startsWith(prefixNorm + "/");
-      if (under) out.add(t.path);
+      if (this.trackMatchesHoverTarget(t, target)) out.add(t.path);
     }
     return out;
   }
 
-  /** Known track paths assigned to cluster *cid* (for solo / fit-in-view). */
-  clusterPaths(cid: number): Set<string> {
-    const out = new Set<string>();
-    for (const [path, id] of this.clusterAssignments) {
-      if (id === cid) out.add(path);
+  /** Replace the selection with every visible track belonging to *target*. */
+  selectOnlyHoverTarget(target: HoverTarget | null): void {
+    if (!target) return;
+    this.selected.clear();
+    for (const t of this.tracks) {
+      if (this.trackMatchesHoverTarget(t, target)) this.selected.add(t.path);
     }
-    return out;
+    this.emit("change");
   }
 
   /**
@@ -613,29 +647,6 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
-  /**
-   * Bring back a fully excluded folder subtree, then exclude everything outside it (single update).
-   * Used when **s** (isolate) is pressed on a hovered folder that is already entirely excluded.
-   */
-  revealThenFocusFolderSubtree(prefixNorm: string): void {
-    this._mutateRevealFolderSubtree(prefixNorm);
-    this._cache = null;
-    const add: string[] = [];
-    for (const t of this.allTracks) {
-      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
-      const tf = t.folder ?? "";
-      const under =
-        prefixNorm === "" ||
-        tf === prefixNorm ||
-        tf.startsWith(prefixNorm + "/");
-      if (under) continue;
-      add.push(t.path);
-    }
-    this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
-    this._clearExclusionsIfNoneVisible();
-    this.emit("change");
-  }
-
   clearExclusions(): void {
     if (!this.hasExclusions) return;
     this.hiddenPaths.clear();
@@ -646,14 +657,21 @@ export class Model extends EventBus {
 
   /**
    * Bring back a fully excluded path set, then exclude everything outside it
-   * (single update). Used when **s** (isolate) is pressed on a hovered cluster
-   * that is already entirely excluded.
+   * (single update). Used when **s** (isolate) is pressed on a hovered target that is
+   * already entirely excluded.
    */
   revealThenFocusPaths(paths: Iterable<string>): void {
     const keep = new Set(paths);
     this._mutateRevealPaths(keep);
     this._cache = null;
     this.focusPaths(keep);
+  }
+
+  /** Un-hide *paths* (and any folder prefix covering one) without changing the rest. */
+  revealPaths(paths: Iterable<string>): void {
+    this._mutateRevealPaths(paths);
+    this._cache = null;
+    this.emit("change");
   }
 
   /** Shared reveal mutation: un-hide *paths* and any folder prefix that covers one. */
@@ -761,14 +779,7 @@ export class Model extends EventBus {
   /** Replace selection with every visible track in this folder (and subfolders). */
   selectOnlyInFolder(folderPath: string): void {
     const norm = !folderPath || folderPath === "." ? "" : folderPath;
-    this.selected.clear();
-    for (const t of this.allTracks) {
-      if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
-      const tf = t.folder ?? "";
-      if (norm === "" || tf === norm || tf.startsWith(norm + "/"))
-        this.selected.add(t.path);
-    }
-    this.emit("change");
+    this.selectOnlyHoverTarget({ kind: "folder", prefix: norm });
   }
 
   /* ── Tags ─────────────────────────────────────────────────── */

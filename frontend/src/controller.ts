@@ -1,4 +1,11 @@
-import { type Model, type PreviewSection, type Track, type TrackStructure, isAudioFeatureAxisId } from "./model";
+import {
+  type Model,
+  type PreviewSection,
+  type Track,
+  type TrackStructure,
+  isAudioFeatureAxisId,
+  previewGain,
+} from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -214,8 +221,8 @@ export class Controller {
       scheduleDraw: () => this.canvas.scheduleDraw(),
       toggleViewMode: () => void this.embedding.toggleViewMode(),
       stopPreview: () => this._stopPreview(),
-      applyPreviewVolume: (volume) => {
-        this.$audio.volume = volume;
+      applyPreviewGain: (gain) => {
+        this.$audio.volume = gain;
       },
     });
 
@@ -530,7 +537,7 @@ export class Controller {
     this.previewPath = track.path;
     this.model.previewTrackPath = track.path;
     this.model.previewSection = null;
-    this.$audio.volume = this.model.previewVolume;
+    this.$audio.volume = previewGain(this.model.previewVolume);
     this.$audio.src = `/api/audio/${encodeURIComponent(track.path)}`;
     this.$audio.onloadedmetadata = () => {
       const s = this.model.trackStructure.get(track.path);
@@ -662,19 +669,28 @@ export class Controller {
     hk.on("fit-view", () => this.interaction.fitView());
 
     hk.on("focus-folder", () => {
-      const hp = this.interaction.effectiveHoveredFolderPrefix();
-      if (hp === null) return;
-      m.selectOnlyInFolder(hp);
+      const target = this.interaction.effectiveHoverTarget();
+      if (!target) return;
+      m.selectOnlyHoverTarget(target);
       m.saveLS();
     });
 
     hk.on("exclude-selection", () => {
-      const hp = this.interaction.effectiveHoveredFolderPrefix();
-      if (hp !== null) {
-        if (m.folderSubtreeFullyExcluded(hp)) {
-          m.revealFolderSubtree(hp);
+      const target = this.interaction.effectiveHoverTarget();
+      if (target) {
+        // A folder keeps its prefix-based exclusion so newly discovered files
+        // under it are hidden too; the other kinds are path sets.
+        if (target.kind === "folder") {
+          if (m.folderSubtreeFullyExcluded(target.prefix)) {
+            m.revealFolderSubtree(target.prefix);
+          } else {
+            m.hideFolderTree(target.prefix);
+          }
         } else {
-          m.hideFolderTree(hp);
+          const paths = m.hoverTargetPaths(target);
+          if (paths.size === 0) return;
+          if (m.pathsFullyHidden(paths)) m.revealPaths(paths);
+          else m.hidePaths(paths);
         }
         m.saveLS();
         return;

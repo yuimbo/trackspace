@@ -83,7 +83,12 @@ describe("buildTooltip", () => {
     const m = new Model();
     m.trackStructure = new Map([["a.mp3", structure({ peak_start: 10, genre_spanning: true })]]);
     const card = buildTooltip(makeTrack(), m);
-    expect(card.genre).toEqual({ name: null, color: null, spanning: true });
+    expect(card.genre).toEqual({
+      name: null,
+      color: null,
+      spanning: true,
+      target: null,
+    });
   });
 
   it("renders user tags as bars and excludes feature axis ids", () => {
@@ -119,8 +124,18 @@ describe("buildTooltip", () => {
       "Energy",
       "Dance",
     ]);
-    expect(card.features[0]).toEqual({ label: "Tempo", value: 0.5, readout: "128 BPM" });
-    expect(card.features[1]).toEqual({ label: "Key", value: 0.3, readout: "Am" });
+    expect(card.features[0]).toEqual({
+      label: "Tempo",
+      value: 0.5,
+      readout: "128 BPM",
+      target: { kind: "bpm", value: 128.4 },
+    });
+    expect(card.features[1]).toEqual({
+      label: "Key",
+      value: 0.3,
+      readout: "Am",
+      target: { kind: "key", value: "Am" },
+    });
     expect(card.features[3]).toEqual({ label: "Energy", value: 0.75, readout: "0.75" });
   });
 
@@ -173,6 +188,38 @@ describe("buildTooltip", () => {
     });
     expect(card.results[0]).toMatchObject({ path: "new.mp3", title: "new.mp3" });
   });
+
+  it("marks the folder, cluster, key and BPM as navigation targets", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Techno"]]);
+    const card = buildTooltip(
+      makeTrack({
+        folder: "House",
+        bpm: 128.4,
+        musical_key: "Am",
+        audio_features: {
+          tempo: 0.5,
+          key: 0.3,
+          mode: 1,
+          energy: 0.75,
+          danceability: 0.6,
+        },
+      }),
+      m,
+    );
+    expect(card.folderTarget).toEqual({ kind: "folder", prefix: "House" });
+    expect(card.genre?.target).toEqual({ kind: "cluster", id: 3 });
+    const bar = (label: string) => card.features.find((f) => f.label === label);
+    expect(bar("Tempo")?.target).toEqual({ kind: "bpm", value: 128.4 });
+    expect(bar("Key")?.target).toEqual({ kind: "key", value: "Am" });
+    expect(bar("Energy")?.target).toBeUndefined();
+  });
+
+  it("marks user tag bars without a target", () => {
+    const card = buildTooltip(makeTrack({ tags: { "4x4": 0.5 } }), new Model());
+    expect(card.tags[0].target).toBeUndefined();
+  });
 });
 
 describe("renderTooltip", () => {
@@ -221,6 +268,51 @@ describe("renderTooltip", () => {
     renderTooltip(host, buildTooltip(makeTrack(), new Model()));
     expect(host.querySelector(".tt-inspect")).toBeNull();
     expect(host.querySelectorAll("[data-inspect-action]").length).toBe(0);
+  });
+
+  it("renders card navigation targets with their hover hints", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Techno"]]);
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(
+        makeTrack({
+          folder: "House",
+          bpm: 128.4,
+          musical_key: "Am",
+          audio_features: {
+            tempo: 0.5,
+            key: 0.3,
+            mode: 1,
+            energy: 0.75,
+            danceability: 0.6,
+          },
+        }),
+        m,
+      ),
+    );
+
+    const folder = host.querySelector<HTMLElement>(".tt-folder");
+    expect(folder?.dataset.hoverTarget).toBe(
+      JSON.stringify({ kind: "folder", prefix: "House" }),
+    );
+    expect(folder?.classList.contains("tt-target")).toBe(true);
+    expect(folder?.title).toContain("S solo");
+
+    const genre = host.querySelector<HTMLElement>(".tt-genre");
+    expect(genre?.dataset.hoverTarget).toBe(
+      JSON.stringify({ kind: "cluster", id: 3 }),
+    );
+
+    const rows = [...host.querySelectorAll<HTMLElement>(".tt-stat")];
+    const tempo = rows.find((r) => r.textContent?.startsWith("Tempo"));
+    expect(tempo?.dataset.hoverTarget).toBe(
+      JSON.stringify({ kind: "bpm", value: 128.4 }),
+    );
+    const energy = rows.find((r) => r.textContent?.startsWith("Energy"));
+    expect(energy?.dataset.hoverTarget).toBeUndefined();
   });
 
   it("renders the navigate buttons and ranked rows when pinned", () => {

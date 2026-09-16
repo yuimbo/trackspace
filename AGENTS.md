@@ -13,6 +13,7 @@ you are touching.
 |-----|--------|
 | `architecture.md` | Where things live, frontend MVC + event bus, backend packages, lifecycle, HTTP API, non-goals |
 | `ui_conventions.md` | Frontend interaction rules: canvas, tags, batch, selection, folder tree, commands, hotkeys |
+| `design-patterns.md` | Shared interaction patterns: navigation targets, hover state, coordinators, input controls |
 | `audio_pipeline.md` | Fingerprinting → embeddings → projection → clustering, and the analysis job queue |
 | `TODO.md` | Actionable tasks, deferred work, product roadmap |
 | `README.md` | Setup and running |

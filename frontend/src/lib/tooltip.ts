@@ -7,6 +7,7 @@
 // only DOM code, so the canvas view stays free of layout.
 
 import {
+  type HoverTarget,
   type Model,
   type PreviewSection,
   type Track,
@@ -23,6 +24,8 @@ export interface TooltipBar {
   label: string;
   value: number;
   readout: string;
+  /** Navigation target when the row is a key/BPM stat (hover glows + S/H act on it). */
+  target?: HoverTarget;
 }
 
 export interface TooltipGenre {
@@ -31,6 +34,8 @@ export interface TooltipGenre {
   /** Swatch colour, or ``null`` when there is no cluster. */
   color: string | null;
   spanning: boolean;
+  /** Hover target for the cluster name (``null`` when unassigned). */
+  target: HoverTarget | null;
 }
 
 /** One ranked neighbour: the raw path plus the similarity score. */
@@ -55,6 +60,8 @@ export interface TooltipCard {
   key: string;
   path: string;
   folder: string;
+  /** Hover target for the folder kicker (the track's folder). */
+  folderTarget: HoverTarget;
   title: string;
   meta: string[];
   chips: StructureChip[];
@@ -97,11 +104,18 @@ function audioFeatureRows(track: Track, m: Model): TooltipBar[] {
     const fromAudio = row ? row[k as keyof TrackAudioFeatures] : undefined;
     const v = typeof fromAudio === "number" ? fromAudio : track.tags[k];
     if (typeof v !== "number" || !Number.isFinite(v)) continue;
-    rows.push({
+    const bar: TooltipBar = {
       label: m.axisDisplayName(k),
       value: clamp01(v),
       readout: featureReadout(k, v, track),
-    });
+    };
+    // Key and tempo are navigation targets: hovering the row glows every track
+    // with the same key / a near tempo, and S/H act on them.
+    if (k === "tempo" && track.bpm != null && Number.isFinite(track.bpm))
+      bar.target = { kind: "bpm", value: track.bpm };
+    else if (k === "key" && track.musical_key)
+      bar.target = { kind: "key", value: track.musical_key };
+    rows.push(bar);
   }
   return rows;
 }
@@ -154,6 +168,7 @@ export function buildTooltip(
               : m.clusterNames.get(cid) || `Cluster ${cid}`,
           color: cid === undefined ? null : clusterColor(cid),
           spanning,
+          target: cid === undefined ? null : { kind: "cluster", id: cid },
         };
 
   const tags = tagRows(track);
@@ -184,6 +199,7 @@ export function buildTooltip(
     key,
     path: track.path,
     folder,
+    folderTarget: { kind: "folder", prefix: track.folder ?? "" },
     title,
     meta,
     chips,
@@ -229,6 +245,20 @@ function el(tag: string, className?: string, text?: string): HTMLElement {
   return node;
 }
 
+/** Hint shown on every navigation-target element in the card. */
+const TARGET_HINT = "Highlight matches · S solo · H fit";
+
+/**
+ * Mark an element as a navigation target: the canvas reads `data-hover-target` to
+ * glow matching dots, and S/H act on it exactly as they do for a sidebar row.
+ */
+function markTarget(el: HTMLElement, target: HoverTarget): HTMLElement {
+  el.classList.add("tt-target");
+  el.dataset.hoverTarget = JSON.stringify(target);
+  el.title = TARGET_HINT;
+  return el;
+}
+
 function statSection(
   title: string,
   rows: TooltipBar[],
@@ -245,6 +275,7 @@ function statSection(
     bar.appendChild(fill);
     row.appendChild(bar);
     row.appendChild(el("span", "tt-stat-value", r.readout));
+    if (r.target) markTarget(row, r.target);
     section.appendChild(row);
   }
   return section;
@@ -253,7 +284,7 @@ function statSection(
 /** Render a built card into *host*, replacing any previous content. */
 export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   const root = el("div", "tt-card");
-  root.appendChild(el("div", "tt-folder", card.folder));
+  root.appendChild(markTarget(el("div", "tt-folder", card.folder), card.folderTarget));
   root.appendChild(el("div", "tt-title", card.title));
 
   if (card.meta.length) {
@@ -288,6 +319,7 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
       badge.title = SPANNING_HINT;
       genre.appendChild(badge);
     }
+    if (card.genre.target) markTarget(genre, card.genre.target);
     root.appendChild(genre);
   }
 

@@ -34,11 +34,19 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 ### Frontend
 
 - [ ] **Inspect card follow-ups.** The pinned card (Alt over a dot) has anti-track,
-      nearest, solo-neighbourhood and result focus. Still open: "same cluster" / "same
-      folder" jumps, a `k` control instead of the fixed `NEAR_K`/`SOLO_K`, and showing
-      the similarity score's meaning (cosine, not a probability). `_fetchSimilar` builds
-      the whole-library matrix on first call — a warm-up on library load would hide the
-      first-click latency (it is cached for `CACHE_TTL_SECONDS` after that).
+      nearest, solo-neighbourhood and result focus, and its folder/cluster/key/BPM elements
+      are navigation targets (glow + S/H/F/Shift+S) — see `design-patterns.md`. Still open:
+      "same cluster" / "same folder" jumps from the result rows, a `k` control instead of
+      the fixed `NEAR_K`/`SOLO_K`, and showing that the similarity score is a cosine, not a
+      probability. `_fetchSimilar` builds the whole-library matrix on first call — a warm-up
+      on library load would hide the first-click latency (cached for `CACHE_TTL_SECONDS`
+      after that).
+- [ ] **Preview audio may need a user gesture.** The preview volume now tapers
+      (`previewGain`) and defaults to a moderate 80 %, but a browser that blocks autoplay
+      will silently drop the *first* hover's `play()` (`_startPreview` swallows the
+      rejection). Unreproduced in headless Chromium, so unconfirmed: if a user reports a
+      silent first hover after a reload, catch `NotAllowedError` and show a one-time
+      "click to enable preview audio" hint, then retry on the next gesture.
 - [ ] **Projection refit progress.** The t-SNE/UMAP refit is still opaque: the
       canvas shows a static "Computing layout…" pill (`canvas-view.ts`,
       `_embeddingWaitLabel`) while `/api/embeddings/projection` runs for seconds.

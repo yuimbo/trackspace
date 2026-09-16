@@ -129,13 +129,11 @@ action `"isolate-selection"`, **s**) and **exclude** (remove from view, often re
 `"exclude-selection"`, **Shift+s**), with **Alt+s** as `"show-all-tracks"`. Implementation still
 uses `hiddenPaths` and `hiddenFolderPrefixes` on the model.
 
-`CanvasInteractionController.solo()` owns the isolate behaviour. It resolves the target in order:
-**hovered cluster** (a cluster-panel row sets `canvas.hoveredClusterId`) → hovered folder
-(`canvas.hoveredFolderPrefix`) → selection. A second press on an already-isolated target clears the
-exclusions, and with nothing hovered and no selection **s** also clears them (show all). Cluster solo/fit
-reduce to a keep-set of `clusterAssignments` paths (`Model.clusterPaths`), which is why the model's
-`focusPaths` / `revealPaths` / `pathsFullyHidden` helpers are path-set based. **H** fits the same
-targets (80th-percentile disc) via `fitView()`.
+**S**, **H**, **F** and **Shift+S** all act on the *hovered navigation element* — a folder row, a
+cluster row, or a card chip (key/BPM). That is one `HoverTarget` descriptor resolved by
+`CanvasInteractionController.effectiveHoverTarget()` (hovered target first, else the hovered dot's
+folder); `Model.trackMatchesHoverTarget` is the only place a target is interpreted. See
+`design-patterns.md` → *Navigation targets* before adding another element of this kind.
 
 **Cycle preview section** (action `"cycle-preview-section"`, **d**) advances the hover preview through
 the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active chip is
@@ -214,6 +212,12 @@ open when the pointer leaves the canvas (that is how you reach it), and closes o
 `CanvasInteractionController._bindInspectKey` owns the Alt toggle; `CanvasView`
 owns the pin/anchor state and delegates clicks (`data-inspect-action`,
 `data-inspect-focus`, `data-inspect-close`) to `onInspectAction`.
+
+In the pinned card the folder kicker, cluster name and the key/BPM feature rows are
+**navigation targets** (`data-hover-target`, `.tt-target`): hovering one glows the matching
+dots and makes **S**/**H**/**F**/**Shift+S** act on that set, exactly like a sidebar row.
+`CanvasView` delegates the card's `mouseover`/`mouseout` onto `canvas.hoverTarget`; see
+`design-patterns.md` → *Navigation targets*.
 
 `InspectCoordinator` (`coordinators/inspect-coordinator.ts`) owns the actions —
 same seam as `SearchCoordinator`:
