@@ -1,4 +1,5 @@
 import type { Model, QueueStatus } from "../model";
+import { pipelineProgress, stageDetail } from "../lib/pipeline";
 
 const PANEL_HIDE_MS = 140;
 
@@ -37,13 +38,11 @@ export class StatusView {
       this._clearHideTimer();
       const kind = el.dataset.detailKind as
         | "library"
-        | "embed"
         | "queue"
         | undefined;
       if (!kind) return;
       let html: string;
       if (kind === "library") html = this._libraryPanelHtml(this._model);
-      else if (kind === "embed") html = this._embedPanelHtml(this._model);
       else html = this._queuePanelHtml(this._model);
       this._showPanel(el, html, kind);
     });
@@ -67,14 +66,12 @@ export class StatusView {
       this._clearHideTimer();
       const kind = el.dataset.detailKind as
         | "library"
-        | "embed"
         | "queue"
         | undefined;
       if (!kind) return;
       this._hoverAnchor = el;
       let html: string;
       if (kind === "library") html = this._libraryPanelHtml(this._model);
-      else if (kind === "embed") html = this._embedPanelHtml(this._model);
       else html = this._queuePanelHtml(this._model);
       this._showPanel(el, html, kind);
     });
@@ -176,31 +173,6 @@ ${last}
 <div class="status-detail-note">Each track loads ID3 tags and a Chromaprint fingerprint. SQLite caches results by path and file modification time; cache hits avoid opening the MP3.</div>`;
   }
 
-  private _embedPanelHtml(model: Model): string {
-    const p = model.embeddingProgress!;
-    const pct =
-      p.total > 0 ? Math.round((100 * p.done) / p.total) : 0;
-    const srcs = "MAEST genre logits, MAEST embedding, rhythm, CLAP";
-    let last = "";
-    if (p.lastPath) {
-      const ok =
-        p.lastOk === false
-          ? '<span class="status-detail-bad">failed</span>'
-          : '<span class="status-detail-ok">ok</span>';
-      const fail =
-        p.lastFailures?.length &&
-        `<div class="status-detail-kv"><span>Missing layers</span><span>${esc(p.lastFailures.join(", "))}</span></div>`;
-      last = `<div class="status-detail-kv"><span>Last track</span><span class="status-detail-mono">${esc(p.lastPath)}</span></div>
-<div class="status-detail-kv"><span>Batch item</span><span>${ok}</span></div>${fail || ""}`;
-    }
-    return `
-<div class="status-detail-title">Embedding generation</div>
-<div class="status-detail-kv"><span>Progress</span><span>${p.done} / ${p.total} (${pct}%)</span></div>
-<div class="status-detail-kv"><span>Active sources</span><span>${esc(srcs)}</span></div>
-${last}
-<div class="status-detail-note">The server batches MAEST and CLAP inference across tracks and runs the classical features per track. The UI refreshes the projection periodically (PCA) while generation continues.</div>`;
-  }
-
   private _queuePanelHtml(model: Model): string {
     const q: QueueStatus | null = model.queueStatus;
     if (!q) {
@@ -217,8 +189,12 @@ ${last}
         k.failed > 0
           ? ` · <span class="status-detail-bad">${k.failed} failed</span>`
           : "";
+      // Singleton stages report a named phase instead of a track count.
+      const progressText = k.stage
+        ? esc(stageDetail(kind, k))
+        : `${k.done} / ${k.total} (${pct}%)`;
       rows.push(
-        `<div class="status-detail-kv"><span>${esc(k.label)}</span><span>${k.done} / ${k.total} (${pct}%)${failed}</span></div>`,
+        `<div class="status-detail-kv"><span>${esc(k.label)}</span><span>${progressText}${failed}</span></div>`,
       );
     }
     let newest: { path: string; at: number } | null = null;
@@ -285,42 +261,16 @@ ${maestError}
       this.$el.appendChild(mode);
     }
 
-    if (model.embeddingsGenerating && model.embeddingProgress) {
+    const prog = pipelineProgress(model.queueStatus);
+    if (prog) {
       addSep();
       const a = document.createElement("span");
       a.className = "status-hoverable";
-      a.dataset.detailKind = "embed";
+      a.dataset.detailKind = "queue";
       a.tabIndex = 0;
       a.setAttribute("aria-describedby", "status-detail-panel");
-      const ep = model.embeddingProgress;
-      a.textContent = `generating ${ep.done}/${ep.total}`;
+      a.textContent = `${prog.label} ${prog.detail} · ${Math.round(prog.fraction * 100)}%`;
       this.$el.appendChild(a);
-    }
-
-    if (model.queueStatus && model.queueStatus.outstanding > 0) {
-      const qs = model.queueStatus;
-      let label = "";
-      let finished = 0;
-      let total = 0;
-      for (const kind of qs.order) {
-        const k = qs.kinds[kind];
-        if (k && k.outstanding > 0) {
-          label = k.label;
-          finished = k.finished;
-          total = k.total;
-          break;
-        }
-      }
-      if (label) {
-        addSep();
-        const a = document.createElement("span");
-        a.className = "status-hoverable";
-        a.dataset.detailKind = "queue";
-        a.tabIndex = 0;
-        a.setAttribute("aria-describedby", "status-detail-panel");
-        a.textContent = `${label.charAt(0).toLowerCase()}${label.slice(1)} ${finished}/${total}`;
-        this.$el.appendChild(a);
-      }
     }
 
     if (reopenKind === "library" && model.libraryLoadProgress) {
@@ -329,20 +279,7 @@ ${maestError}
       ) as HTMLElement | null;
       if (el)
         this._showPanel(el, this._libraryPanelHtml(model), "library");
-    } else if (
-      reopenKind === "embed" &&
-      model.embeddingsGenerating &&
-      model.embeddingProgress
-    ) {
-      const el = this.$el.querySelector(
-        '[data-detail-kind="embed"]',
-      ) as HTMLElement | null;
-      if (el) this._showPanel(el, this._embedPanelHtml(model), "embed");
-    } else if (
-      reopenKind === "queue" &&
-      model.queueStatus &&
-      model.queueStatus.outstanding > 0
-    ) {
+    } else if (reopenKind === "queue" && prog) {
       const el = this.$el.querySelector(
         '[data-detail-kind="queue"]',
       ) as HTMLElement | null;

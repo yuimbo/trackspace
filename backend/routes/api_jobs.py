@@ -68,6 +68,9 @@ def create_api_jobs_blueprint(
             progress = job_queue.progress(kind)
             if progress:
                 entry["last"] = progress
+            stage = job_queue.stage_progress(kind)
+            if stage:
+                entry["stage"] = stage
             kinds[kind] = entry
 
         outstanding = sum(k["outstanding"] for k in kinds.values())

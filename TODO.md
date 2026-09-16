@@ -7,6 +7,13 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 
 ### Frontend
 
+- [ ] **Projection refit progress.** The t-SNE/UMAP refit is still opaque: the
+      canvas shows a static "Computing layout…" pill (`canvas-view.ts`,
+      `_embeddingWaitLabel`) while `/api/embeddings/projection` runs for seconds.
+      openTSNE exposes iteration callbacks; a phase/percent on the same
+      `stage_progress` channel would cover it. Only worth it if the refit is a
+      visible fraction of a first run.
+
 - [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1040 lines, the
       largest frontend file). The ~200 lines of fit-view math (`_vpFromWorldBounds`,
       `_computeFitVP`, `_p80Radius`, `_fitViewToFolderPercentile`, `_fitViewToTracks`,

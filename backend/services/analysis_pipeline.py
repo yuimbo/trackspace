@@ -31,7 +31,7 @@ import numpy as np
 
 from backend.embeddings import clustering as clustering_mod
 from backend.embeddings import supervised as supervised_mod
-from backend.embeddings.clustering import ClusterResult
+from backend.embeddings.clustering import ClusterResult, ProgressFn
 from backend.embeddings.projection_config import SUPERVISED_INPUT_WEIGHTS
 from backend.jobs import (
     Job,
@@ -553,6 +553,7 @@ def make_cluster_handler(
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
     weights: dict[str, float] | None = None,
+    emit: ProgressFn | None = None,
 ) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
     """Re-cluster the whole library.
 
@@ -564,6 +565,8 @@ def make_cluster_handler(
     the *weights* argument fixed at wiring time. Reading them at run time — rather
     than from the job payload — keeps user-chosen weights applied to the automatic
     re-clusters that follow an analysis drain.
+
+    *emit* receives ``(phase, done, total)`` phase updates for the status UI.
     """
 
     def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
@@ -574,7 +577,10 @@ def make_cluster_handler(
         effective_weights = store.weights() or weights
         try:
             result = run_clustering(
-                deps, build_track_infos=build_track_infos, weights=effective_weights
+                deps,
+                build_track_infos=build_track_infos,
+                weights=effective_weights,
+                on_progress=emit,
             )
         except Exception as e:
             log.exception("Clustering failed")
@@ -673,8 +679,15 @@ def run_clustering(
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
     weights: dict[str, float] | None = None,
+    on_progress: ProgressFn | None = None,
 ) -> ClusterResult | None:
     """Gather cached vectors for the whole library and run the clustering pipeline."""
+
+    def _progress(phase: str, done: int = 0, total: int = 0) -> None:
+        if on_progress is not None:
+            on_progress(phase, done, total)
+
+    _progress("vectors")
     infos = build_track_infos("", True)
     # Give newly analysed tracks their supervised row before gathering, so this
     # pass already clusters them in the learned space. Best-effort: a projection
@@ -704,6 +717,7 @@ def run_clustering(
             deps.features_version,
             supervised_mod.cache_version(deps.feature_cache),
         ),
+        on_progress=on_progress,
     )
 
 
@@ -751,6 +765,7 @@ def train_supervised(
     deps: AnalysisDeps,
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+    on_progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """Train the folder-supervised head and (re)write every supervised row.
 
@@ -759,6 +774,12 @@ def train_supervised(
     propagate: the handler maps them to a failed ``JobResult`` so the queue owns
     the retry decision.
     """
+
+    def _progress(phase: str, done: int = 0, total: int = 0) -> None:
+        if on_progress is not None:
+            on_progress(phase, done, total)
+
+    _progress("gather")
     infos = build_track_infos("", True)
     paths, blocks, _logits = gather_source_blocks(
         deps, infos, clap_version=deps.clap_version
@@ -790,6 +811,7 @@ def train_supervised(
 
     excerpts = _excerpts_aligned(deps, infos, paths)
     confidence = supervised_mod.excerpt_confidence(excerpts)
+    _progress("mining")
     mining = _mining_vectors(blocks, excerpts)
     hard_pairs = (
         supervised_mod.mine_hard_negatives(mining, labels)
@@ -798,7 +820,11 @@ def train_supervised(
     )
 
     result = supervised_mod.train_head(
-        mat, labels, sample_weights=confidence, hard_pairs=hard_pairs
+        mat,
+        labels,
+        sample_weights=confidence,
+        hard_pairs=hard_pairs,
+        on_epoch=lambda e, n: _progress("training", e, n),
     )
 
     run_id = supervised_mod.new_run_id(deps.data_dir)
@@ -828,6 +854,7 @@ def train_supervised(
         out_dim=result["out_dim"],
         mat=mat,
     )
+    _progress("projecting")
     fp_by_path = {t["path"]: t.get("fingerprint") for t in infos}
     written = 0
     for i, path in enumerate(paths):
@@ -921,6 +948,7 @@ def make_supervised_handler(
     deps: AnalysisDeps,
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+    emit: ProgressFn | None = None,
 ) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
     """Train the supervised head once for the whole library (singleton job)."""
 
@@ -929,7 +957,9 @@ def make_supervised_handler(
         if not jobs:
             return out
         try:
-            stats = train_supervised(deps, build_track_infos=build_track_infos)
+            stats = train_supervised(
+                deps, build_track_infos=build_track_infos, on_progress=emit
+            )
         except Exception as e:
             log.exception("Supervised training failed")
             for job in jobs:

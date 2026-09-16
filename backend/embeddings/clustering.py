@@ -26,13 +26,16 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
 log = logging.getLogger(__name__)
+
+#: ``(phase, done, total)`` — progress hook for a library-wide singleton run.
+ProgressFn = Callable[[str, int, int], None]
 
 #: Bump when the clustering recipe changes (invalidates cached cluster runs).
 CLUSTERING_VERSION = 1
@@ -475,11 +478,25 @@ def cluster_tracks(
     style_logits: np.ndarray | None = None,
     style_label_names: Sequence[str] | None = None,
     cache_versions: Sequence[int] = (),
+    on_progress: ProgressFn | None = None,
 ) -> ClusterResult | None:
     """Run the full pipeline: weight → PCA → cosine kNN → multi-resolution Leiden.
 
+    *on_progress* is called as ``(phase, done, total)`` at each stage boundary so
+    a status UI can show what a whole-library run is doing; ``total`` is 0 for
+    one-shot phases and ``len(resolutions)`` while Leiden sweeps.
+
     Returns ``None`` when there is too little data to cluster meaningfully.
     """
+
+    def _progress(phase: str, done: int = 0, total: int = 0) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(phase, int(done), int(total))
+        except Exception:
+            log.debug("clustering progress callback failed", exc_info=True)
+
     n = len(paths)
     if n < MIN_TRACKS_FOR_CLUSTERING:
         log.info("Clustering skipped: only %d track(s)", n)
@@ -495,7 +512,9 @@ def cluster_tracks(
         )
         return None
 
+    _progress("pca")
     reduced = reduce_dimensions(mat, pca_dim)
+    _progress("graph")
     edges, edge_weights = build_knn_graph(reduced, knn_k)
 
     revision = compute_clustering_revision(
@@ -514,7 +533,8 @@ def cluster_tracks(
             graph = None
 
     levels: list[ClusterLevel] = []
-    for res in resolutions:
+    total_res = len(resolutions)
+    for i, res in enumerate(resolutions):
         try:
             if graph is not None:
                 labels, modularity = _cluster_one_resolution(graph, edge_weights, float(res))
@@ -522,6 +542,7 @@ def cluster_tracks(
                 labels, modularity = _fallback_cluster(reduced, float(res))
         except Exception as e:
             log.warning("Clustering failed at resolution %.3g: %s", res, e)
+            _progress("leiden", i + 1, total_res)
             continue
 
         uniq, counts = np.unique(labels, return_counts=True)
@@ -537,6 +558,7 @@ def cluster_tracks(
                 modularity=modularity,
             )
         )
+        _progress("leiden", i + 1, total_res)
 
     if not levels:
         return None

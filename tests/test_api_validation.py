@@ -190,6 +190,12 @@ class _FakeQueue:
     def progress(self, kind):
         return None
 
+    def stage_progress(self, kind):
+        # Only the clustering stage is mid-run in this fixture.
+        if kind == "cluster":
+            return {"phase": "leiden", "done": 2, "total": 6, "at": 1.0}
+        return None
+
     def epoch(self):
         return 1
 
@@ -205,12 +211,20 @@ class _FakeWorkers:
         pass
 
 
+class _FakeMaest:
+    def is_model_ready(self):
+        return True
+
+    def load_error(self):
+        return None
+
+
 @pytest.fixture
 def jobs_client():
     bp = create_api_jobs_blueprint(
         job_queue=_FakeQueue(),
         workers=_FakeWorkers(),
-        clusters=None,
+        clusters=_FakeClusters(),
         build_track_infos_fn=lambda folder, recursive: [],
         enqueue_library_work=lambda *a, **k: {},
         enqueue_clustering=lambda *a, **k: 0,
@@ -218,7 +232,7 @@ def jobs_client():
         analysis_deps=None,
         broadcaster=None,
         sse_response=None,
-        maest_mod=None,
+        maest_mod=_FakeMaest(),
     )
     return _app(bp).test_client()
 
@@ -249,6 +263,19 @@ def test_jobs_enqueue_valid(jobs_client):
 def test_jobs_retry_unknown_kind_is_400(jobs_client):
     r = jobs_client.post("/api/jobs/retry", json={"kind": "bogus"})
     assert r.status_code == 400
+
+
+def test_jobs_status_carries_singleton_stage_phase(jobs_client):
+    """A mid-run singleton phase must survive the status snapshot, not just SSE."""
+    body = jobs_client.get("/api/jobs/status").get_json()
+    assert body["kinds"]["cluster"]["stage"] == {
+        "phase": "leiden",
+        "done": 2,
+        "total": 6,
+        "at": 1.0,
+    }
+    # Per-track kinds carry no phase.
+    assert "stage" not in body["kinds"]["maest"]
 
 
 # ─── folders blueprint ──────────────────────────────────────

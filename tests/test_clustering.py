@@ -148,6 +148,29 @@ def test_multiple_resolutions_produce_a_hierarchy() -> None:
     assert counts[-1] > counts[0]
 
 
+def test_cluster_tracks_reports_phase_progress() -> None:
+    """A library-wide run reports named phases so the UI can show progress."""
+    paths, mat, _ = _synthetic_library(n_genres=4, per_genre=20, seed=3)
+    seen: list[tuple[str, int, int]] = []
+
+    result = cl.cluster_tracks(
+        paths,
+        {"maest_logits": mat},
+        weights={"maest_logits": 1.0},
+        resolutions=(0.15, 0.4, 1.5),
+        on_progress=lambda phase, done, total: seen.append((phase, done, total)),
+    )
+    assert result is not None
+
+    phases = [p for p, _, _ in seen]
+    # One-shot phases bracket the per-resolution Leiden sweep.
+    assert "pca" in phases and "graph" in phases
+    leiden = [(d, t) for p, d, t in seen if p == "leiden"]
+    assert leiden, "Leiden sweep reported no progress"
+    assert [d for d, _ in leiden] == [1, 2, 3]
+    assert {t for _, t in leiden} == {3}
+
+
 def test_revision_is_deterministic_and_config_sensitive() -> None:
     paths, mat, _ = _synthetic_library(n_genres=3, per_genre=15)
     blocks = {"maest_logits": mat}

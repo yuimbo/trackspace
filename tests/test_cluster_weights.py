@@ -51,7 +51,7 @@ def test_cluster_store_summary_exposes_requested_weights():
 def test_cluster_handler_uses_stored_weights(monkeypatch):
     captured: dict = {}
 
-    def _fake_run_clustering(deps, *, build_track_infos, weights=None):
+    def _fake_run_clustering(deps, *, build_track_infos, weights=None, on_progress=None):
         captured["weights"] = weights
         return None
 
@@ -68,7 +68,7 @@ def test_cluster_handler_uses_stored_weights(monkeypatch):
 def test_cluster_handler_falls_back_to_wiring_weights(monkeypatch):
     captured: dict = {}
 
-    def _fake_run_clustering(deps, *, build_track_infos, weights=None):
+    def _fake_run_clustering(deps, *, build_track_infos, weights=None, on_progress=None):
         captured["weights"] = weights
         return None
 
@@ -79,6 +79,28 @@ def test_cluster_handler_falls_back_to_wiring_weights(monkeypatch):
     )
     handler([_job()])
     assert captured["weights"] == {"clap": 0.9}
+
+
+def test_cluster_handler_forwards_phase_progress(monkeypatch):
+    """The handler's ``emit`` sink receives the pipeline's phase updates."""
+    captured: dict = {}
+
+    def _fake_run_clustering(deps, *, build_track_infos, weights=None, on_progress=None):
+        assert on_progress is not None
+        on_progress("leiden", 2, 6)
+        return None
+
+    monkeypatch.setattr(ap, "run_clustering", _fake_run_clustering)
+
+    phases: list[tuple] = []
+    handler = make_cluster_handler(
+        _NO_DEPS,
+        ClusterStore(),
+        build_track_infos=lambda f, r: [],
+        emit=lambda phase, done, total: phases.append((phase, done, total)),
+    )
+    handler([_job()])
+    assert phases == [("leiden", 2, 6)]
 
 
 def test_cluster_handler_empty_batch_is_noop():

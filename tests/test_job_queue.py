@@ -56,6 +56,29 @@ def test_completion_is_durable_across_instances(q: JobQueue) -> None:
     assert reopened.stats("maest").pending == 2
 
 
+def test_stage_progress_is_scoped_per_kind_and_cleared_on_completion(q: JobQueue) -> None:
+    q.note_stage_progress("cluster", phase="leiden", done=2, total=6)
+    stage = q.stage_progress("cluster")
+    assert stage is not None
+    assert (stage["phase"], stage["done"], stage["total"]) == ("leiden", 2, 6)
+    # An unrelated kind has no in-flight phase.
+    assert q.stage_progress("maest") is None
+
+    _enqueue(q, "cluster", 1)
+    job = q.claim("cluster")[0]
+    q.complete(job)
+    # The phase describes a running job, so completion clears it.
+    assert q.stage_progress("cluster") is None
+
+
+def test_stage_progress_is_cleared_on_failure(q: JobQueue) -> None:
+    q.note_stage_progress("supervise", phase="training", done=1, total=10)
+    _enqueue(q, "supervise", 1)
+    job = q.claim("supervise")[0]
+    q.fail(job, "boom")
+    assert q.stage_progress("supervise") is None
+
+
 def test_expired_lease_is_reclaimed(q: JobQueue) -> None:
     fast = JobQueue(q._db_path, lease_seconds=-1.0)  # already expired on claim
     _enqueue(fast, "maest", 2)

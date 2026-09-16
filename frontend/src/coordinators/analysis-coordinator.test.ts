@@ -6,6 +6,12 @@ import {
   type QueueStatus,
 } from "../model";
 import { AnalysisCoordinator } from "./analysis-coordinator";
+import { toast } from "../lib/toast";
+
+vi.mock("../lib/toast", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/toast")>();
+  return { ...actual, toast: vi.fn() };
+});
 
 // ─── Fakes ───────────────────────────────────────────────────
 
@@ -190,6 +196,57 @@ describe("AnalysisCoordinator queue stream", () => {
     expect(spy).toHaveBeenCalledTimes(1);
     es.emit("drained");
     expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("records the running singleton stage phase", async () => {
+    const { model, update, scheduleDraw, coord } = makeHarness();
+    const es = await startSettled(coord);
+    model.queueStatus = makeQueueStatus({
+      active: true,
+      outstanding: 1,
+      total: 1,
+      order: ["cluster"],
+      kinds: { cluster: makeKind({ label: "Clustering", running: 1, outstanding: 1, total: 1 }) },
+    });
+    es.emit("stage_progress", { kind: "cluster", phase: "leiden", done: 2, total: 6 });
+    expect(model.queueStatus.kinds.cluster.stage).toMatchObject({
+      phase: "leiden",
+      done: 2,
+      total: 6,
+    });
+    expect(update).toHaveBeenCalledWith(model);
+    expect(scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("ignores a stage phase for an unknown kind", async () => {
+    const { model, coord } = makeHarness();
+    const es = await startSettled(coord);
+    model.queueStatus = makeQueueStatus({ active: true, outstanding: 1 });
+    es.emit("stage_progress", { kind: "bogus", phase: "pca" });
+    expect(model.queueStatus.kinds.bogus).toBeUndefined();
+  });
+
+  it("toasts analysis complete only once the whole queue drains", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/jobs/status")
+        ? makeQueueStatus({ outstanding: 1, active: true })
+        : {},
+    );
+    const es = await startSettled(coord);
+    vi.mocked(toast).mockClear();
+
+    // Another library-wide stage is still queued: not the end of the run.
+    es.emit("drained");
+    await flush();
+    expect(toast).not.toHaveBeenCalled();
+
+    // Now the authoritative status reports a fully idle queue.
+    vi.spyOn(coord, "refreshQueueStatus").mockImplementation(async () => {
+      model.queueStatus = makeQueueStatus({ outstanding: 0 });
+    });
+    es.emit("drained");
+    await flush();
+    expect(toast).toHaveBeenCalledWith("Analysis complete", "ok");
   });
 
   it("closes the stream on stop", async () => {

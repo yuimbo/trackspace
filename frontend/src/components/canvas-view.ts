@@ -2,6 +2,7 @@ import type { Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/toast";
 import { displayFolderPath } from "../lib/path-presenter";
+import { pipelineProgress, type PipelineProgress } from "../lib/pipeline";
 
 
 // ─── Types ───────────────────────────────────────────────────
@@ -857,14 +858,69 @@ export class CanvasView {
   /** Centred pill while embedding space has nothing to plot yet or layout is in flight. */
   private _embeddingWaitLabel(m: Model): string | null {
     if (m.viewMode !== "embeddings") return null;
-    if (m.projectionPending) return "clustering…";
+    // The analysis pipeline owns its own progress pill (see _drawPipelinePill), so
+    // these fallbacks only cover states the queue cannot describe.
+    if (m.projectionPending) return "Computing layout…";
     if (m.embeddingPositions.size > 0) return null;
     if (m.embeddingsReady) return null;
     if (m.embeddingModelsLoading) return "loading models…";
-    if (m.embeddingsGenerating && m.embeddingProgress)
-      return `generating ${m.embeddingProgress.done}/${m.embeddingProgress.total}…`;
     if (m.embeddingsGenerating) return "generating embeddings…";
     return "loading…";
+  }
+
+  /** Progress pill for the whole analysis pipeline, with a determinate bar.
+   *
+   * Big and centred while the map has nothing to plot; once positions exist it
+   * docks to the top-centre so progress stays visible without covering the map.
+   */
+  private _drawPipelinePill(
+    w: number,
+    h: number,
+    prog: PipelineProgress,
+    docked: boolean,
+  ): void {
+    const ctx = this.ctx;
+    const label = `${prog.label} · ${prog.detail}`;
+    const fontSize = docked ? 12 : 16;
+    const barW = docked ? 200 : 240;
+    const barH = 4;
+
+    ctx.font = `${docked ? "" : "bold "}${fontSize}px monospace`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    const pw = Math.max(barW, ctx.measureText(label).width) + 28;
+    const ph = fontSize + 34;
+    const cx = w / 2;
+    const cy = docked ? 34 + ph / 2 : h / 2;
+    const x = cx - pw / 2;
+    const y = cy - ph / 2;
+
+    ctx.beginPath();
+    ctx.roundRect(x, y, pw, ph, 8);
+    ctx.fillStyle = "rgba(10,14,30,0.82)";
+    ctx.fill();
+    ctx.strokeStyle = "rgba(180,220,255,0.35)";
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(180,220,255,0.95)";
+    ctx.fillText(label, cx, y + 10 + fontSize / 2);
+
+    // Determinate bar: overall finished/total across every queued stage.
+    const bx = cx - barW / 2;
+    const by = y + ph - 12;
+    ctx.fillStyle = "rgba(255,255,255,0.14)";
+    ctx.beginPath();
+    ctx.roundRect(bx, by, barW, barH, barH / 2);
+    ctx.fill();
+    const fw = Math.max(barH, barW * Math.max(0, Math.min(1, prog.fraction)));
+    ctx.fillStyle = "rgba(120,200,255,0.9)";
+    ctx.beginPath();
+    ctx.roundRect(bx, by, fw, barH, barH / 2);
+    ctx.fill();
+
+    ctx.textAlign = "start";
+    ctx.textBaseline = "alphabetic";
   }
 
   private _drawCenterStatusPill(w: number, h: number, label: string): void {
@@ -901,23 +957,15 @@ export class CanvasView {
     ctx.textBaseline = "top";
     ctx.fillStyle = "rgba(120,200,255,0.6)";
     ctx.fillText("EMBEDDING SPACE", w - 8, 8);
-    let y = 22;
-    if (
-      m.embeddingsGenerating &&
-      m.embeddingProgress &&
-      m.embeddingPositions.size > 0
-    ) {
-      ctx.fillStyle = "rgba(255,200,100,0.6)";
-      ctx.fillText(
-        `generating ${m.embeddingProgress.done}/${m.embeddingProgress.total}…`,
-        w - 8,
-        y,
-      );
-      y += 14;
-    }
 
     const wait = this._embeddingWaitLabel(m);
-    if (wait) this._drawCenterStatusPill(w, h, wait);
+    const prog = pipelineProgress(m.queueStatus);
+    if (prog) {
+      // Docked once the map is drawn, so the indicator never covers the points.
+      this._drawPipelinePill(w, h, prog, m.embeddingPositions.size > 0);
+    } else if (wait) {
+      this._drawCenterStatusPill(w, h, wait);
+    }
 
     ctx.restore();
   }

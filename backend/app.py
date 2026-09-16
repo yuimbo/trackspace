@@ -437,6 +437,30 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         _after_cluster_inputs_changed(event)
 
 
+    def _stage_emit(kind: str):
+        """Phase-progress sink for a library-wide singleton stage.
+
+        Records the phase on the queue (so a status snapshot mid-run is correct)
+        and publishes it on the same SSE channel as the worker events.
+        """
+
+        def _emit(phase: str, done: int = 0, total: int = 0) -> None:
+            state.job_queue.note_stage_progress(
+                kind, phase=phase, done=done, total=total
+            )
+            _job_event_sink(
+                {
+                    "type": "stage_progress",
+                    "kind": kind,
+                    "phase": phase,
+                    "done": int(done),
+                    "total": int(total),
+                }
+            )
+
+        return _emit
+
+
     def _enqueue_analysis(
         *,
         infos: list[dict],
@@ -509,6 +533,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 make_supervised_handler(
                     ANALYSIS_DEPS,
                     build_track_infos=_build_track_infos,
+                    emit=_stage_emit(KIND_SUPERVISED),
                 ),
                 batch_size=1,
                 # Drain hook: a completed training run rewrites the supervised
@@ -524,6 +549,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                     ANALYSIS_DEPS,
                     state.clusters,
                     build_track_infos=_build_track_infos,
+                    emit=_stage_emit(KIND_CLUSTER),
                 ),
                 batch_size=1,
                 on_event=_on_job_event,

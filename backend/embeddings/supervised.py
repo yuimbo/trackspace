@@ -38,7 +38,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import numpy as np
 
@@ -400,12 +400,16 @@ def train_head(
     samples_per_class: int = DEFAULT_SAMPLES_PER_CLASS,
     val_fraction: float = VAL_FRACTION,
     seed: int = DEFAULT_SEED,
+    on_epoch: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Train the head; returns ``{"state_dict", "in_dim", "hidden_dim", "out_dim", "stats"}``.
 
     Only labelled rows (``labels >= 0``) are used. The validation split is taken
     per class so every class keeps at least one training example; early stopping on
     validation loss returns the best weights, not the last ones.
+
+    *on_epoch* is called as ``(epoch_number, max_epochs)`` after each epoch
+    (1-based), for a progress UI.
     """
     import torch
 
@@ -492,6 +496,12 @@ def train_head(
                 )
             )
         history.append({"epoch": epoch, "train": train_loss, "val": val_loss})
+
+        if on_epoch is not None:
+            try:
+                on_epoch(epoch + 1, int(max(1, epochs)))
+            except Exception:
+                log.debug("supervised epoch callback failed", exc_info=True)
 
         if val_loss < best_val - 1e-6:
             best_val = val_loss

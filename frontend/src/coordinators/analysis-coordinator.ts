@@ -279,6 +279,7 @@ export class AnalysisCoordinator {
     const applySnapshot = (data: QueueStatus) => {
       this.deps.model.queueStatus = data;
       this.deps.status.update(this.deps.model);
+      this.deps.scheduleDraw();
       this._syncApplyEnabled();
     };
 
@@ -288,6 +289,29 @@ export class AnalysisCoordinator {
 
     es.addEventListener("stats", (() => {
       void this.refreshQueueStatus();
+    }) as EventListener);
+
+    es.addEventListener("stage_progress", ((e: MessageEvent) => {
+      // In-flight phase of a library-wide singleton stage (supervise/cluster):
+      // update the stage in place so both the status bar and the canvas
+      // indicator re-render without waiting for the next snapshot.
+      const d = JSON.parse(e.data) as {
+        kind: string;
+        phase: string;
+        done?: number;
+        total?: number;
+      };
+      const m = this.deps.model;
+      const k = m.queueStatus?.kinds[d.kind];
+      if (!k) return;
+      k.stage = {
+        phase: d.phase,
+        done: d.done ?? 0,
+        total: d.total ?? 0,
+        at: Date.now() / 1000,
+      };
+      this.deps.status.update(m);
+      this.deps.scheduleDraw();
     }) as EventListener);
 
     es.addEventListener("progress", ((e: MessageEvent) => {
@@ -314,13 +338,19 @@ export class AnalysisCoordinator {
           at: Date.now() / 1000,
         };
         this.deps.status.update(m);
+        this.deps.scheduleDraw();
         this._syncApplyEnabled();
       }
     }) as EventListener);
 
     es.addEventListener("drained", (() => {
-      void this.refreshQueueStatus();
-      toast("Analysis stage complete", "ok");
+      // Workers drain per kind, and every per-track drain queues the next
+      // library-wide stage, so only a fully idle queue ends the whole run.
+      void this.refreshQueueStatus().then(() => {
+        if ((this.deps.model.queueStatus?.outstanding ?? 0) === 0) {
+          toast("Analysis complete", "ok");
+        }
+      });
     }) as EventListener);
 
     es.onerror = () => {
@@ -343,6 +373,7 @@ export class AnalysisCoordinator {
       const prevRevision = m.clusterRevision;
       m.queueStatus = st;
       this.deps.status.update(m);
+      this.deps.scheduleDraw();
       this._syncApplyEnabled();
       // Clustering finished or changed → refresh assignments.
       const rev = st.clusters?.revision ?? null;

@@ -156,6 +156,22 @@ def test_train_head_separates_classes():
     assert sim[same & off].mean() > sim[~same & off].mean()
 
 
+def test_train_head_reports_epoch_progress():
+    x, y = _blobs(n_classes=3, per_class=20, dim=8)
+    seen: list[tuple[int, int]] = []
+    sup.train_head(
+        x,
+        y,
+        epochs=5,
+        patience=5,
+        seed=4,
+        on_epoch=lambda epoch, total: seen.append((epoch, total)),
+    )
+    # One call per completed epoch, 1-based, with the epoch budget.
+    assert [e for e, _ in seen] == [1, 2, 3, 4, 5]
+    assert {t for _, t in seen} == {5}
+
+
 def test_train_head_rejects_insufficient_labels():
     x, y = _blobs(n_classes=1, per_class=8, dim=4)
     with pytest.raises(ValueError):

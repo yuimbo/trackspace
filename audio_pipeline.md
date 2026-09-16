@@ -490,6 +490,16 @@ drift apart.
 renders while the (decode-dominated) CLAP backfill continues; its drain triggers a
 re-cluster like any other per-track stage.
 
+**Progress is reported per job and per phase.** Each completed per-track job emits a
+`progress` event on `/api/jobs/stream`; the two library-wide singletons instead
+report named phases as `stage_progress` events — `supervise` emits `gather`,
+`mining`, `training (epoch i/N)`, `projecting`, and `cluster` emits `vectors`,
+`pca`, `graph`, `leiden (i/N)`. The latest phase is echoed in `/api/jobs/status`
+(`kind.stage`) so a reload mid-run still renders it. The frontend reduces the
+whole snapshot to one summary — overall `finished/total` plus the running stage —
+in `frontend/src/lib/pipeline.ts`, shown both in the status bar and as the
+on-canvas indicator.
+
 **The `features` stage parallelises across processes, not threads.**
 `backend/services/features_worker.py` is the pool child; `make_features_handler`
 runs each claimed track there and the parent keeps the cache write and the

@@ -8,6 +8,14 @@ export interface TrackAudioFeatures {
   danceability: number;
 }
 
+/** In-flight phase of a library-wide singleton stage (supervise/cluster). */
+export interface QueueStageStatus {
+  phase: string;
+  done: number;
+  total: number;
+  at: number;
+}
+
 /** Counts for one job kind, as reported by ``/api/jobs/status``. */
 export interface QueueKindStatus {
   label: string;
@@ -24,6 +32,8 @@ export interface QueueKindStatus {
     detail: Record<string, unknown>;
     at: number;
   };
+  /** Present only while a singleton stage is mid-run. */
+  stage?: QueueStageStatus;
 }
 
 /** Whole-queue snapshot; ``order`` lists kinds in pipeline order. */

@@ -107,6 +107,21 @@ class _Progress:
     at: float = 0.0
 
 
+@dataclass
+class _StageProgress:
+    """In-flight phase of a singleton stage (supervise/cluster).
+
+    Per-track kinds get their granularity from job rows; a library-wide singleton is
+    one row, so its handlers report named phases (``leiden 3/6``, ``epoch 4/10``)
+    through :meth:`JobQueue.note_stage_progress` instead.
+    """
+
+    phase: str
+    done: int = 0
+    total: int = 0
+    at: float = 0.0
+
+
 class JobQueue:
     """Durable work queue backed by one SQLite table.
 
@@ -129,6 +144,7 @@ class JobQueue:
         #: Bumps on every state transition so status caches can invalidate.
         self._epoch = 0
         self._progress: dict[str, _Progress] = {}
+        self._stage: dict[str, _StageProgress] = {}
         self._init_db()
 
     # ── plumbing ──────────────────────────────────────────────
@@ -375,6 +391,7 @@ class JobQueue:
                 ok=True,
                 detail=detail or {},
             )
+            self.clear_stage_progress(kind)
         self._bump_epoch()
 
     def fail(
@@ -407,6 +424,7 @@ class JobQueue:
         self._note_progress(
             job.kind, path=job.path, ok=False, detail={**(detail or {}), "error": error}
         )
+        self.clear_stage_progress(job.kind)
         self._bump_epoch()
         return will_retry
 
@@ -525,6 +543,28 @@ class JobQueue:
         if p is None:
             return None
         return {"path": p.path, "ok": p.ok, "detail": p.detail, "at": p.at}
+
+    # ── in-flight phase of singleton stages ────────────────────
+
+    def note_stage_progress(
+        self, kind: str, *, phase: str, done: int = 0, total: int = 0
+    ) -> None:
+        """Record the phase a singleton stage (supervise/cluster) is currently in."""
+        with self._lock:
+            self._stage[kind] = _StageProgress(
+                phase=phase, done=int(done), total=int(total), at=time.time()
+            )
+
+    def stage_progress(self, kind: str) -> dict[str, Any] | None:
+        with self._lock:
+            s = self._stage.get(kind)
+        if s is None:
+            return None
+        return {"phase": s.phase, "done": s.done, "total": s.total, "at": s.at}
+
+    def clear_stage_progress(self, kind: str) -> None:
+        with self._lock:
+            self._stage.pop(kind, None)
 
     # ── maintenance ───────────────────────────────────────────
 
