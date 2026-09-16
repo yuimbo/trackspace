@@ -8,6 +8,17 @@ export interface TrackAudioFeatures {
   danceability: number;
 }
 
+/** Coarse track structure from the ``structure`` stage; seconds, or null. */
+export interface TrackStructure {
+  intro_end: number | null;
+  peak_start: number | null;
+  peak_end: number | null;
+  break_start: number | null;
+  break_end: number | null;
+  /** True when the track's excerpts disagree (intro vs drop). */
+  genre_spanning?: boolean;
+}
+
 /** In-flight phase of a library-wide singleton stage (supervise/cluster). */
 export interface QueueStageStatus {
   phase: string;
@@ -262,6 +273,13 @@ export class Model extends EventBus {
   clusterWeights: Record<string, number> = { ...DEFAULT_CLUSTER_WEIGHTS };
   clusterRevision: string | null = null;
   clustersAvailable = false;
+
+  /* ── Track structure ────────────────────────────────────────
+   * Coarse intro/drop/break timestamps, fetched lazily per path (the structure
+   * stage backfills the cache in the background). Missing entries fall back to a
+   * fixed preview position.
+   */
+  trackStructure: Map<string, TrackStructure> = new Map();
 
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;

@@ -3,6 +3,7 @@ import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/toast";
 import { displayFolderPath } from "../lib/path-presenter";
 import { pipelineProgress, type PipelineProgress } from "../lib/pipeline";
+import { structureLine } from "../lib/structure";
 
 
 // ─── Types ───────────────────────────────────────────────────
@@ -1077,6 +1078,9 @@ export function tooltipLines(track: Track, m: Model): string[] {
     audioParts.push(`${Math.round(track.bpm)} BPM`);
   if (track.musical_key) audioParts.push(track.musical_key);
   if (audioParts.length) lines.push(audioParts.join(" · "));
+
+  const structure = structureLine(m.trackStructure.get(track.path));
+  if (structure) lines.push(structure);
 
   const cid = m.clusterAssignments.get(track.path);
   if (cid !== undefined) lines.push(m.clusterNames.get(cid) || `Cluster ${cid}`);

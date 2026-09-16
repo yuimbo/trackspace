@@ -74,7 +74,8 @@ class _SourceSpec:
 
 
 #: Canonical source registry. Names match the ``sources`` vocabulary shared by
-#: projection, clustering and coverage.
+#: projection, clustering and coverage; ``structure`` is metadata-only and is not a
+#: clustering/projection source.
 _SOURCES: dict[str, _SourceSpec] = {
     "clap": _SourceSpec("clap_embedding", "version", "clap:"),
     "features": _SourceSpec("features", "features_version", "feat:"),
@@ -94,6 +95,9 @@ _SOURCES: dict[str, _SourceSpec] = {
     #: Folder-supervised projection output. Versioned by training-run id, so a
     #: retrain rewrites every row under a new version and old rows read absent.
     "supervised": _SourceSpec("supervised_embedding", "supervised_version", "sup:"),
+    #: Coarse track structure (intro/drop/break timestamps). Metadata, not a
+    #: clustering/projection vector — kept out of ``FROZEN_SOURCES``.
+    "structure": _SourceSpec("structure", "structure_version", "struct:"),
 }
 
 #: ``clap_embedding`` is NOT NULL, so writing another source to a new row pads
@@ -162,6 +166,8 @@ class FeatureCache:
                 ("supervised_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("rhythm", "BLOB"),
                 ("rhythm_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("structure", "BLOB"),
+                ("structure_version", "INTEGER NOT NULL DEFAULT 0"),
             ]:
                 try:
                     conn.execute(

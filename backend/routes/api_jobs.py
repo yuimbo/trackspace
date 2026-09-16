@@ -22,6 +22,7 @@ from backend.jobs import (
     KIND_CLUSTER,
     KIND_FEATURES,
     KIND_MAEST,
+    KIND_STRUCTURE,
     KIND_SUPERVISED,
     kind_label,
 )
@@ -115,7 +116,9 @@ def create_api_jobs_blueprint(
         recursive = opt_bool(data, "recursive", True)
         force = opt_bool(data, "force", False)
         priority_paths = opt_str_list(data, "priority_paths")
-        kinds = opt_str_list(data, "kinds", [KIND_FEATURES, KIND_MAEST, KIND_CLAP])
+        kinds = opt_str_list(
+            data, "kinds", [KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP]
+        )
         for kind in kinds:
             one_of(kind, JOB_KINDS, field="kinds")
 

@@ -1,4 +1,4 @@
-import { type Model, type Track, isAudioFeatureAxisId } from "./model";
+import { type Model, type Track, type TrackStructure, isAudioFeatureAxisId } from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -9,6 +9,7 @@ import type {
 } from "./components";
 import { toast, showLoad, hideLoad } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
+import { previewStartSeconds } from "./lib/structure";
 import {
   CommandManager,
   RenameTagCommand,
@@ -62,6 +63,8 @@ export class Controller {
   private searchView: SearchView;
 
   private previewPath: string | null = null;
+  /** Paths with an in-flight structure fetch, so a hover burst fetches once. */
+  private structurePending = new Set<string>();
   private $audio: HTMLAudioElement;
   private pending = new Map<string, PendingUpdate>();
   private cmdMgr: CommandManager;
@@ -499,9 +502,51 @@ export class Controller {
     this.$audio.volume = this.model.previewVolume;
     this.$audio.src = `/api/audio/${encodeURIComponent(track.path)}`;
     this.$audio.onloadedmetadata = () => {
-      this.$audio.currentTime = this.$audio.duration * 0.4;
+      this.$audio.currentTime = previewStartSeconds(
+        this.model.trackStructure.get(track.path),
+        this.$audio.duration,
+      );
     };
     this.$audio.play().catch(() => {});
+    if (!this.model.trackStructure.has(track.path)) {
+      void this._fetchStructure(track.path);
+    }
+  }
+
+  /**
+   * Fetch one track's cached structure (intro/drop/break) and remember it.
+   *
+   * Silent and best-effort: the background ``structure`` stage may not have
+   * reached the track yet, in which case the preview keeps its fixed position.
+   * When the fetch lands while the track is still being auditioned, seek it to the
+   * detected drop.
+   */
+  private async _fetchStructure(path: string): Promise<void> {
+    if (this.model.trackStructure.has(path) || this.structurePending.has(path)) {
+      return;
+    }
+    this.structurePending.add(path);
+    try {
+      const res = await api<{
+        tracks?: (TrackStructure & { path: string })[];
+      }>(
+        `/api/tracks/structure?paths=${encodeURIComponent(path)}`,
+        undefined,
+        true,
+      );
+      for (const entry of res?.tracks ?? []) {
+        const { path: entryPath, ...structure } = entry;
+        this.model.trackStructure.set(entryPath, structure);
+      }
+      const s = this.model.trackStructure.get(path);
+      if (this.previewPath === path && s?.peak_start != null && this.$audio.duration > 0) {
+        this.$audio.currentTime = previewStartSeconds(s, this.$audio.duration);
+      }
+    } catch {
+      /* A missing row is the normal "not analysed yet" case; keep the fallback. */
+    } finally {
+      this.structurePending.delete(path);
+    }
   }
 
   private _stopPreview(): void {

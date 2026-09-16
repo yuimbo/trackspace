@@ -28,6 +28,7 @@ export interface PipelineProgress {
 const STAGE_LABELS: Record<string, string> = {
   scan: "Scanning library",
   features: "Audio features",
+  structure: "Track structure",
   maest: "MAEST embeddings",
   clap: "CLAP embeddings",
   supervise: "Folder supervision",

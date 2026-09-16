@@ -76,6 +76,11 @@ HARD_NEG_WEIGHT = 0.5
 #: genre-straddling tracks (dispersion ≳ 0.3) are strongly down-weighted.
 DISPERSION_ALPHA = 2.0
 
+#: Excerpt dispersion at/above which a track is reported as *genre-spanning* in the
+#: UI. Same measure as the confidence decay above (1 − mean pairwise cosine), but a
+#: separate knob: the threshold is a display decision, not a loss weight.
+SPANNING_DISPERSION_THRESHOLD = 0.25
+
 HEAD_FILENAME = "supervised_head.pt"
 META_FILENAME = "supervised_head.json"
 
@@ -195,19 +200,45 @@ def excerpt_confidence(
     """
     out = np.ones(len(excerpts_per_track), dtype=np.float32)
     for i, exc in enumerate(excerpts_per_track):
-        if exc is None:
+        dispersion = excerpt_dispersion(exc)
+        if dispersion is None:
             continue
-        arr = np.asarray(exc, dtype=np.float32)
-        if arr.ndim != 2 or arr.shape[0] < 2:
-            continue
-        norm = _l2_normalize_rows(arr)
-        sim = norm @ norm.T
-        m = int(sim.shape[0])
-        iu = np.triu_indices(m, k=1)
-        mean_cos = float(np.clip(sim[iu].mean(), -1.0, 1.0))
-        dispersion = max(0.0, 1.0 - mean_cos)
         out[i] = float(np.exp(-float(alpha) * dispersion))
     return out
+
+
+def excerpt_dispersion(excerpts: np.ndarray | None) -> float | None:
+    """Intra-track excerpt dispersion (``1 − mean pairwise cosine``), or ``None``.
+
+    ``None`` when there are fewer than two usable excerpts — a single excerpt
+    carries no dispersion signal, so callers must not read "0.0" as agreement.
+    """
+    if excerpts is None:
+        return None
+    arr = np.asarray(excerpts, dtype=np.float32)
+    if arr.ndim != 2 or arr.shape[0] < 2:
+        return None
+    norm = _l2_normalize_rows(arr)
+    sim = norm @ norm.T
+    m = int(sim.shape[0])
+    iu = np.triu_indices(m, k=1)
+    mean_cos = float(np.clip(sim[iu].mean(), -1.0, 1.0))
+    return max(0.0, 1.0 - mean_cos)
+
+
+def is_genre_spanning(
+    excerpts: np.ndarray | None,
+    *,
+    threshold: float = SPANNING_DISPERSION_THRESHOLD,
+) -> bool:
+    """True when a track's excerpts disagree enough to look intro-vs-drop.
+
+    The user-facing counterpart of the confidence decay in
+    :func:`excerpt_confidence`: the same dispersion measure, reported as a flag.
+    Tracks with fewer than two excerpts are never flagged.
+    """
+    dispersion = excerpt_dispersion(excerpts)
+    return dispersion is not None and dispersion >= threshold
 
 
 def mine_hard_negatives(

@@ -161,3 +161,20 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   full weighting.
 - Switching projection method or source checkboxes re-fetches positions from the
   backend and animates the transition.
+
+---
+
+## Hover preview and tooltip
+
+- **Hover preview** (**M** toggles, volume slider in Options) streams the track
+  through `/api/audio/…`. It seeks to the **detected drop** when the track has a
+  cached structure row, else to 40 % of the track — `previewStartSeconds` in
+  `lib/structure.ts` owns that choice.
+- Structure is **fetched lazily on first hover** (`/api/tracks/structure?paths=…`,
+  silent, deduped per path) and cached on `model.trackStructure`. A missing row is
+  the normal "not analysed yet" case; the preview keeps its fallback position and
+  re-seeks to the drop if the fetch lands while the track is still auditioning.
+- The hover **tooltip** renders a structure line — `intro 0:32 · drop 1:04 · break
+  3:12 · genre-spanning` — after the BPM/key line, omitting unknown sections. It
+  is a pure function of `model.trackStructure` (`structureLine`), like the rest of
+  `tooltipLines`.

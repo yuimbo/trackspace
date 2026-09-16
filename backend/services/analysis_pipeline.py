@@ -30,6 +30,7 @@ from typing import Any
 import numpy as np
 
 from backend.embeddings import clustering as clustering_mod
+from backend.embeddings import structure as structure_mod
 from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.clustering import ClusterResult, ProgressFn
 from backend.embeddings.projection_config import SUPERVISED_INPUT_WEIGHTS
@@ -42,6 +43,7 @@ from backend.jobs import (
     KIND_FEATURES,
     KIND_MAEST,
     KIND_SCAN,
+    KIND_STRUCTURE,
     KIND_SUPERVISED,
 )
 from backend.services import features_worker
@@ -67,6 +69,8 @@ class AnalysisDeps:
     features_version: int
     clap_mod: Any = None
     clap_version: int = 0
+    #: Coarse track-structure (intro/drop/break) cache version.
+    structure_version: int = 0
     #: False when the server was started with ``--no-clap`` — the CLAP stage is
     #: then never enqueued, so a disabled server cannot accumulate pending jobs
     #: behind a model that will never load.
@@ -387,6 +391,127 @@ def _default_pool_factory(pool_size: int) -> Any:
     )
     atexit.register(executor.shutdown, wait=False, cancel_futures=True)
     return executor
+
+
+def _default_thread_pool_factory(pool_size: int) -> Any:
+    """A plain thread pool.
+
+    Structure detection decodes with ``soundfile``, whose reads release the GIL, so
+    threads scale (measured ~2.1x at 4 workers) without a spawned child re-importing
+    the whole backend for a few hundred milliseconds of work per track.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    executor = ThreadPoolExecutor(max_workers=pool_size, thread_name_prefix="structure")
+    atexit.register(executor.shutdown, wait=False, cancel_futures=True)
+    return executor
+
+
+def make_structure_handler(
+    deps: AnalysisDeps,
+    *,
+    pool_size: int = 1,
+    executor_factory: Callable[[int], Any] | None = None,
+    compute_fn: Callable[[str], dict[str, Any]] | None = None,
+) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
+    """Intro / drop / break timestamps from a whole-track loudness envelope.
+
+    One source, one per-track job. Decode dominates the cost and its reads release
+    the GIL, so the per-track work runs in a **thread** pool (no spawned child pays
+    the backend re-import the ``features`` process pool does). ``compute_fn`` /
+    ``executor_factory`` exist so tests can inject fakes.
+    """
+
+    compute = compute_fn or structure_mod.compute_structure
+
+    executor: Any = None
+    executor_lock = threading.Lock()
+
+    def _get_executor() -> Any:
+        nonlocal executor
+        if pool_size <= 1:
+            return None
+        with executor_lock:
+            if executor is None:
+                executor = (executor_factory or _default_thread_pool_factory)(pool_size)
+            return executor
+
+    def _reset_executor() -> None:
+        """Drop a broken pool so the next batch rebuilds it."""
+        nonlocal executor
+        with executor_lock:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    log.debug("structure pool shutdown failed", exc_info=True)
+                executor = None
+
+    def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
+        out: dict[int, JobResult] = {}
+        targets: list[tuple[Job, str, str]] = []  # (job, abs_path, fingerprint)
+
+        for job in jobs:
+            vpath = job.path
+            if not vpath:
+                out[job.id] = JobResult.failure("job payload has no path", retry=False)
+                continue
+            fp, abs_path = _fingerprint_for(deps, vpath)
+            if abs_path is None:
+                out[job.id] = JobResult.failure("file not found", retry=False)
+                continue
+            if not fp:
+                out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
+                continue
+            if deps.feature_cache.has(
+                "structure", fp, version=deps.structure_version
+            ):
+                out[job.id] = JobResult.success(cached=True)
+                continue
+            targets.append((job, abs_path, fp))
+
+        if not targets:
+            return out
+
+        executor = _get_executor()
+        if executor is None:
+            results = {abs_path: compute(abs_path) for _, abs_path, _ in targets}
+        else:
+            try:
+                futures = {
+                    executor.submit(compute, abs_path): abs_path
+                    for _, abs_path, _ in targets
+                }
+                results = {}
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+            except Exception:
+                log.exception("structure worker pool failed")
+                _reset_executor()
+                for job, *_rest in targets:
+                    out[job.id] = JobResult.failure("structure worker pool failed")
+                return out
+
+        for job, abs_path, fp in targets:
+            res = results.get(abs_path) or {}
+            if res.get("error"):
+                out[job.id] = JobResult.failure(str(res["error"]))
+                continue
+            blob = res.get("structure")
+            if blob is None:
+                out[job.id] = JobResult.failure("structure produced no result")
+                continue
+            try:
+                deps.feature_cache.put(
+                    "structure", fp, blob, version=deps.structure_version
+                )
+            except Exception as e:
+                out[job.id] = JobResult.failure(f"cache write failed: {e}")
+                continue
+            out[job.id] = JobResult.success()
+        return out
+
+    return handle
 
 
 def make_maest_handler(
@@ -1026,6 +1151,11 @@ def enqueue_library_work(
         if KIND_CLAP in kinds
         else set()
     )
+    have_structure = (
+        set(fc.get_all("structure", fps, version=deps.structure_version))
+        if KIND_STRUCTURE in kinds
+        else set()
+    )
 
     if KIND_SCAN in kinds:
         items = [(t["path"], {"path": t["path"]}) for t in infos]
@@ -1063,6 +1193,17 @@ def enqueue_library_work(
             KIND_MAEST, items, priority=100, requeue_terminal=force
         )
 
+    if KIND_STRUCTURE in kinds:
+        items = [
+            (t["path"], {"path": t["path"]})
+            for t in infos
+            if t.get("fingerprint")
+            and (force or t["fingerprint"] not in have_structure)
+        ]
+        queued[KIND_STRUCTURE] = queue.enqueue_many(
+            KIND_STRUCTURE, items, priority=105, requeue_terminal=force
+        )
+
     # CLAP is skipped entirely when the server runs with --no-clap: the worker
     # gates on model readiness, so enqueueing would leave jobs pending forever.
     if KIND_CLAP in kinds and deps.clap_enabled:
@@ -1078,7 +1219,7 @@ def enqueue_library_work(
 
     if priority_paths:
         wanted = list(priority_paths)
-        for kind in (KIND_FEATURES, KIND_MAEST, KIND_CLAP):
+        for kind in (KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP):
             if kind in kinds and (kind != KIND_CLAP or deps.clap_enabled):
                 queue.prioritize(kind, wanted, priority=0)
 

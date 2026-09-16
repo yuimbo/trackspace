@@ -5,7 +5,13 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 
 ## User feedback
 
-- [ ] Implement the intro/peak/break detection, and also use that to yield distinct timestamps for the hover audio preview
+- ✅ **Intro/drop/break detection, and a meaningful hover preview.** The `structure`
+  stage derives intro end, drop, and break timestamps from a whole-track loudness
+  envelope (no model) and caches them; the hover preview now seeks to the detected
+  drop instead of a fixed 40 %, and the tooltip shows the sections. See
+  `audio_pipeline.md` → *Track structure*.
+
+- [ ] Whacko idea? Add a 3d view for the embedding space?
 
 ## Deferred / optional
 
@@ -28,6 +34,12 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       types out of `model.ts` / `lib/api.ts`.
 - [ ] **Nit:** `clamp` is duplicated in `coordinators/options-panel.ts`,
       `coordinators/canvas-interaction.ts`, and `coordinators/analysis-coordinator.ts`.
+- [ ] **Structure preview follow-ups.** The preview always seeks to the drop;
+      cycling peak → break → intro on repeated hovers of the same track was
+      deferred (product decision). `_fetchStructure` (`controller.ts`) fetches one
+      path per hover — a batched request for the visible tracks would cut the
+      round-trips. A small section timeline in the tooltip (or a track inspector)
+      would make the break/peak markers legible, not just textual.
 
 ### Backend
 
@@ -38,6 +50,19 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       `clap.batch_ensure_embeddings` have no callers since the durable queue took
       over (the queue's `enqueue_library_work` filter supersedes them); remove them
       and their re-exports in `embeddings/__init__.py` / `layout.py`.
+- [ ] **Cheaper loudness envelope for `structure`.** `analyze_structure` decodes the
+      whole file a second time, but the `scan` stage's `fpcalc` already decodes it
+      and its raw fingerprint is discarded (only the hash is kept). If chromaprint can
+      expose its 16-band frame image, the envelope could ride the scan pass and the
+      structure stage would need no decode at all.
+- [ ] **Structure on damaged files.** `analyze_structure` calls `librosa_load`
+      directly; the resilient probe in `audio_decode.load_resilient_audio_segments`
+      tolerates bad MP3 metadata and broken seeks. Reuse it if damaged files show up
+      as structure gaps.
+- [ ] **Structure coverage in `/api/embeddings/status`.** Deliberately omitted (the
+      queue's per-kind stats already report structure progress, and `SourceVersions`
+      feeds the layout revision hash, where a metadata-only source must not appear).
+      Add a separate count if the status UI ever needs it.
 
 ## Product roadmap (analysis)
 
@@ -52,9 +77,9 @@ none require re-running an encoder over the library.
 - **Playlist labels.** Playlists do not exist in the product yet; when they do, they
   are another noisy label source for the same head (the training recipe already takes
   a label vector, so this is a data-plumbing change, not a new model).
-- **Per-excerpt analysis.** Excerpt vectors are now cached and used for mining, but
-  the *user-facing* genre-spanning flag (intro vs drop) is still unused — it needs
-  a track-inspection surface and a dispersion threshold, no new inference.
+- **Per-excerpt analysis.** Excerpt vectors are cached and used for mining, and the
+  *user-facing* genre-spanning flag (intro vs drop) now rides `/api/tracks/structure`
+  and the tooltip (`supervised.is_genre_spanning`).
 - ✅ **Text search.** `GET /api/search?q=…&limit=` encodes the query with CLAP's text
   tower (`generate_text_embeddings`) and ranks cached CLAP audio embeddings by cosine
   similarity; the Search panel turns the hits into the canvas selection and clicking a
@@ -100,6 +125,10 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 - [ ] **Tune `scan`.** `batch_size=8` with `TRACKSPACE_FPCALC_CONCURRENCY`
       (default `min(8, cpus)`). Measure whether fpcalc subprocesses or the SQLite
       writes are the limit and raise only the one that is.
+- [ ] **Structure pool sizing.** The `structure` stage runs 4 threads by default
+      (`TRACKSPACE_STRUCTURE_WORKERS`; measured ~2.1× at 4 on a 16-track sample).
+      Sweep the worker count on the real library and confirm threads stay ahead of a
+      process pool as the library (and decode mix) grows.
 - [ ] **Parallelise within a stage.** `features` and `maest` decode per track
       sequentially; a small per-stage thread pool (decode+compute) could overlap the
       locked open with DSP/GPU work without adding workers.
@@ -164,7 +193,7 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 - [ ] **Per-stage throughput harness.** `tests/test_profiling_embeddings.py` and
       `tests/profile_madmom_tempo.py` are ad-hoc. Add one script that reports
-      tracks/min and s/track per stage (scan/features/maest/clap/supervise/cluster)
+      tracks/min and s/track per stage (scan/features/structure/maest/clap/supervise/cluster)
       on a fixed sample, so every change here is comparable.
 - [ ] **CLAP stage throughput.** The stage is decode-dominated (3 × 15 s at 48 kHz)
       with one batched forward per track. Measure tracks/min on the real library and

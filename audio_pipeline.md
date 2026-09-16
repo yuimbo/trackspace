@@ -15,6 +15,7 @@ audio features**). Expensive analysis runs through a durable SQLite-backed job q
 ```
 scan      → ID3 tags + Chromaprint fingerprint
 features  → classical 6-D + rhythm 14-D
+structure → intro/drop/break timestamps (loudness envelope, no model)
 maest     → MAEST embedding + 519 style logits + per-excerpt vectors
 clap      → CLAP audio embedding (the column span text directions project onto)
 supervise → folder-supervised 128-D projection head over the cached vectors
@@ -103,6 +104,10 @@ slider per source, and **Apply** sends the vector to both the map and the cluste
 | Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
 | Supervised | `backend/embeddings/supervised.py` | 128 | folder-labelled projection head over the cached blocks (no encoder) |
 
+`structure` is cached alongside the vector sources but is **not one of them**: it is
+per-track metadata (five timestamps), never a projection or clustering block, so it
+is absent from `FROZEN_SOURCES` and from the source-weight sliders.
+
 ### Independent versioning per source
 
 | Source | Version constant | Cache columns |
@@ -112,6 +117,7 @@ slider per source, and **Apply** sends the vector to both the map and the cluste
 | MAEST | `MAEST_VERSION` (`embeddings/maest.py`) | `maest_embedding` + `maest_logits` + `maest_excerpts`, `maest_version` |
 | Rhythm | `RHYTHM_VERSION` (`embeddings/rhythm_features.py`) | `rhythm`, `rhythm_version` |
 | Supervised | training-run id (see *Weak supervision*) | `supervised_embedding`, `supervised_version` |
+| Structure | `STRUCTURE_VERSION` (`embeddings/structure.py`) | `structure`, `structure_version` |
 
 Bumping one source's version invalidates only that source's cached data.
 MAEST's embedding and logits share one version column because a single model
@@ -276,6 +282,41 @@ and the circular wrap is seamless.  Mode (major=1, minor=0) is a 3rd dimension.
 normalised to [0,1]; the STFT / onset envelope / beat track are computed once
 and reused across dimensions. This block is what separates rhythmically
 distinct neighbouring genres.
+
+---
+
+## Track structure (`backend/embeddings/structure.py`)
+
+Cheap DSP, not a model: a whole-track mono decode at **2205 Hz** yields an RMS
+envelope (~4 Hz frames, ~3 s moving average), and three coarse sections are read
+off it by thresholding against the track's own 95th-percentile level:
+
+- **intro end** — first *sustained* crossing of 80 % of the peak level (0 when the
+  track starts loud).
+- **drop (peak)** — the start of the highest-energy 30 s window; this is what the
+  hover preview seeks to.
+- **break** — the longest sustained dip below 60 % of the peak level (≥ 8 s) that
+  returns to full energy afterwards. A quiet opening or trailing fade touches an end
+  and is not a break.
+
+The detector (`detect_sections`) is a pure function over the envelope, so it is
+unit-tested without audio. Boundaries are compensated for the half-window smoothing
+lag, and the first window at the maximum energy wins (not an arbitrary later
+equal-energy window). Absent sections are stored as `NaN` and surface as `null` over
+the API.
+
+**Decode dominates the cost, and it is cache-backed.** A six-minute MP3 is ~0.3–0.4 s
+warm; the stage runs in a **thread** pool (`TRACKSPACE_STRUCTURE_WORKERS`, default
+4) rather than a process pool — `soundfile` reads release the GIL, so threads scale
+(~2.1× at 4 workers measured) and no spawned child pays the backend re-import the
+`features` process pool pays. A one-off whole-library backfill is ~an hour of decode.
+
+**Genre-spanning flag.** The per-excerpt MAEST vectors (already cached for weak
+supervision) give a second, free signal: `supervised.is_genre_spanning` flags a track
+whose excerpts disagree (mean pairwise cosine dispersion ≥
+`SPANNING_DISPERSION_THRESHOLD`), i.e. intro and drop sit in different corners of
+the space. The route `/api/tracks/structure` returns the five timestamps plus this
+flag, read-only over `FeatureCache` — no audio is decoded on a request thread.
 
 ---
 
@@ -507,6 +548,7 @@ global "running" flag. The change matters for correctness, not just tidiness:
 ```
 scan      → ID3 tags + Chromaprint fingerprint   (CPU, batch 8)
 features  → classical 6-D + rhythm 14-D          (CPU, N processes, batch = N)
+structure → intro/drop/break timestamps          (CPU, N threads, batch = N)
 maest     → MAEST embedding + 519 style logits   (GPU, batch 4, gated on model)
 clap      → CLAP audio embedding                 (GPU, batch 4, gated on model)
 supervise → folder-supervised projection head    (CPU, singleton, whole-library)

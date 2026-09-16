@@ -32,6 +32,7 @@ from backend.embeddings.clap import EMBEDDING_VERSION
 from backend.embeddings.librosa_audio_features import FEATURES_VERSION
 from backend.embeddings.maest import MAEST_VERSION
 from backend.embeddings.rhythm_features import RHYTHM_VERSION
+from backend.embeddings.structure import STRUCTURE_VERSION
 from backend.embeddings.coverage import (
     SourceVersions,
     batch_fetch_maps,
@@ -44,6 +45,7 @@ from backend.jobs import (
     KIND_FEATURES,
     KIND_MAEST,
     KIND_SCAN,
+    KIND_STRUCTURE,
     KIND_SUPERVISED,
 )
 from backend.services.analysis_pipeline import (
@@ -56,6 +58,7 @@ from backend.services.analysis_pipeline import (
     make_features_handler,
     make_maest_handler,
     make_scan_handler,
+    make_structure_handler,
     make_supervised_handler,
 )
 from backend.services.layout_revision_for_status import layout_revision_for_projection
@@ -98,6 +101,12 @@ log = logging.getLogger(__name__)
 DEFAULT_FEATURES_WORKERS = 4
 
 
+#: Structure detection decodes with ``soundfile``, whose reads release the GIL, so
+#: threads scale (measured ~2.1x at 4 workers on a real sample) without the spawn
+#: cost the features process pool pays. Override with ``TRACKSPACE_STRUCTURE_WORKERS``.
+DEFAULT_STRUCTURE_WORKERS = 4
+
+
 def _features_worker_count() -> int:
     """``TRACKSPACE_FEATURES_WORKERS`` if valid, else the measured default."""
     raw = (os.environ.get("TRACKSPACE_FEATURES_WORKERS") or "").strip()
@@ -122,6 +131,30 @@ def _features_worker_count() -> int:
     return n
 
 
+def _structure_worker_count() -> int:
+    """``TRACKSPACE_STRUCTURE_WORKERS`` if valid, else the measured default."""
+    raw = (os.environ.get("TRACKSPACE_STRUCTURE_WORKERS") or "").strip()
+    if not raw:
+        return DEFAULT_STRUCTURE_WORKERS
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning(
+            "TRACKSPACE_STRUCTURE_WORKERS=%r is not an integer; using %d",
+            raw,
+            DEFAULT_STRUCTURE_WORKERS,
+        )
+        return DEFAULT_STRUCTURE_WORKERS
+    if n < 1:
+        log.warning(
+            "TRACKSPACE_STRUCTURE_WORKERS=%d < 1; using %d",
+            n,
+            DEFAULT_STRUCTURE_WORKERS,
+        )
+        return DEFAULT_STRUCTURE_WORKERS
+    return n
+
+
 def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
     """NULL out cached blobs older than current version constants.
 
@@ -134,6 +167,7 @@ def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
         "features": FEATURES_VERSION,
         "maest": MAEST_VERSION,
         "rhythm": RHYTHM_VERSION,
+        "structure": STRUCTURE_VERSION,
     }
     return {src: fc.purge_old_versions(src, ver) for src, ver in versions.items()}
 
@@ -396,6 +430,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         rhythm_version=RHYTHM_VERSION,
         features_version=FEATURES_VERSION,
         clap_version=EMBEDDING_VERSION,
+        structure_version=STRUCTURE_VERSION,
         clap_enabled=clap_enabled,
         data_dir=state.data_dir,
         emit_decode_warning=lambda rel, msg: _broadcast_embed_event(
@@ -472,7 +507,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             state.job_queue,
             infos,
             deps=ANALYSIS_DEPS,
-            kinds=(KIND_FEATURES, KIND_MAEST, KIND_CLAP),
+            kinds=(KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP),
             priority_paths=priority_paths or [],
             force=force,
         )
@@ -499,6 +534,17 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 make_features_handler(ANALYSIS_DEPS, pool_size=features_workers),
                 # Claim enough to keep every pool process busy in one batch.
                 batch_size=max(2, features_workers),
+                on_event=_job_event_sink,
+            )
+        )
+        structure_workers = _structure_worker_count()
+        state.workers.add(
+            JobWorker(
+                state.job_queue,
+                KIND_STRUCTURE,
+                make_structure_handler(ANALYSIS_DEPS, pool_size=structure_workers),
+                # Claim enough to keep every pool thread busy in one batch.
+                batch_size=max(2, structure_workers),
                 on_event=_job_event_sink,
             )
         )
@@ -612,6 +658,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             analysis_deps=ANALYSIS_DEPS,
             maest_mod=maest_mod,
             rhythm_version=RHYTHM_VERSION,
+            structure_version=STRUCTURE_VERSION,
         ),
     )
     app.extensions["trackspace_state"] = state

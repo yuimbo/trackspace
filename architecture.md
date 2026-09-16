@@ -63,22 +63,23 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Backend entry + wiring | `backend/app.py` | ~640 | Helpers, deps assembly, `main()` |
 | Process state | `backend/trackspace_state.py` | ~75 | `TrackspaceState.create()` |
 | App factory | `backend/factory.py` | ~170 | `create_app()` + blueprints |
-| Analysis seam | `backend/services/analysis_pipeline.py` | ~870 | Job handlers + `ClusterStore` + supervised training/projection |
+| Analysis seam | `backend/services/analysis_pipeline.py` | ~1255 | Job handlers + `ClusterStore` + supervised training/projection |
 | Queue | `backend/jobs/` | ~900 | `queue.py` + `worker.py` + `kinds.py` |
 | ML / layout | `backend/embeddings/layout.py` | ~565 | Composite gather + orchestration |
 | Semantic weighting | `backend/embeddings/semantic_weighting.py` | ~265 | Folder/text directions |
-| Weak supervision | `backend/embeddings/supervised.py` | ~655 | Folder-labelled projection head |
+| Weak supervision | `backend/embeddings/supervised.py` | ~700 | Folder-labelled projection head + excerpt dispersion |
+| Track structure | `backend/embeddings/structure.py` | ~275 | Intro/drop/break from a loudness envelope |
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
-| Feature cache | `backend/embeddings/feature_cache.py` | ~365 | One generic `_SOURCES` registry |
+| Feature cache | `backend/embeddings/feature_cache.py` | ~380 | One generic `_SOURCES` registry |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
-| Frontend orchestration | `frontend/src/controller.ts` | ~620 | Wiring, data loading, tag-write queue, preview, keyboard |
+| Frontend orchestration | `frontend/src/controller.ts` | ~700 | Wiring, data loading, tag-write queue, preview, keyboard |
 | Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~310 | Queue SSE + clusters |
 | Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~680 | Layout cache + SSE + animations |
 | Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | ~675 | HTMX tree + roots + highlights |
 | Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1040 | Pointer gestures + transforms |
 | Options panel | `frontend/src/coordinators/options-panel.ts` | ~90 | Right-column controls |
-| Canvas view | `frontend/src/components/canvas-view.ts` | ~1010 | |
-| State | `frontend/src/model.ts` | ~730 | Optional persistence / EventBus split |
+| Canvas view | `frontend/src/components/canvas-view.ts` | ~1095 | |
+| State | `frontend/src/model.ts` | ~830 | Optional persistence / EventBus split |
 
 `canvas-interaction.ts` is the largest frontend file; the fit-view math is the
 natural next split if it needs to shrink (see `TODO.md`).
@@ -208,6 +209,10 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
   see `/api/tracks/tags` and `/api/tracks/move`.  The frontend's `api()` /
   `postJSON` read `error` from the JSON body into the toast, so messages must stay
   client-safe (never include a traceback or absolute paths).
+- **Analysis reads are read-only over `FeatureCache`.**  `/api/search` (CLAP text
+  ranking) and `/api/tracks/structure` (cached intro/drop/break + genre-spanning
+  flag) never run an encoder or decode on a request thread; expensive analysis goes
+  through the queue.
 
 ---
 
@@ -227,8 +232,11 @@ Structural refactors already completed. Kept as a record of where the seams land
   small persistence layer; it depends only on `embeddings/*` (never on
   `analysis_pipeline`), so the job handler owns the cache gathering and the module
   stays unit-testable.
+- `embeddings/structure.py` — intro/drop/break detection. A pure envelope detector
+  plus a fixed-length cache blob; it depends only on `decode_stderr` / `librosa`, so
+  the `structure` stage handler owns the cache write and the thread pool.
 
-**Frontend** — `controller.ts` went from ~2250 to ~620 lines. Extracted, in order, each
+**Frontend** — `controller.ts` went from ~2250 to ~700 lines. Extracted, in order, each
 with vitest coverage:
 
 - ✅ `lib/api.ts` — centralised `fetch` / `postJSON`; the controller stays the caller.

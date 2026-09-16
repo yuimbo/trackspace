@@ -58,6 +58,34 @@ describe("tooltipLines", () => {
     expect(lines).not.toContain("Techno");
     expect(lines.some((l) => l.startsWith("Cluster "))).toBe(false);
   });
+
+  it("adds the structure line after the audio features", () => {
+    const m = new Model();
+    m.trackStructure = new Map([
+      [
+        "a.mp3",
+        {
+          intro_end: 32,
+          peak_start: 64,
+          peak_end: 94,
+          break_start: 192,
+          break_end: 224,
+          genre_spanning: true,
+        },
+      ],
+    ]);
+    const lines = tooltipLines(makeTrack({ bpm: 128 }), m);
+    expect(lines).toContain("intro 0:32 · drop 1:04 · break 3:12 · genre-spanning");
+    expect(lines.indexOf("128 BPM")).toBeLessThan(
+      lines.indexOf("intro 0:32 · drop 1:04 · break 3:12 · genre-spanning"),
+    );
+  });
+
+  it("omits the structure line when nothing is cached", () => {
+    const m = new Model();
+    const lines = tooltipLines(makeTrack(), m);
+    expect(lines.some((l) => l.startsWith("drop "))).toBe(false);
+  });
 });
 
 // ─── Cluster hover glow ───────────────────────────────────────

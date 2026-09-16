@@ -12,6 +12,7 @@ from .kinds import (
     KIND_FEATURES,
     KIND_MAEST,
     KIND_SCAN,
+    KIND_STRUCTURE,
     KIND_SUPERVISED,
     kind_label,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "KIND_FEATURES",
     "KIND_MAEST",
     "KIND_SCAN",
+    "KIND_STRUCTURE",
     "KIND_SUPERVISED",
     "Job",
     "JobHandler",
