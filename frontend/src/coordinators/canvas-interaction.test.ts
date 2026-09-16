@@ -526,6 +526,26 @@ describe("CanvasInteractionController solo", () => {
     expect(model.hasExclusions).toBe(false);
   });
 
+  it("isolates to a hovered folder and reveals it when fully hidden", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "Techno/b.mp3", folder: "Techno" }),
+    ]);
+    canvas.hoverTarget = { kind: "folder", prefix: "House" };
+    coord.solo();
+    expect(model.isTrackHidden(model.trackByPath("Techno/b.mp3")!)).toBe(true);
+    expect(model.isTrackHidden(model.trackByPath("House/a.mp3")!)).toBe(false);
+
+    // Hide the folder entirely, then a second press restores and isolates it.
+    coord.solo(); // already soloed → show all
+    model.hideFolderTree("House");
+    expect(model.isTrackHidden(model.trackByPath("House/a.mp3")!)).toBe(true);
+    coord.solo();
+    expect(model.isTrackHidden(model.trackByPath("House/a.mp3")!)).toBe(false);
+    expect(model.isTrackHidden(model.trackByPath("Techno/b.mp3")!)).toBe(true);
+  });
+
   it("isolates to the tracks sharing a hovered key", () => {
     const { model, canvas, coord } = makeHarness();
     model.setAllTracks([
