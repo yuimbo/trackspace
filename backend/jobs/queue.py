@@ -31,6 +31,8 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.sqlite_conn import ClosingConnection
+
 log = logging.getLogger(__name__)
 
 PENDING = "pending"
@@ -149,12 +151,12 @@ class JobQueue:
 
     # ── plumbing ──────────────────────────────────────────────
 
-    def _conn(self) -> sqlite3.Connection:
+    def _conn(self) -> ClosingConnection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=30.0)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
-        return conn
+        return ClosingConnection(conn)
 
     def _init_db(self) -> None:
         with self._conn() as conn:

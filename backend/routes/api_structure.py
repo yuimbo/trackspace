@@ -2,8 +2,8 @@
 
 Read-only over ``FeatureCache``: the ``structure`` blob is written by the queue's
 ``structure`` stage, and the genre-spanning flag is derived from the cached
-``maest_excerpts`` blob. Nothing here decodes audio, so a hover can never kick off
-expensive work on a request thread.
+``maest_excerpts`` blob. Only the requested paths are resolved (via the track cache),
+so a hover is O(requested paths), not O(library) — no full-library scan per request.
 
 Absent sections are stored as ``NaN`` and surface as ``null``. Paths with no cached
 structure row are simply omitted from the response — the frontend falls back to a fixed
@@ -24,7 +24,7 @@ from backend.services.request_validation import ApiValidationError
 
 log = logging.getLogger(__name__)
 
-#: Upper bound on paths per request, so one hover cannot build every track's info.
+#: Upper bound on paths per request, so one hover cannot resolve the whole library.
 MAX_PATHS = 64
 
 
@@ -33,7 +33,8 @@ def create_api_structure_blueprint(
     feature_cache: Any,
     structure_version: int,
     maest_version: int,
-    build_track_infos_fn: Callable[[str, bool], list[dict[str, Any]]],
+    resolve_virtual_path: Callable[[str], str],
+    cached_read_all: Callable[[str], dict[str, Any]],
 ) -> Blueprint:
     bp = Blueprint("api_structure", __name__)
 
@@ -48,9 +49,19 @@ def create_api_structure_blueprint(
         if len(wanted) > MAX_PATHS:
             raise ApiValidationError(f"at most {MAX_PATHS} paths per request")
 
-        infos = build_track_infos_fn("", True)
-        by_path = {t["path"]: t.get("fingerprint") for t in infos}
-        fps = [by_path[p] for p in wanted if by_path.get(p)]
+        by_path: dict[str, str] = {}
+        fps: list[str] = []
+        for path in wanted:
+            try:
+                abs_path = resolve_virtual_path(path)
+                info = cached_read_all(abs_path) if abs_path else {}
+            except Exception:
+                continue
+            fp = info.get("fingerprint")
+            if isinstance(fp, str) and fp:
+                by_path[path] = fp
+                fps.append(fp)
+
         structures = feature_cache.get_all(
             "structure", fps, version=structure_version
         )
@@ -59,10 +70,7 @@ def create_api_structure_blueprint(
         )
 
         tracks: list[dict[str, Any]] = []
-        for path in wanted:
-            fp = by_path.get(path)
-            if not fp:
-                continue
+        for path, fp in by_path.items():
             blob = structures.get(fp)
             if blob is None:
                 continue

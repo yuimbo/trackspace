@@ -37,6 +37,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from backend.sqlite_conn import ClosingConnection
+
 log = logging.getLogger(__name__)
 
 #: ``WHERE ... IN (...)`` chunk size, safely below SQLite's variable limit.
@@ -121,7 +123,7 @@ class FeatureCache:
             return self._write_epoch
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with ClosingConnection(sqlite3.connect(self._db_path)) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             if os.environ.get("TRACKSPACE_SQLITE_INTEGRITY", "").strip().lower() in (
                 "1",
@@ -176,14 +178,14 @@ class FeatureCache:
                 except sqlite3.OperationalError:
                     pass
 
-    def _conn(self) -> sqlite3.Connection:
+    def _conn(self) -> ClosingConnection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         # Writers (analysis workers + request threads) serialise on the WAL write
         # lock; wait rather than raising "database is locked" and silently
         # dropping a put(). Matches JobQueue.
         conn.execute("PRAGMA busy_timeout=30000")
-        return conn
+        return ClosingConnection(conn)
 
     # ── Key/value metadata ─────────────────────────────────────
     # Used for values that are not per-track vectors but still belong to the

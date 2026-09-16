@@ -20,6 +20,8 @@ import sqlite3
 import threading
 from collections import OrderedDict
 
+from backend.sqlite_conn import ClosingConnection
+
 
 class TrackCache:
     def __init__(self, db_path: str, max_memory: int = 4000) -> None:
@@ -34,7 +36,7 @@ class TrackCache:
     # ------------------------------------------------------------------
 
     def _init_db(self) -> None:
-        with sqlite3.connect(self._db_path) as conn:
+        with ClosingConnection(sqlite3.connect(self._db_path)) as conn:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute(
                 """
@@ -47,12 +49,12 @@ class TrackCache:
                 """
             )
 
-    def _conn(self) -> sqlite3.Connection:
+    def _conn(self) -> ClosingConnection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         # Wait on the WAL write lock instead of raising "database is locked".
         conn.execute("PRAGMA busy_timeout=30000")
-        return conn
+        return ClosingConnection(conn)
 
     def _lru_put(self, key: tuple, data: dict) -> None:
         """Insert/promote *key* in the memory LRU, evicting LRU entry if full."""

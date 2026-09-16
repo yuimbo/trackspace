@@ -159,7 +159,8 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             feature_cache=deps.feature_cache,
             structure_version=deps.structure_version,
             maest_version=deps.maest_mod.MAEST_VERSION,
-            build_track_infos_fn=deps.build_track_infos_fn,
+            resolve_virtual_path=deps.resolve_virtual_path,
+            cached_read_all=deps.cached_read_all,
         )
     )
     app.register_blueprint(

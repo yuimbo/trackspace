@@ -39,11 +39,11 @@ class _FakeCache:
         return {fp: rows[fp] for fp in fps if fp in rows}
 
 
-_INFOS = [
-    {"path": "a.mp3", "fingerprint": "fp-a"},
-    {"path": "b.mp3", "fingerprint": "fp-b"},
-    {"path": "missing.mp3", "fingerprint": None},
-]
+_INFOS = {
+    "a.mp3": "fp-a",
+    "b.mp3": "fp-b",
+    "missing.mp3": None,
+}
 
 _STRUCTURES = {
     "fp-a": encode_structure(
@@ -58,7 +58,10 @@ def _client(*, rows=None, structure_version: int = 1):
         feature_cache=cache,
         structure_version=structure_version,
         maest_version=1,
-        build_track_infos_fn=lambda folder, recursive: list(_INFOS),
+        resolve_virtual_path=lambda p: f"/abs/{p}",
+        cached_read_all=lambda abs_path: {
+            "fingerprint": _INFOS.get(abs_path.removeprefix("/abs/"))
+        },
     )
     return _app(bp).test_client()
 
@@ -125,3 +128,22 @@ def test_structure_not_spanning_without_two_excerpts():
     }
     body = _client(rows=rows).get("/api/tracks/structure?paths=a.mp3").get_json()
     assert body["tracks"][0]["genre_spanning"] is False
+
+
+def test_structure_reads_only_requested_paths():
+    """A hover must not rescan the whole library (that is what exhausted FDs)."""
+    reads: list[str] = []
+
+    def read(abs_path: str) -> dict:
+        reads.append(abs_path)
+        return {"fingerprint": "fp-a"}
+
+    bp = create_api_structure_blueprint(
+        feature_cache=_FakeCache({"structure": _STRUCTURES}),
+        structure_version=1,
+        maest_version=1,
+        resolve_virtual_path=lambda p: f"/abs/{p}",
+        cached_read_all=read,
+    )
+    _app(bp).test_client().get("/api/tracks/structure?paths=a.mp3,b.mp3")
+    assert reads == ["/abs/a.mp3", "/abs/b.mp3"]

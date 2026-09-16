@@ -87,7 +87,10 @@ none require re-running an encoder over the library.
   CLAP stage first).
 - **Search follow-ups.** Folder-scoped search (`folder` param), search-as-you-type
   debounce, and a minimum-score threshold / "select all" affordance. Fit-on-focus is done
-  (`CanvasInteractionController.fitViewToPaths`).
+  (`CanvasInteractionController.fitViewToPaths`). Perf: `/api/search` calls the *uncached*
+  `build_track_infos_fn` (`backend/routes/api_search.py`), so every query re-reads the
+  whole library — use `track_infos_cached` (with `library_mtime_signature`) or resolve only
+  the candidate paths, as `/api/tracks/structure` now does.
 - **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
   6-genre validation it reached 96.6% purity.
 - **Persist cluster results.** `ClusterStore` is in-memory; a restart recomputes in

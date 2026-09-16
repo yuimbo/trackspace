@@ -191,6 +191,13 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
   `app.extensions["trackspace_lifecycle"]` so `main()` needs no module global.
 - Flask runs with `use_reloader=False`: the reloader would fork a second set of worker
   threads competing for the same queue.
+- **Every cache connection goes through `sqlite_conn.ClosingConnection`.** The stdlib
+  `with sqlite3.connect(...) as conn:` only ends the transaction and leaves the handle
+  open, so the per-access `with self._conn() as conn:` idiom leaked one connection (db +
+  wal + shm FDs) per cache call — 112k open `track_cache.db` handles exhausted
+  `RLIMIT_NOFILE` and SQLite began failing with "unable to open database file". Each
+  cache's `_conn()` wraps the raw connection; do not construct a bare `sqlite3.connect`
+  in a `with`.
 
 ---
 

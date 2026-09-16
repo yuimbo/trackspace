@@ -87,6 +87,12 @@ The rules most likely to be violated. Each links to its full explanation.
     `features` and `maest` workers kill the process with SIGBUS. All decode goes
     through `decode_stderr.librosa_load` / `librosa_get_duration`, which hold
     `decode_stderr._DECODE_LOCK` across the open. → `audio_pipeline.md`
+11. **Never `with sqlite3.connect(...) as conn:`.** The stdlib connection context
+    manager only commits/rolls back — it does **not** close the handle, so a connection
+    (and its db/wal/shm FDs) leaks on every cache access. Return
+    `backend.sqlite_conn.ClosingConnection` from each cache's `_conn()`; the
+    `with self._conn() as conn:` idiom is then correct at every call site.
+    → `architecture.md`
 
 ---
 
