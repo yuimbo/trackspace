@@ -617,8 +617,8 @@ body { display: flex; }
   margin-top: 0;
 }
 .hover-preview-row input[type="range"] {
-  flex: 0 0 80px;
-  width: 80px;
+  flex: 0 0 110px;
+  width: 110px;
   margin: 0;
 }
 
@@ -630,6 +630,13 @@ body { display: flex; }
   font-size: 12px;
 }
 .option-label { color: var(--fg-dim); flex-shrink: 0; }
+
+.option-value {
+  flex: 0 0 32px;
+  text-align: right;
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+}
 
 .option-stack {
   flex-wrap: wrap;

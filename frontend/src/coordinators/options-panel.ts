@@ -8,7 +8,7 @@
 // Deps are structural interfaces so the binder is unit-testable without the
 // DOM-heavy component classes.
 
-import { type Model } from "../model";
+import { DEFAULT_PREVIEW_VOLUME, previewGain, type Model } from "../model";
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
@@ -19,8 +19,8 @@ export interface OptionsPanelDeps {
   toggleViewMode(): void;
   /** Stop hover-preview playback (when the toggle is turned off). */
   stopPreview(): void;
-  /** Apply a new preview volume to the audio element. */
-  applyPreviewVolume(volume: number): void;
+  /** Apply a new preview gain (already tapered) to the audio element. */
+  applyPreviewGain(gain: number): void;
 }
 
 export class OptionsPanelBinder {
@@ -45,10 +45,12 @@ export class OptionsPanelBinder {
     const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
     if ($pv) {
       $pv.value = String(m.previewVolume);
-      this.deps.applyPreviewVolume(m.previewVolume);
+      this.deps.applyPreviewGain(previewGain(m.previewVolume));
+      this._renderPreviewVolume();
       $pv.addEventListener("input", () => {
         m.previewVolume = clamp(parseFloat($pv.value) || 0, 0, 1);
-        this.deps.applyPreviewVolume(m.previewVolume);
+        this._renderPreviewVolume();
+        this.deps.applyPreviewGain(previewGain(m.previewVolume));
       });
       $pv.addEventListener("change", () => {
         m.previewVolume = clamp(parseFloat($pv.value) || 0, 0, 1);
@@ -83,7 +85,16 @@ export class OptionsPanelBinder {
     if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
     const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
     if ($pv) $pv.value = String(m.previewVolume);
+    this._renderPreviewVolume();
     const $hov = document.getElementById("hover-preview-toggle") as HTMLInputElement | null;
     if ($hov) $hov.checked = m.hoverPreview;
+  }
+
+  /** Show the slider position as a percentage. */
+  private _renderPreviewVolume(): void {
+    const out = document.getElementById("hover-preview-volume-value");
+    if (!out) return;
+    const pct = Math.round(this.deps.model.previewVolume * 100);
+    out.textContent = `${pct}%`;
   }
 }

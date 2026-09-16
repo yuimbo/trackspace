@@ -200,6 +200,21 @@ class EventBus {
   }
 }
 
+// ─── Hover preview volume ─────────────────────────────────────
+
+/** Default hover-preview slider position. Moderate, not full scale. */
+export const DEFAULT_PREVIEW_VOLUME = 0.8;
+
+/**
+ * Slider position → audio gain, with a perceptual taper: half the slider is a
+ * quarter of full scale. A linear 0–1 mapping puts almost all of the usable range
+ * in the top few pixels, so the preview jumps from inaudible to deafening.
+ */
+export function previewGain(volume: number): number {
+  const v = Math.max(0, Math.min(1, volume));
+  return v * v;
+}
+
 // ─── Model ───────────────────────────────────────────────────
 export class Model extends EventBus {
   allTracks: Track[] = [];
@@ -215,8 +230,8 @@ export class Model extends EventBus {
   filterRanges: Record<string, [number, number]> = {};
   selected = new Set<string>();
   hoverPreview = false;
-  /** Hover preview playback level [0, 1]. */
-  previewVolume = 1;
+  /** Hover preview slider position [0, 1]; the audio gain is ``previewGain(this)``. */
+  previewVolume = DEFAULT_PREVIEW_VOLUME;
   /**
    * Track currently being auditioned by the hover preview (in-memory only).
    * With ``previewSection`` it drives the tooltip chip highlight.
@@ -884,10 +899,13 @@ export class Model extends EventBus {
         this.axisY = _migrateLibrosaAxisId(d.axisY ?? null);
         this.filterRanges = _migrateFilterRanges(d.filterRanges);
         this.hoverPreview = d.hoverPreview ?? false;
-        const pv = Number((d as { previewVolume?: number }).previewVolume);
-        this.previewVolume = Number.isFinite(pv)
-          ? Math.min(1, Math.max(0, pv))
-          : 1;
+        // A stored 0 is indistinguishable from "never set" and reads as a broken,
+        // silent preview, so it falls back to the default; mute is the M toggle.
+        const rawPv = (d as { previewVolume?: unknown }).previewVolume;
+        this.previewVolume =
+          typeof rawPv === "number" && Number.isFinite(rawPv) && rawPv > 0
+            ? Math.min(1, rawPv)
+            : DEFAULT_PREVIEW_VOLUME;
         this.viewMode = d.viewMode ?? "tags";
         const ex = Number((d as { explodeStrength?: number }).explodeStrength);
         this.explodeStrength = Number.isFinite(ex)

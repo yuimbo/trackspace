@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model } from "../model";
+import { Model, previewGain } from "../model";
 import { OptionsPanelBinder } from "./options-panel";
 
 const OPTIONS_HTML = `
@@ -14,7 +14,7 @@ interface Harness {
   scheduleDraw: ReturnType<typeof vi.fn>;
   toggleViewMode: ReturnType<typeof vi.fn>;
   stopPreview: ReturnType<typeof vi.fn>;
-  applyPreviewVolume: ReturnType<typeof vi.fn>;
+  applyPreviewGain: ReturnType<typeof vi.fn>;
   binder: OptionsPanelBinder;
 }
 
@@ -23,13 +23,13 @@ function makeHarness(): Harness {
   const scheduleDraw = vi.fn();
   const toggleViewMode = vi.fn();
   const stopPreview = vi.fn();
-  const applyPreviewVolume = vi.fn();
+  const applyPreviewGain = vi.fn();
   const binder = new OptionsPanelBinder({
     model,
     scheduleDraw,
     toggleViewMode,
     stopPreview,
-    applyPreviewVolume,
+    applyPreviewGain,
   });
   binder.bind();
   return {
@@ -37,7 +37,7 @@ function makeHarness(): Harness {
     scheduleDraw,
     toggleViewMode,
     stopPreview,
-    applyPreviewVolume,
+    applyPreviewGain,
     binder,
   };
 }
@@ -63,12 +63,14 @@ afterEach(() => {
 
 describe("OptionsPanelBinder", () => {
   it("reflects the model into the controls on bind", () => {
-    const { model, applyPreviewVolume } = makeHarness();
+    const { model, applyPreviewGain } = makeHarness();
     expect(el<HTMLInputElement>("hover-preview-toggle").checked).toBe(
       model.hoverPreview,
     );
     expect(el<HTMLInputElement>("view-mode-toggle").checked).toBe(false);
-    expect(applyPreviewVolume).toHaveBeenCalledWith(model.previewVolume);
+    expect(applyPreviewGain).toHaveBeenCalledWith(
+      previewGain(model.previewVolume),
+    );
   });
 
   it("toggles hover preview and stops playback when disabled", () => {
@@ -81,13 +83,14 @@ describe("OptionsPanelBinder", () => {
     expect(stopPreview).toHaveBeenCalled();
   });
 
-  it("updates and applies the preview volume", () => {
-    const { model, applyPreviewVolume } = makeHarness();
+  it("applies the perceptual taper of the preview volume", () => {
+    const { model, applyPreviewGain } = makeHarness();
     const $pv = el<HTMLInputElement>("hover-preview-volume");
-    $pv.value = "0.42";
+    $pv.value = "0.5";
     input("hover-preview-volume");
-    expect(model.previewVolume).toBeCloseTo(0.42, 5);
-    expect(applyPreviewVolume).toHaveBeenCalledWith(0.42);
+    expect(model.previewVolume).toBeCloseTo(0.5, 5);
+    // Half the slider is a quarter of full scale.
+    expect(applyPreviewGain).toHaveBeenCalledWith(0.25);
   });
 
   it("delegates the view-mode toggle", () => {
