@@ -40,6 +40,7 @@ export const MOUSE_HINTS: { label: string; description: string }[] = [
   { label: "Shift+click",     description: "Add tracks from each folder between anchor and this row (set anchor with a normal click)" },
   { label: "Hold X + scroll", description: "Explode strength (5–20%) on canvas" },
   { label: "Alt+click folder", description: "Exclude folder from the view" },
+  { label: "Alt + hover dot",  description: "Pin the inspect card (anti-track, nearest, solo)" },
   { label: "Hover cluster + s / H", description: "Isolate to the cluster / fit the view to it" },
   { label: "Drag→folder",     description: "Move files to folder" },
   { label: "Dbl-click tag",   description: "Rename tag" },

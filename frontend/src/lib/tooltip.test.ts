@@ -132,6 +132,47 @@ describe("buildTooltip", () => {
     m.previewSection = "drop";
     expect(buildTooltip(makeTrack(), m).key).not.toBe(before);
   });
+
+  it("has no inspect state for the plain hover card", () => {
+    const card = buildTooltip(makeTrack(), new Model());
+    expect(card.inspect).toBeNull();
+    expect(card.results).toEqual([]);
+  });
+
+  it("resolves inspect results against the loaded library", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({
+        path: "b.mp3",
+        folder: "House",
+        artist: "A",
+        title: "B",
+      }),
+    ]);
+    const card = buildTooltip(makeTrack(), m, {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: "far",
+      results: [{ path: "b.mp3", score: -0.42 }],
+    });
+    expect(card.inspect?.mode).toBe("far");
+    expect(card.results).toEqual([
+      { path: "b.mp3", title: "A — B", folder: "House", score: -0.42 },
+    ]);
+  });
+
+  it("keeps a result for a track added since the library load", () => {
+    const card = buildTooltip(makeTrack(), new Model(), {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: "near",
+      results: [{ path: "new.mp3", score: 0.5 }],
+    });
+    expect(card.results[0]).toMatchObject({ path: "new.mp3", title: "new.mp3" });
+  });
 });
 
 describe("renderTooltip", () => {
@@ -173,5 +214,83 @@ describe("renderTooltip", () => {
     renderTooltip(host, buildTooltip(makeTrack({ title: "Two" }), m));
     expect(host.querySelectorAll(".tt-card").length).toBe(1);
     expect(host.querySelector(".tt-title")?.textContent).toBe("Two");
+  });
+
+  it("omits the navigate section while the card is not pinned", () => {
+    const host = document.createElement("div");
+    renderTooltip(host, buildTooltip(makeTrack(), new Model()));
+    expect(host.querySelector(".tt-inspect")).toBeNull();
+    expect(host.querySelectorAll("[data-inspect-action]").length).toBe(0);
+  });
+
+  it("renders the navigate buttons and ranked rows when pinned", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3", artist: "A", title: "B" }),
+    ]);
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(makeTrack(), m, {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        mode: "far",
+        results: [{ path: "b.mp3", score: -0.42 }],
+      }),
+    );
+
+    const actions = [...host.querySelectorAll("[data-inspect-action]")].map(
+      (b) => (b as HTMLElement).dataset.inspectAction,
+    );
+    expect(actions).toEqual(["anti", "near", "solo"]);
+    expect(host.querySelector("[data-inspect-close]")).not.toBeNull();
+    expect(host.querySelector(".tt-section-title")?.textContent).not.toBe("Anti-track");
+    expect(
+      [...host.querySelectorAll(".tt-section-title")].some(
+        (t) => t.textContent === "Anti-track",
+      ),
+    ).toBe(true);
+
+    const row = host.querySelector("[data-inspect-focus]") as HTMLElement;
+    expect(row.dataset.inspectFocus).toBe("b.mp3");
+    expect(row.textContent).toContain("A — B");
+    expect(row.querySelector(".tt-result-score")?.textContent).toBe("-0.42");
+  });
+
+  it("shows a busy note while a ranking is in flight", () => {
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(makeTrack(), new Model(), {
+        path: "a.mp3",
+        busy: true,
+        message: null,
+        mode: null,
+        results: [],
+      }),
+    );
+    expect(host.querySelector(".tt-note")?.textContent).toContain("Searching");
+    expect(
+      (host.querySelector("[data-inspect-action]") as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("shows the inspect error message", () => {
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(makeTrack(), new Model(), {
+        path: "a.mp3",
+        busy: false,
+        message: "No analysed tracks yet",
+        mode: null,
+        results: [],
+      }),
+    );
+    expect(host.querySelector(".tt-note-error")?.textContent).toBe(
+      "No analysed tracks yet",
+    );
   });
 });

@@ -42,6 +42,8 @@ interface FakeCanvas {
   clearHover: ReturnType<typeof vi.fn>;
   worldPosForTrack: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
+  unpinInspect: ReturnType<typeof vi.fn>;
+  toggleInspect: ReturnType<typeof vi.fn>;
 }
 
 function makeCanvas(): FakeCanvas {
@@ -68,6 +70,8 @@ function makeCanvas(): FakeCanvas {
     clearHover: vi.fn(),
     worldPosForTrack: vi.fn(() => ({ wx: 0.5, wy: 0.5 })),
     scheduleDraw: vi.fn(),
+    unpinInspect: vi.fn(() => false),
+    toggleInspect: vi.fn(),
   };
 }
 
@@ -370,6 +374,39 @@ describe("CanvasInteractionController gesture state", () => {
       new KeyboardEvent("keyup", { code: "KeyX", bubbles: true }),
     );
     expect(model.explodeHold).toBe(false);
+  });
+
+  it("toggles the inspect card on the Alt key", () => {
+    const { canvas } = makeHarness();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Alt", bubbles: true }),
+    );
+    expect(canvas.toggleInspect).toHaveBeenCalled();
+  });
+
+  it("ignores Alt while typing in a text field", () => {
+    const { canvas } = makeHarness();
+    const input = document.createElement("input");
+    input.type = "text";
+    document.body.appendChild(input);
+    input.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Alt", bubbles: true }),
+    );
+    expect(canvas.toggleInspect).not.toHaveBeenCalled();
+  });
+
+  it("unpins the inspect card on a plain background click", () => {
+    const { canvas } = makeHarness();
+    canvas.hitTest.mockReturnValue(-1);
+    down(canvas, 10, 10);
+    expect(canvas.unpinInspect).toHaveBeenCalled();
+  });
+
+  it("keeps the inspect card when shift-clicking to lasso", () => {
+    const { canvas } = makeHarness();
+    canvas.hitTest.mockReturnValue(-1);
+    down(canvas, 10, 10, { shiftKey: true });
+    expect(canvas.unpinInspect).not.toHaveBeenCalled();
   });
 });
 

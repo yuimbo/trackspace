@@ -33,6 +33,12 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 
 ### Frontend
 
+- [ ] **Inspect card follow-ups.** The pinned card (Alt over a dot) has anti-track,
+      nearest, solo-neighbourhood and result focus. Still open: "same cluster" / "same
+      folder" jumps, a `k` control instead of the fixed `NEAR_K`/`SOLO_K`, and showing
+      the similarity score's meaning (cosine, not a probability). `_fetchSimilar` builds
+      the whole-library matrix on first call — a warm-up on library load would hide the
+      first-click latency (it is cached for `CACHE_TTL_SECONDS` after that).
 - [ ] **Projection refit progress.** The t-SNE/UMAP refit is still opaque: the
       canvas shows a static "Computing layout…" pill (`canvas-view.ts`,
       `_embeddingWaitLabel`) while `/api/embeddings/projection` runs for seconds.

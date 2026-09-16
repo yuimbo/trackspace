@@ -33,9 +33,27 @@ export interface TooltipGenre {
   spanning: boolean;
 }
 
+/** One ranked neighbour: the raw path plus the similarity score. */
+export interface TooltipResult {
+  path: string;
+  score: number;
+}
+
+/** Interactive inspect state, present only while the card is pinned. */
+export interface InspectState {
+  /** The inspected track. */
+  path: string;
+  busy: boolean;
+  message: string | null;
+  /** Which ranking produced ``results`` (``far`` = anti-track). */
+  mode: "near" | "far" | null;
+  results: TooltipResult[];
+}
+
 export interface TooltipCard {
   /** Identity of every rendered input; the canvas re-renders only when it changes. */
   key: string;
+  path: string;
   folder: string;
   title: string;
   meta: string[];
@@ -45,6 +63,18 @@ export interface TooltipCard {
   features: TooltipBar[];
   /** Section currently auditioned by the hover preview (highlighted chip). */
   activeSection: PreviewSection | null;
+  /** Pinned inspect card; ``null`` for the plain hover card. */
+  inspect: InspectState | null;
+  /** ``inspect.results`` resolved against the loaded library for display. */
+  results: ResultRow[];
+}
+
+/** A ranked neighbour resolved against the loaded library for display. */
+export interface ResultRow {
+  path: string;
+  title: string;
+  folder: string;
+  score: number;
 }
 
 const SPANNING_HINT =
@@ -89,9 +119,14 @@ function tagRows(track: Track): TooltipBar[] {
 
 /**
  * Build the tooltip card for a track. Pure over the model so it can be asserted
- * in tests; the canvas only renders the result.
+ * in tests; the canvas only renders the result. *inspect* is passed while the card
+ * is pinned and turns the navigate/results sections on.
  */
-export function buildTooltip(track: Track, m: Model): TooltipCard {
+export function buildTooltip(
+  track: Track,
+  m: Model,
+  inspect: InspectState | null = null,
+): TooltipCard {
   const folder = displayFolderPath(track.folder || "");
   const ar = (track.artist || "").trim();
   const ti = (track.title || "").trim();
@@ -123,6 +158,9 @@ export function buildTooltip(track: Track, m: Model): TooltipCard {
 
   const tags = tagRows(track);
   const features = audioFeatureRows(track, m);
+  const results = inspect
+    ? inspect.results.map((r) => resolveResult(r, m))
+    : [];
 
   const key = [
     track.path,
@@ -139,10 +177,12 @@ export function buildTooltip(track: Track, m: Model): TooltipCard {
     activeSection ?? "",
     cid ?? "",
     m.clusterRevision ?? "",
+    inspect ? inspectKey(inspect) : "",
   ].join("\u0001");
 
   return {
     key,
+    path: track.path,
     folder,
     title,
     meta,
@@ -151,7 +191,33 @@ export function buildTooltip(track: Track, m: Model): TooltipCard {
     tags,
     features,
     activeSection,
+    inspect,
+    results,
   };
+}
+
+/** Resolve one ranked neighbour against the loaded library for display. */
+function resolveResult(result: TooltipResult, m: Model): ResultRow {
+  const t = m.trackByPath(result.path);
+  const ar = (t?.artist || "").trim();
+  const ti = (t?.title || "").trim();
+  return {
+    path: result.path,
+    title: ar && ti ? `${ar} — ${ti}` : ti || ar || t?.filename || result.path,
+    folder: displayFolderPath(t?.folder ?? ""),
+    score: result.score,
+  };
+}
+
+/** Identity of the inspect state, so the card re-renders when a ranking lands. */
+function inspectKey(inspect: InspectState): string {
+  return [
+    inspect.path,
+    inspect.busy ? "busy" : "",
+    inspect.message ?? "",
+    inspect.mode ?? "",
+    inspect.results.map((r) => `${r.path}:${r.score}`).join("|"),
+  ].join("\u0001");
 }
 
 /* ── DOM rendering ─────────────────────────────────────────── */
@@ -229,5 +295,64 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   if (card.features.length)
     root.appendChild(statSection("Features", card.features, "tt-features"));
 
+  if (card.inspect) root.appendChild(inspectSection(card.inspect, card.results));
+
   host.replaceChildren(root);
+}
+
+/** Navigate buttons + the last ranking's rows (pinned card only). */
+function inspectSection(inspect: InspectState, results: ResultRow[]): HTMLElement {
+  const section = el("div", "tt-section tt-inspect");
+  const head = el("div", "tt-inspect-head");
+  head.appendChild(el("div", "tt-section-title", "Navigate"));
+  const close = el("button", "tt-close", "×");
+  close.dataset.inspectClose = "";
+  close.title = "Close inspect (Esc)";
+  head.appendChild(close);
+  section.appendChild(head);
+
+  const buttons = el("div", "tt-nav-buttons");
+  const actions: [string, string, string][] = [
+    ["anti", "Anti-track", "The track furthest away in the embedding space"],
+    ["near", "Nearest", "The closest tracks in the embedding space"],
+    ["solo", "Solo", "Isolate to this track's neighbourhood and fit the view"],
+  ];
+  for (const [action, label, hint] of actions) {
+    const btn = el("button", "tt-nav-btn", label) as HTMLButtonElement;
+    btn.dataset.inspectAction = action;
+    btn.title = hint;
+    btn.disabled = inspect.busy;
+    buttons.appendChild(btn);
+  }
+  section.appendChild(buttons);
+
+  if (inspect.busy) {
+    section.appendChild(el("div", "tt-note", "Searching the embedding space…"));
+  } else if (inspect.message) {
+    section.appendChild(el("div", "tt-note tt-note-error", inspect.message));
+  } else if (results.length) {
+    section.appendChild(
+      el(
+        "div",
+        "tt-section-title",
+        inspect.mode === "far" ? "Anti-track" : "Nearest",
+      ),
+    );
+    for (const r of results) section.appendChild(resultRow(r));
+  }
+  return section;
+}
+
+function resultRow(result: ResultRow): HTMLElement {
+  const row = el("div", "tt-result");
+  row.dataset.inspectFocus = result.path;
+  row.title = "Select, fit the view, and audition";
+
+  const text = el("div", "tt-result-text");
+  text.appendChild(el("div", "tt-result-title", result.title));
+  text.appendChild(el("div", "tt-result-folder", result.folder));
+  row.appendChild(text);
+
+  row.appendChild(el("span", "tt-result-score", result.score.toFixed(2)));
+  return row;
 }

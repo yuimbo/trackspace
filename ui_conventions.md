@@ -141,6 +141,9 @@ targets (80th-percentile disc) via `fitView()`.
 the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active chip is
 highlighted in the tooltip (`model.previewSection`).
 
+**Inspect card** is pinned by **Alt** (not a `HOTKEY_MAP` action — it is a bare modifier over a hovered
+dot, so it lives in `CanvasInteractionController._bindInspectKey`). See *Inspect card* below.
+
 **Adding a new hotkey:**
 1. Add an entry to `HOTKEY_MAP` in `hotkeys.ts`.
 2. Register a handler in `Controller._bindKeyboard` via `hk.on("your-action", () => { ... })`.
@@ -200,3 +203,31 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   **Features**. Feature axis ids never render as tags. `buildTooltip` returns a
   `key`; the canvas re-renders the DOM only when that key changes, so pan/zoom
   frames do not rebuild the card.
+
+## Inspect card (pinned, interactive)
+
+The tooltip is `pointer-events: none` and follows the hover. **Alt** over a hovered
+dot pins it: `CanvasView.inspect` is set, the card anchors at the dot's position
+captured at pin time, gets `pointer-events: auto` and a `Navigate` section. It stays
+open when the pointer leaves the canvas (that is how you reach it), and closes on
+**Esc**, a plain click on empty canvas, the card's `×`, or another Alt press.
+`CanvasInteractionController._bindInspectKey` owns the Alt toggle; `CanvasView`
+owns the pin/anchor state and delegates clicks (`data-inspect-action`,
+`data-inspect-focus`, `data-inspect-close`) to `onInspectAction`.
+
+`InspectCoordinator` (`coordinators/inspect-coordinator.ts`) owns the actions —
+same seam as `SearchCoordinator`:
+
+- **Anti-track** — `GET /api/tracks/similar?path=…&mode=far&k=1`, the single
+  furthest track in the composite embedding space (what the map/clusters describe).
+- **Nearest** — `mode=near`, the `NEAR_K` closest tracks.
+- **Solo** — isolate to the neighbourhood (the inspected track plus `SOLO_K`
+  neighbours) and fit the view to it, reusing `Model.focusPaths` and
+  `fitViewToPaths`.
+- **Result row** — click focuses it: select alone, fit the view, audition it (only
+  when hover preview is on).
+
+Results are shown as title/artist/folder + similarity score, resolved against the
+loaded library (the endpoint returns only `path` + `score`). The card shows a
+"Searching…" note while a ranking is in flight and an inline error note when the
+endpoint fails (e.g. no analysed tracks yet).

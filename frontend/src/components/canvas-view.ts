@@ -2,7 +2,7 @@ import type { Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/toast";
 import { pipelineProgress, type PipelineProgress } from "../lib/pipeline";
-import { buildTooltip, renderTooltip } from "../lib/tooltip";
+import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
 
 
 // ─── Types ───────────────────────────────────────────────────
@@ -66,6 +66,15 @@ export class CanvasView {
   tipTimer = 0;
   /** Identity of the rendered tooltip card, so pan/zoom frames do not rebuild it. */
   private _tipKey = "";
+  /**
+   * Pinned inspect card state (Alt over a track). ``null`` = the plain hover
+   * tooltip; while set, the card is interactive and ignores hover changes.
+   */
+  inspect: InspectState | null = null;
+  /** Anchor (page coords) captured when the card was pinned. */
+  private _pinPos: { left: number; top: number } | null = null;
+  /** Inspect-card action clicked (``anti``/``near``/``solo``/``focus``/``close``). */
+  onInspectAction: ((action: string, path: string) => void) | null = null;
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
@@ -94,6 +103,7 @@ export class CanvasView {
     this.$canvas = document.getElementById("viewport") as HTMLCanvasElement;
     this.ctx = this.$canvas.getContext("2d")!;
     this.$tip = document.getElementById("tooltip")!;
+    this.$tip.addEventListener("click", (e) => this._onTipClick(e));
   }
 
   /* ── Coordinate transforms ──────────────────────────────── */
@@ -1034,31 +1044,116 @@ export class CanvasView {
   /* ── Tooltip ────────────────────────────────────────────── */
 
   private _updateTooltip(tracks: Track[]): void {
-    if (this.hoveredIdx < 0 || !this.tipReady) {
-      this.$tip.classList.add("hidden");
-      return;
+    const pinned = this.inspect !== null;
+    let track: Track | undefined;
+    let anchor: { left: number; top: number } | null = null;
+
+    if (pinned) {
+      track = this.model.trackByPath(this.inspect!.path);
+      if (!track) {
+        this.unpinInspect();
+        this.$tip.classList.add("hidden");
+        return;
+      }
+      anchor = this._pinPos;
+    } else if (this.hoveredIdx >= 0 && this.tipReady) {
+      track = tracks[this.hoveredIdx];
+      const pos = this.positions.find((p) => p.idx === this.hoveredIdx);
+      if (track && pos) {
+        const r = this.$canvas.getBoundingClientRect();
+        anchor = { left: r.left + pos.sx, top: r.top + pos.sy };
+      }
     }
-    const track = tracks[this.hoveredIdx];
-    const pos = this.positions.find((p) => p.idx === this.hoveredIdx);
-    if (!track || !pos) {
+
+    if (!track || !anchor) {
       this.$tip.classList.add("hidden");
       return;
     }
 
-    const card = buildTooltip(track, this.model);
+    const card = buildTooltip(track, this.model, this.inspect);
     if (card.key !== this._tipKey) {
       this._tipKey = card.key;
       renderTooltip(this.$tip, card);
     }
+    this.$tip.classList.toggle("pinned", pinned);
     this.$tip.classList.remove("hidden");
 
-    const r = this.$canvas.getBoundingClientRect();
-    let tx = r.left + pos.sx + 14;
-    const ty = r.top + pos.sy - 10;
+    // Keep the card inside the viewport, preferring the right of the anchor.
+    let tx = anchor.left + 14;
     if (tx + this.$tip.offsetWidth > window.innerWidth)
-      tx = r.left + pos.sx - this.$tip.offsetWidth - 14;
+      tx = anchor.left - this.$tip.offsetWidth - 14;
+    let ty = anchor.top - 10;
+    tx = Math.max(4, Math.min(tx, window.innerWidth - this.$tip.offsetWidth - 4));
+    ty = Math.max(4, Math.min(ty, window.innerHeight - this.$tip.offsetHeight - 4));
     this.$tip.style.left = tx + "px";
     this.$tip.style.top = ty + "px";
+  }
+
+  /* ── Inspect card (pinned, interactive) ──────────────────── */
+
+  /** Pin the hovered track's card open and make it interactive (Alt). */
+  pinInspect(): void {
+    if (this.inspect || this.hoveredIdx < 0 || !this.tipReady) return;
+    const track = this.model.tracks[this.hoveredIdx];
+    const pos = this.positions.find((p) => p.idx === this.hoveredIdx);
+    if (!track || !pos) return;
+    const r = this.$canvas.getBoundingClientRect();
+    this._pinPos = { left: r.left + pos.sx, top: r.top + pos.sy };
+    this.inspect = {
+      path: track.path,
+      busy: false,
+      message: null,
+      mode: null,
+      results: [],
+    };
+    this._tipKey = "";
+    this.scheduleDraw();
+  }
+
+  /** Close the inspect card; returns whether one was open. */
+  unpinInspect(): boolean {
+    if (!this.inspect) return false;
+    this.inspect = null;
+    this._pinPos = null;
+    this._tipKey = "";
+    this.$tip.classList.remove("pinned");
+    this.scheduleDraw();
+    return true;
+  }
+
+  /** Alt toggles the hovered track's inspect card. */
+  toggleInspect(): void {
+    if (this.inspect) this.unpinInspect();
+    else this.pinInspect();
+  }
+
+  /** Merge a patch into the pinned inspect state (busy/results/…). */
+  setInspect(patch: Partial<InspectState>): void {
+    if (!this.inspect) return;
+    this.inspect = { ...this.inspect, ...patch };
+    this._tipKey = "";
+    this.scheduleDraw();
+  }
+
+  /** Delegated click handling for the inspect card's buttons and result rows. */
+  private _onTipClick(e: MouseEvent): void {
+    const t = e.target as HTMLElement;
+    if (t.closest("[data-inspect-close]")) {
+      this.onInspectAction?.("close", this.inspect?.path ?? "");
+      return;
+    }
+    const focus = t.closest<HTMLElement>("[data-inspect-focus]");
+    if (focus) {
+      this.onInspectAction?.("focus", focus.dataset.inspectFocus!);
+      return;
+    }
+    const action = t.closest<HTMLElement>("[data-inspect-action]");
+    if (action) {
+      this.onInspectAction?.(
+        action.dataset.inspectAction!,
+        this.inspect?.path ?? "",
+      );
+    }
   }
 
   clearHover(): void {
@@ -1066,6 +1161,7 @@ export class CanvasView {
     this.tipReady = false;
     this.hoveredIdx = -1;
     this.hoveredSiblingFolder = null;
-    this.$tip.classList.add("hidden");
+    // The pinned inspect card outlives the pointer leaving the canvas.
+    if (!this.inspect) this.$tip.classList.add("hidden");
   }
 }

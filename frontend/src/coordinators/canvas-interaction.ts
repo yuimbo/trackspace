@@ -137,6 +137,7 @@ export class CanvasInteractionController {
   bind(): void {
     this._bindCanvas();
     this._bindExplodeKeys();
+    this._bindInspectKey();
   }
 
   /** True while a drag/transform gesture is in progress (hover clearing is suppressed). */
@@ -194,6 +195,10 @@ export class CanvasInteractionController {
     const tracks = m.tracks;
     const hit = cv.hitTest(sx, sy);
     mouse.hitIdx = hit;
+
+    // A plain click on empty background closes the pinned inspect card.
+    if (hit < 0 && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+      cv.unpinInspect();
 
     // Shift on empty space (no dot, not inside selection box) → lasso.
     if (e.shiftKey && hit < 0 && !(txh?.type === "move")) {
@@ -1147,6 +1152,18 @@ export class CanvasInteractionController {
       if (!this.deps.model.explodeHold) return;
       this.deps.model.explodeHold = false;
       this.deps.canvas.scheduleDraw();
+    });
+  }
+
+  /**
+   * **Alt** over a hovered dot pins its inspect card open (and again closes it).
+   * The card then survives leaving the canvas so it can be clicked.
+   */
+  private _bindInspectKey(): void {
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.key !== "Alt" || e.repeat) return;
+      if (!this._explodeKeysAllowed(e.target)) return;
+      this.deps.canvas.toggleInspect();
     });
   }
 }

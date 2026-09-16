@@ -1232,6 +1232,95 @@ kbd {
   font-variant-numeric: tabular-nums;
 }
 
+/* Pinned inspect card: interactive (Alt over a dot). */
+.tooltip.pinned {
+  pointer-events: auto;
+  border-color: #ffffff3d;
+}
+
+.tt-inspect-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.tt-close {
+  border: none;
+  background: none;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.tt-close:hover { color: var(--fg); }
+
+.tt-nav-buttons {
+  display: flex;
+  gap: 4px;
+  margin: 3px 0 2px;
+}
+
+.tt-nav-btn {
+  flex: 1 1 auto;
+  border: 1px solid #ffffff2e;
+  border-radius: 4px;
+  background: #ffffff0d;
+  color: var(--fg);
+  font-size: 10px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+
+.tt-nav-btn:hover:not(:disabled) {
+  border-color: #7dffb3;
+  color: #7dffb3;
+}
+
+.tt-nav-btn:disabled { opacity: 0.4; cursor: default; }
+
+.tt-note {
+  color: var(--fg-dim);
+  font-size: 10px;
+  padding: 2px 0;
+}
+
+.tt-note-error { color: #ff8e9d; }
+
+.tt-result {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 4px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.tt-result:hover { background: #ffffff14; }
+
+.tt-result-text { flex: 1 1 auto; min-width: 0; }
+
+.tt-result-title {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tt-result-folder {
+  color: var(--fg-dim);
+  font-size: 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tt-result-score {
+  flex: 0 0 auto;
+  color: #7fc7ff;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Toasts ───────────────────────────────────────────────── */
 #toast-container {
   position: fixed;

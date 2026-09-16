@@ -26,6 +26,10 @@ import {
   SearchCoordinator,
   type SearchResponse,
 } from "./coordinators/search-coordinator";
+import {
+  InspectCoordinator,
+  type SimilarResponse,
+} from "./coordinators/inspect-coordinator";
 
 // ─── Constants ───────────────────────────────────────────────
 const FLUSH_MS = 500;
@@ -87,6 +91,9 @@ export class Controller {
 
   /** Semantic search: query fetch, result selection, result panel. */
   private search: SearchCoordinator;
+
+  /** Pinned inspect card: anti-track / nearest / solo-neighbourhood. */
+  private inspect: InspectCoordinator;
 
   constructor(
     model: Model,
@@ -168,6 +175,28 @@ export class Controller {
         ),
       fitToPaths: (paths) => this.interaction.fitViewToPaths(paths),
     });
+
+    this.inspect = new InspectCoordinator({
+      model,
+      view: {
+        setInspect: (patch) => canvasView.setInspect(patch),
+        unpinInspect: () => canvasView.unpinInspect(),
+      },
+      fetchSimilar: (path, mode, k) =>
+        api<SimilarResponse>(
+          `/api/tracks/similar?path=${encodeURIComponent(path)}&mode=${mode}&k=${k}`,
+          undefined,
+          true,
+        ),
+      fitToPaths: (paths) => this.interaction.fitViewToPaths(paths),
+      preview: (path) => {
+        if (!model.hoverPreview) return;
+        const t = model.trackByPath(path);
+        if (t) this._startPreview(t);
+      },
+    });
+    canvasView.onInspectAction = (action, path) =>
+      void this.inspect.action(action, path);
 
     this.folders = new FolderTreeCoordinator({
       model,
@@ -674,6 +703,7 @@ export class Controller {
     hk.on("toggle-clusters", () => this.analysis.toggleColorByCluster());
 
     hk.on("deselect", () => {
+      if (this.canvas.unpinInspect()) return;
       if (this.interaction.cancelActiveGesture()) return;
       m.clearSelection();
     });
