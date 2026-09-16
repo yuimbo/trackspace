@@ -1,4 +1,4 @@
-import { type Model, type Track, type TrackStructure, isAudioFeatureAxisId } from "./model";
+import { type Model, type PreviewSection, type Track, type TrackStructure, isAudioFeatureAxisId } from "./model";
 import type {
   CanvasView,
   TagPanelView,
@@ -9,7 +9,7 @@ import type {
 } from "./components";
 import { toast, showLoad, hideLoad } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
-import { previewStartSeconds } from "./lib/structure";
+import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
 import {
   CommandManager,
   RenameTagCommand,
@@ -499,13 +499,15 @@ export class Controller {
   private _startPreview(track: Track): void {
     if (!track || this.previewPath === track.path) return;
     this.previewPath = track.path;
+    this.model.previewTrackPath = track.path;
+    this.model.previewSection = null;
     this.$audio.volume = this.model.previewVolume;
     this.$audio.src = `/api/audio/${encodeURIComponent(track.path)}`;
     this.$audio.onloadedmetadata = () => {
-      this.$audio.currentTime = previewStartSeconds(
-        this.model.trackStructure.get(track.path),
-        this.$audio.duration,
-      );
+      const s = this.model.trackStructure.get(track.path);
+      this.model.previewSection = s?.peak_start != null ? "drop" : null;
+      this.$audio.currentTime = previewStartSeconds(s, this.$audio.duration);
+      this.canvas.scheduleDraw();
     };
     this.$audio.play().catch(() => {});
     if (!this.model.trackStructure.has(track.path)) {
@@ -514,12 +516,36 @@ export class Controller {
   }
 
   /**
+   * Cycle the hover preview between the sections the track actually has
+   * (drop → break → intro) and re-seek. No-op when nothing is auditioning.
+   */
+  private _cyclePreviewSection(): void {
+    const m = this.model;
+    const path = this.previewPath;
+    if (!path) return;
+    const structure = m.trackStructure.get(path);
+    const order: PreviewSection[] = ["drop", "break", "intro"];
+    const present = order.filter((s) => sectionStartSeconds(structure, s) != null);
+    if (!present.length) {
+      toast("No cached structure for this track yet", "info");
+      return;
+    }
+    const idx = m.previewSection ? present.indexOf(m.previewSection) : -1;
+    const next = present[(idx + 1) % present.length];
+    const start = sectionStartSeconds(structure, next);
+    if (start == null) return;
+    m.previewSection = next;
+    if (this.$audio.duration > 0) this.$audio.currentTime = start;
+    this.canvas.scheduleDraw();
+  }
+
+  /**
    * Fetch one track's cached structure (intro/drop/break) and remember it.
    *
    * Silent and best-effort: the background ``structure`` stage may not have
    * reached the track yet, in which case the preview keeps its fixed position.
    * When the fetch lands while the track is still being auditioned, seek it to the
-   * detected drop.
+   * detected drop (unless the user already cycled to another section).
    */
   private async _fetchStructure(path: string): Promise<void> {
     if (this.model.trackStructure.has(path) || this.structurePending.has(path)) {
@@ -539,9 +565,17 @@ export class Controller {
         this.model.trackStructure.set(entryPath, structure);
       }
       const s = this.model.trackStructure.get(path);
-      if (this.previewPath === path && s?.peak_start != null && this.$audio.duration > 0) {
+      if (
+        this.previewPath === path &&
+        s?.peak_start != null &&
+        this.$audio.duration > 0 &&
+        (this.model.previewSection == null || this.model.previewSection === "drop")
+      ) {
+        this.model.previewSection = "drop";
         this.$audio.currentTime = previewStartSeconds(s, this.$audio.duration);
       }
+      // Chips appear as soon as the structure lands, without moving the mouse.
+      this.canvas.scheduleDraw();
     } catch {
       /* A missing row is the normal "not analysed yet" case; keep the fallback. */
     } finally {
@@ -552,9 +586,12 @@ export class Controller {
   private _stopPreview(): void {
     if (!this.previewPath) return;
     this.previewPath = null;
+    this.model.previewTrackPath = null;
+    this.model.previewSection = null;
     this.$audio.pause();
     this.$audio.removeAttribute("src");
     this.$audio.load();
+    this.canvas.scheduleDraw();
   }
 
   /* ── Tag controls ───────────────────────────────────────── */
@@ -579,26 +616,6 @@ export class Controller {
   }
 
   /* ── Keyboard shortcuts ─────────────────────────────────── */
-
-  /** True if isolating would still exclude at least one currently visible track. */
-  private _wouldIsolateExcludeMore(
-    m: Model,
-    kind: { type: "selection" } | { type: "folder"; prefix: string },
-  ): boolean {
-    for (const t of m.allTracks) {
-      if (!m.trackInViewUnion(t) || m.isTrackHidden(t)) continue;
-      if (kind.type === "selection") {
-        if (!m.selected.has(t.path)) return true;
-      } else {
-        const tf = t.folder ?? "";
-        const p = kind.prefix;
-        const under =
-          p === "" || tf === p || tf.startsWith(p + "/");
-        if (!under) return true;
-      }
-    }
-    return false;
-  }
 
   private _bindKeyboard(): void {
     const m = this.model;
@@ -639,33 +656,14 @@ export class Controller {
       }
     });
 
-    hk.on("isolate-selection", () => {
-      const hp = this.interaction.effectiveHoveredFolderPrefix();
-      if (hp !== null) {
-        if (m.folderSubtreeFullyExcluded(hp)) {
-          m.revealThenFocusFolderSubtree(hp);
-        } else if (this._wouldIsolateExcludeMore(m, { type: "folder", prefix: hp })) {
-          m.focusFolderSubtree(hp);
-        } else {
-          m.clearExclusions();
-        }
-        m.saveLS();
-        return;
-      }
-      if (m.selected.size) {
-        if (this._wouldIsolateExcludeMore(m, { type: "selection" })) {
-          m.focusSelection();
-        } else {
-          m.clearExclusions();
-        }
-        m.saveLS();
-      }
-    });
+    hk.on("isolate-selection", () => this.interaction.solo());
 
     hk.on("show-all-tracks", () => {
       m.clearExclusions();
       m.saveLS();
     });
+
+    hk.on("cycle-preview-section", () => this._cyclePreviewSection());
 
     hk.on("select-all", () => m.selectAll());
 

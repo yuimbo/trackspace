@@ -26,6 +26,7 @@ interface FakeCanvas {
   hoveredIdx: number;
   hoveredFolderPrefix: string | null;
   hoveredSiblingFolder: string | null;
+  hoveredClusterId: number | null;
   boxSel: { x0: number; y0: number; x1: number; y1: number } | null;
   lassoPoints: [number, number][];
   intersectMode: boolean;
@@ -50,6 +51,7 @@ function makeCanvas(): FakeCanvas {
     hoveredIdx: -1,
     hoveredFolderPrefix: null,
     hoveredSiblingFolder: null,
+    hoveredClusterId: null,
     boxSel: null,
     lassoPoints: [],
     intersectMode: false,
@@ -396,5 +398,81 @@ describe("CanvasInteractionController fit view", () => {
     coord.fitView();
     expect(canvas.scheduleDraw).toHaveBeenCalled();
     expect(model.vp.zoom).not.toBe(1);
+  });
+
+  it("fits to the hovered cluster's members", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    model.clusterAssignments = new Map([
+      ["a.mp3", 1],
+      ["b.mp3", 1],
+      ["c.mp3", 2],
+    ]);
+    canvas.hoveredClusterId = 1;
+    canvas.worldPosForTrack.mockImplementation((t: Track) => ({
+      wx: t.path === "a.mp3" ? 0.2 : t.path === "b.mp3" ? 0.8 : 0.1,
+      wy: 0.5,
+    }));
+    model.vp = { ox: 0, oy: 0, zoom: 1 };
+    coord.fitView();
+    expect(model.vp.zoom).not.toBe(1);
+  });
+});
+
+// ─── Solo (isolate) ──────────────────────────────────────
+
+describe("CanvasInteractionController solo", () => {
+  it("isolates to a hovered cluster", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    model.clusterAssignments = new Map([
+      ["a.mp3", 1],
+      ["b.mp3", 1],
+      ["c.mp3", 2],
+    ]);
+    canvas.hoveredClusterId = 1;
+    coord.solo();
+    expect(model.isTrackHidden(model.trackByPath("c.mp3")!)).toBe(true);
+    expect(model.isTrackHidden(model.trackByPath("a.mp3")!)).toBe(false);
+  });
+
+  it("clears the exclusions when the hovered cluster is already soloed", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    model.clusterAssignments = new Map([
+      ["a.mp3", 1],
+      ["b.mp3", 2],
+    ]);
+    canvas.hoveredClusterId = 1;
+    coord.solo();
+    expect(model.hasExclusions).toBe(true);
+    coord.solo();
+    expect(model.hasExclusions).toBe(false);
+  });
+
+  it("shows everything when nothing is hovered and nothing is selected", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    model.hidePaths(["b.mp3"]);
+    expect(model.hasExclusions).toBe(true);
+    coord.solo();
+    expect(model.hasExclusions).toBe(false);
+  });
+
+  it("still isolates the selection when nothing is hovered", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    model.selected.add("a.mp3");
+    coord.solo();
+    expect(model.isTrackHidden(model.trackByPath("b.mp3")!)).toBe(true);
+    expect(model.isTrackHidden(model.trackByPath("a.mp3")!)).toBe(false);
   });
 });

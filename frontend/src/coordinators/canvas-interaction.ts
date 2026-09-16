@@ -857,19 +857,9 @@ export class CanvasInteractionController {
     return s[idx];
   }
 
-  /** Fit viewport to an 80th-percentile disc around the centroid (folder/track folder hover + H). */
-  private _fitViewToFolderPercentile(prefixNorm: string): void {
+  /** Fit viewport to an 80th-percentile disc around the centroid of *subset*. */
+  private _fitViewToTracksPercentile(subset: Track[]): void {
     const m = this.deps.model;
-    const subset: Track[] = [];
-    for (const t of m.allTracks) {
-      if (!m.trackInViewUnion(t) || m.isTrackHidden(t)) continue;
-      if (!m.passesFilter(t)) continue;
-      const tf = t.folder ?? "";
-      if (prefixNorm !== "") {
-        if (tf !== prefixNorm && !tf.startsWith(prefixNorm + "/")) continue;
-      }
-      subset.push(t);
-    }
     const pos: { wx: number; wy: number }[] = [];
     for (const t of subset) {
       const p = this.deps.canvas.worldPosForTrack(t);
@@ -907,6 +897,32 @@ export class CanvasInteractionController {
     Object.assign(m.vp, this._vpFromWorldBounds(minX, maxX, minY, maxY));
   }
 
+  /** Fit viewport to an 80th-percentile disc around the centroid (folder/track folder hover + H). */
+  private _fitViewToFolderPercentile(prefixNorm: string): void {
+    const m = this.deps.model;
+    const subset: Track[] = [];
+    for (const t of m.allTracks) {
+      if (!m.trackInViewUnion(t) || m.isTrackHidden(t)) continue;
+      if (!m.passesFilter(t)) continue;
+      const tf = t.folder ?? "";
+      if (prefixNorm !== "") {
+        if (tf !== prefixNorm && !tf.startsWith(prefixNorm + "/")) continue;
+      }
+      subset.push(t);
+    }
+    this._fitViewToTracksPercentile(subset);
+  }
+
+  /** Fit viewport to the visible members of a hovered cluster (80th-percentile disc). */
+  private _fitViewToClusterPercentile(cid: number): void {
+    const m = this.deps.model;
+    const keep = m.clusterPaths(cid);
+    if (keep.size === 0) return;
+    this._fitViewToTracksPercentile(
+      m.tracks.filter((t) => keep.has(t.path) && m.passesFilter(t)),
+    );
+  }
+
   private _fitViewToTracks(): void {
     const target = this._computeFitVP();
     Object.assign(this.deps.model.vp, target);
@@ -926,9 +942,16 @@ export class CanvasInteractionController {
     return null;
   }
 
-  /** Fit-view hotkey (H): hovered folder 80th-percentile disc, else full view toggle. */
+  /** Fit-view hotkey (H): hovered cluster/folder 80th-percentile disc, else full view toggle. */
   fitView(): void {
     const m = this.deps.model;
+    const cid = this.deps.canvas.hoveredClusterId;
+    if (cid !== null && m.clusterPaths(cid).size > 0) {
+      this._fitViewToClusterPercentile(cid);
+      this.deps.canvas.scheduleDraw();
+      m.saveLS();
+      return;
+    }
     const hp = this.effectiveHoveredFolderPrefix();
     if (hp !== null) {
       this._fitViewToFolderPercentile(hp);
@@ -950,6 +973,57 @@ export class CanvasInteractionController {
       this._fitViewToTracks();
     }
     this.deps.canvas.scheduleDraw();
+    m.saveLS();
+  }
+
+  /**
+   * Isolate hotkey (S): hovered cluster → hovered folder → selection → everything.
+   *
+   * A second press on an already-isolated target clears the exclusions (show all);
+   * with nothing hovered and no selection it also shows all.
+   */
+  solo(): void {
+    const m = this.deps.model;
+
+    const cid = this.deps.canvas.hoveredClusterId;
+    if (cid !== null) {
+      const keep = m.clusterPaths(cid);
+      if (keep.size === 0) return;
+      if (m.pathsFullyHidden(keep)) {
+        m.revealThenFocusPaths(keep);
+      } else if (m.hasVisibleTracksOutside(keep)) {
+        m.focusPaths(keep);
+      } else {
+        m.clearExclusions();
+      }
+      m.saveLS();
+      return;
+    }
+
+    const hp = this.effectiveHoveredFolderPrefix();
+    if (hp !== null) {
+      if (m.folderSubtreeFullyExcluded(hp)) {
+        m.revealThenFocusFolderSubtree(hp);
+      } else if (m.hasVisibleTracksOutside(m.pathsUnderPrefix(hp))) {
+        m.focusFolderSubtree(hp);
+      } else {
+        m.clearExclusions();
+      }
+      m.saveLS();
+      return;
+    }
+
+    if (m.selected.size) {
+      if (m.hasVisibleTracksOutside(m.selected)) {
+        m.focusSelection();
+      } else {
+        m.clearExclusions();
+      }
+      m.saveLS();
+      return;
+    }
+
+    m.clearExclusions();
     m.saveLS();
   }
 

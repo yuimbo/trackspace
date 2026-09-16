@@ -15,11 +15,12 @@ const MOD_SYMBOL = IS_MAC ? "⌘" : "Ctrl+";
 export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "focus-search",   key: "/",      mod: false, shift: false, alt: false, label: "/",                      description: "Focus semantic search" },
   { action: "toggle-preview",  key: "m",      mod: false, shift: false, alt: false, label: "M",                      description: "Toggle hover preview" },
-  { action: "fit-view",        key: "h",      mod: false, shift: false, alt: false, label: "H",                      description: "Fit view to hovered folder or track's folder (80% radius), else full view" },
+  { action: "fit-view",        key: "h",      mod: false, shift: false, alt: false, label: "H",                      description: "Fit view to hovered cluster/folder or track's folder (80% radius), else full view" },
   { action: "focus-folder",    key: "f",      mod: false, shift: false, alt: false, label: "F",                      description: "Select all tracks in hovered folder or track's folder (and subfolders)" },
-  { action: "isolate-selection", key: "s",  mod: false, shift: false, alt: false, label: "s",                      description: "Isolate to hovered folder/track folder if any, else to selection; fully excluded folder: isolate to that subtree; again when isolated: show all" },
+  { action: "isolate-selection", key: "s",  mod: false, shift: false, alt: false, label: "s",                      description: "Isolate to hovered cluster/folder or selection; again when isolated: show all; hovering nothing: show all" },
   { action: "exclude-selection", key: "s",  mod: false, shift: true, alt: false, label: `Shift+s`,                description: "Exclude hovered folder/track folder if any, else selection; repeat to narrow; on excluded folder: restore it" },
   { action: "show-all-tracks",   key: "s",  mod: false, shift: false, alt: true,  label: "Alt+s",                 description: "Show all tracks again (clear exclusions)" },
+  { action: "cycle-preview-section", key: "d", mod: false, shift: false, alt: false, label: "D",                  description: "Cycle hover preview between drop, break and intro" },
   { action: "select-all",      key: "a",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}A`,         description: "Select all tracks" },
   { action: "undo",            key: "z",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}Z`,         description: "Undo last action" },
   { action: "deselect",        key: "Escape", mod: false, shift: false, alt: false, label: "Esc",                    description: "Deselect / cancel" },
@@ -39,6 +40,7 @@ export const MOUSE_HINTS: { label: string; description: string }[] = [
   { label: "Shift+click",     description: "Add tracks from each folder between anchor and this row (set anchor with a normal click)" },
   { label: "Hold X + scroll", description: "Explode strength (5–20%) on canvas" },
   { label: "Alt+click folder", description: "Exclude folder from the view" },
+  { label: "Hover cluster + s / H", description: "Isolate to the cluster / fit the view to it" },
   { label: "Drag→folder",     description: "Move files to folder" },
   { label: "Dbl-click tag",   description: "Rename tag" },
 ];

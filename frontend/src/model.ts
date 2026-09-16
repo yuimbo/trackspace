@@ -10,6 +10,8 @@ export interface TrackAudioFeatures {
 
 /** Coarse track structure from the ``structure`` stage; seconds, or null. */
 export interface TrackStructure {
+  /** Where the audio starts after lead-in silence (``0`` when it starts immediately). */
+  intro_start?: number | null;
   intro_end: number | null;
   peak_start: number | null;
   peak_end: number | null;
@@ -167,6 +169,9 @@ export function isAudioFeatureAxisId(tag: string): boolean {
 
 export type ViewMode = "tags" | "embeddings";
 
+/** Hover-preview audition section; cycled with **D** and highlighted in the tooltip. */
+export type PreviewSection = "intro" | "drop" | "break";
+
 export interface Viewport {
   ox: number;
   oy: number;
@@ -212,6 +217,13 @@ export class Model extends EventBus {
   hoverPreview = false;
   /** Hover preview playback level [0, 1]. */
   previewVolume = 1;
+  /**
+   * Track currently being auditioned by the hover preview (in-memory only).
+   * With ``previewSection`` it drives the tooltip chip highlight.
+   */
+  previewTrackPath: string | null = null;
+  /** Section the hover preview is auditioning; ``null`` while not previewing. */
+  previewSection: PreviewSection | null = null;
   vp: Viewport = { ox: 0, oy: 0, zoom: 1 };
   _knownTags: string[] = [];
 
@@ -460,10 +472,18 @@ export class Model extends EventBus {
 
   /** Hide every visible-until-now track that is not currently selected. */
   focusSelection(): void {
+    this.focusPaths(this.selected);
+  }
+
+  /**
+   * Hide every visible track whose path is not in *keep* (folder subtree, cluster
+   * membership, or selection — all isolate actions reduce to a keep-set).
+   */
+  focusPaths(keep: ReadonlySet<string>): void {
     const add: string[] = [];
     for (const t of this.allTracks) {
       if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
-      if (this.selected.has(t.path)) continue;
+      if (keep.has(t.path)) continue;
       add.push(t.path);
     }
     this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
@@ -472,23 +492,53 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
-  /** Hide visible tracks not under ``prefixNorm`` (``""`` = library root); same idea as ``focusSelection`` for a hovered folder row. */
-  focusFolderSubtree(prefixNorm: string): void {
-    const add: string[] = [];
+  /** True when some visible track lies outside *keep* (isolating would hide more). */
+  hasVisibleTracksOutside(keep: ReadonlySet<string>): boolean {
     for (const t of this.allTracks) {
       if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
+      if (!keep.has(t.path)) return true;
+    }
+    return false;
+  }
+
+  /** Every known track in *paths* is excluded (and at least one exists). */
+  pathsFullyHidden(paths: Iterable<string>): boolean {
+    let any = false;
+    for (const p of paths) {
+      const t = this.trackByPath(p);
+      if (!t) continue;
+      any = true;
+      if (!this.isTrackHidden(t)) return false;
+    }
+    return any;
+  }
+
+  /** Hide every visible tracks not under ``prefixNorm``; same idea as ``focusSelection`` for a hovered folder row. */
+  focusFolderSubtree(prefixNorm: string): void {
+    this.focusPaths(this.pathsUnderPrefix(prefixNorm));
+  }
+
+  /** All known track paths under ``prefixNorm`` (``""`` = library root), hidden or not. */
+  pathsUnderPrefix(prefixNorm: string): Set<string> {
+    const out = new Set<string>();
+    for (const t of this.allTracks) {
       const tf = t.folder ?? "";
       const under =
         prefixNorm === "" ||
         tf === prefixNorm ||
         tf.startsWith(prefixNorm + "/");
-      if (under) continue;
-      add.push(t.path);
+      if (under) out.add(t.path);
     }
-    this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
-    this._cache = null;
-    this._clearExclusionsIfNoneVisible();
-    this.emit("change");
+    return out;
+  }
+
+  /** Known track paths assigned to cluster *cid* (for solo / fit-in-view). */
+  clusterPaths(cid: number): Set<string> {
+    const out = new Set<string>();
+    for (const [path, id] of this.clusterAssignments) {
+      if (id === cid) out.add(path);
+    }
+    return out;
   }
 
   /**
@@ -577,6 +627,39 @@ export class Model extends EventBus {
     this.hiddenFolderPrefixes.clear();
     this._cache = null;
     this.emit("change");
+  }
+
+  /**
+   * Bring back a fully excluded path set, then exclude everything outside it
+   * (single update). Used when **s** (isolate) is pressed on a hovered cluster
+   * that is already entirely excluded.
+   */
+  revealThenFocusPaths(paths: Iterable<string>): void {
+    const keep = new Set(paths);
+    this._mutateRevealPaths(keep);
+    this._cache = null;
+    this.focusPaths(keep);
+  }
+
+  /** Shared reveal mutation: un-hide *paths* and any folder prefix that covers one. */
+  private _mutateRevealPaths(paths: Iterable<string>): void {
+    const keep = new Set(paths);
+    for (const p of [...this.hiddenFolderPrefixes]) {
+      if (p === "") {
+        this.hiddenFolderPrefixes.delete(p);
+        continue;
+      }
+      for (const path of keep) {
+        const tf = this.trackByPath(path)?.folder ?? "";
+        if (tf === p || tf.startsWith(p + "/")) {
+          this.hiddenFolderPrefixes.delete(p);
+          break;
+        }
+      }
+    }
+    const next = new Set(this.hiddenPaths);
+    for (const path of keep) next.delete(path);
+    this.hiddenPaths = next;
   }
 
   toggleAxis(which: "axisX" | "axisY", tag: string): void {

@@ -129,6 +129,18 @@ action `"isolate-selection"`, **s**) and **exclude** (remove from view, often re
 `"exclude-selection"`, **Shift+s**), with **Alt+s** as `"show-all-tracks"`. Implementation still
 uses `hiddenPaths` and `hiddenFolderPrefixes` on the model.
 
+`CanvasInteractionController.solo()` owns the isolate behaviour. It resolves the target in order:
+**hovered cluster** (a cluster-panel row sets `canvas.hoveredClusterId`) → hovered folder
+(`canvas.hoveredFolderPrefix`) → selection. A second press on an already-isolated target clears the
+exclusions, and with nothing hovered and no selection **s** also clears them (show all). Cluster solo/fit
+reduce to a keep-set of `clusterAssignments` paths (`Model.clusterPaths`), which is why the model's
+`focusPaths` / `revealPaths` / `pathsFullyHidden` helpers are path-set based. **H** fits the same
+targets (80th-percentile disc) via `fitView()`.
+
+**Cycle preview section** (action `"cycle-preview-section"`, **d**) advances the hover preview through
+the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active chip is
+highlighted in the tooltip (`model.previewSection`).
+
 **Adding a new hotkey:**
 1. Add an entry to `HOTKEY_MAP` in `hotkeys.ts`.
 2. Register a handler in `Controller._bindKeyboard` via `hk.on("your-action", () => { ... })`.
@@ -169,12 +181,22 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 - **Hover preview** (**M** toggles, volume slider in Options) streams the track
   through `/api/audio/…`. It seeks to the **detected drop** when the track has a
   cached structure row, else to 40 % of the track — `previewStartSeconds` in
-  `lib/structure.ts` owns that choice.
+  `lib/structure.ts` owns that choice. **D** cycles the preview between the
+  sections the track actually has (drop → break → intro) and re-seeks; the intro
+  seeks to `intro_start` (the detected audio start after lead-in silence), falling
+  back to `0`. `model.previewTrackPath` / `model.previewSection` are in-memory
+  preview state, not persisted.
 - Structure is **fetched lazily on first hover** (`/api/tracks/structure?paths=…`,
   silent, deduped per path) and cached on `model.trackStructure`. A missing row is
   the normal "not analysed yet" case; the preview keeps its fallback position and
-  re-seeks to the drop if the fetch lands while the track is still auditioning.
-- The hover **tooltip** renders a structure line — `intro 0:32 · drop 1:04 · break
-  3:12 · genre-spanning` — after the BPM/key line, omitting unknown sections. It
-  is a pure function of `model.trackStructure` (`structureLine`), like the rest of
-  `tooltipLines`.
+  re-seeks to the drop if the fetch lands while the track is still auditioning
+  (unless the user has already cycled to another section).
+- The hover **tooltip** is a card (`lib/tooltip.ts`: pure `buildTooltip` +
+  `renderTooltip`), not a block of text. It shows the folder kicker and title, a
+  BPM/key meta row, **structure chips** (`intro 0:12–0:32`, `drop 1:04`,
+  `break 3:12`; the auditioned one is highlighted), the **genre group** (cluster
+  swatch + name + a `genre-spanning` badge whose hover text explains that the
+  intro and drop excerpts disagree) and two stat-bar areas — user **Tags** and audio
+  **Features**. Feature axis ids never render as tags. `buildTooltip` returns a
+  `key`; the canvas re-renders the DOM only when that key changes, so pan/zoom
+  frames do not rebuild the card.

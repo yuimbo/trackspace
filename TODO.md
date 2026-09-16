@@ -13,6 +13,22 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 
 - [ ] Whacko idea? Add a 3d view for the embedding space?
 
+- ✅ **Structure chips + preview cycling.** The tooltip renders intro/drop/break as
+  chips (`lib/tooltip.ts`) and **D** cycles the hover preview through the sections a
+  track has (drop → break → intro), re-seeking the audio and highlighting the active
+  chip. The intro seeks to the newly detected `intro_start`, so lead-in silence is
+  skipped (`STRUCTURE_VERSION` 2).
+
+- ✅ **S/H over clusters, and S with nothing hovered.** `CanvasInteractionController.solo()`
+  isolates to a hovered cluster row like it already did for folders, `fitView()` fits the
+  cluster's members, and **s** with nothing hovered and no selection clears the
+  exclusions. See `ui_conventions.md` → *Hotkey system*.
+
+- ✅ **Hockey-card tooltip.** User tags (`4x`) and audio features get separate
+  stat-bar areas, and the genre-spanning flag sits with the cluster on its own line.
+  `buildTooltip` is pure; the canvas renders it. The flag is excerpt dispersion
+  (intro vs drop ≥ 0.25), not cluster-centroid distance — the badge's hover text says so.
+
 ## Deferred / optional
 
 ### Frontend
@@ -34,12 +50,10 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       types out of `model.ts` / `lib/api.ts`.
 - [ ] **Nit:** `clamp` is duplicated in `coordinators/options-panel.ts`,
       `coordinators/canvas-interaction.ts`, and `coordinators/analysis-coordinator.ts`.
-- [ ] **Structure preview follow-ups.** The preview always seeks to the drop;
-      cycling peak → break → intro on repeated hovers of the same track was
-      deferred (product decision). `_fetchStructure` (`controller.ts`) fetches one
+- [ ] **Structure preview follow-up.** `_fetchStructure` (`controller.ts`) fetches one
       path per hover — a batched request for the visible tracks would cut the
-      round-trips. A small section timeline in the tooltip (or a track inspector)
-      would make the break/peak markers legible, not just textual.
+      round-trips. (Cycling sections on **D** and the chip timeline are done; see
+      the ✅ entry under *User feedback*.)
 
 ### Backend
 
@@ -174,6 +188,11 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
       music-trained one and is now `CLAP_MODEL_ID` (`EMBEDDING_VERSION` 2 → 3).
       Real-track check: a techno track ranks "techno" 0.59 > "deep house" 0.36; a
       deep-house track ranks "deep house" 0.55 > "ambient" 0.41 > "techno" 0.25.
+- [ ] **Structure v2 backfill.** `STRUCTURE_VERSION` 1 → 2 (added `intro_start`)
+      blanks the cached v1 blobs on the next backend start, so the structure stage
+      re-analyses the library once (~0.12 s/track, background). Until it drains,
+      tooltip chips show `intro <end>` without the detected audio start; restart the
+      backend to trigger it.
 - [ ] **Re-run the CLAP stage and retrain the supervised head.** The checkpoint switch
       bumped `EMBEDDING_VERSION` 2 → 3, so every cached `clap` row is purged on next
       startup and must be regenerated (decode-dominated — hours on the real library). The

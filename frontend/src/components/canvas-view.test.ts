@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Model, type Track } from "../model";
 import { clusterColor } from "../lib/toast";
-import { CanvasView, tooltipLines } from "./canvas-view";
+import { CanvasView } from "./canvas-view";
 
 function makeTrack(over: Partial<Track> = {}): Track {
   return {
@@ -14,79 +14,6 @@ function makeTrack(over: Partial<Track> = {}): Track {
     ...over,
   };
 }
-
-describe("tooltipLines", () => {
-  it("renders folder, title, audio features, and tags", () => {
-    const m = new Model();
-    const lines = tooltipLines(
-      makeTrack({
-        folder: "House",
-        artist: "A",
-        title: "B",
-        bpm: 128.4,
-        musical_key: "Am",
-        tags: { energy: 0.5 },
-      }),
-      m,
-    );
-    expect(lines).toEqual(["House", "A — B", "128 BPM · Am", "energy: 0.50"]);
-  });
-
-  it("inserts the cluster name between the audio line and the tags", () => {
-    const m = new Model();
-    m.clusterAssignments = new Map([["a.mp3", 3]]);
-    m.clusterNames = new Map([[3, "Techno"]]);
-    const lines = tooltipLines(
-      makeTrack({ bpm: 120, tags: { energy: 0.25 } }),
-      m,
-    );
-    expect(lines).toEqual(["Library root", "a.mp3", "120 BPM", "Techno", "energy: 0.25"]);
-  });
-
-  it("falls back to a numbered label for an unnamed cluster", () => {
-    const m = new Model();
-    m.clusterAssignments = new Map([["a.mp3", 9]]);
-    const lines = tooltipLines(makeTrack(), m);
-    expect(lines).toContain("Cluster 9");
-  });
-
-  it("omits the cluster line when the track has no assignment", () => {
-    const m = new Model();
-    m.clusterAssignments = new Map([["other.mp3", 1]]);
-    m.clusterNames = new Map([[1, "Techno"]]);
-    const lines = tooltipLines(makeTrack(), m);
-    expect(lines).not.toContain("Techno");
-    expect(lines.some((l) => l.startsWith("Cluster "))).toBe(false);
-  });
-
-  it("adds the structure line after the audio features", () => {
-    const m = new Model();
-    m.trackStructure = new Map([
-      [
-        "a.mp3",
-        {
-          intro_end: 32,
-          peak_start: 64,
-          peak_end: 94,
-          break_start: 192,
-          break_end: 224,
-          genre_spanning: true,
-        },
-      ],
-    ]);
-    const lines = tooltipLines(makeTrack({ bpm: 128 }), m);
-    expect(lines).toContain("intro 0:32 · drop 1:04 · break 3:12 · genre-spanning");
-    expect(lines.indexOf("128 BPM")).toBeLessThan(
-      lines.indexOf("intro 0:32 · drop 1:04 · break 3:12 · genre-spanning"),
-    );
-  });
-
-  it("omits the structure line when nothing is cached", () => {
-    const m = new Model();
-    const lines = tooltipLines(makeTrack(), m);
-    expect(lines.some((l) => l.startsWith("drop "))).toBe(false);
-  });
-});
 
 // ─── Cluster hover glow ───────────────────────────────────────
 

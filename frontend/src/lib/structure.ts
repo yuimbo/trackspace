@@ -1,9 +1,9 @@
 // ─── Track structure (intro / drop / break) ───────────────────
 //
-// The server's ``structure`` stage caches five section timestamps per track; the
-// hover preview seeks to the drop and the tooltip renders a one-line summary. Both
-// are pure derivations of a fetched ``TrackStructure``, so they live here to stay
-// unit-testable and keep the controller free of formatting.
+// The server's ``structure`` stage caches six section timestamps per track; the
+// hover preview seeks to the drop (and cycles sections on **D**) while the tooltip
+// renders them as chips. Both are pure derivations of a fetched ``TrackStructure``,
+// so they live here to stay unit-testable and keep the controller free of formatting.
 
 import type { TrackStructure } from "../model";
 
@@ -37,21 +37,68 @@ export function formatTimestamp(seconds: number | null | undefined): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+/** A section the tooltip renders as a chip and the preview can cycle to. */
+export type StructureSection = "intro" | "drop" | "break";
+
+export interface StructureChip {
+  section: StructureSection;
+  /** Chip text, e.g. ``drop 1:04`` or ``intro 0:12–0:32``. */
+  text: string;
+  /** Seek target in seconds when the preview cycles to this chip. */
+  seconds: number;
+}
+
 /**
- * One-line tooltip summary of the known sections, or ``null`` when nothing is
- * cached yet. The genre-spanning flag rides the same line.
+ * Seek target for a section, or ``null`` when the track has no such section.
+ * The intro starts where the audio does (after any lead-in silence).
  */
-export function structureLine(
+export function sectionStartSeconds(
   structure: TrackStructure | undefined,
-): string | null {
+  section: StructureSection,
+): number | null {
   if (!structure) return null;
-  const parts: string[] = [];
-  if (structure.intro_end != null && structure.intro_end > 0)
-    parts.push(`intro ${formatTimestamp(structure.intro_end)}`);
-  if (structure.peak_start != null)
-    parts.push(`drop ${formatTimestamp(structure.peak_start)}`);
-  if (structure.break_start != null)
-    parts.push(`break ${formatTimestamp(structure.break_start)}`);
-  if (structure.genre_spanning) parts.push("genre-spanning");
-  return parts.length ? parts.join(" · ") : null;
+  if (section === "intro") {
+    return structure.intro_end != null && structure.intro_end > 0
+      ? (structure.intro_start ?? 0)
+      : null;
+  }
+  if (section === "drop") return structure.peak_start ?? null;
+  return structure.break_start ?? null;
+}
+
+/**
+ * Tooltip structure chips (intro, drop, break) in track order, omitting unknown
+ * sections. Empty when nothing is cached yet.
+ */
+export function structureChips(
+  structure: TrackStructure | undefined,
+): StructureChip[] {
+  const chips: StructureChip[] = [];
+  const intro = sectionStartSeconds(structure, "intro");
+  if (structure && intro != null) {
+    const start = structure.intro_start ?? 0;
+    const end = formatTimestamp(structure.intro_end);
+    chips.push({
+      section: "intro",
+      seconds: intro,
+      text: start > 0 ? `intro ${formatTimestamp(start)}–${end}` : `intro ${end}`,
+    });
+  }
+  const drop = sectionStartSeconds(structure, "drop");
+  if (drop != null) {
+    chips.push({
+      section: "drop",
+      seconds: drop,
+      text: `drop ${formatTimestamp(drop)}`,
+    });
+  }
+  const brk = sectionStartSeconds(structure, "break");
+  if (brk != null) {
+    chips.push({
+      section: "break",
+      seconds: brk,
+      text: `break ${formatTimestamp(brk)}`,
+    });
+  }
+  return chips;
 }

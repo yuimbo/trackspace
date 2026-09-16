@@ -1,9 +1,8 @@
 import type { Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/toast";
-import { displayFolderPath } from "../lib/path-presenter";
 import { pipelineProgress, type PipelineProgress } from "../lib/pipeline";
-import { structureLine } from "../lib/structure";
+import { buildTooltip, renderTooltip } from "../lib/tooltip";
 
 
 // ─── Types ───────────────────────────────────────────────────
@@ -65,6 +64,8 @@ export class CanvasView {
   hoveredClusterId: number | null = null;
   tipReady = false;
   tipTimer = 0;
+  /** Identity of the rendered tooltip card, so pan/zoom frames do not rebuild it. */
+  private _tipKey = "";
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
@@ -1044,13 +1045,18 @@ export class CanvasView {
       return;
     }
 
-    this.$tip.textContent = tooltipLines(track, this.model).join("\n");
+    const card = buildTooltip(track, this.model);
+    if (card.key !== this._tipKey) {
+      this._tipKey = card.key;
+      renderTooltip(this.$tip, card);
+    }
     this.$tip.classList.remove("hidden");
 
     const r = this.$canvas.getBoundingClientRect();
     let tx = r.left + pos.sx + 14;
     const ty = r.top + pos.sy - 10;
-    if (tx + 320 > window.innerWidth) tx = r.left + pos.sx - 320;
+    if (tx + this.$tip.offsetWidth > window.innerWidth)
+      tx = r.left + pos.sx - this.$tip.offsetWidth - 14;
     this.$tip.style.left = tx + "px";
     this.$tip.style.top = ty + "px";
   }
@@ -1062,33 +1068,4 @@ export class CanvasView {
     this.hoveredSiblingFolder = null;
     this.$tip.classList.add("hidden");
   }
-}
-
-/** Build the hover-tooltip lines for a track (pure; exported for tests). */
-export function tooltipLines(track: Track, m: Model): string[] {
-  const folderLine = displayFolderPath(track.folder || "");
-  const ar = (track.artist || "").trim();
-  const ti = (track.title || "").trim();
-  const titleLine = ar && ti ? `${ar} — ${ti}` : ti || ar || track.filename;
-
-  const lines = [folderLine, titleLine];
-
-  const audioParts: string[] = [];
-  if (track.bpm != null && Number.isFinite(track.bpm))
-    audioParts.push(`${Math.round(track.bpm)} BPM`);
-  if (track.musical_key) audioParts.push(track.musical_key);
-  if (audioParts.length) lines.push(audioParts.join(" · "));
-
-  const structure = structureLine(m.trackStructure.get(track.path));
-  if (structure) lines.push(structure);
-
-  const cid = m.clusterAssignments.get(track.path);
-  if (cid !== undefined) lines.push(m.clusterNames.get(cid) || `Cluster ${cid}`);
-
-  const tagStr = Object.entries(track.tags)
-    .map(([k, v]) => `${k}: ${v.toFixed(2)}`)
-    .join("  ");
-  if (tagStr) lines.push(tagStr);
-
-  return lines;
 }
