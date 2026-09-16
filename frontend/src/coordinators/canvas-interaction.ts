@@ -954,6 +954,43 @@ export class CanvasInteractionController {
   }
 
   /**
+   * Fit the viewport to a specific set of track paths (semantic-search result
+   * focus). Unlike the folder fit, a single track is zoomed to rather than reset
+   * to the full view — focusing one hit is the whole point.
+   */
+  fitViewToPaths(paths: Iterable<string>): void {
+    const m = this.deps.model;
+    const wanted = new Set(paths);
+    const pos: { wx: number; wy: number }[] = [];
+    for (const t of m.allTracks) {
+      if (!wanted.has(t.path)) continue;
+      const p = this.deps.canvas.worldPosForTrack(t);
+      if (p) pos.push(p);
+    }
+    if (pos.length === 0) return;
+    let minX = Infinity,
+      maxX = -Infinity,
+      minY = Infinity,
+      maxY = -Infinity;
+    for (const p of pos) {
+      if (p.wx < minX) minX = p.wx;
+      if (p.wx > maxX) maxX = p.wx;
+      if (p.wy < minY) minY = p.wy;
+      if (p.wy > maxY) maxY = p.wy;
+    }
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    // A single hit has zero extent; give it a readable window, not max zoom.
+    const half = Math.max(maxX - minX, maxY - minY, 0.05) / 2;
+    Object.assign(
+      m.vp,
+      this._vpFromWorldBounds(cx - half, cx + half, cy - half, cy + half),
+    );
+    this.deps.canvas.scheduleDraw();
+    m.saveLS();
+  }
+
+  /**
    * Abort an in-flight box/lasso/drag gesture (the deselect hotkey).
    * Returns true when a gesture was cancelled; false means the caller should
    * fall through to clearing the selection.

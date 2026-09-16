@@ -13,7 +13,7 @@ backend/
   app.py                  CLI entry + wiring (helpers, ANALYSIS_DEPS, worker registration)
   factory.py              create_app() + blueprint registration
   trackspace_state.py     TrackspaceState: caches, roots, queue, workers, clusters
-  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, static_audio)
+  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, static_audio)
   tags.py                 ID3 tag read/write via mutagen
   cache.py                TrackCache (path+mtime → metadata, LRU + SQLite)
   fingerprint.py          Chromaprint audio fingerprinting (fpcalc)
@@ -46,7 +46,8 @@ frontend/src/
                             folder-tree-coordinator HTMX tree, roots, highlights, overlay
                             canvas-interaction     pointer gestures + transforms + fit view
                             options-panel          right-column controls
-  components/             one view per file (canvas, tags, properties, batch, status)
+                            search-coordinator     semantic search: fetch, selection, results panel
+  components/             one view per file (canvas, tags, properties, batch, status, search)
   lib/toast.ts            shared DOM helpers
   lib/api.ts              shared fetch / postJSON
 tests/                    pytest suite (backend); vitest lives beside frontend sources

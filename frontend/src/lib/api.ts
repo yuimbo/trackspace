@@ -25,8 +25,12 @@ async function request<T>(url: string, init: RequestInit | undefined, silent: bo
   return res.json();
 }
 
-export function api<T = unknown>(url: string, opts?: RequestInit): Promise<T> {
-  return request<T>(url, opts, false);
+/**
+ * ``api`` toasts failures by default; pass ``silent`` when the caller renders the
+ * error itself (e.g. an inline error in a panel rather than a global toast).
+ */
+export function api<T = unknown>(url: string, opts?: RequestInit, silent = false): Promise<T> {
+  return request<T>(url, opts, silent);
 }
 
 export function postJSON<T = unknown>(url: string, body: unknown, silent = false): Promise<T> {

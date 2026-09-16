@@ -13,6 +13,7 @@ const IS_MAC =
 const MOD_SYMBOL = IS_MAC ? "⌘" : "Ctrl+";
 
 export const HOTKEY_MAP: HotkeyBinding[] = [
+  { action: "focus-search",   key: "/",      mod: false, shift: false, alt: false, label: "/",                      description: "Focus semantic search" },
   { action: "toggle-preview",  key: "m",      mod: false, shift: false, alt: false, label: "M",                      description: "Toggle hover preview" },
   { action: "fit-view",        key: "h",      mod: false, shift: false, alt: false, label: "H",                      description: "Fit view to hovered folder or track's folder (80% radius), else full view" },
   { action: "focus-folder",    key: "f",      mod: false, shift: false, alt: false, label: "F",                      description: "Select all tracks in hovered folder or track's folder (and subfolders)" },

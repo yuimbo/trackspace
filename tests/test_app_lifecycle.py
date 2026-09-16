@@ -49,5 +49,7 @@ def test_build_app_accepts_injected_state(tmp_path):
             "load_roots_state",
             "schedule_root_watch",
         }
+        # The search blueprint is registered with the existing deps (no new wiring).
+        assert "/api/search" in {r.rule for r in app.url_map.iter_rules()}
     finally:
         state.thread_pool.shutdown(wait=False)

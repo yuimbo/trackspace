@@ -590,6 +590,26 @@ export class Model extends EventBus {
     this.emit("change");
   }
 
+  /**
+   * Replace the whole selection with *paths*, dropping paths the model does not
+   * know (e.g. a search hit for a file added since the last library load).
+   * No-ops when the resulting set equals the current one.
+   */
+  replaceSelection(paths: Iterable<string>): void {
+    const next = new Set<string>();
+    for (const p of paths) {
+      if (this.trackByPath(p)) next.add(p);
+    }
+    if (
+      next.size === this.selected.size &&
+      [...next].every((p) => this.selected.has(p))
+    )
+      return;
+    this.selected.clear();
+    for (const p of next) this.selected.add(p);
+    this.emit("change");
+  }
+
   selectInFolder(folderPath: string): void {
     const norm = !folderPath || folderPath === "." ? "" : folderPath;
     for (const t of this.allTracks) {

@@ -190,6 +190,29 @@ constant auto-invalidates stale entries. Old-version rows are purged on server s
 When changing how embeddings are produced (model, chunk strategy, post-processing),
 bump `EMBEDDING_VERSION` and add a row to the table above.
 
+### Text search (`backend/routes/api_search.py`)
+
+`GET /api/search?q=…&limit=50` encodes the query with CLAP's text tower and ranks
+every cached CLAP audio embedding by cosine similarity — the retrieval use of the same
+text encoder that semantic weighting already projects tag/folder names with. It is
+**read-only over `FeatureCache`** (no encoder re-runs over the library) and returns
+the top-N hits plus `searched` / `total_tracks` coverage counts. The text forward
+pass runs on the request thread under `clap.inference_lock`, exactly like semantic
+weighting during a projection request. The frontend turns the hits into the canvas
+selection and lists them (with score bars) in the Search panel; clicking a result
+selects it alone and fits the viewport to it.
+
+**Known limitation — CLAP text/audio alignment is weak in this environment.** Measured
+against the real library, `laion/larger_clap_music` produces near-degenerate embeddings:
+text-vs-text cosine ≈ 0.999, audio-vs-audio ≈ 0.95–0.996, and text-vs-audio ≈ 0.00,
+so the canonical HF pipeline gives a uniform softmax (0.0834 across 12 labels on a
+techno track; white noise and silence give *identical* outputs). This holds on CPU and
+MPS and under both `transformers` 4.57.1 and 5.3.0, with no missing checkpoint
+keys, correct `audio=` processor usage, and valid log-mel input — so it is not our decode,
+device, or version. It also makes the existing CLAP semantic weighting inert. Tracked in
+`TODO.md` under *Dependencies*; the search endpoint is correct and will produce
+meaningful rankings once the CLAP path is fixed.
+
 ---
 
 ## MAEST model management

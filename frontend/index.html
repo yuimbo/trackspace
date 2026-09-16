@@ -34,6 +34,20 @@
 
 <!-- component: right-panel -->
 <aside id="right-panel">
+  <!-- component: search-panel -->
+  <section id="search-section" x-data>
+    <h2>Search</h2>
+    <input
+      id="search-input"
+      type="search"
+      placeholder="Describe the sound…  /"
+      spellcheck="false"
+      autocomplete="off"
+      title="Semantic search over the cached CLAP embeddings"
+    />
+    <div id="search-results"></div>
+  </section>
+
   <section id="properties-section" x-data>
     <h2>Properties</h2>
     <div id="properties-list"></div>

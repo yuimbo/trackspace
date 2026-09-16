@@ -16,6 +16,7 @@ from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
 from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
+from backend.routes.api_search import create_api_search_blueprint
 from backend.routes.api_tags import create_api_tags_blueprint
 from backend.routes.static_audio import create_static_audio_blueprint
 from backend.services.request_validation import ApiValidationError
@@ -141,6 +142,14 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             job_queue=deps.job_queue,
             maest_mod=deps.maest_mod,
             rhythm_version=deps.rhythm_version,
+        )
+    )
+    app.register_blueprint(
+        create_api_search_blueprint(
+            clap_mod=deps.embeddings_mod,
+            feature_cache=deps.feature_cache,
+            embedding_version=deps.embedding_version,
+            build_track_infos_fn=deps.build_track_infos_fn,
         )
     )
     app.register_blueprint(

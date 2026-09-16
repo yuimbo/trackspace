@@ -10,6 +10,7 @@ import {
   PropertiesView,
   BatchView,
   StatusView,
+  SearchView,
 } from "./components";
 import { Controller } from "./controller";
 import { renderShortcutList } from "./hotkeys";
@@ -35,6 +36,10 @@ const props = new PropertiesView(
 const batch = new BatchView(model, document.getElementById("batch-list")!);
 const status = new StatusView();
 status.update(model);
+const search = new SearchView(
+  model,
+  document.getElementById("search-section")!,
+);
 
 const ctrl = new Controller(
   model,
@@ -44,6 +49,7 @@ const ctrl = new Controller(
   props,
   batch,
   status,
+  search,
 );
 void ctrl.init();
 

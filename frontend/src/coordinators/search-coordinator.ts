@@ -1,0 +1,98 @@
+// ─── SearchCoordinator ───────────────────────────────────────
+//
+// Owns semantic search: run the query against `/api/search`, turn the ranked
+// hits into the canvas selection, and feed the right-panel result list. Extracted
+// from `Controller` — the fetch/select/rank flow is independent of the DOM-heavy
+// views, so the deps are structural and the coordinator is unit-testable.
+//
+// Search is whole-library: the backend ranks every track with a cached CLAP
+// embedding, and the map shows the whole library too.
+
+import { type Model } from "../model";
+import type { SearchResult, SearchMeta } from "../components/search-view";
+
+/** Ranked result list size requested from the backend (1–200). */
+export const SEARCH_LIMIT = 50;
+
+/** Shape of ``GET /api/search``. */
+export interface SearchResponse {
+  ok: boolean;
+  query?: string;
+  results?: SearchResult[];
+  searched?: number;
+  total_tracks?: number;
+  error?: string;
+}
+
+/** The parts of `SearchView` this coordinator drives (structural for tests). */
+export interface SearchViewLike {
+  setBusy(busy: boolean): void;
+  clear(): void;
+  showError(message: string): void;
+  renderResults(results: SearchResult[], meta: SearchMeta): void;
+}
+
+export interface SearchCoordinatorDeps {
+  model: Model;
+  view: SearchViewLike;
+  /** Fetch ranked matches for a query (injectable so tests avoid `fetch`). */
+  fetchResults(query: string, limit: number): Promise<SearchResponse>;
+  /** Fit the canvas viewport to the given paths (result-row focus). */
+  fitToPaths(paths: string[]): void;
+}
+
+export class SearchCoordinator {
+  private _lastQuery = "";
+
+  constructor(private deps: SearchCoordinatorDeps) {}
+
+  /** Clear the result list (the box clears itself). */
+  clear(): void {
+    this._lastQuery = "";
+    this.deps.view.clear();
+  }
+
+  /**
+   * Encode *rawQuery* server-side and make the ranked hits the selection.
+   *
+   * A later query always wins: a response that arrives after a newer query was
+   * submitted is dropped rather than overwriting the newer results.
+   */
+  async search(rawQuery: string): Promise<void> {
+    const query = rawQuery.trim();
+    this._lastQuery = query;
+    if (!query) {
+      this.deps.view.clear();
+      return;
+    }
+
+    this.deps.view.setBusy(true);
+    let body: SearchResponse;
+    try {
+      body = await this.deps.fetchResults(query, SEARCH_LIMIT);
+    } catch (err) {
+      if (this._lastQuery !== query) return;
+      this.deps.view.setBusy(false);
+      this.deps.view.showError(err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (this._lastQuery !== query) return;
+    this.deps.view.setBusy(false);
+
+    const m = this.deps.model;
+    // Drop hits for files added since the last library load: the model cannot
+    // resolve them, so they must not enter the selection.
+    const results = (body.results ?? []).filter((r) => m.trackByPath(r.path));
+    m.replaceSelection(results.map((r) => r.path));
+    this.deps.view.renderResults(results, {
+      searched: body.searched ?? 0,
+      totalTracks: body.total_tracks ?? results.length,
+    });
+  }
+
+  /** Focus one hit: select it alone and fit the viewport to it. */
+  focusResult(path: string): void {
+    this.deps.model.replaceSelection([path]);
+    this.deps.fitToPaths([path]);
+  }
+}

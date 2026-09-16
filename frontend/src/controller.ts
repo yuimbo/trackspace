@@ -5,9 +5,10 @@ import type {
   PropertiesView,
   BatchView,
   StatusView,
+  SearchView,
 } from "./components";
 import { toast, showLoad, hideLoad } from "./lib/toast";
-import { postJSON } from "./lib/api";
+import { api, postJSON } from "./lib/api";
 import {
   CommandManager,
   RenameTagCommand,
@@ -20,6 +21,10 @@ import { EmbeddingCoordinator } from "./coordinators/embedding-coordinator";
 import { FolderTreeCoordinator } from "./coordinators/folder-tree-coordinator";
 import { CanvasInteractionController } from "./coordinators/canvas-interaction";
 import { OptionsPanelBinder } from "./coordinators/options-panel";
+import {
+  SearchCoordinator,
+  type SearchResponse,
+} from "./coordinators/search-coordinator";
 
 // ─── Constants ───────────────────────────────────────────────
 const FLUSH_MS = 500;
@@ -54,6 +59,7 @@ export class Controller {
   private props: PropertiesView;
   private batch: BatchView;
   private status: StatusView;
+  private searchView: SearchView;
 
   private previewPath: string | null = null;
   private $audio: HTMLAudioElement;
@@ -76,6 +82,9 @@ export class Controller {
   /** Right-column Options panel controls. */
   private options: OptionsPanelBinder;
 
+  /** Semantic search: query fetch, result selection, result panel. */
+  private search: SearchCoordinator;
+
   constructor(
     model: Model,
     canvasView: CanvasView,
@@ -84,6 +93,7 @@ export class Controller {
     propsView: PropertiesView,
     batchView: BatchView,
     statusView: StatusView,
+    searchView: SearchView,
   ) {
     this.model = model;
     this.canvas = canvasView;
@@ -92,6 +102,7 @@ export class Controller {
     this.props = propsView;
     this.batch = batchView;
     this.status = statusView;
+    this.searchView = searchView;
 
     this.cmdMgr = new CommandManager((effect) => {
       if (effect === "tags-dirty") {
@@ -141,6 +152,18 @@ export class Controller {
       onHoverFolderChanged: () => this.folders.updateHighlights(),
       onHoverPreview: () => this._handlePreview(),
       stopPreview: () => this._stopPreview(),
+    });
+
+    this.search = new SearchCoordinator({
+      model,
+      view: searchView,
+      fetchResults: (query, limit) =>
+        api<SearchResponse>(
+          `/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+          undefined,
+          true,
+        ),
+      fitToPaths: (paths) => this.interaction.fitViewToPaths(paths),
     });
 
     this.folders = new FolderTreeCoordinator({
@@ -244,14 +267,22 @@ export class Controller {
         if (!keepPaths.has(p)) m.selected.delete(p);
       m.emit("change");
     };
-    this.props.onHoverTrack = (path) => {
+    // Hovering a selected track (Properties) or a search hit previews it.
+    const onHoverTrack = (path: string) => {
       if (!m.hoverPreview) return;
       const t = m.trackByPath(path);
       if (t) this._startPreview(t);
     };
-    this.props.onHoverEnd = () => {
-      this._stopPreview();
+    const onHoverEnd = () => this._stopPreview();
+    this.props.onHoverTrack = onHoverTrack;
+    this.props.onHoverEnd = onHoverEnd;
+    this.searchView.onHoverTrack = onHoverTrack;
+    this.searchView.onHoverEnd = onHoverEnd;
+
+    this.searchView.onSearch = (query) => {
+      void this.search.search(query);
     };
+    this.searchView.onFocusResult = (path) => this.search.focusResult(path);
 
     this.batch.onApply = (tag, updates) => {
       for (const [path, value] of updates) {
@@ -527,6 +558,8 @@ export class Controller {
   private _bindKeyboard(): void {
     const m = this.model;
     const hk = this.hotkeyMgr;
+
+    hk.on("focus-search", () => this.searchView.focusInput());
 
     hk.on("toggle-preview", () => {
       m.hoverPreview = !m.hoverPreview;
