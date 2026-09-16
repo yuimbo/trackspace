@@ -9,7 +9,7 @@ pipeline is ``features → standardize → PCA(64–256) → cosine kNN → Leid
 the 2-D layout is computed separately.
 
 **Weighted blocks, not blind concatenation.** Each source (MAEST style logits,
-MAEST embedding, rhythm, CLAP, EffNet, classical features) is L2-normalised
+MAEST embedding, rhythm, CLAP, classical features) is L2-normalised
 *within its block* and then scaled by ``sqrt(weight)``. Because squared
 Euclidean distance decomposes as a sum over blocks, scaling a block by
 ``sqrt(w)`` makes it contribute exactly ``w ×`` its distance — so the familiar
@@ -38,13 +38,13 @@ log = logging.getLogger(__name__)
 CLUSTERING_VERSION = 1
 
 #: Plan §8 starting weights. MAEST's genre/style space leads; rhythm is a
-#: meaningful but minority voice; CLAP/EffNet are complementary texture.
+#: meaningful but minority voice; CLAP is complementary texture (and the only
+#: text encoder — see ``projection_config``).
 DEFAULT_WEIGHTS: dict[str, float] = {
     "maest_logits": 0.45,
     "maest": 0.25,
     "rhythm": 0.15,
     "clap": 0.10,
-    "effnet": 0.05,
     "supervised": 0.15,
     "features": 0.00,
 }

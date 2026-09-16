@@ -1,7 +1,7 @@
 """Shared embedding-space layout: composite vectors and 2-D projection.
 
-CLAP model I/O lives in `clap.py`. EffNet and librosa descriptors live in
-`effnet` / `librosa_audio_features`). This module concatenates cached source rows
+CLAP model I/O lives in `clap.py`. Librosa descriptors live in
+`librosa_audio_features.py`. This module concatenates cached source rows
 and orchestrates projection; semantic re-weighting lives in `semantic_weighting` and
 the PCA / t-SNE backends in `projection_backends`. Re-exported from
 ``backend.embeddings``.
@@ -96,13 +96,12 @@ def _supervised_cache_version(feature_cache) -> int:
 
 
 def _source_versions_token(feature_cache=None) -> str:
-    from .effnet import EFFNET_VERSION
     from .librosa_audio_features import FEATURES_VERSION
     from .maest import MAEST_VERSION
     from .rhythm_features import RHYTHM_VERSION
 
     return (
-        f"C{EMBEDDING_VERSION}E{EFFNET_VERSION}F{FEATURES_VERSION}"
+        f"C{EMBEDDING_VERSION}F{FEATURES_VERSION}"
         f"M{MAEST_VERSION}R{RHYTHM_VERSION}"
         f"S{_supervised_cache_version(feature_cache)}"
     )
@@ -149,14 +148,12 @@ def _source_version(source: str, feature_cache=None) -> int:
     For ``supervised`` this is the current training-run id, so a retrain
     invalidates the in-process composite and row caches.
     """
-    from .effnet import EFFNET_VERSION
     from .librosa_audio_features import FEATURES_VERSION
     from .maest import MAEST_VERSION
     from .rhythm_features import RHYTHM_VERSION
 
     return {
         "clap": EMBEDDING_VERSION,
-        "effnet": EFFNET_VERSION,
         "features": FEATURES_VERSION,
         "maest": MAEST_VERSION,
         "maest_logits": MAEST_VERSION,
@@ -175,7 +172,7 @@ def _get_prepared_source_row(
 ) -> np.ndarray:
     """Return one track row for *source* with the same preprocessing as composite gather.
 
-    Every source is L2-normalised so a high-dimensional block (1280-D EffNet)
+    Every source is L2-normalised so a high-dimensional block (768-D MAEST)
     cannot dominate a low-dimensional one (14-D rhythm) through sheer length.
     Relative influence is then set explicitly by the per-source weights applied
     in :func:`_gather_composite_vecs`, not by dimensionality.

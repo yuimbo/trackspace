@@ -5,7 +5,7 @@ cheap CPU stage (tag scan). The worker owns the whole lifecycle:
 
     claim(batch) → handler(jobs) → complete()/fail() → publish event
 
-Handlers receive a *list* of jobs so GPU stages can batch (MAEST/EffNet want
+Handlers receive a *list* of jobs so GPU stages can batch (MAEST/CLAP want
 batched inference), and report per-job outcomes back. A handler that raises is
 treated as "every job in the batch failed" — the queue's retry budget then
 decides whether they come back.

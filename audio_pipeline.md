@@ -9,7 +9,7 @@ clustering, plus the durable job queue that runs it. System shape lives in
 ## Overview
 
 Trackspace supports content-based audio similarity via **chromaprint** fingerprinting
-and several embedding models (**CLAP**, **MAEST**, **EffNet**, **rhythm**, **librosa
+and several embedding models (**CLAP**, **MAEST**, **rhythm**, **librosa
 audio features**). Expensive analysis runs through a durable SQLite-backed job queue.
 
 ```
@@ -75,7 +75,7 @@ worker thread per stage, so decode that was serial by construction now overlaps.
 | Cache | File | Key | Stores |
 |-------|------|-----|--------|
 | `TrackCache` | `data/track_cache.db` | `(path, mtime)` | ID3 tags, metadata, chromaprint fingerprint hash |
-| `FeatureCache` | `data/audio_features.db` | `fingerprint` (SHA-256 of chromaprint) | one row per source: CLAP/MAEST/EffNet/rhythm/features vectors + version |
+| `FeatureCache` | `data/audio_features.db` | `fingerprint` (SHA-256 of chromaprint) | one row per source: CLAP/MAEST/rhythm/features vectors + version |
 
 The split means identical audio content (same recording, different filenames) shares one
 embedding entry. `TrackCache` still invalidates on mtime change; `FeatureCache` is
@@ -85,8 +85,8 @@ content-addressed and versioned.
 
 ## Embedding sources
 
-Three sources can be independently enabled via checkboxes in the Options panel.
-The user can activate any combination (at least one must stay on):
+The source set is fixed (`FROZEN_SOURCES`); the Options panel exposes one weight
+slider per source, and **Apply** sends the vector to both the map and the clusters.
 
 | Source | Module | Dimensions | Model |
 |--------|--------|-----------|-------|
@@ -94,7 +94,6 @@ The user can activate any combination (at least one must stay on):
 | MAEST embedding | `backend/embeddings/maest.py` | 768 | same model pass |
 | Rhythm | `backend/embeddings/rhythm_features.py` | 14 | `librosa` DSP |
 | CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
-| EffNet | `backend/embeddings/effnet.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
 | Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
 | Supervised | `backend/embeddings/supervised.py` | 128 | folder-labelled projection head over the cached blocks (no encoder) |
 
@@ -103,7 +102,6 @@ The user can activate any combination (at least one must stay on):
 | Source | Version constant | Cache columns |
 |--------|-----------------|---------------|
 | CLAP | `EMBEDDING_VERSION` (`embeddings/clap.py`) | `clap_embedding`, `version` |
-| EffNet | `EFFNET_VERSION` (`embeddings/effnet.py`) | `effnet_embedding`, `effnet_version` |
 | Audio features | `FEATURES_VERSION` (`embeddings/librosa_audio_features.py`) | `features`, `features_version` |
 | MAEST | `MAEST_VERSION` (`embeddings/maest.py`) | `maest_embedding` + `maest_logits` + `maest_excerpts`, `maest_version` |
 | Rhythm | `RHYTHM_VERSION` (`embeddings/rhythm_features.py`) | `rhythm`, `rhythm_version` |
@@ -213,22 +211,6 @@ tracks without re-running inference.
 
 ---
 
-## EffNet model management
-
-The `discogs-effnet-bsdynamic-1.onnx` file (~18 MB) is auto-downloaded from
-`essentia.upf.edu` to `data/models/` on first use.  The `data/` directory
-is gitignored.  Loading is gated behind `--no-effnet` CLI flag (parallel
-to `--no-clap`).  If `onnxruntime` is not installed, EffNet features are
-silently unavailable.
-
-**Mel-spectrogram preprocessing** (matches Essentia's `TensorflowInputMusiCNN`):
-`librosa.feature.melspectrogram(sr=16000, n_fft=512, hop_length=256, n_mels=96)`
-followed by `np.log10(10000 * mel + 1)`.  The mel is then patched into
-128-frame windows (hop 64) and fed to the ONNX model.  Recipe confirmed
-equivalent by Essentia maintainers: https://github.com/MTG/essentia/issues/1471
-
----
-
 ## Audio feature extraction (`librosa` + optional `madmom`)
 
 **Audio feature vector (6D):**
@@ -266,7 +248,7 @@ distinct neighbouring genres.
 `_gather_composite_vecs` in `embeddings/layout.py`:
 
 Each enabled source block is **L2-normalized per row** before concatenation so
-that 1280-D EffNet does not dominate 14-D rhythm through dimensionality, then
+that 768-D MAEST does not dominate 14-D rhythm through dimensionality, then
 scaled by `sqrt(weight)` from `FROZEN_SOURCE_WEIGHTS` so relative influence is
 set explicitly (same algebra as the clustering pipeline — see *Microgenre
 clustering*).
@@ -453,6 +435,13 @@ the head sidecar and mirrored into the `feature_meta` table). Layout and cluster
 revisions include the run id, so a retrain invalidates cached coordinates; the
 openTSNE fit and composite caches include it via `_source_versions_token`.
 
+**A changed input space needs a retrain.** The head's `input_sources` and `in_dim`
+are recorded at training time; `project_supervised_missing` refuses to project new
+tracks when the gathered input space no longer matches (it logs "input space changed"
+and returns 0). Any change to `FROZEN_SOURCES` — e.g. adding the `clap` block or
+removing a source — therefore requires one manual retrain (the *Train folder view*
+button) before new tracks get supervised rows again.
+
 **Triggers and staleness.** Training is a library-wide singleton (`"library"` dedupe
 key). It is queued manually (the *Train folder view* button) or automatically once
 after the first MAEST pass drains while no head exists. New tracks analysed later are
@@ -513,7 +502,7 @@ re-cluster like any other per-track stage.
    a stage whose model never loads would otherwise leave jobs pending forever
    (the `clap_enabled` gate on `enqueue_library_work`).
 
-`--no-maest` / `--no-clap` / `--no-effnet` skip eager model loading. Flask runs
+`--no-maest` / `--no-clap` skip eager model loading. Flask runs
 with `use_reloader=False`: the reloader would fork a second set of worker
 threads competing for the same queue.
 
@@ -561,7 +550,6 @@ and every resolution returned the same 9 clusters.
 | `maest` | 0.25 | Audio semantics from the hidden embedding |
 | `rhythm` | 0.15 | Groove/BPM distinctions between neighbouring genres |
 | `clap` | 0.10 | Complementary texture **+ the only text encoder** |
-| `effnet` | 0.05 | Complementary texture |
 | `supervised` | 0.15 | Learned folder-organisation signal (absent until trained) |
 | `features` | 0.00 | Off by default (subsumed by `rhythm`) |
 
@@ -602,7 +590,7 @@ CLAP would remove that capability.
 placed; optional sources — including `supervised` — contribute a neutral zero row
 when missing, so a partially analysed (or not-yet-trained) library still renders
 instead of hiding tracks until every model has run. The frontend gates the embedding
-view on **MAEST only** — gating on CLAP/EffNet left the canvas stuck on "loading
+view on **MAEST only** — gating on CLAP left the canvas stuck on "loading
 models…" under `--no-clap`.
 
 ### Resolutions

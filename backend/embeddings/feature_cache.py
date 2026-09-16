@@ -1,6 +1,5 @@
-"""Content-addressed cache for audio features (CLAP embeddings, EffNet
-embeddings, MAEST embeddings/style logits, rhythm features, and extracted
-audio features).
+"""Content-addressed cache for audio features (CLAP embeddings, MAEST
+embeddings/style logits, rhythm features, and extracted audio features).
 
 Keyed by chromaprint fingerprint hash so identical audio content shares
 one entry regardless of filename or location.
@@ -9,19 +8,19 @@ Same two-layer (memory LRU + SQLite) pattern as TrackCache.
 
 All sources share one generic implementation, driven by the :data:`_SOURCES`
 registry. Each source carries its own ``version`` integer so that bumping one
-source (e.g. CLAP) does not invalidate others (e.g. EffNet). The public API is
+source (e.g. CLAP) does not invalidate others (e.g. MAEST). The public API is
 source-parameterised::
 
     cache.get("clap", fp)
     cache.put("rhythm", fp, vec)
     cache.has("maest", fp)
-    cache.get_all("effnet", fingerprints)
+    cache.get_all("supervised", fingerprints)
     cache.count("features")
     cache.purge_old_versions("clap", current_version)
     cache.put_maest(fp, embedding, logits, excerpts)   # paired escape hatch
 
-Canonical source names are ``clap``, ``effnet``, ``features``, ``maest``,
-``maest_logits``, ``maest_excerpts`` and ``rhythm``.
+Canonical source names are ``clap``, ``features``, ``maest``, ``maest_logits``,
+``maest_excerpts`` and ``rhythm``.
 
 ``maest_excerpts`` stores the per-excerpt MAEST embeddings as one flat float32
 blob of shape ``(n_excerpts, MAEST_EMBED_DIM)``. It shares ``maest_version``
@@ -78,7 +77,6 @@ class _SourceSpec:
 #: projection, clustering and coverage.
 _SOURCES: dict[str, _SourceSpec] = {
     "clap": _SourceSpec("clap_embedding", "version", "clap:"),
-    "effnet": _SourceSpec("effnet_embedding", "effnet_version", "effnet:"),
     "features": _SourceSpec("features", "features_version", "feat:"),
     "maest": _SourceSpec(
         "maest_embedding",
@@ -154,8 +152,6 @@ class FeatureCache:
             )
             for col, default in [
                 ("version", "INTEGER NOT NULL DEFAULT 0"),
-                ("effnet_embedding", "BLOB"),
-                ("effnet_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("features", "BLOB"),
                 ("features_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("maest_embedding", "BLOB"),
@@ -213,7 +209,7 @@ class FeatureCache:
             raise ValueError(f"unknown source {source!r}") from None
 
     # ── Memory LRU ────────────────────────────────────────────
-    # Keys are prefixed per source: "clap:fp", "effnet:fp", "feat:fp",
+    # Keys are prefixed per source: "clap:fp", "feat:fp",
     # "maest:fp", "maestlog:fp", "rhythm:fp".
 
     def _lru_put(self, key: str, data: np.ndarray) -> None:

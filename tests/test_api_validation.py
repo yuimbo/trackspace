@@ -304,9 +304,7 @@ def test_roots_add_missing_path_is_400(folders_client):
 def embeddings_client():
     bp = create_api_embeddings_blueprint(
         embeddings_mod=None,
-        audio_features_mod=None,
         embedding_version=1,
-        effnet_version=1,
         features_version=1,
         feature_cache=None,
         source_versions_cls=object,

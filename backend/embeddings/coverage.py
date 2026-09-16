@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class SourceVersions:
     clap: int
-    effnet: int
     features: int
     maest: int = 0
     rhythm: int = 0
@@ -30,7 +29,6 @@ class CachedSourceMaps:
     """Fingerprint → row maps from one batch read per source."""
 
     clap: Mapping[str, object]
-    effnet: Mapping[str, object]
     features: Mapping[str, object]
     maest: Mapping[str, object] = field(default_factory=dict)
     maest_logits: Mapping[str, object] = field(default_factory=dict)
@@ -40,7 +38,6 @@ class CachedSourceMaps:
     def for_source(self, source: str) -> Mapping[str, object]:
         return {
             "clap": self.clap,
-            "effnet": self.effnet,
             "features": self.features,
             "maest": self.maest,
             "maest_logits": self.maest_logits,
@@ -56,7 +53,6 @@ def batch_fetch_maps(
 ) -> CachedSourceMaps:
     return CachedSourceMaps(
         clap=feature_cache.get_all("clap", fingerprints, version=versions.clap),
-        effnet=feature_cache.get_all("effnet", fingerprints, version=versions.effnet),
         features=feature_cache.get_all("features", fingerprints, version=versions.features),
         maest=feature_cache.get_all("maest", fingerprints, version=versions.maest),
         maest_logits=feature_cache.get_all(
@@ -125,7 +121,7 @@ def build_generation_work(
     maps = batch_fetch_maps(feature_cache, fps, versions)
 
     # "maest_logits" rides along with "maest" — one model pass produces both.
-    checkable = [s for s in sources if s in ("clap", "effnet", "features", "maest", "rhythm")]
+    checkable = [s for s in sources if s in ("clap", "features", "maest", "rhythm")]
 
     work: list[tuple[dict, list[str]]] = []
     for t in infos:
@@ -148,14 +144,12 @@ def coverage_payload(
     fingerprinted = sum(1 for t in infos if t.get("fingerprint"))
 
     tracks_with_clap = tracks_with_fp_in_maps(infos, maps, "clap")
-    tracks_with_effnet = tracks_with_fp_in_maps(infos, maps, "effnet")
     tracks_with_features = tracks_with_fp_in_maps(infos, maps, "features")
     tracks_with_maest = tracks_with_fp_in_maps(infos, maps, "maest")
     tracks_with_rhythm = tracks_with_fp_in_maps(infos, maps, "rhythm")
     tracks_with_supervised = tracks_with_fp_in_maps(infos, maps, "supervised")
 
     pending_clap = pending_tracks_for_source(fingerprinted, tracks_with_clap)
-    pending_effnet = pending_tracks_for_source(fingerprinted, tracks_with_effnet)
     pending_features = pending_tracks_for_source(fingerprinted, tracks_with_features)
     pending_maest = pending_tracks_for_source(fingerprinted, tracks_with_maest)
     pending_rhythm = pending_tracks_for_source(fingerprinted, tracks_with_rhythm)
@@ -166,8 +160,6 @@ def coverage_payload(
         "tracks_with_fingerprint": fingerprinted,
         "tracks_with_clap": tracks_with_clap,
         "tracks_pending_clap": pending_clap,
-        "tracks_with_effnet": tracks_with_effnet,
-        "tracks_pending_effnet": pending_effnet,
         "tracks_with_audio_features": tracks_with_features,
         "tracks_pending_audio_features": pending_features,
         "tracks_with_maest": tracks_with_maest,
@@ -178,7 +170,6 @@ def coverage_payload(
         "tracks_pending_supervised": pending_supervised,
         "cache_versions": {
             "clap": versions.clap,
-            "effnet": versions.effnet,
             "audio_features": versions.features,
             "maest": versions.maest,
             "rhythm": versions.rhythm,
@@ -189,8 +180,6 @@ def coverage_payload(
         "fingerprinted": fingerprinted,
         "embedded": tracks_with_clap,
         "pending": pending_clap,
-        "effnet_embedded": tracks_with_effnet,
-        "effnet_pending": pending_effnet,
         "features_extracted": tracks_with_features,
         "features_pending": pending_features,
         "embedding_version": versions.clap,

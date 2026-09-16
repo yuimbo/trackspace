@@ -34,9 +34,7 @@ class _Broadcaster(Protocol):
 def create_api_embeddings_blueprint(
     *,
     embeddings_mod: Any,
-    audio_features_mod: Any,
     embedding_version: int,
-    effnet_version: int,
     features_version: int,
     feature_cache: Any,
     source_versions_cls: type,
@@ -102,7 +100,6 @@ def create_api_embeddings_blueprint(
     def _versions() -> Any:
         return source_versions_cls(
             embedding_version,
-            effnet_version,
             features_version,
             maest_mod.MAEST_VERSION,
             rhythm_version,
@@ -113,7 +110,6 @@ def create_api_embeddings_blueprint(
         """Cache generations that feed the layout revision hash."""
         return (
             versions.clap,
-            versions.effnet,
             versions.features,
             versions.maest,
             versions.rhythm,
@@ -147,7 +143,6 @@ def create_api_embeddings_blueprint(
             running, progress = _analysis_progress()
             return jsonify({
                 "model_ready": embeddings_mod.is_model_ready(),
-                "effnet_model_ready": audio_features_mod.is_effnet_ready(),
                 "maest_model_ready": maest_mod.is_model_ready(),
                 "generating": running,
                 "progress": progress if running else None,
@@ -194,7 +189,6 @@ def create_api_embeddings_blueprint(
         payload = {
             **base,
             "model_ready": embeddings_mod.is_model_ready(),
-            "effnet_model_ready": audio_features_mod.is_effnet_ready(),
             "maest_model_ready": maest_mod.is_model_ready(),
             "maest_error": maest_mod.load_error(),
             "generating": running,

@@ -1,4 +1,4 @@
-"""CLAP / EffNet / librosa features, FeatureCache, coverage, and 2-D layout.
+"""CLAP / librosa features, FeatureCache, coverage, and 2-D layout.
 
 Public symbols are loaded lazily so ``import backend.embeddings.audio_features`` does not
 import the layout / projection stack.

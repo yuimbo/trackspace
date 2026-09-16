@@ -58,9 +58,7 @@ def _stats(features_done: int, maest_done: int) -> dict:
 def _stream(client_queue: _FakeQueue, broadcaster: _FakeBroadcaster):
     bp = create_api_embeddings_blueprint(
         embeddings_mod=None,
-        audio_features_mod=None,
         embedding_version=1,
-        effnet_version=1,
         features_version=1,
         feature_cache=None,
         source_versions_cls=object,

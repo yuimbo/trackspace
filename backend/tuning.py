@@ -20,15 +20,6 @@ from typing import Final
 BPM_LO: Final[float] = 60.0
 BPM_HI: Final[float] = 200.0
 
-# --- EffNet ONNX model download (backend/embeddings/effnet.py) ---
-
-#: Reject a downloaded/cached model smaller than this many bytes. The published
-#: file is ~18 MB; this catches truncation before the checksum is even read.
-EFFNET_MODEL_MIN_BYTES: Final[int] = 10_000_000
-
-#: Download attempts before the loader gives up and raises.
-EFFNET_DOWNLOAD_MAX_RETRIES: Final[int] = 3
-
 # --- Projection recipe (backend/embeddings/projection_config.py) ---
 
 #: Blend weight for the 6-D audio-feature block when it is folded into the

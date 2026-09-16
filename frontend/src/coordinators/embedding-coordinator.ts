@@ -140,9 +140,6 @@ export class EmbeddingCoordinator {
         embedded: number;
         pending: number;
         model_ready: boolean;
-        effnet_embedded: number;
-        effnet_pending: number;
-        effnet_model_ready: boolean;
         maest_model_ready?: boolean;
         maest_error?: string | null;
         tracks_with_maest?: number;
@@ -156,9 +153,9 @@ export class EmbeddingCoordinator {
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
       // Only MAEST gates the map: it is the required source (see the backend's
-      // REQUIRED_SOURCES). CLAP/EffNet are optional low-weight blocks, so a
-      // server started with --no-clap/--no-effnet must still render — blocking
-      // on them left the canvas stuck on "loading models…" forever.
+      // REQUIRED_SOURCES). CLAP is an optional low-weight block, so a server
+      // started with --no-clap must still render — blocking on it left the
+      // canvas stuck on "loading models…" forever.
       const modelsBlocked = status.maest_model_ready === false;
       m.embeddingModelsLoading = modelsBlocked;
       if (modelsBlocked) {
@@ -224,7 +221,6 @@ export class EmbeddingCoordinator {
       try {
         const status = await api<{
           model_ready: boolean;
-          effnet_model_ready: boolean;
           maest_model_ready?: boolean;
         }>("/api/embeddings/status?folder=&recursive=1&models_only=1");
         if (status.maest_model_ready !== false) {

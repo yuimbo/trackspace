@@ -33,7 +33,7 @@ backend/
     rhythm_features.py    14-D rhythm/DSP descriptors
     clap.py               CLAP audio + text encoder
     feature_cache.py      content-addressed SQLite cache (7 vector sources)
-    ...                   effnet, audio_decode, librosa features, coverage, revision
+    ...                   audio_decode, librosa features, coverage, revision
   templates/partials/     Jinja templates served by Flask (HTMX)
 frontend/src/
   controller.ts           wiring: events, view callbacks, API calls, keyboard dispatch
@@ -138,7 +138,7 @@ Never emit `"change"` inside a tight animation loop.
 Principles that emerged from consolidating the embedding / audio-feature stack into
 `backend/embeddings/` and similar cleanups:
 
-- **Co-locate what changes together.**  CLAP, EffNet, librosa features, FeatureCache,
+- **Co-locate what changes together.**  CLAP, librosa features, FeatureCache,
   coverage, layout revision, and 2-D layout share caches, versions, and import edges — a
   dedicated subpackage keeps the mental model and grep scope small.
 

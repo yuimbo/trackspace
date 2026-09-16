@@ -23,6 +23,10 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
 - [ ] **`services/analysis_pipeline.py` — split if it grows again.** Handlers are
       already one factory function per stage; the cluster store and the enqueue helpers
       are the natural next seams.
+- [ ] **Drop the dead generation helpers.** `coverage.build_generation_work` and
+      `clap.batch_ensure_embeddings` have no callers since the durable queue took
+      over (the queue's `enqueue_library_work` filter supersedes them); remove them
+      and their re-exports in `embeddings/__init__.py` / `layout.py`.
 
 ## Product roadmap (analysis)
 
@@ -51,20 +55,6 @@ none require re-running an encoder over the library.
 
 Making the pipeline faster. Ordered roughly by expected value; measure before and after.
 
-### Correctness gaps that also gate speed
-
-- [ ] **CLAP and EffNet are orphaned in the queue.** The stages are
-      `scan → features → maest → supervise → cluster`; nothing enqueues CLAP or
-      EffNet any more, so `clap_embedding` / `effnet_embedding` rows are never
-      written. `clap.generate_embedding`, `clap.batch_ensure_embeddings`,
-      `effnet.generate_effnet_embedding(s)_batch`, and `coverage.build_generation_work`
-      are dead entry points. They still carry weight in `DEFAULT_WEIGHTS`
-      (`clap` 0.10, `effnet` 0.05) and are zero-filled in
-      `gather_source_blocks`, so the map and clusters silently lose both signals.
-      Decide: add `KIND_CLAP` / `KIND_EFFNET` stages, or delete the sources and
-      re-weight. (CLAP must stay if text weighting is kept — it is the only text
-      encoder.)
-
 ### Parallelism
 
 - [ ] **Scale the `features` stage horizontally.** One worker, `batch_size=2`
@@ -72,10 +62,11 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
       independent per track. Run N workers for the kind and measure the wall-clock
       curve; the durable queue already leases per job, so this is a wiring change
       plus a check that concurrent SQLite WAL writers do not contend.
-- [ ] **Measure `_DECODE_LOCK` contention.** The new decode lock serialises every
-      native MP3 open. Instrument the wait time in `decode_stderr.librosa_load`; if it
-      is a material fraction of `features` / `maest` wall time, prioritise the
-      torchaudio-decode item under *Acceleration*.
+- [ ] **Measure `_DECODE_LOCK` contention.** The decode lock serialises every
+      native MP3 open, and now also covers CLAP's 48 kHz decodes alongside
+      `features` / `maest`. Instrument the wait time in
+      `decode_stderr.librosa_load`; if it is a material fraction of the stage wall
+      time, prioritise the torchaudio-decode item under *Acceleration*.
 - [ ] **Tune `scan`.** `batch_size=8` with `TRACKSPACE_FPCALC_CONCURRENCY`
       (default `min(8, cpus)`). Measure whether fpcalc subprocesses or the SQLite
       writes are the limit and raise only the one that is.
@@ -100,9 +91,6 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 - [ ] **madmom tempo.** `TRACKSPACE_MADMOM_FAST=1` (one BLSTM) is ~4× faster but
       opt-in. Benchmark the tempo error on a labelled sample and consider making it the
       default (bump `FEATURES_VERSION` if the vector changes).
-- [ ] **EffNet provider.** It loads CoreML + CPU; confirm the CoreML partition is
-      actually used (not silently falling back) and that the mel preprocessing is not the
-      dominant cost.
 - [ ] **Projection backends.** `TRACKSPACE_CUML` / `TRACKSPACE_MLX_VIS` are chosen by
       import success; re-benchmark mlx-vis vs openTSNE vs sklearn after any
       torch/librosa bump, and revisit `TRACKSPACE_OPENTSNE` being off by default.
@@ -117,7 +105,7 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
       or vendoring the two processors we use.
 - [ ] **`libsndfile`/mpg123 thread safety.** Track the upstream fix for the
       `mpeg_decoder_init` FIXME and drop `_DECODE_LOCK` when it lands.
-- [ ] **Pin the GPU/ML stack.** `torch` 2.11 / `onnxruntime` 1.24 / `mlx-vis` 0.7 are
+- [ ] **Pin the GPU/ML stack.** `torch` 2.11 / `mlx-vis` 0.7 are
       unpinned floors; a breaking change would land silently. Add upper bounds for the
       ones that affect embeddings.
 
@@ -125,8 +113,17 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 - [ ] **Per-stage throughput harness.** `tests/test_profiling_embeddings.py` and
       `tests/profile_madmom_tempo.py` are ad-hoc. Add one script that reports
-      tracks/min and s/track per stage (scan/features/maest/supervise/cluster) on a
-      fixed sample, so every change here is comparable.
+      tracks/min and s/track per stage (scan/features/maest/clap/supervise/cluster)
+      on a fixed sample, so every change here is comparable.
+- [ ] **CLAP stage throughput.** The stage is decode-dominated (3 × 15 s at 48 kHz)
+      with one batched forward per track. Measure tracks/min on the real library and
+      sweep `max_batch` (the handler passes `batch_size=4` → 12 segments) against
+      MPS memory, then pick a default the way MAEST did.
+- [ ] **Purge leftover EffNet cache rows.** `data/audio_features.db` still holds
+      `effnet_embedding` / `effnet_version` columns and rows from before the source
+      was deleted (~48 MB at 9.5k tracks), and `data/models/discogs-effnet-*.onnx`
+      is still on disk. `data/` is gitignored and nothing reads them, so this is
+      only worth doing if the disk footprint matters.
 - [ ] **Cold vs warm end-to-end run.** Record wall-clock for a full `force` re-analysis
       and a no-op re-run; that is the number the parallelism work must move.
 - [ ] **MAEST batch-size sweep.** The handler passes `max_batch=12` (4 tracks × 3

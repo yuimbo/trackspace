@@ -64,7 +64,6 @@ class AnalysisDeps:
     features_version: int
     clap_mod: Any = None
     clap_version: int = 0
-    effnet_version: int = 0
     #: False when the server was started with ``--no-clap`` — the CLAP stage is
     #: then never enqueued, so a disabled server cannot accumulate pending jobs
     #: behind a model that will never load.
@@ -475,7 +474,6 @@ def gather_source_blocks(
     infos: list[dict[str, Any]],
     *,
     clap_version: int,
-    effnet_version: int,
 ) -> tuple[list[str], dict[str, np.ndarray], np.ndarray | None]:
     """Assemble aligned per-source matrices for the tracks that have MAEST data.
 
@@ -494,7 +492,6 @@ def gather_source_blocks(
     rhythm_map = fc.get_all("rhythm", fps, version=deps.rhythm_version)
     feat_map = fc.get_all("features", fps, version=deps.features_version)
     clap_map = fc.get_all("clap", fps, version=clap_version)
-    effnet_map = fc.get_all("effnet", fps, version=effnet_version)
     supervised_map = fc.get_all(
         "supervised", fps, version=supervised_mod.cache_version(fc)
     )
@@ -532,7 +529,6 @@ def gather_source_blocks(
         ("rhythm", rhythm_map),
         ("features", feat_map),
         ("clap", clap_map),
-        ("effnet", effnet_map),
         ("supervised", supervised_map),
     ):
         block = _stack(source_map, name)
@@ -561,7 +557,6 @@ def run_clustering(
         deps,
         infos,
         clap_version=deps.clap_version,
-        effnet_version=deps.effnet_version,
     )
     if not paths:
         log.info("Clustering: no tracks with MAEST data yet")
@@ -636,7 +631,7 @@ def train_supervised(
     """
     infos = build_track_infos("", True)
     paths, blocks, _logits = gather_source_blocks(
-        deps, infos, clap_version=deps.clap_version, effnet_version=deps.effnet_version
+        deps, infos, clap_version=deps.clap_version
     )
     if not paths:
         log.info("Supervised training skipped: no tracks with MAEST data")
@@ -687,7 +682,6 @@ def train_supervised(
         class_names=class_names,
         source_versions={
             "clap": deps.clap_version,
-            "effnet": deps.effnet_version,
             "features": deps.features_version,
             "maest": deps.maest_version,
             "rhythm": deps.rhythm_version,
@@ -749,7 +743,7 @@ def project_supervised_missing(
         return 0
 
     paths, blocks, _logits = gather_source_blocks(
-        deps, infos, clap_version=deps.clap_version, effnet_version=deps.effnet_version
+        deps, infos, clap_version=deps.clap_version
     )
     if not paths:
         return 0

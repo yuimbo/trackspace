@@ -29,7 +29,6 @@ from backend.embeddings import maest as maest_mod
 from backend.embeddings import rhythm_features as rhythm_mod
 from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.clap import EMBEDDING_VERSION
-from backend.embeddings.effnet import EFFNET_VERSION
 from backend.embeddings.librosa_audio_features import FEATURES_VERSION
 from backend.embeddings.maest import MAEST_VERSION
 from backend.embeddings.rhythm_features import RHYTHM_VERSION
@@ -100,7 +99,6 @@ def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
     fc = ts.feature_cache
     versions = {
         "clap": EMBEDDING_VERSION,
-        "effnet": EFFNET_VERSION,
         "features": FEATURES_VERSION,
         "maest": MAEST_VERSION,
         "rhythm": RHYTHM_VERSION,
@@ -366,7 +364,6 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         rhythm_version=RHYTHM_VERSION,
         features_version=FEATURES_VERSION,
         clap_version=EMBEDDING_VERSION,
-        effnet_version=EFFNET_VERSION,
         clap_enabled=clap_enabled,
         data_dir=state.data_dir,
         emit_decode_warning=lambda rel, msg: _broadcast_embed_event(
@@ -509,7 +506,6 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             embeddings_mod=embeddings,
             audio_features_mod=audio_features,
             embedding_version=EMBEDDING_VERSION,
-            effnet_version=EFFNET_VERSION,
             features_version=FEATURES_VERSION,
             feature_cache=state.feature_cache,
             source_versions_cls=SourceVersions,
@@ -599,8 +595,6 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--no-clap", action="store_true",
                         help="Skip eager CLAP model loading at startup")
-    parser.add_argument("--no-effnet", action="store_true",
-                        help="Skip eager EffNet model loading at startup")
     parser.add_argument("--no-maest", action="store_true",
                         help="Skip eager MAEST model loading at startup")
     args = parser.parse_args()
@@ -642,7 +636,6 @@ def main():
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
     _version_labels = {
         "clap": EMBEDDING_VERSION,
-        "effnet": EFFNET_VERSION,
         "features": FEATURES_VERSION,
         "maest": MAEST_VERSION,
         "rhythm": RHYTHM_VERSION,
@@ -654,7 +647,7 @@ def main():
                 f"entr{'y' if n == 1 else 'ies'} (on load)"
             )
     print(
-        f"Versions: CLAP={EMBEDDING_VERSION} EffNet={EFFNET_VERSION} "
+        f"Versions: CLAP={EMBEDDING_VERSION} "
         f"Features={FEATURES_VERSION} MAEST={MAEST_VERSION} Rhythm={RHYTHM_VERSION}"
     )
 
@@ -680,15 +673,6 @@ def main():
             # Workers gate on model readiness; nudge them once it flips.
             state.workers.wake(KIND_CLAP)
         threading.Thread(target=_bg_load_clap, daemon=True).start()
-    if not args.no_effnet:
-        def _bg_load_effnet():
-            print("Loading EffNet model in background…")
-            audio_features.load_effnet()
-            if audio_features.is_effnet_ready():
-                print("EffNet model ready.")
-            else:
-                print("EffNet model not available (essentia-tensorflow may not be installed).")
-        threading.Thread(target=_bg_load_effnet, daemon=True).start()
     if not args.no_maest:
         def _bg_load_maest():
             print("Loading MAEST model in background…")

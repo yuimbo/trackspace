@@ -66,9 +66,6 @@ class _FakeMaest:
 
 
 class _FakeAudioFeatures:
-    def is_effnet_ready(self) -> bool:
-        return False
-
     audio_features_display_bpm_key = staticmethod(audio_features_display_bpm_key)
 
 
@@ -166,9 +163,7 @@ def client(roots, tmp_path):
 
     embeddings_bp = create_api_embeddings_blueprint(
         embeddings_mod=_FakeEmbeddings(),
-        audio_features_mod=_FakeAudioFeatures(),
         embedding_version=1,
-        effnet_version=1,
         features_version=1,
         feature_cache=feature_cache,
         source_versions_cls=SourceVersions,

@@ -1,4 +1,4 @@
-"""Tests for the EffNet embedding + librosa audio feature pipeline.
+"""Tests for the librosa audio feature pipeline.
 
 Run:  .venv/bin/python -m pytest tests/test_audio_features.py -v
   or: .venv/bin/python -m tests.test_audio_features       (standalone)
@@ -19,56 +19,6 @@ TEST_TRACK = os.path.join(FIXTURE_DIR, "test_track.mp3")
 TEST_TRACK_HARMONIC = os.path.join(FIXTURE_DIR, "test_track_2.mp3")
 
 
-# ── Mel-spectrogram preprocessing ─────────────────────────────
-
-def test_mel_preprocessing():
-    import librosa
-    from backend.embeddings.effnet import compute_mel_spectrogram, _EFFNET_SR
-
-    audio, _ = librosa.load(TEST_TRACK, sr=_EFFNET_SR, mono=True)
-    mel = compute_mel_spectrogram(audio)
-
-    print(f"Mel shape: {mel.shape}, dtype: {mel.dtype}")
-    assert mel.ndim == 2
-    assert mel.shape[1] == 96, f"Expected 96 mel bins, got {mel.shape[1]}"
-    assert mel.shape[0] > 0
-    assert mel.dtype == np.float32
-    assert np.isfinite(mel).all(), "Mel contains NaN/Inf"
-    assert mel.min() >= 0, "log10(10000*x+1) should be non-negative"
-
-
-def test_mel_patching():
-    import librosa
-    from backend.embeddings.effnet import (
-        compute_mel_spectrogram,
-        patch_mel_spectrogram,
-        _EFFNET_PATCH_FRAMES,
-        _EFFNET_SR,
-    )
-
-    audio, _ = librosa.load(TEST_TRACK, sr=_EFFNET_SR, mono=True)
-    mel = compute_mel_spectrogram(audio)
-    patches = patch_mel_spectrogram(mel)
-
-    print(f"Patches shape: {patches.shape}")
-    assert patches.ndim == 3
-    assert patches.shape[1] == _EFFNET_PATCH_FRAMES
-    assert patches.shape[2] == 96
-    assert patches.shape[0] >= 1, "Should produce at least one patch"
-
-
-def test_mel_patching_short_audio():
-    """A very short signal should still produce one zero-padded patch."""
-    from backend.embeddings.effnet import patch_mel_spectrogram, _EFFNET_PATCH_FRAMES
-
-    short_mel = np.random.rand(10, 96).astype(np.float32)
-    patches = patch_mel_spectrogram(short_mel)
-
-    assert patches.shape == (1, _EFFNET_PATCH_FRAMES, 96)
-    assert np.allclose(patches[0, :10], short_mel)
-    assert np.allclose(patches[0, 10:], 0.0)
-
-
 def test_feature_excerpt_falls_back_when_seek_returns_empty():
     """Bad duration metadata can put the centered excerpt past EOF; librosa then
     returns an empty array without raising. Full-file decode must still succeed."""
@@ -82,192 +32,6 @@ def test_feature_excerpt_falls_back_when_seek_returns_empty():
     assert sr == laf._FEATURE_SR
     assert warn is not None
     assert "600" in warn
-
-
-# ── EffNet embeddings ─────────────────────────────────────────
-
-@pytest.fixture(scope="module")
-def effnet_loaded():
-    from backend.embeddings.effnet import is_effnet_ready, load_effnet
-    load_effnet()
-    return is_effnet_ready()
-
-
-def test_effnet_embedding(effnet_loaded):
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embedding
-
-    emb = generate_effnet_embedding(TEST_TRACK)
-    print(f"EffNet embedding: shape={emb.shape}, dtype={emb.dtype}")
-    print(f"  min={emb.min():.4f}  max={emb.max():.4f}  mean={emb.mean():.4f}")
-
-    assert emb is not None, "generate_effnet_embedding returned None"
-    assert emb.ndim == 1, f"Expected 1-D vector, got {emb.ndim}-D"
-    assert emb.shape[0] > 0
-    assert emb.dtype == np.float32
-    assert np.isfinite(emb).all(), "Embedding contains NaN/Inf"
-    assert np.linalg.norm(emb) > 0, "Embedding is all zeros"
-
-
-def test_effnet_embedding_harmonic(effnet_loaded):
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embedding
-
-    emb = generate_effnet_embedding(TEST_TRACK_HARMONIC)
-    print(f"EffNet (harmonic): shape={emb.shape}")
-
-    assert emb is not None
-    assert emb.ndim == 1
-    assert emb.dtype == np.float32
-    assert np.isfinite(emb).all()
-
-
-def test_effnet_deterministic(effnet_loaded):
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embedding
-
-    emb1 = generate_effnet_embedding(TEST_TRACK)
-    emb2 = generate_effnet_embedding(TEST_TRACK)
-
-    assert emb1 is not None and emb2 is not None
-    np.testing.assert_array_equal(emb1, emb2)
-
-
-# ── Batched EffNet inference ──────────────────────────────────
-
-def test_effnet_batch(effnet_loaded):
-    """Batch inference should return an embedding for each valid path."""
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embeddings_batch
-
-    paths = [TEST_TRACK, TEST_TRACK_HARMONIC]
-    results = generate_effnet_embeddings_batch(paths)
-
-    assert isinstance(results, dict)
-    assert set(results.keys()) == set(paths)
-
-    for p in paths:
-        emb = results[p]
-        assert emb is not None, f"Batch returned None for {p}"
-        assert emb.ndim == 1
-        assert emb.shape[0] > 0
-        assert emb.dtype == np.float32
-        assert np.isfinite(emb).all()
-        assert np.linalg.norm(emb) > 0
-
-
-def test_effnet_batch_matches_single(effnet_loaded):
-    """Batch inference must produce identical embeddings to single-track calls."""
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import (
-        generate_effnet_embedding,
-        generate_effnet_embeddings_batch,
-    )
-
-    paths = [TEST_TRACK, TEST_TRACK_HARMONIC]
-    single = {p: generate_effnet_embedding(p) for p in paths}
-    batched = generate_effnet_embeddings_batch(paths)
-
-    for p in paths:
-        assert single[p] is not None and batched[p] is not None
-        np.testing.assert_allclose(
-            batched[p], single[p], rtol=1e-5, atol=1e-6,
-            err_msg=f"Batch vs single mismatch for {os.path.basename(p)}",
-        )
-
-
-def test_effnet_batch_empty():
-    """Empty path list should return empty dict without errors."""
-    from backend.embeddings.effnet import generate_effnet_embeddings_batch
-
-    assert generate_effnet_embeddings_batch([]) == {}
-
-
-def test_effnet_batch_progress_callback(monkeypatch):
-    """progress_cb fires per track with (done, total) as preprocessing proceeds."""
-    from backend.embeddings import effnet
-
-    monkeypatch.setattr(effnet, "_effnet_loaded", True)
-    monkeypatch.setattr(effnet, "_effnet_session", object())
-    monkeypatch.setattr(
-        effnet,
-        "_preprocess_effnet",
-        lambda _path: (np.ones((3, 4), dtype=np.float32), None),
-    )
-    monkeypatch.setattr(
-        effnet,
-        "_run_effnet_batched",
-        lambda patches: np.ones((len(patches), 4), dtype=np.float32),
-    )
-
-    calls: list[tuple[int, int]] = []
-    results = effnet.generate_effnet_embeddings_batch(
-        ["a.mp3", "b.mp3"], progress_cb=lambda done, total: calls.append((done, total))
-    )
-
-    assert calls == [(1, 2), (2, 2)]
-    assert set(results) == {"a.mp3", "b.mp3"}
-    assert results["a.mp3"] is not None
-
-
-def test_effnet_batch_progress_callback_empty():
-    """An empty batch returns early and never invokes progress_cb."""
-    from backend.embeddings.effnet import generate_effnet_embeddings_batch
-
-    calls: list[tuple[int, int]] = []
-    assert generate_effnet_embeddings_batch(
-        [], progress_cb=lambda done, total: calls.append((done, total))
-    ) == {}
-    assert calls == []
-
-
-def test_effnet_batch_invalid_path(effnet_loaded):
-    """Invalid paths should map to None, valid paths should still succeed."""
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embeddings_batch
-
-    bogus = "/nonexistent/file.mp3"
-    results = generate_effnet_embeddings_batch([TEST_TRACK, bogus])
-
-    assert results[TEST_TRACK] is not None
-    assert results[TEST_TRACK].ndim == 1
-    assert results[bogus] is None
-
-
-# ── EffNet model checksum ─────────────────────────────────────
-
-def test_effnet_verifier_rejects_wrong_content(tmp_path):
-    from backend.embeddings.effnet import _verify_effnet_model
-
-    bad = tmp_path / "bad.onnx"
-    bad.write_bytes(b"not the model")
-    assert _verify_effnet_model(str(bad)) is False
-    assert _verify_effnet_model(str(tmp_path / "missing.onnx")) is False
-
-
-def test_effnet_local_model_matches_pinned_checksum():
-    from backend.embeddings.effnet import (
-        _EFFNET_MODEL_NAME,
-        _model_dir,
-        _verify_effnet_model,
-    )
-
-    path = os.path.join(_model_dir(), _EFFNET_MODEL_NAME)
-    if not os.path.isfile(path):
-        pytest.skip("EffNet model not downloaded")
-    assert _verify_effnet_model(path)
 
 
 # ── Key detection ─────────────────────────────────────────────
@@ -430,9 +194,6 @@ def test_madmom_tempo_when_installed():
 
 if __name__ == "__main__":
     tests = [
-        test_mel_preprocessing,
-        test_mel_patching,
-        test_mel_patching_short_audio,
         test_circle_of_fifths_mapping,
         test_circle_of_fifths_unit_circle,
         test_harmonically_close_keys_are_geometrically_close,
@@ -450,26 +211,5 @@ if __name__ == "__main__":
         print(f"\n--- {t.__name__} ---")
         t()
         print("  OK")
-
-    print("\n--- EffNet tests (require model download) ---")
-    from backend.embeddings.effnet import is_effnet_ready, load_effnet
-    load_effnet()
-    if is_effnet_ready():
-        test_effnet_embedding(True)
-        print("  OK")
-        test_effnet_embedding_harmonic(True)
-        print("  OK")
-        test_effnet_deterministic(True)
-        print("  OK")
-        test_effnet_batch(True)
-        print("  OK")
-        test_effnet_batch_matches_single(True)
-        print("  OK")
-        test_effnet_batch_empty()
-        print("  OK")
-        test_effnet_batch_invalid_path(True)
-        print("  OK")
-    else:
-        print("  SKIPPED (onnxruntime not available)")
 
     print("\nAll tests passed.")

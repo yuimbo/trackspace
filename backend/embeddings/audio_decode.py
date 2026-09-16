@@ -1,6 +1,6 @@
 """Robust librosa-based decode: short/long track probes, seeks, and segment lists.
 
-Used by CLAP, EffNet (via segment loader), and librosa classical features.  Keeps
+Used by CLAP and the librosa classical features.  Keeps
 MP3/metadata edge cases in one place."""
 from __future__ import annotations
 

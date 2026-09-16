@@ -29,12 +29,10 @@ class _StubFeatureCache:
     def __init__(
         self,
         clap: dict[str, np.ndarray] | None = None,
-        effnet: dict[str, np.ndarray] | None = None,
         feats: dict[str, np.ndarray] | None = None,
     ) -> None:
         self._maps = {
             "clap": clap or {},
-            "effnet": effnet or {},
             "features": feats or {},
         }
 

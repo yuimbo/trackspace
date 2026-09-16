@@ -55,14 +55,6 @@ def _print_stats(label: str, samples: list[float]) -> None:
 
 
 @pytest.fixture(scope="module")
-def effnet_loaded() -> bool:
-    from backend.embeddings.effnet import is_effnet_ready, load_effnet
-
-    load_effnet()
-    return is_effnet_ready()
-
-
-@pytest.fixture(scope="module")
 def clap_loaded() -> bool:
     from backend.embeddings import is_model_ready, load_model
 
@@ -121,48 +113,8 @@ def test_profile_audio_features_batch_vs_sequential():
         assert np.isfinite(val).all()
 
 
-def test_profile_effnet_single(effnet_loaded):
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embedding
-
-    result, samples = _timed_runs(
-        lambda: generate_effnet_embedding(TEST_TRACK),
-        runs=3,
-    )
-    _print_stats("effnet_single", samples)
-
-    assert result is not None
-    assert isinstance(result, np.ndarray)
-    assert result.ndim == 1
-    assert result.shape[0] > 0
-    assert np.isfinite(result).all()
 
 
-def test_profile_effnet_batch(effnet_loaded):
-    if not effnet_loaded:
-        pytest.skip("onnxruntime or EffNet model not available")
-
-    from backend.embeddings.effnet import generate_effnet_embeddings_batch
-
-    paths = [TEST_TRACK, TEST_TRACK_HARMONIC]
-    result, samples = _timed_runs(
-        lambda: generate_effnet_embeddings_batch(paths),
-        runs=3,
-    )
-    _print_stats("effnet_batch_2tracks", samples)
-    per_track_ms = (mean(samples) * 1000.0) / len(paths)
-    print(f"{'effnet_batch_per_track':<24} mean={per_track_ms:8.1f} ms")
-
-    assert isinstance(result, dict)
-    assert set(result.keys()) == set(paths)
-    for emb in result.values():
-        assert emb is not None
-        assert isinstance(emb, np.ndarray)
-        assert emb.ndim == 1
-        assert emb.shape[0] > 0
-        assert np.isfinite(emb).all()
 
 
 def test_profile_clap_single(clap_loaded):

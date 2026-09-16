@@ -13,7 +13,6 @@ from backend.embeddings.projection_config import PROJECTION_RECIPE_VERSION
 def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
     maps = CachedSourceMaps(
         clap={"fp1": object()},
-        effnet={"fp1": object()},
         features={},
     )
     infos = [
@@ -32,12 +31,11 @@ def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
 def test_eligible_paths_requires_all_sources():
     maps = CachedSourceMaps(
         clap={"fp1": object()},
-        effnet={},
         features={},
     )
     infos = [{"path": "a.mp3", "fingerprint": "fp1"}]
     assert eligible_paths_for_projection(infos, maps, ("clap",)) == ["a.mp3"]
-    assert eligible_paths_for_projection(infos, maps, ("clap", "effnet")) == []
+    assert eligible_paths_for_projection(infos, maps, ("clap", "features")) == []
 
 
 def test_layout_revision_stable_for_same_inputs():

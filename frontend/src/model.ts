@@ -109,7 +109,6 @@ export const DEFAULT_CLUSTER_WEIGHTS: Record<string, number> = {
   maest: 0.25,
   rhythm: 0.15,
   clap: 0.1,
-  effnet: 0.05,
   supervised: 0.15,
   features: 0,
 };
@@ -120,7 +119,6 @@ export const CLUSTER_WEIGHT_LABELS: Record<string, string> = {
   maest: "MAEST",
   rhythm: "Rhythm",
   clap: "CLAP",
-  effnet: "EffNet",
   supervised: "Folders",
   features: "Audio",
 };
@@ -208,7 +206,7 @@ export class Model extends EventBus {
     lastFailures?: string[];
   } | null = null;
   projectionPending = false;
-  /** True while CLAP/EffNet are not ready yet (embedding mode waits on `_pollModelReady`). */
+  /** True while the required models are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
   /**
    * Hold **X** on the canvas: nudge dots by tag axes (embedding mode) or toward

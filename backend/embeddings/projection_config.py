@@ -21,14 +21,13 @@ import numpy as np
 from .librosa_audio_features import AUDIO_FEATURE_DIM
 
 # Bump in layout_revision.compute_layout_revision payload when this recipe changes.
-PROJECTION_RECIPE_VERSION = 4
+PROJECTION_RECIPE_VERSION = 5
 
 FROZEN_SOURCES: tuple[str, ...] = (
     "maest_logits",
     "maest",
     "rhythm",
     "clap",
-    "effnet",
     "supervised",
     "features",
 )
@@ -41,7 +40,6 @@ FROZEN_SOURCE_WEIGHTS: dict[str, float] = {
     "maest": 0.25,
     "rhythm": 0.15,
     "clap": 0.10,
-    "effnet": 0.05,
     "supervised": 0.15,
     "features": 0.00,
 }

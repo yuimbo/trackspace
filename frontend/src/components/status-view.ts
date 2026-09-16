@@ -180,7 +180,7 @@ ${last}
     const p = model.embeddingProgress!;
     const pct =
       p.total > 0 ? Math.round((100 * p.done) / p.total) : 0;
-    const srcs = "MAEST genre logits, MAEST embedding, rhythm, CLAP, EffNet";
+    const srcs = "MAEST genre logits, MAEST embedding, rhythm, CLAP";
     let last = "";
     if (p.lastPath) {
       const ok =
@@ -198,7 +198,7 @@ ${last}
 <div class="status-detail-kv"><span>Progress</span><span>${p.done} / ${p.total} (${pct}%)</span></div>
 <div class="status-detail-kv"><span>Active sources</span><span>${esc(srcs)}</span></div>
 ${last}
-<div class="status-detail-note">The server runs CLAP per track and batches EffNet and classical features. The UI refreshes the projection periodically (PCA) while generation continues.</div>`;
+<div class="status-detail-note">The server batches MAEST and CLAP inference across tracks and runs the classical features per track. The UI refreshes the projection periodically (PCA) while generation continues.</div>`;
   }
 
   private _queuePanelHtml(model: Model): string {

@@ -59,7 +59,6 @@ class TrackspaceBlueprintDeps:
     embeddings_mod: Any
     audio_features_mod: Any
     embedding_version: int
-    effnet_version: int
     features_version: int
     feature_cache: Any
     source_versions_cls: type
@@ -119,9 +118,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
     app.register_blueprint(
         create_api_embeddings_blueprint(
             embeddings_mod=deps.embeddings_mod,
-            audio_features_mod=deps.audio_features_mod,
             embedding_version=deps.embedding_version,
-            effnet_version=deps.effnet_version,
             features_version=deps.features_version,
             feature_cache=deps.feature_cache,
             source_versions_cls=deps.source_versions_cls,

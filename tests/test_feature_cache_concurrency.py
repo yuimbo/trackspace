@@ -56,7 +56,7 @@ def test_concurrent_reads_writes_and_purges(tmp_path):
         for i in range(per_writer * n_writers):
             fp = f"w{i % n_writers}-{i % per_writer}"
             fc.get("clap", fp, version=version)
-            fc.get_all("effnet", [fp], version=version)
+            fc.get_all("features", [fp], version=version)
             fc.has("rhythm", fp, version=version)
             fc.count("maest", version=version)
 

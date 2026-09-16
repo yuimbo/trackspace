@@ -65,9 +65,9 @@ def test_put_maest_writes_pair_and_count(tmp_path):
 def test_lru_eviction_across_mixed_prefixes(tmp_path):
     fc = _mk(tmp_path, max_memory=3)
     fc.put("clap", "a", np.ones(2, np.float32))
-    fc.put("effnet", "b", np.ones(2, np.float32))
+    fc.put("features", "b", np.ones(2, np.float32))
     fc.put("rhythm", "c", np.ones(2, np.float32))
-    assert set(fc._mem) == {"clap:a", "effnet:b", "rhythm:c"}
+    assert set(fc._mem) == {"clap:a", "feat:b", "rhythm:c"}
 
     fc.put("maest", "d", np.ones(2, np.float32))
     assert "clap:a" not in fc._mem
@@ -143,13 +143,13 @@ def test_lru_keys_use_documented_source_prefixes(tmp_path):
 def test_lru_get_promotes_recency(tmp_path):
     fc = _mk(tmp_path, max_memory=2)
     fc.put("clap", "a", np.ones(2, np.float32))
-    fc.put("effnet", "b", np.ones(2, np.float32))
+    fc.put("features", "b", np.ones(2, np.float32))
 
     # Touching the oldest key makes it the most recently used.
     assert fc.get("clap", "a") is not None
     fc.put("rhythm", "c", np.ones(2, np.float32))
 
-    assert "effnet:b" not in fc._mem  # evicted: it was the least recently used
+    assert "feat:b" not in fc._mem  # evicted: it was the least recently used
     assert set(fc._mem) == {"clap:a", "rhythm:c"}
 
 
@@ -169,14 +169,14 @@ def test_lru_get_all_promotes_recency(tmp_path):
 def test_purge_maest_evicts_only_maest_prefixes(tmp_path):
     fc = _mk(tmp_path, max_memory=16)
     fc.put("clap", "c", np.ones(2, np.float32))
-    fc.put("effnet", "e", np.ones(2, np.float32))
+    fc.put("features", "e", np.ones(2, np.float32))
     fc.put("rhythm", "r", np.ones(2, np.float32))
     fc.put_maest("m", np.ones(4, np.float32), np.ones(8, np.float32), version=1)
     assert {"maest:m", "maestlog:m"} <= set(fc._mem)
 
     assert fc.purge_old_versions("maest", 2) == 1
     assert not any(k.startswith(("maest:", "maestlog:")) for k in fc._mem)
-    assert {"clap:c", "effnet:e", "rhythm:r"} <= set(fc._mem)
+    assert {"clap:c", "feat:e", "rhythm:r"} <= set(fc._mem)
 
 
 def test_put_maest_writes_excerpts(tmp_path):
