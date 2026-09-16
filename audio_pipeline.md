@@ -99,7 +99,7 @@ slider per source, and **Apply** sends the vector to both the map and the cluste
 | MAEST logits | `backend/embeddings/maest.py` | 519 | `discogs-maest-30s-pw-129e-519l` (primary genre signal) |
 | MAEST embedding | `backend/embeddings/maest.py` | 768 | same model pass |
 | Rhythm | `backend/embeddings/rhythm_features.py` | 14 | `librosa` DSP |
-| CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
+| CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music_and_speech` (HuggingFace) |
 | Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
 | Supervised | `backend/embeddings/supervised.py` | 128 | folder-labelled projection head over the cached blocks (no encoder) |
 
@@ -137,7 +137,7 @@ empty-blob-as-absent rule or it will resurrect purged rows.
 
 ## CLAP embeddings (`backend/embeddings/clap.py`)
 
-- Model: `laion/larger_clap_music` loaded in a background thread at server startup
+- Model: `laion/larger_clap_music_and_speech` loaded in a background thread at server startup
   (does not block Flask from accepting requests).
 - **Inference lock:** `clap.inference_lock` is the single process-wide accelerator
   lock. It serialises every forward pass that touches MPS/CUDA: CLAP audio, CLAP
@@ -186,9 +186,23 @@ constant auto-invalidates stale entries. Old-version rows are purged on server s
 | 0 | Legacy (pre-versioning) |
 | 1 | Single 30 s middle-of-track chunk |
 | 2 | Multi-segment: 3 × 15 s at 20 %/50 %/80 %, averaged |
+| 3 | Model switched `laion/larger_clap_music` → `laion/larger_clap_music_and_speech` (see below) |
 
 When changing how embeddings are produced (model, chunk strategy, post-processing),
 bump `EMBEDDING_VERSION` and add a row to the table above.
+
+**The `laion/larger_clap_music` HF checkpoint is broken — do not use it.** Its
+converted weights are degenerate: both towers collapse to near-constant vectors
+(text-vs-text cosine ≈ 0.999, audio-vs-audio ≈ 0.95–0.996, text-vs-audio ≈ 0.00), so
+the canonical HF pipeline returns a uniform softmax (0.0834 across 12 labels on a techno
+track; white noise, silence and a sine tone give *identical* outputs). Reproduced on CPU and
+MPS and under transformers 4.57.1 and 5.3.0, with exact weight loading and no missing
+checkpoint keys — it is the checkpoint, not our decode or the transformers version (HF
+discussion #2 on that repo, open since Dec 2023). `laion/larger_clap_music_and_speech` is the
+music-trained conversion that works (real-track check: a techno track ranks "techno" 0.59 over
+"deep house" 0.36; a deep-house track ranks "deep house" 0.55). Switching it invalidated
+every cached `clap` row (`EMBEDDING_VERSION` 2 → 3), so a one-off CLAP re-analysis is
+required; the supervised head also consumes the `clap` block and should be retrained afterwards.
 
 ### Text search (`backend/routes/api_search.py`)
 
@@ -202,16 +216,9 @@ weighting during a projection request. The frontend turns the hits into the canv
 selection and lists them (with score bars) in the Search panel; clicking a result
 selects it alone and fits the viewport to it.
 
-**Known limitation — CLAP text/audio alignment is weak in this environment.** Measured
-against the real library, `laion/larger_clap_music` produces near-degenerate embeddings:
-text-vs-text cosine ≈ 0.999, audio-vs-audio ≈ 0.95–0.996, and text-vs-audio ≈ 0.00,
-so the canonical HF pipeline gives a uniform softmax (0.0834 across 12 labels on a
-techno track; white noise and silence give *identical* outputs). This holds on CPU and
-MPS and under both `transformers` 4.57.1 and 5.3.0, with no missing checkpoint
-keys, correct `audio=` processor usage, and valid log-mel input — so it is not our decode,
-device, or version. It also makes the existing CLAP semantic weighting inert. Tracked in
-`TODO.md` under *Dependencies*; the search endpoint is correct and will produce
-meaningful rankings once the CLAP path is fixed.
+Retrieval quality depends on the CLAP checkpoint above — with the working
+`larger_clap_music_and_speech` conversion the query ranking is meaningful; with the
+old `larger_clap_music` conversion it was query-insensitive.
 
 ---
 

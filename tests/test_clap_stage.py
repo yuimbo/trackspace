@@ -186,3 +186,18 @@ def test_enqueue_maest_does_not_queue_clap(tmp_path):
         queue, infos, deps=_deps(tmp_path, fc), kinds=(KIND_MAEST,)
     )
     assert KIND_CLAP not in queued
+
+
+def test_clap_checkpoint_is_not_the_degenerate_music_conversion():
+    """Guard against reverting to the broken ``larger_clap_music`` conversion.
+
+    Its text and audio towers both collapse to near-constant vectors, making both
+    semantic weighting and text search inert (HF discussion #2 on that repo, open
+    since Dec 2023). ``larger_clap_music_and_speech`` is the working music
+    checkpoint; switching back must bump ``EMBEDDING_VERSION`` in lockstep.
+    """
+    from backend.embeddings import clap
+
+    assert clap.CLAP_MODEL_ID == "laion/larger_clap_music_and_speech"
+    assert clap.CLAP_MODEL_ID != "laion/larger_clap_music"
+    assert clap.EMBEDDING_VERSION >= 3

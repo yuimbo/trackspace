@@ -3,6 +3,10 @@
 Concrete, actionable work and deferred items. Design rules live in the docs:
 `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`.
 
+## User feedback
+
+- [ ] Implement the intro/peak/break detection, and also use that to yield distinct timestamps for the hover audio preview
+
 ## Deferred / optional
 
 ### Frontend
@@ -54,11 +58,11 @@ none require re-running an encoder over the library.
 - ✅ **Text search.** `GET /api/search?q=…&limit=` encodes the query with CLAP's text
   tower (`generate_text_embeddings`) and ranks cached CLAP audio embeddings by cosine
   similarity; the Search panel turns the hits into the canvas selection and clicking a
-  result fits the viewport to it. **Blocked on the CLAP alignment bug below** — the
-  plumbing is correct, but the model currently returns near-uniform rankings.
-- **Search follow-ups (once CLAP is fixed).** Folder-scoped search (`folder` param),
-  search-as-you-type debounce, and a minimum-score threshold / "select all" affordance.
-  Fit-on-focus is done (`CanvasInteractionController.fitViewToPaths`).
+  result fits the viewport to it. Unblocked by the CLAP checkpoint fix below (re-run the
+  CLAP stage first).
+- **Search follow-ups.** Folder-scoped search (`folder` param), search-as-you-type
+  debounce, and a minimum-score threshold / "select all" affordance. Fit-on-focus is done
+  (`CanvasInteractionController.fitViewToPaths`).
 - **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
   6-genre validation it reached 96.6% purity.
 - **Persist cluster results.** `ClusterStore` is in-memory; a restart recomputes in
@@ -123,25 +127,29 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 ### Dependencies
 
-- [ ] **CLAP text/audio alignment is near-degenerate (HIGH — makes text search and
-      semantic weighting inert).** Measured on the real library, `laion/larger_clap_music`
-      gives text-vs-text cosine ≈ 0.999, audio-vs-audio ≈ 0.95–0.996, and text-vs-audio
-      ≈ 0.00, so the canonical HF `zero-shot-audio-classification` pipeline returns a
-      uniform softmax (0.0834 across 12 labels on a techno track; white noise, silence
-      and a sine tone all return *identical* outputs). Ruled out as our bug: decode is fine
-      (audio RMS 0.37, log-mel mean −33 / std 19), `audio=` is the correct processor
-      keyword (`audios=` is deprecated), CPU and MPS agree, `transformers` 4.57.1 and 5.3.0
-      agree, no checkpoint keys are missing, and prompt templating ("This is a sound of …")
-      does not help. Text mean-pooling is somewhat more discriminative (0.92) than the
-      CLAP pooler (0.999) but still wrong-ranked. Next: reproduce the model card's own
-      example (`hf-internal-testing/librispeech_asr_dummy`, labels "Sound of a dog" /
-      "Sound of vaccum cleaner") to see whether *any* input discriminates; if not, evaluate
-      the reference `laion_clap` package or a different CLAP checkpoint, then bump
-      `EMBEDDING_VERSION` and re-run the CLAP stage (decode-dominated, hours on the real
-      library) so search and semantic weighting become meaningful.
+- [x] **CLAP text/audio alignment was near-degenerate — fixed by switching the
+      checkpoint.** The `laion/larger_clap_music` HF conversion is broken: both towers
+      collapse to near-constant vectors (text-vs-text cosine ≈ 0.999, audio-vs-audio
+      ≈ 0.95–0.996, text-vs-audio ≈ 0.00), so the canonical HF
+      `zero-shot-audio-classification` pipeline returns a uniform softmax (0.0834 across
+      12 labels on a techno track; white noise, silence and a sine tone give *identical*
+      outputs). Confirmed to be the checkpoint, not us: exact weight loading, correct
+      `audio=` processor keyword, valid log-mel, CPU=MPS, transformers 4.57=5.3, and an
+      open upstream report (HF discussion #2, Dec 2023). `laion/clap-htsat-unfused` and
+      `laion/larger_clap_music_and_speech` both discriminate; the latter is the
+      music-trained one and is now `CLAP_MODEL_ID` (`EMBEDDING_VERSION` 2 → 3).
+      Real-track check: a techno track ranks "techno" 0.59 > "deep house" 0.36; a
+      deep-house track ranks "deep house" 0.55 > "ambient" 0.41 > "techno" 0.25.
+- [ ] **Re-run the CLAP stage and retrain the supervised head.** The checkpoint switch
+      bumped `EMBEDDING_VERSION` 2 → 3, so every cached `clap` row is purged on next
+      startup and must be regenerated (decode-dominated — hours on the real library). The
+      supervised head consumes the `clap` block (`SUPERVISED_INPUT_WEIGHTS`), so its
+      weights are stale against the new vectors — retrain via *Train folder view* once the
+      CLAP backfill drains, or its `supervised` block is misleading.
 - [ ] **`transformers` is installed at 5.3** against a `>=4.40` floor — a major bump.
-      Pin a tested floor and smoke-test the CLAP text/audio paths. (The CLAP alignment bug
-      above reproduces on 4.57.1, so it is not simply a 5.x regression.)
+      Pin a tested floor and smoke-test the CLAP text/audio paths. (The
+      `larger_clap_music` checkpoint bug above reproduces on 4.57.1, so it is a broken
+      conversion, not a 5.x regression.)
 - [ ] **`madmom` is unmaintained** (last release 2020) and already emits
       `pkg_resources` (removal slated) and NumPy 2.4 `align=0` deprecations. It will
       break on a future setuptools/NumPy. Evaluate replacing the tempo/key estimators

@@ -1,4 +1,4 @@
-"""Laion CLAP (``larger_clap_music``) — audio + text embeddings for Trackspace.
+"""Laion CLAP (``larger_clap_music_and_speech``) — audio + text embeddings for Trackspace.
 
 Segment decode uses `load_resilient_audio_segments` from `audio_decode`.
 `inference_lock` is the process-wide GPU/accelerator serialisation point: it is
@@ -11,6 +11,15 @@ runs *one* forward pass per batch of segments (the feature extractor pads each
 segment independently, so variable-length inputs batch safely). This mirrors
 `maest.analyze_batch` and cuts lock acquisitions from three per track to one per
 batch.
+
+**Do not switch back to ``laion/larger_clap_music``.** That HF conversion is
+degenerate: its text and audio towers both collapse to near-constant vectors
+(text-vs-text cosine ≈ 0.999, audio-vs-audio ≈ 0.95–0.996, text-vs-audio ≈ 0.00),
+so the canonical HF pipeline returns a uniform softmax and both semantic weighting and
+text search are inert. Verified across CPU/MPS and transformers 4.57/5.3, with exact
+weight loading — the checkpoint itself is broken (HF discussion #2 on that repo, open
+since Dec 2023). ``larger_clap_music_and_speech`` is the music-trained checkpoint
+whose conversion works.
 """
 
 from __future__ import annotations
@@ -28,12 +37,14 @@ from .audio_decode import load_resilient_audio_segments
 
 log = logging.getLogger(__name__)
 
-CLAP_MODEL_ID = "laion/larger_clap_music"
+CLAP_MODEL_ID = "laion/larger_clap_music_and_speech"
 CLAP_SR = 48000
 SEGMENT_SECONDS = 15
 NUM_SEGMENTS = 3
 # Bump when CLAP chunking / pooling strategy changes (FeatureCache clap column).
-EMBEDDING_VERSION = 2
+# 3: switched from the degenerate ``laion/larger_clap_music`` conversion to
+#    ``laion/larger_clap_music_and_speech`` (see the module docstring).
+EMBEDDING_VERSION = 3
 
 _model: ClapModel | None = None
 _processor: ClapProcessor | None = None
