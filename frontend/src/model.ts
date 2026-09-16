@@ -110,6 +110,7 @@ export const DEFAULT_CLUSTER_WEIGHTS: Record<string, number> = {
   rhythm: 0.15,
   clap: 0.1,
   effnet: 0.05,
+  supervised: 0.15,
   features: 0,
 };
 
@@ -120,6 +121,7 @@ export const CLUSTER_WEIGHT_LABELS: Record<string, string> = {
   rhythm: "Rhythm",
   clap: "CLAP",
   effnet: "EffNet",
+  supervised: "Folders",
   features: "Audio",
 };
 

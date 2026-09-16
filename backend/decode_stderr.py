@@ -13,6 +13,15 @@ Redirection is process-wide and holds a lock so nested and concurrent decode
 calls do not corrupt the saved fd.  Any other thread that writes to stderr
 while the lock is held may interleave or briefly follow the redirected fd;
 decode windows are typically short.
+
+**The native MP3 open is not thread-safe.**  libsndfile's
+``mpeg_decoder_init`` calls the global, non-thread-safe ``mpg123_init()`` on
+*every* ``sf_open`` — libsndfile's own source flags this as
+"*** FIXME - Threading issues ***".  Two analysis workers opening MP3s at once
+(the ``features`` and ``maest`` stages do) race in mpg123's static layer-table
+init and call through a half-written function pointer, killing the process with
+SIGBUS.  ``_open_soundfile`` serialises the open; reads on an already-open
+handle use per-handle state, so the expensive decode still runs in parallel.
 """
 
 from __future__ import annotations
@@ -23,8 +32,18 @@ from contextlib import contextmanager
 from typing import Iterator
 
 import librosa as _librosa
+import soundfile as _soundfile
 
 _ENV_LOG = "TRACKSPACE_DECODE_STDERR_LOG"
+
+#: Serialises the native libsndfile MP3 open across threads (see module docstring).
+_DECODE_LOCK = threading.Lock()
+
+
+def _open_soundfile(path):
+    """Open a native ``soundfile.SoundFile`` with the process-wide open lock held."""
+    with _DECODE_LOCK:
+        return _soundfile.SoundFile(path)
 
 
 class _Silence:
@@ -72,12 +91,28 @@ def silence_c_stderr() -> Iterator[None]:
 
 
 def librosa_load(path, **kwargs):
-    """Like :func:`librosa.load` but silencing native decode stderr."""
+    """Like :func:`librosa.load`, but serialising the native MP3 open.
+
+    The open is hoisted out of :func:`librosa.load` so the open lock covers only
+    ``sf_open``; the read (the expensive part) still runs unlocked.  Anything
+    soundfile cannot open falls back to librosa's own handling (audioread), exactly
+    as it would have without the hoist.
+    """
     with silence_c_stderr():
-        return _librosa.load(path, **kwargs)
+        if isinstance(path, _soundfile.SoundFile):
+            return _librosa.load(path, **kwargs)
+        try:
+            desc = _open_soundfile(path)
+        except _soundfile.SoundFileRuntimeError:
+            return _librosa.load(path, **kwargs)
+        try:
+            return _librosa.load(desc, **kwargs)
+        except Exception:
+            desc.close()
+            raise
 
 
 def librosa_get_duration(**kwargs):
-    """Like :func:`librosa.get_duration` but silencing native decode stderr."""
-    with silence_c_stderr():
+    """Like :func:`librosa.get_duration` but serialising the native decode open."""
+    with silence_c_stderr(), _DECODE_LOCK:
         return _librosa.get_duration(**kwargs)

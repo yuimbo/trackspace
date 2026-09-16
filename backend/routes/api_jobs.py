@@ -16,7 +16,14 @@ from typing import Any
 from flask import Blueprint, jsonify, request
 
 from backend.embeddings.clustering import DEFAULT_WEIGHTS
-from backend.jobs import JOB_KINDS, KIND_CLUSTER, KIND_FEATURES, KIND_MAEST, kind_label
+from backend.jobs import (
+    JOB_KINDS,
+    KIND_CLUSTER,
+    KIND_FEATURES,
+    KIND_MAEST,
+    KIND_SUPERVISED,
+    kind_label,
+)
 from backend.services.request_validation import (
     one_of,
     opt_bool,
@@ -38,6 +45,7 @@ def create_api_jobs_blueprint(
     build_track_infos_fn: Callable[[str, bool], list[dict[str, Any]]],
     enqueue_library_work: Callable[..., dict[str, int]],
     enqueue_clustering: Callable[..., int],
+    enqueue_supervised: Callable[..., int],
     analysis_deps: Any,
     broadcaster: Any,
     sse_response: Callable[[Any], Any],
@@ -216,6 +224,18 @@ def create_api_jobs_blueprint(
         n = enqueue_clustering(job_queue, reason="manual")
         workers.wake(KIND_CLUSTER)
         return jsonify({"ok": True, "queued": n, "weights": clusters.weights()})
+
+    @bp.route("/api/supervised/train", methods=["POST"])
+    def api_supervised_train():
+        """Queue one folder-supervised head training run.
+
+        Library-wide and idempotent: the job dedupes on ``"library"``, so a
+        double-click cannot queue two training runs. Skipped (too few labelled
+        folders) is reported by the job's own detail, not here.
+        """
+        n = enqueue_supervised(job_queue, reason="manual")
+        workers.wake(KIND_SUPERVISED)
+        return jsonify({"ok": True, "queued": n})
 
     @bp.route("/api/clusters/track")
     def api_clusters_track():

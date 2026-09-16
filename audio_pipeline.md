@@ -15,7 +15,8 @@ audio features**). Expensive analysis runs through a durable SQLite-backed job q
 ```
 scan      → ID3 tags + Chromaprint fingerprint
 features  → classical 6-D + rhythm 14-D
-maest     → MAEST embedding + 519 style logits
+maest     → MAEST embedding + 519 style logits + per-excerpt vectors
+supervise → folder-supervised 128-D projection head over the cached vectors
 cluster   → weighted blocks → PCA → cosine kNN → multi-resolution Leiden
 ```
 
@@ -35,6 +36,36 @@ cluster   → weighted blocks → PCA → cosine kNN → multi-resolution Leiden
 not just `"fingerprint" in cached`.  If a previous run stored `null` (e.g. fpcalc was
 missing), the next run with fpcalc available will retry rather than serving the stale null.
 Never cache a `None` fingerprint and treat it as a permanent result.
+
+---
+
+## Audio decoding (`backend/decode_stderr.py`)
+
+All audio decode goes through `librosa_load` / `librosa_get_duration`, which do two
+things bare `librosa.load` does not:
+
+- **Silence native stderr.** libsndfile / libmpg123 print ID3, Xing/VBR and resync
+  diagnostics straight to fd 2, bypassing Python logging (`redirect_stderr` does not
+  help), so fd 2 is `dup2`-ed to `/dev/null` (or `TRACKSPACE_DECODE_STDERR_LOG`) for
+  the duration of the call.
+- **Serialise the native MP3 open.** libsndfile's `mpeg_decoder_init` calls the global,
+  non-thread-safe `mpg123_init()` on *every* `sf_open` — libsndfile's own source carries
+  a `*** FIXME - Threading issues ***` note there. Two workers opening MP3s at once (the
+  `features` and `maest` stages decode in parallel) race in mpg123's static layer-table
+  init and call through a half-written function pointer, killing the process with
+  **SIGBUS** (`mpeg_init` → `mpeg_open` → `psf_open_file` → `sf_open`).
+
+`_DECODE_LOCK` is held only across the open: reads on an already-open handle use
+per-handle state, so the expensive decode still runs in parallel. `librosa_load` hoists
+the open out of `librosa.load` (which accepts a pre-opened `soundfile.SoundFile`) to
+achieve this; `librosa_get_duration` takes the lock for the whole (cheap) call.
+
+A one-time single-threaded warmup does **not** fix it — the init runs on every open.
+Reproduced standalone against the real library: 10/10 crashes unlocked, 0/10 with the open
+serialised. `tests/test_decode_stderr.py` pins the contract.
+
+**Why this regressed:** the durable job queue replaced a single generation thread with one
+worker thread per stage, so decode that was serial by construction now overlaps.
 
 ---
 
@@ -64,6 +95,7 @@ The user can activate any combination (at least one must stay on):
 | CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music` (HuggingFace) |
 | EffNet | `backend/embeddings/effnet.py` | ~1280 | `discogs-effnet-bsdynamic-1.onnx` via `onnxruntime` |
 | Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
+| Supervised | `backend/embeddings/supervised.py` | 128 | folder-labelled projection head over the cached blocks (no encoder) |
 
 ### Independent versioning per source
 
@@ -72,8 +104,9 @@ The user can activate any combination (at least one must stay on):
 | CLAP | `EMBEDDING_VERSION` (`embeddings/clap.py`) | `clap_embedding`, `version` |
 | EffNet | `EFFNET_VERSION` (`embeddings/effnet.py`) | `effnet_embedding`, `effnet_version` |
 | Audio features | `FEATURES_VERSION` (`embeddings/librosa_audio_features.py`) | `features`, `features_version` |
-| MAEST | `MAEST_VERSION` (`embeddings/maest.py`) | `maest_embedding` + `maest_logits`, `maest_version` |
+| MAEST | `MAEST_VERSION` (`embeddings/maest.py`) | `maest_embedding` + `maest_logits` + `maest_excerpts`, `maest_version` |
 | Rhythm | `RHYTHM_VERSION` (`embeddings/rhythm_features.py`) | `rhythm`, `rhythm_version` |
+| Supervised | training-run id (see *Weak supervision*) | `supervised_embedding`, `supervised_version` |
 
 Bumping one source's version invalidates only that source's cached data.
 MAEST's embedding and logits share one version column because a single model
@@ -162,8 +195,9 @@ Batching matters: mel-on-CPU + batched transformer inference measured
 **~0.11 s/excerpt** on MPS versus ~1.0 s/excerpt unbatched on CPU (~9×).
 
 Three 30 s excerpts at 20/50/80 % are embedded as one batch and mean-pooled.
-Per-excerpt vectors are returned in `MaestAnalysis` so future work can detect
-genre-spanning tracks without re-running inference.
+Per-excerpt vectors are stored alongside the pooled pair (the `maest_excerpts`
+blob) so weak supervision can mine hard negatives and detect genre-spanning
+tracks without re-running inference.
 
 ---
 
@@ -366,6 +400,56 @@ projected unmodified.
 
 ---
 
+## Weak supervision (folder-supervised projection head)
+
+`backend/embeddings/supervised.py` trains a small MLP over the **cached** vectors
+and exposes its 128-D output as an ordinary source block (`supervised`), so the map
+and the clusters consume it like any other signal. Nothing here re-runs an encoder:
+training reads only `FeatureCache`.
+
+**Folders are the labels.** The leaf folder of each virtual path is a class; folders
+with fewer than `MIN_FOLDER_LABEL_SIZE` (8) tracks are noise and their tracks are
+unlabelled. Classes are sorted so the class list is stable across runs.
+
+**The input recipe is stateless.** The head's input is the per-source blocks
+L2-normalised per row and scaled by `sqrt(weight)` (`SUPERVISED_INPUT_WEIGHTS`),
+with **no column standardisation** — unlike the clustering pipeline. Column statistics
+depend on the current track set, so a stateful recipe would make a single new track's
+projection drift as the library grows. The head's own output is excluded from its
+input (`SUPERVISED_INPUT_WEIGHTS` drops `supervised`), so the block cannot feed
+back into itself.
+
+**Loss.** Supervised contrastive (SupCon) with class-balanced batches, plus a
+hard-negative repulsion term. Positives are all same-folder rows in a batch;
+early stopping on a per-class validation split returns the best weights.
+
+**Excerpts refine the supervision** (`maest_excerpts`, written by the MAEST stage):
+
+- *Hard-negative mining.* Per-track vectors are excerpt centroids (or the pooled
+  MAEST embedding when excerpts are absent — both live in the same 768-D MAEST
+  space). The hardest cross-folder pairs are mined and pushed apart explicitly.
+- *Label confidence.* A track whose excerpts disagree (intro vs drop) is a noisy
+  single-label example; its loss weight decays with intra-track dispersion.
+
+**Training is CPU-only.** At library scale the head is a few seconds of CPU matmuls.
+This is deliberate: the GPU paths are serialised by `clap.inference_lock`, and a
+training run holding that lock would stall all embedding generation for no benefit.
+
+**The run id is the cache version.** A retrain rewrites every `supervised` row in
+place, so rows are stored under `version = run_id` (a monotonic counter persisted in
+the head sidecar and mirrored into the `feature_meta` table). Layout and cluster
+revisions include the run id, so a retrain invalidates cached coordinates; the
+openTSNE fit and composite caches include it via `_source_versions_token`.
+
+**Triggers and staleness.** Training is a library-wide singleton (`"library"` dedupe
+key). It is queued manually (the *Train folder view* button) or automatically once
+after the first MAEST pass drains while no head exists. New tracks analysed later are
+projected through the current head at the top of every cluster pass (a cheap matmul), so
+they get a row without a retrain. A retrain is an explicit user action — folder
+reorganisation is invisible to the filesystem watcher.
+
+---
+
 ## Analysis pipeline: durable job queue
 
 All expensive analysis runs through a **durable SQLite-backed job queue**
@@ -387,6 +471,7 @@ global "running" flag. The change matters for correctness, not just tidiness:
 scan      → ID3 tags + Chromaprint fingerprint   (CPU, batch 8)
 features  → classical 6-D + rhythm 14-D          (CPU, batch 2)
 maest     → MAEST embedding + 519 style logits   (GPU, batch 4, gated on model)
+supervise → folder-supervised projection head    (CPU, singleton, whole-library)
 cluster   → kNN graph + multi-resolution Leiden  (whole-library singleton)
 ```
 
@@ -457,6 +542,7 @@ and every resolution returned the same 9 clusters.
 | `rhythm` | 0.15 | Groove/BPM distinctions between neighbouring genres |
 | `clap` | 0.10 | Complementary texture **+ the only text encoder** |
 | `effnet` | 0.05 | Complementary texture |
+| `supervised` | 0.15 | Learned folder-organisation signal (absent until trained) |
 | `features` | 0.00 | Off by default (subsumed by `rhythm`) |
 
 `projection_config.FROZEN_SOURCE_WEIGHTS` mirrors `clustering.DEFAULT_WEIGHTS`
@@ -493,10 +579,11 @@ CLAP would remove that capability.
 ### Required vs optional sources
 
 `REQUIRED_SOURCES = ("maest_logits", "maest")`. A track needs MAEST to be
-placed; optional sources contribute a neutral zero row when missing, so a
-partially analysed library still renders instead of hiding tracks until every
-model has run. The frontend gates the embedding view on **MAEST only** — gating
-on CLAP/EffNet left the canvas stuck on "loading models…" under `--no-clap`.
+placed; optional sources — including `supervised` — contribute a neutral zero row
+when missing, so a partially analysed (or not-yet-trained) library still renders
+instead of hiding tracks until every model has run. The frontend gates the embedding
+view on **MAEST only** — gating on CLAP/EffNet left the canvas stuck on "loading
+models…" under `--no-clap`.
 
 ### Resolutions
 

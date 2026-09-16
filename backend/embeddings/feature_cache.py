@@ -18,10 +18,15 @@ source-parameterised::
     cache.get_all("effnet", fingerprints)
     cache.count("features")
     cache.purge_old_versions("clap", current_version)
-    cache.put_maest(fp, embedding, logits)   # paired escape hatch
+    cache.put_maest(fp, embedding, logits, excerpts)   # paired escape hatch
 
 Canonical source names are ``clap``, ``effnet``, ``features``, ``maest``,
-``maest_logits`` and ``rhythm``.
+``maest_logits``, ``maest_excerpts`` and ``rhythm``.
+
+``maest_excerpts`` stores the per-excerpt MAEST embeddings as one flat float32
+blob of shape ``(n_excerpts, MAEST_EMBED_DIM)``. It shares ``maest_version``
+because a single model pass produces the pooled embedding, the logits and the
+excerpts together, and the reader owns the dimension (the blob carries no header).
 """
 
 import logging
@@ -79,12 +84,18 @@ _SOURCES: dict[str, _SourceSpec] = {
         "maest_embedding",
         "maest_version",
         "maest:",
-        purge_cols=("maest_embedding", "maest_logits"),
-        purge_prefixes=("maest:", "maestlog:"),
+        purge_cols=("maest_embedding", "maest_logits", "maest_excerpts"),
+        purge_prefixes=("maest:", "maestlog:", "maestexc:"),
         count_cols=("maest_embedding", "maest_logits"),
     ),
     "maest_logits": _SourceSpec("maest_logits", "maest_version", "maestlog:"),
+    #: Per-excerpt MAEST vectors; shares the MAEST version column. Only written by
+    #: ``put_maest`` and read back for weak-supervision hard-negative mining.
+    "maest_excerpts": _SourceSpec("maest_excerpts", "maest_version", "maestexc:"),
     "rhythm": _SourceSpec("rhythm", "rhythm_version", "rhythm:"),
+    #: Folder-supervised projection output. Versioned by training-run id, so a
+    #: retrain rewrites every row under a new version and old rows read absent.
+    "supervised": _SourceSpec("supervised_embedding", "supervised_version", "sup:"),
 }
 
 #: ``clap_embedding`` is NOT NULL, so writing another source to a new row pads
@@ -133,6 +144,14 @@ class FeatureCache:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS feature_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+                """
+            )
             for col, default in [
                 ("version", "INTEGER NOT NULL DEFAULT 0"),
                 ("effnet_embedding", "BLOB"),
@@ -141,7 +160,10 @@ class FeatureCache:
                 ("features_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("maest_embedding", "BLOB"),
                 ("maest_logits", "BLOB"),
+                ("maest_excerpts", "BLOB"),
                 ("maest_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("supervised_embedding", "BLOB"),
+                ("supervised_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("rhythm", "BLOB"),
                 ("rhythm_version", "INTEGER NOT NULL DEFAULT 0"),
             ]:
@@ -156,6 +178,32 @@ class FeatureCache:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
         return conn
+
+    # ── Key/value metadata ─────────────────────────────────────
+    # Used for values that are not per-track vectors but still belong to the
+    # cache's identity — currently the supervised head's training-run id, which is
+    # the effective cache version for the ``supervised`` source.
+
+    def get_meta(self, key: str) -> str | None:
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT value FROM feature_meta WHERE key=?", (key,)
+                ).fetchone()
+            return str(row[0]) if row and row[0] is not None else None
+        except Exception:
+            return None
+
+    def set_meta(self, key: str, value: object) -> None:
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO feature_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (key, str(value)),
+                )
+        except Exception:
+            return
 
     @staticmethod
     def _spec(source: str) -> _SourceSpec:
@@ -340,26 +388,64 @@ class FeatureCache:
         fingerprint: str,
         embedding: np.ndarray,
         logits: np.ndarray,
+        excerpts: np.ndarray | None = None,
         version: int = 0,
     ) -> None:
-        """Write MAEST embedding + style logits and their shared version in one round-trip."""
+        """Write MAEST embedding + style logits (+ optional per-excerpt vectors).
+
+        All three outputs come from one model pass and share ``maest_version``.
+        When *excerpts* is omitted, an existing excerpt blob is left untouched
+        (so a caller that only has pooled outputs cannot erase mined vectors).
+        Excerpts are stored flattened; the reader reshapes by ``MAEST_EMBED_DIM``.
+        """
         emb_arr = np.asarray(embedding, dtype=np.float32)
         log_arr = np.asarray(logits, dtype=np.float32)
+
+        exc_arr: np.ndarray | None = None
+        if excerpts is not None:
+            exc_arr = np.asarray(excerpts, dtype=np.float32)
+            if exc_arr.ndim == 1:
+                exc_arr = exc_arr.reshape(1, -1)
+            if exc_arr.size == 0:
+                exc_arr = None
+
+        cols = [
+            "fingerprint",
+            "clap_embedding",
+            "maest_embedding",
+            "maest_logits",
+            "maest_version",
+        ]
+        vals: list = [
+            fingerprint,
+            _CLAP_PAD,
+            emb_arr.tobytes(),
+            log_arr.tobytes(),
+            version,
+        ]
+        set_clause = (
+            "maest_embedding=excluded.maest_embedding, "
+            "maest_logits=excluded.maest_logits, "
+            "maest_version=excluded.maest_version"
+        )
+        if exc_arr is not None:
+            cols.insert(4, "maest_excerpts")
+            vals.insert(4, exc_arr.tobytes())
+            set_clause += ", maest_excerpts=excluded.maest_excerpts"
+
+        sql = (
+            f"INSERT INTO audio_features ({', '.join(cols)}) "
+            f"VALUES ({', '.join('?' for _ in cols)}) "
+            f"ON CONFLICT(fingerprint) DO UPDATE SET {set_clause}"
+        )
         try:
             with self._conn() as conn:
-                conn.execute(
-                    """INSERT INTO audio_features
-                           (fingerprint, clap_embedding, maest_embedding, maest_logits, maest_version)
-                       VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(fingerprint) DO UPDATE SET
-                           maest_embedding=excluded.maest_embedding,
-                           maest_logits=excluded.maest_logits,
-                           maest_version=excluded.maest_version""",
-                    (fingerprint, _CLAP_PAD, emb_arr.tobytes(), log_arr.tobytes(), version),
-                )
+                conn.execute(sql, vals)
         except Exception:
             return
         with self._lock:
             self._write_epoch += 1
             self._lru_put("maest:" + fingerprint, emb_arr.astype(np.float32))
             self._lru_put("maestlog:" + fingerprint, log_arr.astype(np.float32))
+            if exc_arr is not None:
+                self._lru_put("maestexc:" + fingerprint, exc_arr.reshape(-1).astype(np.float32))

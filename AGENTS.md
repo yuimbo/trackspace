@@ -82,6 +82,11 @@ The rules most likely to be violated. Each links to its full explanation.
 9. **Expensive analysis goes through the durable job queue.** Never raise for one bad
    track — return `JobResult.failure(...)` and let the queue own the retry.
    → `audio_pipeline.md`
+10. **Serialise the native MP3 open, not the decode.** libsndfile calls the global,
+    non-thread-safe `mpg123_init()` on every `sf_open`; concurrent opens from the
+    `features` and `maest` workers kill the process with SIGBUS. All decode goes
+    through `decode_stderr.librosa_load` / `librosa_get_duration`, which hold
+    `decode_stderr._DECODE_LOCK` across the open. → `audio_pipeline.md`
 
 ---
 
@@ -93,3 +98,28 @@ After any major session, ask yourself:
   (modularisation log) or a task in `TODO.md`.
 - Any common pitfalls worth recording → the relevant doc above, or `AGENTS.md` if it is
   a top-level invariant.
+
+---
+
+## Finishing a task
+
+Before you call a task done, always do all four of these:
+
+1. **Remove finished work from `TODO.md`.** Tick or delete anything this task completed;
+   a stale TODO is worse than no TODO. If it is now a `✅` line in the product roadmap,
+   keep it only while it is still useful context, otherwise delete it.
+2. **Add viable follow-ups to `TODO.md`.** Anything you noticed but did not do —
+   refactors, correctness gaps, perf work, dependency risks — goes in as a concrete,
+   actionable item with file/line references and a "why". Follow the existing sections
+   (`Deferred / optional`, `Product roadmap`, `Analysis performance`); add a new section
+   if none fits. Do not pad it with speculative work you would not act on.
+3. **Sanity-review your local changes.** Re-read `git diff` for the files you touched:
+   no debug leftovers, no dead code, no missing direct dependencies for new imports, no
+   docs that now contradict the code, and tests for new behaviour. Run the relevant suites
+   (`.venv/bin/python -m pytest tests/`, and `npm test` + `npm run build` from
+   `frontend/` for frontend changes) and fix what you broke.
+4. **Commit with a sensible message.** Stage the intended files (never secrets or
+   unrelated scratch) and write a message that matches the repo style: a short imperative
+   subject, then a body explaining the what and why. One topic per commit where the change
+   can be separated cleanly; do not bundle unrelated work.
+

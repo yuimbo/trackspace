@@ -81,7 +81,21 @@ def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
         cache.popitem(last=False)
 
 
-def _source_versions_token() -> str:
+def _supervised_cache_version(feature_cache) -> int:
+    """Effective cache version for the ``supervised`` source.
+
+    Supervised rows are versioned by the *training-run id* rather than a static
+    recipe constant, because a retrain rewrites every row in place. ``0`` means no
+    head has been trained, so the source is absent.
+    """
+    if feature_cache is None or not hasattr(feature_cache, "get_meta"):
+        return 0
+    from .supervised import cache_version
+
+    return cache_version(feature_cache)
+
+
+def _source_versions_token(feature_cache=None) -> str:
     from .effnet import EFFNET_VERSION
     from .librosa_audio_features import FEATURES_VERSION
     from .maest import MAEST_VERSION
@@ -90,6 +104,7 @@ def _source_versions_token() -> str:
     return (
         f"C{EMBEDDING_VERSION}E{EFFNET_VERSION}F{FEATURES_VERSION}"
         f"M{MAEST_VERSION}R{RHYTHM_VERSION}"
+        f"S{_supervised_cache_version(feature_cache)}"
     )
 
 
@@ -98,6 +113,7 @@ def _composite_config_token(
     mask: np.ndarray,
     blend: float,
     weights: dict[str, float] | None = None,
+    versions_token: str = "",
 ) -> str:
     """Vector-config identity, independent of the *set* of tracks.
 
@@ -110,7 +126,7 @@ def _composite_config_token(
         else "-"
     )
     return (
-        f"{_source_versions_token()}|{','.join(sources)}|"
+        f"{versions_token}|{','.join(sources)}|"
         f"{mask.tobytes().hex()}|{blend:.6g}|{wk}"
     )
 
@@ -121,13 +137,18 @@ def _composite_param_key(
     mask: np.ndarray,
     blend: float,
     weights: dict[str, float] | None = None,
+    versions_token: str = "",
 ) -> str:
     ph = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
-    return f"{ph}|{_composite_config_token(sources, mask, blend, weights)}"
+    return f"{ph}|{_composite_config_token(sources, mask, blend, weights, versions_token)}"
 
 
-def _source_version(source: str) -> int:
-    """Cache-version constant for one source (used in row-cache keys)."""
+def _source_version(source: str, feature_cache=None) -> int:
+    """Cache version for one source (used in row-cache keys and reads).
+
+    For ``supervised`` this is the current training-run id, so a retrain
+    invalidates the in-process composite and row caches.
+    """
     from .effnet import EFFNET_VERSION
     from .librosa_audio_features import FEATURES_VERSION
     from .maest import MAEST_VERSION
@@ -140,6 +161,7 @@ def _source_version(source: str) -> int:
         "maest": MAEST_VERSION,
         "maest_logits": MAEST_VERSION,
         "rhythm": RHYTHM_VERSION,
+        "supervised": _supervised_cache_version(feature_cache),
     }[source]
 
 
@@ -149,6 +171,7 @@ def _get_prepared_source_row(
     raw: np.ndarray,
     feature_mask: np.ndarray,
     features_blend: float,
+    feature_cache=None,
 ) -> np.ndarray:
     """Return one track row for *source* with the same preprocessing as composite gather.
 
@@ -164,7 +187,7 @@ def _get_prepared_source_row(
         key = (
             "features",
             fp,
-            _source_version(source),
+            _source_version(source, feature_cache),
             feature_mask.tobytes(),
             round(b, 9),
         )
@@ -180,7 +203,7 @@ def _get_prepared_source_row(
         return v
 
     try:
-        version = _source_version(source)
+        version = _source_version(source, feature_cache)
     except KeyError:
         raise ValueError(f"unknown source {source!r}") from None
 
@@ -225,7 +248,7 @@ def _fetch_source_map(
     projection.
     """
     try:
-        version = _source_version(source)
+        version = _source_version(source, feature_cache)
     except KeyError:
         raise ValueError(f"unknown source {source!r}") from None
     getter = getattr(feature_cache, "get_all", None)
@@ -288,8 +311,13 @@ def _gather_composite_vecs(
 
     blend = float(np.clip(features_blend, 0.05, 1.0))
     weights = dict(source_weights or {})
-    comp_key = _composite_param_key(paths, sources, mask, blend, weights)
-    comp_config = _composite_config_token(sources, mask, blend, weights)
+    versions_token = _source_versions_token(feature_cache)
+    comp_key = _composite_param_key(
+        paths, sources, mask, blend, weights, versions_token
+    )
+    comp_config = _composite_config_token(
+        sources, mask, blend, weights, versions_token
+    )
     cached = _tier_cache_get(_composite_cache, comp_key)
     if cached is not None:
         _p, _mat, _cd, _clo = cached
@@ -318,7 +346,11 @@ def _gather_composite_vecs(
             if raw is None:
                 rows.append(zero)
             else:
-                rows.append(_get_prepared_source_row(s, fp, raw, mask, blend))
+                rows.append(
+                    _get_prepared_source_row(
+                        s, fp, raw, mask, blend, feature_cache
+                    )
+                )
         block = np.stack(rows, axis=0)
         if weight != 1.0:
             block = (block * float(np.sqrt(weight))).astype(np.float32)

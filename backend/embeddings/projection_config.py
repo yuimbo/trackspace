@@ -21,7 +21,7 @@ import numpy as np
 from .librosa_audio_features import AUDIO_FEATURE_DIM
 
 # Bump in layout_revision.compute_layout_revision payload when this recipe changes.
-PROJECTION_RECIPE_VERSION = 3
+PROJECTION_RECIPE_VERSION = 4
 
 FROZEN_SOURCES: tuple[str, ...] = (
     "maest_logits",
@@ -29,6 +29,7 @@ FROZEN_SOURCES: tuple[str, ...] = (
     "rhythm",
     "clap",
     "effnet",
+    "supervised",
     "features",
 )
 
@@ -41,7 +42,14 @@ FROZEN_SOURCE_WEIGHTS: dict[str, float] = {
     "rhythm": 0.15,
     "clap": 0.10,
     "effnet": 0.05,
+    "supervised": 0.15,
     "features": 0.00,
+}
+
+#: Weights for the supervised head's *input*: the raw blocks, excluding the
+#: head's own output (feeding ``supervised`` back in would be circular).
+SUPERVISED_INPUT_WEIGHTS: dict[str, float] = {
+    k: v for k, v in FROZEN_SOURCE_WEIGHTS.items() if k != "supervised"
 }
 
 #: Sources a track must have before it can be placed on the map.

@@ -26,6 +26,7 @@ from backend import audio_features
 from backend import embeddings
 from backend.embeddings import maest as maest_mod
 from backend.embeddings import rhythm_features as rhythm_mod
+from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.clap import EMBEDDING_VERSION
 from backend.embeddings.effnet import EFFNET_VERSION
 from backend.embeddings.librosa_audio_features import FEATURES_VERSION
@@ -42,15 +43,18 @@ from backend.jobs import (
     KIND_FEATURES,
     KIND_MAEST,
     KIND_SCAN,
+    KIND_SUPERVISED,
 )
 from backend.services.analysis_pipeline import (
     AnalysisDeps,
     enqueue_clustering,
     enqueue_library_work,
+    enqueue_supervised,
     make_cluster_handler,
     make_features_handler,
     make_maest_handler,
     make_scan_handler,
+    make_supervised_handler,
 )
 from backend.services.layout_revision_for_status import layout_revision_for_projection
 from backend.services.library_scan import emit_scan_progress_events
@@ -356,6 +360,7 @@ def build_app(state: TrackspaceState) -> Flask:
         features_version=FEATURES_VERSION,
         clap_version=EMBEDDING_VERSION,
         effnet_version=EFFNET_VERSION,
+        data_dir=state.data_dir,
         emit_decode_warning=lambda rel, msg: _broadcast_embed_event(
             {"type": "decode_warning", "path": rel, "message": msg}
         ),
@@ -368,14 +373,26 @@ def build_app(state: TrackspaceState) -> Flask:
 
 
     def _after_cluster_inputs_changed(event: dict) -> None:
-        """Queue a re-cluster once a per-track stage finishes its backlog.
+        """Queue library-wide follow-up work once a per-track stage drains.
 
         Clustering is library-wide, so it is pointless to run it per track — it is
         triggered when a stage drains, and the queue's dedupe key collapses repeats.
+
+        The first full MAEST pass also auto-queues one supervised training run, but
+        only while no head exists: after that a retrain is an explicit user action
+        (folder reorganisation is not visible to the watcher).
         """
-        if event.get("type") == "drained":
-            enqueue_clustering(state.job_queue, reason=f"{event.get('kind')}-drained")
-            state.workers.wake(KIND_CLUSTER)
+        if event.get("type") != "drained":
+            return
+        kind = event.get("kind")
+        if (
+            kind == KIND_MAEST
+            and supervised_mod.current_run_id(state.data_dir) == 0
+        ):
+            enqueue_supervised(state.job_queue, reason="first-maest-drain")
+            state.workers.wake(KIND_SUPERVISED)
+        enqueue_clustering(state.job_queue, reason=f"{kind}-drained")
+        state.workers.wake(KIND_CLUSTER)
 
 
     def _job_event_sink(event: dict) -> None:
@@ -432,6 +449,20 @@ def build_app(state: TrackspaceState) -> Flask:
                 # Idle until the model has finished loading rather than failing
                 # every claimed job during the first minute after startup.
                 gate=maest_mod.is_model_ready,
+            )
+        )
+        state.workers.add(
+            JobWorker(
+                state.job_queue,
+                KIND_SUPERVISED,
+                make_supervised_handler(
+                    ANALYSIS_DEPS,
+                    build_track_infos=_build_track_infos,
+                ),
+                batch_size=1,
+                # Drain hook: a completed training run rewrites the supervised
+                # rows, so the cluster pass must follow to use them.
+                on_event=_job_event_sink,
             )
         )
         state.workers.add(
@@ -500,6 +531,7 @@ def build_app(state: TrackspaceState) -> Flask:
             clusters=state.clusters,
             enqueue_library_work=enqueue_library_work,
             enqueue_clustering=enqueue_clustering,
+            enqueue_supervised=enqueue_supervised,
             enqueue_analysis=_enqueue_analysis,
             analysis_deps=ANALYSIS_DEPS,
             maest_mod=maest_mod,

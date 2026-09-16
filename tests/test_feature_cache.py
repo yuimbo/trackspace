@@ -177,3 +177,64 @@ def test_purge_maest_evicts_only_maest_prefixes(tmp_path):
     assert fc.purge_old_versions("maest", 2) == 1
     assert not any(k.startswith(("maest:", "maestlog:")) for k in fc._mem)
     assert {"clap:c", "effnet:e", "rhythm:r"} <= set(fc._mem)
+
+
+def test_put_maest_writes_excerpts(tmp_path):
+    fc = _mk(tmp_path)
+    excerpts = np.arange(3 * 8, dtype=np.float32).reshape(3, 8)
+    fc.put_maest(
+        "fp", np.ones(8, np.float32), np.ones(519, np.float32),
+        excerpts=excerpts, version=1,
+    )
+    assert fc.has("maest_excerpts", "fp", version=1)
+    got = fc.get("maest_excerpts", "fp", version=1)
+    assert got is not None
+    np.testing.assert_allclose(got, excerpts.reshape(-1))
+
+
+def test_put_maest_without_excerpts_preserves_existing(tmp_path):
+    fc = _mk(tmp_path)
+    excerpts = np.ones((2, 4), np.float32)
+    fc.put_maest(
+        "fp", np.ones(8, np.float32), np.ones(519, np.float32),
+        excerpts=excerpts, version=1,
+    )
+    # A caller with only the pooled pair must not erase mined vectors.
+    fc.put_maest("fp", np.full(8, 2.0, np.float32), np.ones(519, np.float32), version=1)
+    assert fc.has("maest_excerpts", "fp", version=1)
+
+
+def test_purge_maest_clears_excerpts(tmp_path):
+    fc = _mk(tmp_path)
+    fc.put_maest(
+        "fp", np.ones(4, np.float32), np.ones(8, np.float32),
+        excerpts=np.ones((2, 4), np.float32), version=1,
+    )
+    assert fc.purge_old_versions("maest", 2) == 1
+    assert fc.get("maest_excerpts", "fp", version=1) is None
+    assert not any(k.startswith("maestexc:") for k in fc._mem)
+
+
+def test_supervised_source_roundtrip_and_versioning(tmp_path):
+    fc = _mk(tmp_path)
+    v1 = np.ones(4, np.float32)
+    v2 = np.full(4, 2.0, np.float32)
+    fc.put("supervised", "fp", v1, version=1)
+    fc._mem.clear()
+    assert fc.has("supervised", "fp", version=1)
+    assert fc.has("supervised", "fp", version=2) is False
+
+    # A retrain rewrites the same row under the new run id.
+    fc.put("supervised", "fp", v2, version=2)
+    fc._mem.clear()
+    assert fc.get("supervised", "fp", version=1) is None
+    np.testing.assert_allclose(fc.get("supervised", "fp", version=2), v2)
+
+
+def test_meta_roundtrip_and_missing(tmp_path):
+    fc = _mk(tmp_path)
+    assert fc.get_meta("supervised_run_id") is None
+    fc.set_meta("supervised_run_id", 3)
+    assert fc.get_meta("supervised_run_id") == "3"
+    fc.set_meta("supervised_run_id", 4)
+    assert fc.get_meta("supervised_run_id") == "4"

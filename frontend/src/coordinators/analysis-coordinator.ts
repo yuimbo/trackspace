@@ -110,6 +110,11 @@ export class AnalysisCoordinator {
       });
     }
 
+    const $train = document.getElementById("btn-train-supervised");
+    if ($train) {
+      $train.addEventListener("click", () => void this._trainSupervised());
+    }
+
     this._renderWeightSliders();
 
     const $apply = document.getElementById("btn-apply-weights");
@@ -208,13 +213,34 @@ export class AnalysisCoordinator {
     const $apply = document.getElementById(
       "btn-apply-weights",
     ) as HTMLButtonElement | null;
-    if (!$apply) return;
-    const busy =
-      (this.deps.model.queueStatus?.kinds?.cluster?.outstanding ?? 0) > 0;
-    $apply.disabled = busy;
-    $apply.title = busy
-      ? "A cluster job is already queued — it will use the current weights"
-      : "Re-cluster and re-layout with these weights";
+    const $train = document.getElementById(
+      "btn-train-supervised",
+    ) as HTMLButtonElement | null;
+    const kinds = this.deps.model.queueStatus?.kinds;
+    const clusterBusy = (kinds?.cluster?.outstanding ?? 0) > 0;
+    const trainBusy = (kinds?.supervise?.outstanding ?? 0) > 0;
+    if ($apply) {
+      $apply.disabled = clusterBusy;
+      $apply.title = clusterBusy
+        ? "A cluster job is already queued — it will use the current weights"
+        : "Re-cluster and re-layout with these weights";
+    }
+    if ($train) {
+      $train.disabled = trainBusy;
+      $train.title = trainBusy
+        ? "A training run is already queued"
+        : "Train the folder-supervised view (retrains on your folder structure)";
+    }
+  }
+
+  /** Queue one folder-supervised head training run. */
+  private async _trainSupervised(): Promise<void> {
+    try {
+      await postJSON("/api/supervised/train", {});
+      toast("Training folder-supervised view…", "ok");
+    } catch {
+      /* api() already toasted */
+    }
   }
 
   /** Flip cluster colouring; shared by the panel checkbox and the hotkey. */

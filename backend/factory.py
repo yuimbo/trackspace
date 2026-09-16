@@ -106,6 +106,7 @@ class TrackspaceBlueprintDeps:
     clusters: Any
     enqueue_library_work: Callable[..., dict[str, int]]
     enqueue_clustering: Callable[..., int]
+    enqueue_supervised: Callable[..., int]
     enqueue_analysis: Callable[..., dict[str, int]]
     analysis_deps: Any
     maest_mod: Any
@@ -191,6 +192,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             build_track_infos_fn=deps.build_track_infos_fn,
             enqueue_library_work=deps.enqueue_library_work,
             enqueue_clustering=deps.enqueue_clustering,
+            enqueue_supervised=deps.enqueue_supervised,
             analysis_deps=deps.analysis_deps,
             broadcaster=deps.broadcaster,
             sse_response=deps.sse_response,

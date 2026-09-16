@@ -28,8 +28,19 @@ from typing import Any
 import numpy as np
 
 from backend.embeddings import clustering as clustering_mod
+from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.clustering import ClusterResult
-from backend.jobs import Job, JobQueue, JobResult, KIND_CLUSTER, KIND_FEATURES, KIND_MAEST, KIND_SCAN
+from backend.embeddings.projection_config import SUPERVISED_INPUT_WEIGHTS
+from backend.jobs import (
+    Job,
+    JobQueue,
+    JobResult,
+    KIND_CLUSTER,
+    KIND_FEATURES,
+    KIND_MAEST,
+    KIND_SCAN,
+    KIND_SUPERVISED,
+)
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +63,8 @@ class AnalysisDeps:
     features_version: int
     clap_version: int = 0
     effnet_version: int = 0
+    #: Root of the runtime ``data/`` dir — where the supervised head lives.
+    data_dir: str = ""
     emit_decode_warning: Callable[[str, str], None] | None = None
 
 
@@ -262,7 +275,14 @@ def make_maest_handler(
             if not fp:
                 out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
                 continue
-            if deps.feature_cache.has("maest", fp, version=deps.maest_version):
+            # A row counts as cached only when both the pooled outputs *and* the
+            # per-excerpt vectors are present: excerpt vectors were added after the
+            # pooled pair shipped, so pre-existing rows must be re-analysed once.
+            if deps.feature_cache.has(
+                "maest", fp, version=deps.maest_version
+            ) and deps.feature_cache.has(
+                "maest_excerpts", fp, version=deps.maest_version
+            ):
                 out[job.id] = JobResult.success(cached=True)
                 continue
             targets.append((job, abs_path, fp))
@@ -297,7 +317,11 @@ def make_maest_handler(
                 continue
             try:
                 deps.feature_cache.put_maest(
-                    fp, analysis.embedding, analysis.logits, version=deps.maest_version
+                    fp,
+                    analysis.embedding,
+                    analysis.logits,
+                    excerpts=analysis.excerpt_embeddings,
+                    version=deps.maest_version,
                 )
             except Exception as e:
                 out[job.id] = JobResult.failure(f"cache write failed: {e}")
@@ -395,6 +419,9 @@ def gather_source_blocks(
     feat_map = fc.get_all("features", fps, version=deps.features_version)
     clap_map = fc.get_all("clap", fps, version=clap_version)
     effnet_map = fc.get_all("effnet", fps, version=effnet_version)
+    supervised_map = fc.get_all(
+        "supervised", fps, version=supervised_mod.cache_version(fc)
+    )
 
     paths: list[str] = []
     picked: list[str] = []
@@ -430,6 +457,7 @@ def gather_source_blocks(
         ("features", feat_map),
         ("clap", clap_map),
         ("effnet", effnet_map),
+        ("supervised", supervised_map),
     ):
         block = _stack(source_map, name)
         if block is not None:
@@ -446,6 +474,13 @@ def run_clustering(
 ) -> ClusterResult | None:
     """Gather cached vectors for the whole library and run the clustering pipeline."""
     infos = build_track_infos("", True)
+    # Give newly analysed tracks their supervised row before gathering, so this
+    # pass already clusters them in the learned space. Best-effort: a projection
+    # failure must not take clustering down with it.
+    try:
+        project_supervised_missing(deps, infos)
+    except Exception:
+        log.exception("Supervised projection failed; clustering without new rows")
     paths, blocks, logits = gather_source_blocks(
         deps,
         infos,
@@ -466,8 +501,248 @@ def run_clustering(
             deps.maest_version,
             deps.rhythm_version,
             deps.features_version,
+            supervised_mod.cache_version(deps.feature_cache),
         ),
     )
+
+
+# ──────────────────────────────────────────────────────────────
+# Weak supervision (folder-supervised projection head)
+# ──────────────────────────────────────────────────────────────
+
+
+def _mining_vectors(
+    blocks: dict[str, np.ndarray], excerpts: list[np.ndarray | None]
+) -> np.ndarray | None:
+    """Per-track 768-D MAEST vectors for hard-negative mining.
+
+    Excerpt means live in the same space as the pooled MAEST block, so a track
+    with excerpts is represented by its excerpt centroid and one without falls back
+    to its pooled embedding — one consistent space either way.
+    """
+    base = blocks.get("maest")
+    if base is None:
+        return None
+    vecs = np.asarray(base, dtype=np.float32).copy()
+    for i, exc in enumerate(excerpts):
+        if i >= vecs.shape[0]:
+            break
+        if exc is not None and exc.shape[0] > 0:
+            vecs[i] = exc.mean(axis=0)
+    return vecs
+
+
+def _excerpts_aligned(
+    deps: AnalysisDeps, infos: list[dict[str, Any]], paths: list[str]
+) -> list[np.ndarray | None]:
+    fp_by_path = {t["path"]: t.get("fingerprint") for t in infos}
+    fps = [fp_by_path.get(p) for p in paths]
+    exc_map = deps.feature_cache.get_all(
+        "maest_excerpts", [fp for fp in fps if fp], version=deps.maest_version
+    )
+    return [
+        supervised_mod.decode_excerpts(exc_map[fp]) if fp in exc_map else None
+        for fp in fps
+    ]
+
+
+def train_supervised(
+    deps: AnalysisDeps,
+    *,
+    build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Train the folder-supervised head and (re)write every supervised row.
+
+    Returns handler detail: training stats on success, or ``{"skipped": True,
+    "reason": ...}`` when there are too few labelled folders. Exceptions
+    propagate: the handler maps them to a failed ``JobResult`` so the queue owns
+    the retry decision.
+    """
+    infos = build_track_infos("", True)
+    paths, blocks, _logits = gather_source_blocks(
+        deps, infos, clap_version=deps.clap_version, effnet_version=deps.effnet_version
+    )
+    if not paths:
+        log.info("Supervised training skipped: no tracks with MAEST data")
+        return {"skipped": True, "reason": "no tracks with MAEST data yet"}
+
+    labels, class_names = supervised_mod.derive_folder_labels(paths)
+    if len(class_names) < 2:
+        log.info(
+            "Supervised training skipped: %d folder(s) with >= %d tracks",
+            len(class_names),
+            supervised_mod.MIN_FOLDER_LABEL_SIZE,
+        )
+        return {
+            "skipped": True,
+            "reason": (
+                f"need at least 2 folders with "
+                f"{supervised_mod.MIN_FOLDER_LABEL_SIZE}+ tracks "
+                f"(found {len(class_names)})"
+            ),
+        }
+
+    mat, used = supervised_mod.build_input_matrix(blocks, SUPERVISED_INPUT_WEIGHTS)
+    if mat.size == 0 or mat.shape[0] != len(paths):
+        log.warning("Supervised training skipped: input matrix is not aligned")
+        return {"skipped": True, "reason": "input matrix is not aligned"}
+
+    excerpts = _excerpts_aligned(deps, infos, paths)
+    confidence = supervised_mod.excerpt_confidence(excerpts)
+    mining = _mining_vectors(blocks, excerpts)
+    hard_pairs = (
+        supervised_mod.mine_hard_negatives(mining, labels)
+        if mining is not None
+        else None
+    )
+
+    result = supervised_mod.train_head(
+        mat, labels, sample_weights=confidence, hard_pairs=hard_pairs
+    )
+
+    run_id = supervised_mod.new_run_id(deps.data_dir)
+    meta = supervised_mod.build_meta(
+        run_id=run_id,
+        in_dim=result["in_dim"],
+        hidden_dim=result["hidden_dim"],
+        out_dim=result["out_dim"],
+        input_sources=used,
+        input_weights=SUPERVISED_INPUT_WEIGHTS,
+        class_names=class_names,
+        source_versions={
+            "clap": deps.clap_version,
+            "effnet": deps.effnet_version,
+            "features": deps.features_version,
+            "maest": deps.maest_version,
+            "rhythm": deps.rhythm_version,
+        },
+        stats=result["stats"],
+    )
+    supervised_mod.save_head(deps.data_dir, result["state_dict"], meta)
+    deps.feature_cache.set_meta(supervised_mod.RUN_ID_META_KEY, run_id)
+
+    projected = supervised_mod.project_from_state(
+        result["state_dict"],
+        in_dim=result["in_dim"],
+        hidden_dim=result["hidden_dim"],
+        out_dim=result["out_dim"],
+        mat=mat,
+    )
+    fp_by_path = {t["path"]: t.get("fingerprint") for t in infos}
+    written = 0
+    for i, path in enumerate(paths):
+        fp = fp_by_path.get(path)
+        if not fp:
+            continue
+        deps.feature_cache.put("supervised", fp, projected[i], version=run_id)
+        written += 1
+
+    stats = dict(result["stats"])
+    stats.update(
+        {
+            "run_id": run_id,
+            "rows_written": written,
+            "input_dim": result["in_dim"],
+            "folders": len(class_names),
+        }
+    )
+    log.info(
+        "Supervised head run %d: %d folders, %d labelled tracks, %d rows written",
+        run_id,
+        len(class_names),
+        int((labels >= 0).sum()),
+        written,
+    )
+    return stats
+
+
+def project_supervised_missing(
+    deps: AnalysisDeps, infos: list[dict[str, Any]]
+) -> int:
+    """Project tracks missing a supervised row through the current head.
+
+    A cheap CPU matmul, so it runs at the top of every cluster pass: tracks
+    analysed since the last training run get their row without a retrain.
+    """
+    head = supervised_mod.load_head(deps.data_dir)
+    if head is None:
+        return 0
+    meta = head["meta"]
+    version = int(meta.get("run_id", 0))
+    if version <= 0:
+        return 0
+
+    paths, blocks, _logits = gather_source_blocks(
+        deps, infos, clap_version=deps.clap_version, effnet_version=deps.effnet_version
+    )
+    if not paths:
+        return 0
+
+    fp_by_path = {t["path"]: t.get("fingerprint") for t in infos}
+    fps = [fp_by_path.get(p) for p in paths]
+    have = set(
+        deps.feature_cache.get_all(
+            "supervised", [fp for fp in fps if fp], version=version
+        )
+    )
+    todo = [i for i, fp in enumerate(fps) if fp and fp not in have]
+    if not todo:
+        return 0
+
+    mat, used = supervised_mod.build_input_matrix(blocks, SUPERVISED_INPUT_WEIGHTS)
+    if used != list(meta.get("input_sources", [])) or mat.shape[1] != int(
+        meta.get("in_dim", 0)
+    ):
+        log.warning(
+            "Supervised projection skipped: input space changed (used=%s meta=%s dim=%d/%s)",
+            used,
+            meta.get("input_sources"),
+            mat.shape[1],
+            meta.get("in_dim"),
+        )
+        return 0
+
+    z = supervised_mod.project(head, mat[todo])
+    written = 0
+    for k, i in enumerate(todo):
+        fp = fps[i]
+        if not fp:
+            continue
+        deps.feature_cache.put("supervised", fp, z[k], version=version)
+        written += 1
+    if written:
+        log.info(
+            "Supervised: projected %d new track(s) with run %d", written, version
+        )
+    return written
+
+
+def make_supervised_handler(
+    deps: AnalysisDeps,
+    *,
+    build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
+    """Train the supervised head once for the whole library (singleton job)."""
+
+    def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
+        out: dict[int, JobResult] = {}
+        if not jobs:
+            return out
+        try:
+            stats = train_supervised(deps, build_track_infos=build_track_infos)
+        except Exception as e:
+            log.exception("Supervised training failed")
+            for job in jobs:
+                out[job.id] = JobResult.failure(f"{type(e).__name__}: {e}")
+            return out
+        # A skip is a *successful* no-op, not a failure: the auto-trigger fires
+        # on every MAEST drain while no head exists, so it must stay re-runnable
+        # until the library has enough labelled folders.
+        for job in jobs:
+            out[job.id] = JobResult.success(**stats)
+        return out
+
+    return handle
 
 
 # ──────────────────────────────────────────────────────────────
@@ -496,6 +771,13 @@ def enqueue_library_work(
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
     have_maest = (
         set(fc.get_all("maest", fps, version=deps.maest_version))
+        if KIND_MAEST in kinds
+        else set()
+    )
+    # Excerpt vectors shipped after the pooled MAEST pair, so a track can be
+    # "analysed" yet still lack them; the queue re-runs it once to backfill.
+    have_excerpts = (
+        set(fc.get_all("maest_excerpts", fps, version=deps.maest_version))
         if KIND_MAEST in kinds
         else set()
     )
@@ -535,7 +817,12 @@ def enqueue_library_work(
         items = [
             (t["path"], {"path": t["path"]})
             for t in infos
-            if t.get("fingerprint") and (force or t["fingerprint"] not in have_maest)
+            if t.get("fingerprint")
+            and (
+                force
+                or t["fingerprint"] not in have_maest
+                or t["fingerprint"] not in have_excerpts
+            )
         ]
         queued[KIND_MAEST] = queue.enqueue_many(
             KIND_MAEST, items, priority=100, requeue_terminal=force
@@ -560,5 +847,19 @@ def enqueue_clustering(queue: JobQueue, *, reason: str = "library-change") -> in
         KIND_CLUSTER,
         [("library", {"reason": reason})],
         priority=200,
+        requeue_terminal=True,
+    )
+
+
+def enqueue_supervised(queue: JobQueue, *, reason: str = "manual") -> int:
+    """Request one library-wide supervised-head training run.
+
+    Like clustering it is a singleton on the ``"library"`` dedupe key: retraining
+    is whole-library by nature, so repeated requests must coalesce.
+    """
+    return queue.enqueue_many(
+        KIND_SUPERVISED,
+        [("library", {"reason": reason})],
+        priority=150,
         requeue_terminal=True,
     )

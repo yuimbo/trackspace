@@ -6,6 +6,9 @@ torch>=2.0
 torchaudio>=2.0
 transformers>=4.40
 librosa>=0.10
+# Imported directly by ``backend/decode_stderr.py`` for the locked native open
+# (libsndfile is not thread-safe on MP3); librosa also depends on it.
+soundfile>=0.13
 
 # MAEST — primary genre model (519 Discogs style logits + 768-D embedding).
 # Checkpoint auto-downloads to ~/.cache/torch/hub/checkpoints on first use.

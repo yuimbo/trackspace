@@ -86,3 +86,23 @@ def test_cluster_handler_empty_batch_is_noop():
     store.set_weights({"rhythm": 0.4})
     handler = make_cluster_handler(_NO_DEPS, store, build_track_infos=lambda f, r: [])
     assert handler([]) == {}
+
+
+def test_map_and_cluster_weights_stay_in_sync():
+    """The 2-D map and the clusters must describe the same space.
+
+    ``projection_config.FROZEN_SOURCE_WEIGHTS`` mirrors ``clustering.DEFAULT_WEIGHTS``
+    deliberately; a drift here would make the layout disagree with the clusters.
+    """
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+    from backend.embeddings.projection_config import (
+        FROZEN_SOURCE_WEIGHTS,
+        FROZEN_SOURCES,
+        SUPERVISED_INPUT_WEIGHTS,
+    )
+
+    assert FROZEN_SOURCE_WEIGHTS == DEFAULT_WEIGHTS
+    assert set(FROZEN_SOURCES) == set(FROZEN_SOURCE_WEIGHTS)
+    # The head's input must not include its own output.
+    assert "supervised" not in SUPERVISED_INPUT_WEIGHTS
+    assert SUPERVISED_INPUT_WEIGHTS.get("maest_logits") == FROZEN_SOURCE_WEIGHTS["maest_logits"]

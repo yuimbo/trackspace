@@ -21,6 +21,8 @@ class SourceVersions:
     features: int
     maest: int = 0
     rhythm: int = 0
+    #: Training-run id of the supervised head (0 = untrained/absent).
+    supervised: int = 0
 
 
 @dataclass(frozen=True)
@@ -33,6 +35,7 @@ class CachedSourceMaps:
     maest: Mapping[str, object] = field(default_factory=dict)
     maest_logits: Mapping[str, object] = field(default_factory=dict)
     rhythm: Mapping[str, object] = field(default_factory=dict)
+    supervised: Mapping[str, object] = field(default_factory=dict)
 
     def for_source(self, source: str) -> Mapping[str, object]:
         return {
@@ -42,6 +45,7 @@ class CachedSourceMaps:
             "maest": self.maest,
             "maest_logits": self.maest_logits,
             "rhythm": self.rhythm,
+            "supervised": self.supervised,
         }[source]
 
 
@@ -59,6 +63,9 @@ def batch_fetch_maps(
             "maest_logits", fingerprints, version=versions.maest
         ),
         rhythm=feature_cache.get_all("rhythm", fingerprints, version=versions.rhythm),
+        supervised=feature_cache.get_all(
+            "supervised", fingerprints, version=versions.supervised
+        ),
     )
 
 
@@ -145,12 +152,14 @@ def coverage_payload(
     tracks_with_features = tracks_with_fp_in_maps(infos, maps, "features")
     tracks_with_maest = tracks_with_fp_in_maps(infos, maps, "maest")
     tracks_with_rhythm = tracks_with_fp_in_maps(infos, maps, "rhythm")
+    tracks_with_supervised = tracks_with_fp_in_maps(infos, maps, "supervised")
 
     pending_clap = pending_tracks_for_source(fingerprinted, tracks_with_clap)
     pending_effnet = pending_tracks_for_source(fingerprinted, tracks_with_effnet)
     pending_features = pending_tracks_for_source(fingerprinted, tracks_with_features)
     pending_maest = pending_tracks_for_source(fingerprinted, tracks_with_maest)
     pending_rhythm = pending_tracks_for_source(fingerprinted, tracks_with_rhythm)
+    pending_supervised = pending_tracks_for_source(fingerprinted, tracks_with_supervised)
 
     return {
         "tracks_total": total,
@@ -165,12 +174,15 @@ def coverage_payload(
         "tracks_pending_maest": pending_maest,
         "tracks_with_rhythm": tracks_with_rhythm,
         "tracks_pending_rhythm": pending_rhythm,
+        "tracks_with_supervised": tracks_with_supervised,
+        "tracks_pending_supervised": pending_supervised,
         "cache_versions": {
             "clap": versions.clap,
             "effnet": versions.effnet,
             "audio_features": versions.features,
             "maest": versions.maest,
             "rhythm": versions.rhythm,
+            "supervised": versions.supervised,
         },
         # Legacy names (same values as track-space counts above)
         "total": total,

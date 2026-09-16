@@ -45,6 +45,7 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "rhythm": 0.15,
     "clap": 0.10,
     "effnet": 0.05,
+    "supervised": 0.15,
     "features": 0.00,
 }
 

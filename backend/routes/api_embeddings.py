@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from flask import Blueprint, jsonify, request
 
+from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.projection_config import (
     FROZEN_SOURCE_WEIGHTS,
     REQUIRED_SOURCES,
@@ -78,9 +79,21 @@ def create_api_embeddings_blueprint(
                         yield ": keepalive\n\n"
                         continue
                     etype = event.get("type", "progress")
-                    yield f"event: {etype}\ndata: {_json.dumps(event)}\n\n"
-                    if etype in ("done", "error"):
+                    if etype == "drained":
+                        # Workers drain per kind, so the first drained event
+                        # (e.g. features) must not end the stream while MAEST
+                        # is still running. Only a fully idle queue is terminal.
+                        if _analysis_progress()[0]:
+                            continue
+                        yield "event: done\ndata: {}\n\n"
                         break
+                    if etype == "progress":
+                        # Per-job worker events carry no queue totals; merge in
+                        # the aggregate the frontend renders as "done/total".
+                        _running, progress = _analysis_progress()
+                        if progress:
+                            event = {**event, **progress}
+                    yield f"event: {etype}\ndata: {_json.dumps(event)}\n\n"
             finally:
                 broadcaster.unsubscribe(q)
 
@@ -93,6 +106,7 @@ def create_api_embeddings_blueprint(
             features_version,
             maest_mod.MAEST_VERSION,
             rhythm_version,
+            supervised_mod.cache_version(feature_cache),
         )
 
     def _version_tuple(versions: Any) -> tuple[int, ...]:
@@ -103,6 +117,7 @@ def create_api_embeddings_blueprint(
             versions.features,
             versions.maest,
             versions.rhythm,
+            versions.supervised,
         )
 
     def _analysis_progress() -> tuple[bool, dict[str, int] | None]:

@@ -11,6 +11,7 @@ from .kinds import (
     KIND_FEATURES,
     KIND_MAEST,
     KIND_SCAN,
+    KIND_SUPERVISED,
     kind_label,
 )
 from .queue import DONE, FAILED, PENDING, RUNNING, Job, JobQueue, QueueStats
@@ -24,6 +25,7 @@ __all__ = [
     "KIND_FEATURES",
     "KIND_MAEST",
     "KIND_SCAN",
+    "KIND_SUPERVISED",
     "Job",
     "JobHandler",
     "JobQueue",

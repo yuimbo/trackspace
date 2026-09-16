@@ -29,9 +29,10 @@ backend/
     projection_backends.py PCA preview + cuML / mlx-vis / sklearn t-SNE
     maest.py              primary genre model: 519 logits + 768-D embedding
     clustering.py         weighted blocks → PCA → cosine kNN → multi-resolution Leiden
+    supervised.py         folder-supervised 128-D projection head (weak supervision)
     rhythm_features.py    14-D rhythm/DSP descriptors
     clap.py               CLAP audio + text encoder
-    feature_cache.py      content-addressed SQLite cache (6 vector sources)
+    feature_cache.py      content-addressed SQLite cache (7 vector sources)
     ...                   effnet, audio_decode, librosa features, coverage, revision
   templates/partials/     Jinja templates served by Flask (HTMX)
 frontend/src/
@@ -61,10 +62,11 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Backend entry + wiring | `backend/app.py` | ~640 | Helpers, deps assembly, `main()` |
 | Process state | `backend/trackspace_state.py` | ~75 | `TrackspaceState.create()` |
 | App factory | `backend/factory.py` | ~170 | `create_app()` + blueprints |
-| Analysis seam | `backend/services/analysis_pipeline.py` | ~540 | Job handlers + `ClusterStore` |
+| Analysis seam | `backend/services/analysis_pipeline.py` | ~870 | Job handlers + `ClusterStore` + supervised training/projection |
 | Queue | `backend/jobs/` | ~900 | `queue.py` + `worker.py` + `kinds.py` |
-| ML / layout | `backend/embeddings/layout.py` | ~505 | Composite gather + orchestration |
+| ML / layout | `backend/embeddings/layout.py` | ~565 | Composite gather + orchestration |
 | Semantic weighting | `backend/embeddings/semantic_weighting.py` | ~265 | Folder/text directions |
+| Weak supervision | `backend/embeddings/supervised.py` | ~655 | Folder-labelled projection head |
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
 | Feature cache | `backend/embeddings/feature_cache.py` | ~365 | One generic `_SOURCES` registry |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
@@ -217,7 +219,13 @@ Structural refactors already completed. Kept as a record of where the seams land
 - ✅ `TrackspaceState` lifecycle: no import-time side effects; `main()` builds the state
   and `build_app(state)` wires around it (see *Process state & lifecycle*).
 - `analysis_pipeline.py` — split again only if it grows; handlers are one factory function
-  per stage, so the cluster store and enqueue helpers are the next seams.
+  per stage, so the cluster store and enqueue helpers are the next seams. The
+  `supervise` stage (folder-supervised head) was added as one more handler plus the
+  supervised projection helpers, without changing the existing seams.
+- `embeddings/supervised.py` — the weak-supervision module. Pure functions plus a
+  small persistence layer; it depends only on `embeddings/*` (never on
+  `analysis_pipeline`), so the job handler owns the cache gathering and the module
+  stays unit-testable.
 
 **Frontend** — `controller.ts` went from ~2250 to ~620 lines. Extracted, in order, each
 with vitest coverage:

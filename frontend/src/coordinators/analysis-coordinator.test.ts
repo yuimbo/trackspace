@@ -80,6 +80,7 @@ const PANEL_HTML = `
   <button id="btn-apply-weights"></button>
   <button id="btn-reset-weights"></button>
   <button id="btn-rebuild-clusters"></button>
+  <button id="btn-train-supervised"></button>
 `;
 
 interface Harness {
@@ -482,5 +483,37 @@ describe("AnalysisCoordinator source weights", () => {
     const note = document.getElementById("cluster-weights-note")!.textContent!;
     expect(note).toContain("Rhythm");
     expect(note).not.toContain("Genre");
+  });
+
+  it("queues a supervised training run from the Train button", async () => {
+    const { coord, fetchSpy } = makeHarness();
+    coord.bindPanel();
+    document.getElementById("btn-train-supervised")!.click();
+    await flush();
+
+    const post = fetchSpy.mock.calls.find(
+      ([u, init]) =>
+        String(u) === "/api/supervised/train" &&
+        (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(post).toBeDefined();
+  });
+
+  it("disables Train while a supervise job is outstanding", async () => {
+    const { coord } = makeHarness();
+    coord.bindPanel();
+    const $train = document.getElementById(
+      "btn-train-supervised",
+    ) as HTMLButtonElement;
+    expect($train.disabled).toBe(false);
+
+    const es = await startSettled(coord);
+    es.emit(
+      "snapshot",
+      makeQueueStatus({
+        kinds: { supervise: makeKind({ pending: 1, outstanding: 1 }) },
+      }),
+    );
+    expect($train.disabled).toBe(true);
   });
 });
