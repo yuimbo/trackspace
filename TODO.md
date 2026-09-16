@@ -106,15 +106,30 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       queue's per-kind stats already report structure progress, and `SourceVersions`
       feeds the layout revision hash, where a metadata-only source must not appear).
       Add a separate count if the status UI ever needs it.
-- [ ] **Jacobian cost for t-SNE.** `_weight_jacobian` runs one projection per
-      source, and with the fallback backend each perturbation is a *full refit*
-      (`_project_tsne`'s fit cache keys on the weight config). The perturbation
-      fits are now uncached (`cache_fit=False`) so they no longer evict the live
-      fit, and the frontend caches the result per weight vector and runs it after
-      the base layout; the remaining cost is the S+1 refits themselves. Reuse the
-      fitted openTSNE embedding's `transform` for the perturbations (guarding its
-      in-place recentring) so the Jacobian is S+1 cheap transforms; PCA is already
-      cheap.
+- ✅ **Weight-aware landmark extension for the slider Jacobian.** The refit
+      finite difference was not a derivative (t-SNE lands in a different local
+      optimum; measured `cos ≈ −0.17` vs PCA's `0.9998`). `?jacobian=1` now uses
+      `landmark_projection.py`: a fixed smooth `g_i(w)` over cached landmark
+      squared distances, with the exact analytic derivative
+      `dg_i/dw_s = −(1/τ) Σ_l a_il Δ_ils (c_l − g_i)`. The chart is fitted
+      once per `layout_revision` and cached; the refit-FD remains the fallback.
+      See `audio_pipeline.md` → *Smooth landmark extension*.
+- [ ] **Landmark 2-D fidelity is unmeasured.** The construction's derivative is
+      exact (checked against central differences of the same `g`), but whether the
+      2-D layout tracks the *real* t-SNE chart across the weight range is an
+      empirical question. The naive comparison is confounded — a refit is not a
+      smooth function and Procrustes cannot align its cluster rearrangements — so
+      the right experiment is the researcher's §8 harness: neighbourhood
+      recall/trustworthiness at k=10/30/100 and weight hold-out generalization,
+      against a fixed chart. Tune `n_landmarks` (default 128) and `tau`
+      (median of `D²`) on the real library.
+- [ ] **Chart revision vs layout revision.** `landmark_model_for` caches by
+      `layout_revision`, which mixes the chart artifact with the track set. The
+      researcher's §6 asks for a separate `chart_revision` (reference data,
+      preprocessing, semantic transform, landmark artifact, algorithm config) so a
+      layout from insertion stays deterministic *conditional on the same chart*. Also
+      split the semantic correction: `_weight_jacobian` re-runs it per perturbation,
+      and the cross-source terms (`∝√(w_s w_t)`) are not in `Σ_s w_s Δ_s`.
 - [ ] **Imported heads do not check `source_versions`.** `project_supervised_missing`
       refuses on `input_sources`/`in_dim` mismatch but not on a different
       `source_versions` (e.g. a head trained before a CLAP checkpoint switch, same

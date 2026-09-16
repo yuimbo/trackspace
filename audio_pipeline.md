@@ -576,6 +576,44 @@ The approximation is only valid for the small deltas of a drag — the sign and 
 are right, the magnitude only to first order — and a source already at weight 0 has no
 derivative, so raising it from 0 is a step the linearisation cannot describe.
 
+**Why the refit finite difference is not a derivative (measured).** t-SNE is
+non-convex and its init is data-dependent, so a small weight change lands in a
+*different local optimum*: on synthetic data the refit-FD had `cos ≈ −0.17` with a
+step, and PCA's own Jacobian `cos ≈ 0.9998`. The refit-FD is therefore not a
+derivative, and applying it pins dots to the [0,1] corners.
+
+### Smooth landmark extension (weight-aware preview)
+
+`backend/embeddings/landmark_projection.py` replaces that finite difference with a
+*fixed, smooth* function of the weights, differentiated in closed form. Landmarks
+`l` are actual tracks; with their unweighted per-source blocks `u_ls` and cached
+squared distances `Delta_ils = ||u_is − u_ls||^2`:
+
+```
+D2_il(w) = sum_s w_s Delta_ils        (the same additive metric)
+a_il(w)  = softmax_l(−D2_il(w) / tau) (normalised affinities)
+g_i(w)   = sum_l a_il(w) c_l          (landmark coordinates)
+dg_i/dw_s = −(1/tau) sum_l a_il Delta_ils (c_l − g_i)
+```
+
+- `c_l` is fitted once, at `w0`, against the existing base t-SNE layout (ridge
+  least squares) and cached per `layout_revision` in `landmark_model_for`; refitting
+  it per drag would be the "recompute a fitted quantity" mistake. The chart is
+  persisted beyond the layout LRU so an eviction cannot change an "identical" request.
+- The derivative is **exact for this nonlinear `g`** (not a finite difference) and
+  avoids differentiating `sqrt(w_s)`: the squared distances are already affine in `w`.
+  Verified against central differences of the same `g` (relative error < 1e-3).
+- The preview is the residual form `y~_i(w) = y_i^0 + g_i(w) − g_i(w0)`, so it
+  reproduces the base layout *exactly* at `w = w0`. The frontend's `y^0 + J dw` is
+  its first-order truncation.
+- Cost is `O(N*M*S)` after the `Delta` cache (128 landmarks: ~51 MB at 20k
+  tracks). The route uses it for `?jacobian=1` and falls back to the refit-FD when
+  the chart cannot be fit (too few tracks).
+- **Limit:** a frozen reference chart cannot reorganise its own geometry to match a
+  radically different metric, so insertion and chart rebuilding stay different
+  operations. The 2-D fidelity across the weight range is an empirical question, not
+  established by the construction.
+
 ---
 
 ## Analysis pipeline: durable job queue

@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from flask import Blueprint, jsonify, request
 
+from backend.embeddings import landmark_projection as landmark_mod
 from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.projection_config import (
     FROZEN_SOURCE_WEIGHTS,
@@ -248,7 +249,8 @@ def create_api_embeddings_blueprint(
                 "total": int(total),
             })
 
-        result = embeddings_mod.compute_projection(
+        weights0 = dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS)
+        positions = embeddings_mod.compute_projection(
             infos,
             feature_cache,
             version=embedding_version,
@@ -264,21 +266,58 @@ def create_api_embeddings_blueprint(
             layout_revision=revision,
             source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
             required_sources=REQUIRED_SOURCES,
-            with_jacobian=with_jacobian,
             on_progress=_layout_progress,
         )
 
-        if with_jacobian:
-            positions, jacobian = result
-            return jsonify({
-                "positions": positions,
-                "revision": revision,
-                "weights": dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS),
-                "jacobian": {
-                    s: [[float(dx), float(dy)] for dx, dy in arr]
-                    for s, arr in jacobian.items()
-                },
-            })
-        return jsonify({"positions": result, "revision": revision})
+        if not with_jacobian:
+            return jsonify({"positions": positions, "revision": revision})
+
+        # The base layout is fetched and drawn first (above); the Jacobian is a
+        # separate, slower pass. The landmark extension differentiates a *fixed*,
+        # smooth function of the weights, so its derivative is exact rather than
+        # refit noise (an independent refit lands in a different local optimum).
+        model = landmark_mod.landmark_model_for(
+            revision,
+            infos,
+            feature_cache,
+            positions,
+            sources=proj.sources,
+            feature_mask=proj.feature_mask,
+            features_blend=proj.features_blend,
+            required_sources=REQUIRED_SOURCES,
+            weights0=weights0,
+        )
+        if model is None:
+            # Too few tracks to fit a chart: fall back to the refit finite
+            # difference (correct for PCA, noisy for t-SNE).
+            _positions, jacobian = embeddings_mod.compute_projection(
+                infos,
+                feature_cache,
+                version=embedding_version,
+                method=proj.method,
+                context_tags=proj.tag_names,
+                context_folders=proj.explicit_folders if proj.explicit_folders else None,
+                scale_folders=proj.scale_folders,
+                folder_boost=proj.folder_boost,
+                folder_depth_boost=proj.folder_depth_boost,
+                sources=proj.sources,
+                feature_mask=proj.feature_mask,
+                features_blend=proj.features_blend,
+                layout_revision=revision,
+                source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
+                required_sources=REQUIRED_SOURCES,
+                with_jacobian=True,
+            )
+        else:
+            jacobian = model.jacobian(weights0)
+        return jsonify({
+            "positions": positions,
+            "revision": revision,
+            "weights": weights0,
+            "jacobian": {
+                s: [[float(dx), float(dy)] for dx, dy in arr]
+                for s, arr in jacobian.items()
+            },
+        })
 
     return bp
