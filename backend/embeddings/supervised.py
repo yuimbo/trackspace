@@ -84,6 +84,12 @@ SPANNING_DISPERSION_THRESHOLD = 0.25
 HEAD_FILENAME = "supervised_head.pt"
 META_FILENAME = "supervised_head.json"
 
+#: Portable head-bundle format written by export and read by import. A bundle is
+#: self-describing so importing a head trained on another library can verify it
+#: before overwriting anything (see :func:`read_head_bundle`).
+HEAD_BUNDLE_FORMAT = "trackspace-head"
+HEAD_BUNDLE_VERSION = 1
+
 #: FeatureCache meta key holding the current training-run id. Readers that only
 #: hold the cache (layout, clustering) resolve the supervised cache version from it.
 RUN_ID_META_KEY = "supervised_run_id"
@@ -576,20 +582,30 @@ def meta_path(data_dir: str) -> str:
     return os.path.join(data_dir, META_FILENAME)
 
 
-def save_head(data_dir: str, state_dict: dict, meta: dict) -> None:
-    """Persist weights + a JSON sidecar; the sidecar alone carries the run id."""
+def save_head(
+    data_dir: str,
+    state_dict: dict,
+    meta: dict,
+    centroids: np.ndarray | None = None,
+) -> None:
+    """Persist weights + a JSON sidecar; the sidecar alone carries the run id.
+
+    *centroids*, when given, is the ``(n_classes, out_dim)`` per-folder centroid
+    matrix aligned with ``meta["class_names"]`` — the data nearest-centroid folder
+    assignment and the export bundle need.
+    """
     import torch
 
     os.makedirs(data_dir, exist_ok=True)
-    torch.save(
-        {
-            "state_dict": state_dict,
-            "in_dim": int(meta["in_dim"]),
-            "hidden_dim": int(meta["hidden_dim"]),
-            "out_dim": int(meta["out_dim"]),
-        },
-        head_path(data_dir),
-    )
+    payload: dict = {
+        "state_dict": state_dict,
+        "in_dim": int(meta["in_dim"]),
+        "hidden_dim": int(meta["hidden_dim"]),
+        "out_dim": int(meta["out_dim"]),
+    }
+    if centroids is not None:
+        payload["centroids"] = np.asarray(centroids, dtype=np.float32)
+    torch.save(payload, head_path(data_dir))
     tmp = meta_path(data_dir) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2, sort_keys=True)
@@ -627,6 +643,18 @@ def load_head(data_dir: str) -> dict | None:
         log.warning("supervised: failed to load head %s: %s", path, e)
         return None
     return {"payload": payload, "meta": meta}
+
+
+def head_centroids(data_dir: str) -> np.ndarray | None:
+    """Per-folder centroids of the installed head, or ``None`` when absent."""
+    head = load_head(data_dir)
+    if head is None:
+        return None
+    raw = head["payload"].get("centroids")
+    if raw is None:
+        return None
+    arr = np.asarray(raw, dtype=np.float32)
+    return arr if arr.ndim == 2 and arr.shape[0] > 0 else None
 
 
 def project_from_state(
@@ -691,4 +719,224 @@ def build_meta(
         "class_names": list(class_names),
         "source_versions": {k: int(v) for k, v in source_versions.items()},
         "stats": stats,
+    }
+
+
+# ──────────────────────────────────────────────────────────────
+# Centroids, folder prediction, and the portable head bundle
+# ──────────────────────────────────────────────────────────────
+
+
+def compute_centroids(
+    projected: np.ndarray, labels: np.ndarray, n_classes: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-class means of *projected* rows, L2-normalised, with their counts.
+
+    Aligned with the ``class_names`` order, so index ``c`` is that folder. A
+    class with no labelled row keeps a zero row (and count 0), which
+    :func:`predict_folders` can never then select by accident.
+    """
+    x = np.asarray(projected, dtype=np.float32)
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    n = int(max(0, n_classes))
+    if x.ndim != 2 or x.shape[0] != y.shape[0]:
+        return np.zeros((n, 0), dtype=np.float32), np.zeros(n, dtype=np.int64)
+    centroids = np.zeros((n, int(x.shape[1])), dtype=np.float32)
+    counts = np.zeros(n, dtype=np.int64)
+    for c in range(n):
+        rows = x[y == c]
+        if rows.shape[0] == 0:
+            continue
+        centroids[c] = rows.mean(axis=0)
+        counts[c] = rows.shape[0]
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    norms[norms < 1e-9] = 1.0
+    return (centroids / norms).astype(np.float32), counts
+
+
+def predict_folders(
+    centroids: np.ndarray, mat: np.ndarray, *, chunk: int = 4096
+) -> tuple[np.ndarray, np.ndarray]:
+    """Nearest-centroid class index and cosine per row of *mat*.
+
+    ``-1`` marks a row that cannot be assigned — empty centroids or a dimension
+    mismatch — so callers never read a bogus class. Chunked so the similarity
+    matrix never materialises at library scale.
+    """
+    c = np.asarray(centroids, dtype=np.float32)
+    m = np.asarray(mat, dtype=np.float32)
+    if (
+        c.ndim != 2
+        or m.ndim != 2
+        or c.shape[0] == 0
+        or c.shape[1] != m.shape[1]
+    ):
+        return (
+            np.full(m.shape[0] if m.ndim == 2 else 0, -1, dtype=np.int64),
+            np.zeros(m.shape[0] if m.ndim == 2 else 0, dtype=np.float32),
+        )
+    mn = _l2_normalize_rows(m)
+    idx = np.empty(m.shape[0], dtype=np.int64)
+    sim = np.empty(m.shape[0], dtype=np.float32)
+    step = int(max(1, chunk))
+    for start in range(0, m.shape[0], step):
+        stop = min(m.shape[0], start + step)
+        s = mn[start:stop] @ c.T
+        best = np.argmax(s, axis=1)
+        idx[start:stop] = best
+        sim[start:stop] = s[np.arange(stop - start), best]
+    return idx, sim
+
+
+def folder_subpath(class_name: str) -> str:
+    """Folder a class maps to *below a fan-out target folder*.
+
+    Class names are virtual paths that include the training library's root id
+    (``3f2a/Techno/Deep``); that root is meaningless in the target folder, so
+    only the part below it becomes the subfolder. A class that *is* a root maps to
+    the target root itself and returns ``""``.
+    """
+    norm = str(class_name).replace("\\", "/").strip("/")
+    if "/" not in norm:
+        return ""
+    return norm.split("/", 1)[1]
+
+
+def head_bundle(data_dir: str) -> dict | None:
+    """Self-describing, portable bundle for the installed head, or ``None``."""
+    head = load_head(data_dir)
+    if head is None:
+        return None
+    payload = head["payload"]
+    centroids = payload.get("centroids")
+    return {
+        "format": HEAD_BUNDLE_FORMAT,
+        "format_version": HEAD_BUNDLE_VERSION,
+        "exported_at": time.time(),
+        "state_dict": payload["state_dict"],
+        "in_dim": int(payload["in_dim"]),
+        "hidden_dim": int(payload["hidden_dim"]),
+        "out_dim": int(payload["out_dim"]),
+        "meta": head["meta"],
+        "centroids": (
+            None if centroids is None else np.asarray(centroids, dtype=np.float32)
+        ),
+    }
+
+
+def write_head_bundle(path: str, bundle: dict) -> None:
+    import torch
+
+    tmp = path + ".tmp"
+    torch.save(bundle, tmp)
+    os.replace(tmp, path)
+
+
+def read_head_bundle(path: str) -> dict:
+    """Load and validate a portable bundle; raises ``ValueError`` when malformed."""
+    import torch
+
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as e:
+        # A bad upload is a client error, not a server fault: normalise every
+        # deserialisation failure to ValueError so routes can answer 400.
+        raise ValueError(f"could not read head bundle: {e}") from e
+    if not isinstance(payload, dict) or payload.get("format") != HEAD_BUNDLE_FORMAT:
+        raise ValueError("not a trackspace head bundle")
+    try:
+        version = int(payload.get("format_version", 0))
+    except (TypeError, ValueError):
+        version = 0
+    if version > HEAD_BUNDLE_VERSION:
+        raise ValueError(
+            f"head bundle version {version} is newer than this server supports "
+            f"({HEAD_BUNDLE_VERSION})"
+        )
+    for key in ("state_dict", "meta", "in_dim", "hidden_dim", "out_dim"):
+        if key not in payload:
+            raise ValueError(f"head bundle is missing {key!r}")
+    return payload
+
+
+def install_head_bundle(
+    data_dir: str, bundle: dict, *, run_id: int | None = None
+) -> dict:
+    """Install an imported bundle under a *fresh local* run id.
+
+    The run id is the cache version for every ``supervised`` row, so it must be
+    local: reusing the exporting library's id would make the imported head collide
+    with rows already cached here and stop them being re-projected.
+    """
+    if bundle.get("format") != HEAD_BUNDLE_FORMAT:
+        raise ValueError("not a trackspace head bundle")
+    meta = dict(bundle["meta"])
+    new_id = int(run_id) if run_id is not None else new_run_id(data_dir)
+    meta["run_id"] = new_id
+    meta["imported_at"] = time.time()
+    save_head(
+        data_dir,
+        bundle["state_dict"],
+        meta,
+        centroids=bundle.get("centroids"),
+    )
+    return meta
+
+
+def compare_heads(a: dict, b: dict) -> dict:
+    """Compare two head bundles: shared folders and per-class centroid cosine.
+
+    Per-class similarity is only reported when the two heads share an input space
+    (same sources and width). A head trained on a different encoder set or a
+    different checkpoint lives in an unrelated space, so a centroid cosine between
+    them would be a meaningless number; ``compatible`` says so instead.
+    """
+    ma, mb = a.get("meta", {}), b.get("meta", {})
+    ca, cb = a.get("centroids"), b.get("centroids")
+    compatible = (
+        int(a.get("in_dim", 0)) == int(b.get("in_dim", 0))
+        and list(ma.get("input_sources", [])) == list(mb.get("input_sources", []))
+        and dict(ma.get("source_versions", {}))
+        == dict(mb.get("source_versions", {}))
+    )
+    names_a = list(ma.get("class_names", []))
+    names_b = list(mb.get("class_names", []))
+    index_a = {n: i for i, n in enumerate(names_a)}
+    index_b = {n: i for i, n in enumerate(names_b)}
+    shared = sorted(set(names_a) & set(names_b))
+
+    per_class: list[dict] = []
+    if compatible and ca is not None and cb is not None:
+        ca = np.asarray(ca, dtype=np.float32)
+        cb = np.asarray(cb, dtype=np.float32)
+        for name in shared:
+            ia, ib = index_a[name], index_b[name]
+            if ia < ca.shape[0] and ib < cb.shape[0]:
+                per_class.append(
+                    {"folder": name, "cosine": float(np.dot(ca[ia], cb[ib]))}
+                )
+    return {
+        "compatible": bool(compatible),
+        "a": _head_summary(a),
+        "b": _head_summary(b),
+        "shared_classes": shared,
+        "only_a": sorted(set(names_a) - set(names_b)),
+        "only_b": sorted(set(names_b) - set(names_a)),
+        "per_class": per_class,
+        "mean_cosine": (
+            float(np.mean([r["cosine"] for r in per_class])) if per_class else None
+        ),
+    }
+
+
+def _head_summary(bundle: dict) -> dict:
+    meta = bundle.get("meta", {})
+    return {
+        "run_id": meta.get("run_id"),
+        "trained_at": meta.get("trained_at"),
+        "n_classes": len(meta.get("class_names", [])),
+        "in_dim": bundle.get("in_dim"),
+        "input_sources": list(meta.get("input_sources", [])),
+        "source_versions": dict(meta.get("source_versions", {})),
+        "has_centroids": bundle.get("centroids") is not None,
     }

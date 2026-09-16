@@ -269,7 +269,9 @@ ${maestError}
       a.dataset.detailKind = "queue";
       a.tabIndex = 0;
       a.setAttribute("aria-describedby", "status-detail-panel");
-      a.textContent = `${prog.label} ${prog.detail} · ${Math.round(prog.fraction * 100)}%`;
+      a.textContent = prog.indeterminate
+        ? `${prog.label} ${prog.detail}`
+        : `${prog.label} ${prog.detail} · ${Math.round(prog.fraction * 100)}%`;
       this.$el.appendChild(a);
     }
 

@@ -76,7 +76,31 @@ describe("StatusView analysis progress", () => {
       },
     });
     view.update(model);
-    expect(statusText()).toContain("Clustering Leiden 2 / 6 · 0%");
+    expect(statusText()).toContain("Clustering Leiden 2 / 6 · 33%");
+  });
+
+  it("omits the percent while a tail stage reports no steps", () => {
+    const view = new StatusView();
+    const model = new Model();
+    model.queueStatus = queue({
+      active: true,
+      outstanding: 1,
+      total: 1,
+      finished: 0,
+      order: ["supervise"],
+      kinds: {
+        supervise: kind({
+          label: "Folder supervision",
+          running: 1,
+          outstanding: 1,
+          total: 1,
+          stage: { phase: "mining", done: 0, total: 0, at: 1 },
+        }),
+      },
+    });
+    view.update(model);
+    expect(statusText()).toContain("Folder supervision hard negatives");
+    expect(statusText()).not.toContain("%");
   });
 
   it("shows no analysis segment when the queue is idle", () => {

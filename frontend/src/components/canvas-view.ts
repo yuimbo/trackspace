@@ -911,18 +911,28 @@ export class CanvasView {
     ctx.fillStyle = "rgba(180,220,255,0.95)";
     ctx.fillText(label, cx, y + 10 + fontSize / 2);
 
-    // Determinate bar: overall finished/total across every queued stage.
+    // Determinate bar: overall finished/total across every queued stage, except
+    // for the tail stages, where the reducer substitutes the stage's own steps.
     const bx = cx - barW / 2;
     const by = y + ph - 12;
     ctx.fillStyle = "rgba(255,255,255,0.14)";
     ctx.beginPath();
     ctx.roundRect(bx, by, barW, barH, barH / 2);
     ctx.fill();
-    const fw = Math.max(barH, barW * Math.max(0, Math.min(1, prog.fraction)));
-    ctx.fillStyle = "rgba(120,200,255,0.9)";
-    ctx.beginPath();
-    ctx.roundRect(bx, by, fw, barH, barH / 2);
-    ctx.fill();
+    if (prog.indeterminate) {
+      // Opaque phase (gather/mining): no measurable fraction, so fill the whole
+      // track faintly instead of leaving it looking stalled at 0 %.
+      ctx.fillStyle = "rgba(120,200,255,0.35)";
+      ctx.beginPath();
+      ctx.roundRect(bx, by, barW, barH, barH / 2);
+      ctx.fill();
+    } else {
+      const fw = Math.max(barH, barW * Math.max(0, Math.min(1, prog.fraction)));
+      ctx.fillStyle = "rgba(120,200,255,0.9)";
+      ctx.beginPath();
+      ctx.roundRect(bx, by, fw, barH, barH / 2);
+      ctx.fill();
+    }
 
     ctx.textAlign = "start";
     ctx.textBaseline = "alphabetic";

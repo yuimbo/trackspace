@@ -83,14 +83,14 @@ def test_composite_tier_cache_reuses_matrix():
     feat = np.ones(6, dtype=np.float32)
     infos = [{"path": "a/z.mp3", "fingerprint": fp}]
     cache = _StubFeatureCache(clap={fp: clap}, feats={fp: feat})
-    _, m1, _, _, k1, _ = _gather_composite_vecs(
+    _, m1, _, _, k1, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
         feature_mask=parse_audio_feature_mask("111111"),
         features_blend=0.5,
     )
-    _, m2, _, _, k2, _ = _gather_composite_vecs(
+    _, m2, _, _, k2, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
@@ -109,14 +109,14 @@ def test_gather_composite_masks_and_blend():
     cache = _StubFeatureCache(clap={fp: clap}, feats={fp: feat})
     mask = parse_audio_feature_mask("100000")
 
-    _, mat_mask, _, _, _, _ = _gather_composite_vecs(
+    _, mat_mask, _, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
         feature_mask=mask,
         features_blend=1.0,
     )
-    _, mat_no_mask, _, _, _, _ = _gather_composite_vecs(
+    _, mat_no_mask, _, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
@@ -126,14 +126,14 @@ def test_gather_composite_masks_and_blend():
     assert mat_mask.shape == mat_no_mask.shape == (1, 8)
     assert not np.allclose(mat_mask, mat_no_mask)
 
-    _, mat_weak, _, _, _, _ = _gather_composite_vecs(
+    _, mat_weak, _, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
         feature_mask=parse_audio_feature_mask("111111"),
         features_blend=0.2,
     )
-    _, mat_full, _, _, _, _ = _gather_composite_vecs(
+    _, mat_full, _, _, _, _, _ = _gather_composite_vecs(
         infos,
         cache,
         sources=("clap", "features"),
@@ -280,3 +280,67 @@ def test_pca_ref_aligns_revisited_view():
     again = pb._project_pca(mat_a, paths_a)
     assert np.allclose(first, again)
     assert pb.pca_ref_stats()["hit"] == 1
+
+
+def test_weight_jacobian_predicts_small_weight_steps():
+    """The Jacobian is a first-order fit: a small step must point its way.
+
+    This is the property the live source-weight drag relies on — the sign and
+    direction must be right even though the magnitude is only approximate.
+    """
+    rng = np.random.default_rng(3)
+    n = 40
+    clap, feats, infos = {}, {}, []
+    for i in range(n):
+        fp = f"j{i}"
+        clap[fp] = rng.standard_normal(8).astype(np.float32)
+        feats[fp] = rng.standard_normal(6).astype(np.float32)
+        infos.append({"path": f"a/b/t{i}.mp3", "fingerprint": fp})
+    cache = _StubFeatureCache(clap=clap, feats=feats)
+    weights = {"clap": 0.4, "features": 0.6}
+    mask = parse_audio_feature_mask("111111")
+
+    def project(w: dict[str, float]):
+        return compute_projection(
+            infos, cache, method="pca", sources=("clap", "features"),
+            feature_mask=mask, features_blend=0.5, source_weights=w,
+        )
+
+    base = project(weights)
+    _, jac = compute_projection(
+        infos, cache, method="pca", sources=("clap", "features"),
+        feature_mask=mask, features_blend=0.5, source_weights=weights,
+        with_jacobian=True,
+    )
+    assert set(jac) == {"clap", "features"}
+    assert jac["clap"].shape == (n, 2)
+
+    delta = 1e-3
+    stepped = project({"clap": 0.4 + delta, "features": 0.6})
+    actual = np.array(
+        [[p["x"], p["y"]] for p in stepped], dtype=np.float64
+    ) - np.array([[p["x"], p["y"]] for p in base], dtype=np.float64)
+    predicted = jac["clap"].astype(np.float64) * delta
+
+    flat_a, flat_p = actual.ravel(), predicted.ravel()
+    denom = np.linalg.norm(flat_a) * np.linalg.norm(flat_p)
+    assert denom > 1e-9
+    cosine = float(flat_a @ flat_p) / denom
+    assert cosine > 0.5
+
+
+def test_weight_jacobian_skips_zero_weight_source():
+    fp = "z"
+    infos = [{"path": f"a/t{i}.mp3", "fingerprint": fp} for i in range(3)]
+    cache = _StubFeatureCache(
+        clap={fp: np.ones(3, dtype=np.float32)},
+        feats={fp: np.ones(6, dtype=np.float32)},
+    )
+    _, jac = compute_projection(
+        infos, cache, method="pca", sources=("clap", "features"),
+        feature_mask=parse_audio_feature_mask("111111"), features_blend=0.5,
+        source_weights={"clap": 1.0, "features": 0.0}, with_jacobian=True,
+    )
+    # A zero-weight source contributes no block, so it has no derivative.
+    assert "features" not in jac
+    assert "clap" in jac

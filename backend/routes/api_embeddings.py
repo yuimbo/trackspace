@@ -236,7 +236,8 @@ def create_api_embeddings_blueprint(
             infos, maps, proj, cache_versions=_version_tuple(pversions)
         )
 
-        positions = embeddings_mod.compute_projection(
+        with_jacobian = request.args.get("jacobian", "") == "1"
+        result = embeddings_mod.compute_projection(
             infos,
             feature_cache,
             version=embedding_version,
@@ -252,8 +253,20 @@ def create_api_embeddings_blueprint(
             layout_revision=revision,
             source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
             required_sources=REQUIRED_SOURCES,
+            with_jacobian=with_jacobian,
         )
 
-        return jsonify({"positions": positions, "revision": revision})
+        if with_jacobian:
+            positions, jacobian = result
+            return jsonify({
+                "positions": positions,
+                "revision": revision,
+                "weights": dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS),
+                "jacobian": {
+                    s: [[float(dx), float(dy)] for dx, dy in arr]
+                    for s, arr in jacobian.items()
+                },
+            })
+        return jsonify({"positions": result, "revision": revision})
 
     return bp

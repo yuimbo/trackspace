@@ -18,6 +18,11 @@
 import { type Model, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight } from "../model";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
+import {
+  approximatePositions,
+  parseWeightJacobian,
+  type WeightJacobian,
+} from "../lib/weight-jacobian";
 
 /** Subset of ``/api/embeddings/status`` used to avoid duplicate layout fetches. */
 type EmbeddingLayoutStatusHint = {
@@ -85,6 +90,9 @@ export class EmbeddingCoordinator {
   /** Query-string → {revision, positions} map so A→B→A revisits are instant. */
   private _layoutCache = new Map<string, CachedLayout>();
 
+  /** Source-weight Jacobian at the last fetched weights, for live drags. */
+  private _weightJacobian: WeightJacobian | null = null;
+
   private _animFrame = 0;
   /** Monotonic request id; a slow projection must not overwrite a newer one. */
   private _projectionReqSeq = 0;
@@ -118,6 +126,37 @@ export class EmbeddingCoordinator {
   refreshProjection(): void {
     if (!this.deps.model.embeddingsReady) return;
     void this._fetchProjection();
+  }
+
+  /** Fetch the source-weight Jacobian at the current weights and cache it.
+   *
+   *  The server evaluates it at the weights it is queried with, so the base
+   *  vector must match the one the drag starts from. A failed fetch leaves the
+   *  approximation unavailable and the drag falls back to the full recompute.
+   */
+  async fetchWeightJacobian(): Promise<void> {
+    if (!this.deps.model.embeddingsReady) return;
+    try {
+      const raw = await api<unknown>(
+        `/api/embeddings/projection?${this._projectionQueryString()}&jacobian=1`,
+      );
+      this._weightJacobian = parseWeightJacobian(raw);
+    } catch {
+      this._weightJacobian = null;
+    }
+  }
+
+  /** Approximate positions for a live slider drag; false when unavailable.
+   *
+   *  The Jacobian carries the base positions it was evaluated at, so repeated
+   *  drag events each step from that same base rather than compounding.
+   */
+  applyApproximateWeights(weights: Record<string, number>): boolean {
+    const m = this.deps.model;
+    if (!this._weightJacobian || m.embeddingPositions.size === 0) return false;
+    m.embeddingPositions = approximatePositions(this._weightJacobian, weights);
+    this.deps.canvas.scheduleDraw();
+    return true;
   }
 
   /** LRU bump + cap for _layoutCache. */

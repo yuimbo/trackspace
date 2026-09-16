@@ -174,6 +174,12 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   full weighting.
 - Switching projection method or source checkboxes re-fetches positions from the
   backend and animates the transition.
+- **Source weights drag.** Dragging a *Source weights* slider applies a first-order
+  approximation of the layout from the server's cached Jacobian
+  (`EmbeddingCoordinator.applyApproximateWeights`) so the map responds without a
+  refit; the full re-cluster + re-layout runs only on **Apply**. The Jacobian is
+  fetched once when the panel is opened (`toggle` on `#cluster-weights-details`), not
+  per drag frame, and a missing Jacobian falls back to the full recompute.
 
 ---
 

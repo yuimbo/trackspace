@@ -13,7 +13,7 @@ backend/
   app.py                  CLI entry + wiring (helpers, ANALYSIS_DEPS, worker registration)
   factory.py              create_app() + blueprint registration
   trackspace_state.py     TrackspaceState: caches, roots, queue, workers, clusters
-  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, static_audio)
+  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, supervised, static_audio)
   tags.py                 ID3 tag read/write via mutagen
   cache.py                TrackCache (path+mtime → metadata, LRU + SQLite)
   fingerprint.py          Chromaprint audio fingerprinting (fpcalc)

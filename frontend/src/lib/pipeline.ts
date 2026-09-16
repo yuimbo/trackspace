@@ -22,6 +22,8 @@ export interface PipelineProgress {
   generating: boolean;
   /** Only the library-wide tail (supervision/clustering) remains. */
   tail: boolean;
+  /** The running tail stage reported no step count, so the bar cannot be determinate. */
+  indeterminate: boolean;
 }
 
 /** Friendly names for job kinds — action-oriented, unlike the server's nouns. */
@@ -51,6 +53,9 @@ const PHASE_LABELS: Record<string, string> = {
 /** Kinds that produce the per-track embeddings the map is built from. */
 const GENERATING_KINDS = new Set(["features", "maest", "clap"]);
 
+/** Library-wide singleton kinds, each one job among thousands of per-track rows. */
+const TAIL_KINDS = new Set(["supervise", "cluster"]);
+
 export function phaseLabel(phase: string): string {
   return PHASE_LABELS[phase] ?? phase;
 }
@@ -78,6 +83,7 @@ export function pipelineProgress(q: QueueStatus | null): PipelineProgress | null
   let label = "";
   let detail = "";
   let generating = false;
+  let firstKind = "";
   for (const kind of q.order) {
     const k = q.kinds[kind];
     if (!k || k.outstanding <= 0) continue;
@@ -85,10 +91,32 @@ export function pipelineProgress(q: QueueStatus | null): PipelineProgress | null
     if (!label) {
       label = STAGE_LABELS[kind] ?? k.label;
       detail = stageDetail(kind, k);
+      firstKind = kind;
     }
   }
   if (!label) return null;
 
-  const fraction = q.total > 0 ? Math.min(1, q.finished / q.total) : 0;
-  return { active: true, fraction, label, detail, generating, tail: !generating };
+  // The overall fraction is finished/total across the whole queue, which a
+  // library-wide singleton can never move: it is one job among thousands, so the
+  // bar sits pinned near 100 % for its entire run. When the only work left is a
+  // tail stage, drive the bar from that stage's own step count instead — and mark
+  // it indeterminate while the stage reports no steps (gather/mining).
+  const first = q.kinds[firstKind];
+  const stage = first?.stage;
+  let indeterminate = false;
+  let fraction = q.total > 0 ? Math.min(1, q.finished / q.total) : 0;
+  if (TAIL_KINDS.has(firstKind)) {
+    if (stage && stage.total > 0) fraction = Math.min(1, stage.done / stage.total);
+    else indeterminate = true;
+  }
+
+  return {
+    active: true,
+    fraction,
+    label,
+    detail,
+    generating,
+    tail: !generating,
+    indeterminate,
+  };
 }

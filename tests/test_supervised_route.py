@@ -1,0 +1,215 @@
+"""The /api/supervised/* routes: head info, export, import, compare, fan-out.
+
+Built with a real FeatureCache in a temp dir and synthetic per-class MAEST rows, so
+the head is really trained and the bundle really round-trips without touching audio
+or the user's cache.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+from pathlib import Path
+
+import numpy as np
+import pytest
+from flask import Flask
+
+from backend.factory import _register_error_handlers
+from backend.embeddings.feature_cache import FeatureCache
+from backend.routes.api_supervised import create_api_supervised_blueprint
+from backend.services.analysis_pipeline import AnalysisDeps, train_supervised
+
+
+class _FakeMaest:
+    MAEST_VERSION = 1
+
+    def is_model_ready(self) -> bool:
+        return True
+
+    def load_error(self) -> None:
+        return None
+
+    def discogs_style_labels(self) -> list[str]:
+        return []
+
+
+def _library(tmp_path: Path, *, n_classes: int = 3, per_class: int = 10):
+    """Class-distinguishable MAEST rows, their virtual paths, and class centres."""
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    rng = np.random.default_rng(0)
+    infos = []
+    centers = []
+    for c in range(n_classes):
+        center = rng.normal(size=768).astype(np.float32)
+        centers.append(center)
+        for i in range(per_class):
+            fp = f"fp-{c}-{i}"
+            fc.put_maest(
+                fp,
+                center + 0.05 * rng.normal(size=768).astype(np.float32),
+                np.ones(519, np.float32),
+                version=1,
+            )
+            infos.append({"path": f"Root/Folder{c}/t{i}.mp3", "fingerprint": fp})
+    return fc, infos, centers
+
+
+def _deps(tmp_path, fc, *, root: Path | None = None):
+    base = root or tmp_path
+    return AnalysisDeps(
+        feature_cache=fc,
+        track_cache=None,
+        cached_read_all=lambda _p: {"fingerprint": "fp"},
+        resolve_virtual_path=lambda v: str(base / v) if v else str(base),
+        virtual_from_abs=lambda a: os.path.relpath(a, base),
+        list_mp3s=lambda f, _r: sorted(
+            str(p) for p in (base / f if f else base).glob("*.mp3")
+        ),
+        maest_mod=_FakeMaest(),
+        rhythm_mod=None,
+        audio_features_mod=None,
+        maest_version=1,
+        rhythm_version=1,
+        features_version=1,
+        data_dir=str(tmp_path),
+    )
+
+
+def _app(tmp_path, fc, infos, *, deps=None):
+    analysis_deps = deps or _deps(tmp_path, fc)
+    bp = create_api_supervised_blueprint(
+        analysis_deps=analysis_deps,
+        build_track_infos_fn=lambda _f, _r: infos,
+    )
+    app = Flask(__name__)
+    _register_error_handlers(app)
+    app.register_blueprint(bp)
+    app.testing = True
+    return app.test_client(), analysis_deps
+
+
+def test_head_info_is_unavailable_before_training(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    body = client.get("/api/supervised/head").get_json()
+    assert body["available"] is False
+
+
+def test_export_then_import_roundtrips(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    info = client.get("/api/supervised/head").get_json()
+    assert info["available"] is True and info["has_centroids"] is True
+
+    exported = client.get("/api/supervised/export")
+    assert exported.status_code == 200
+    assert exported.mimetype == "application/octet-stream"
+    blob = exported.data
+
+    # Import into a *different* library: it gets a fresh local run id.
+    other = tmp_path / "other"
+    other.mkdir()
+    fc2, infos2, _ = _library(other)
+    client2, _ = _app(other, fc2, infos2)
+    imported = client2.post(
+        "/api/supervised/import",
+        data={"bundle": (io.BytesIO(blob), "head.pt")},
+        content_type="multipart/form-data",
+    )
+    assert imported.status_code == 200
+    body = imported.get_json()
+    assert body["ok"] is True
+    assert body["head"]["available"] is True
+    assert body["head"]["run_id"] == 1
+
+
+def test_export_without_a_head_is_404(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    r = client.get("/api/supervised/export")
+    assert r.status_code == 404
+    assert r.get_json()["ok"] is False
+
+
+def test_import_rejects_a_foreign_file(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    r = client.post(
+        "/api/supervised/import",
+        data={"bundle": (io.BytesIO(b"not a bundle"), "head.pt")},
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 400
+    assert r.get_json()["ok"] is False
+
+
+def test_compare_without_a_head_is_400(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    r = client.post(
+        "/api/supervised/compare",
+        data={"bundle": (io.BytesIO(b"x"), "head.pt")},
+        content_type="multipart/form-data",
+    )
+    assert r.status_code == 400
+    assert "compare" in r.get_json()["error"]
+
+
+def test_compare_against_itself_is_perfectly_compatible(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+    blob = client.get("/api/supervised/export").data
+    body = client.post(
+        "/api/supervised/compare",
+        data={"bundle": (io.BytesIO(blob), "head.pt")},
+        content_type="multipart/form-data",
+    ).get_json()
+    assert body["ok"] is True
+    assert body["compare"]["compatible"] is True
+    assert body["compare"]["mean_cosine"] == pytest.approx(1.0, abs=1e-4)
+
+
+def test_fanout_requires_a_folder(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    r = client.post("/api/supervised/fanout", json={})
+    assert r.status_code == 400
+    assert "folder" in r.get_json()["error"]
+
+
+def test_fanout_plans_then_applies_folder_moves(tmp_path):
+    fc, infos, centers = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    root = tmp_path / "lib"
+    loose = root / "loose"
+    loose.mkdir(parents=True)
+    fanout_infos = []
+    for c in (0, 1):
+        fp = f"loose-{c}"
+        fc.put_maest(fp, centers[c], np.ones(519, np.float32), version=1)
+        (loose / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
+        fanout_infos.append({"path": f"loose/t{c}.mp3", "fingerprint": fp})
+
+    deps = _deps(tmp_path, fc, root=root)
+    client, _ = _app(tmp_path, fc, fanout_infos, deps=deps)
+
+    plan = client.post(
+        "/api/supervised/fanout",
+        json={"folder": "loose", "apply": False},
+    ).get_json()
+    assert plan["ok"] is True
+    assert plan["moved"] == 0
+    assert (loose / "t0.mp3").exists()
+
+    applied = client.post(
+        "/api/supervised/fanout",
+        json={"folder": "loose", "apply": True},
+    ).get_json()
+    assert applied["moved"] == 2
+    assert not (loose / "t0.mp3").exists()

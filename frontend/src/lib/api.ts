@@ -44,3 +44,8 @@ export function postJSON<T = unknown>(url: string, body: unknown, silent = false
     silent,
   );
 }
+
+/** POST a ``FormData`` body (file uploads); no ``Content-Type`` — the browser sets it. */
+export function postForm<T = unknown>(url: string, form: FormData, silent = false): Promise<T> {
+  return request<T>(url, { method: "POST", body: form }, silent);
+}

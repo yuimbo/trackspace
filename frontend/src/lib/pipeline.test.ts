@@ -80,6 +80,33 @@ describe("pipelineProgress", () => {
     expect(prog!.detail).toBe("Leiden 2 / 6");
     expect(prog!.generating).toBe(false);
     expect(prog!.tail).toBe(true);
+    // A singleton is 1 job among thousands, so the queue-wide fraction is
+    // pinned near 100 %; the tail stage's own steps must drive the bar.
+    expect(prog!.fraction).toBeCloseTo(2 / 6);
+    expect(prog!.indeterminate).toBe(false);
+  });
+
+  it("marks an opaque tail phase indeterminate instead of near-complete", () => {
+    const prog = pipelineProgress(
+      queue({
+        active: true,
+        outstanding: 1,
+        total: 9501,
+        finished: 9500,
+        order: ["supervise"],
+        kinds: {
+          supervise: kind({
+            label: "Folder supervision",
+            running: 1,
+            outstanding: 1,
+            total: 1,
+            stage: { phase: "mining", done: 0, total: 0, at: 1 },
+          }),
+        },
+      }),
+    );
+    expect(prog!.indeterminate).toBe(true);
+    expect(prog!.detail).toBe("hard negatives");
   });
 
   it("shows a one-shot phase without counts", () => {

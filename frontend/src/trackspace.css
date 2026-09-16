@@ -1609,5 +1609,41 @@ kbd {
 .cluster-weight-actions button { flex: 1; }
 #btn-apply-weights:disabled { opacity: 0.5; cursor: default; }
 
+/* ── Folder-head tools (cluster section) ────────────────────── */
+#head-tools-details { margin-top: 6px; }
+#head-tools-details summary {
+  font-size: 11px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.head-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+.head-actions button { flex: 1; }
+.head-fanout-folder {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.head-fanout-folder input[type="text"] {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+}
+.head-fanout-apply {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+}
+
 /* ── Hidden utility ───────────────────────────────────────── */
 .hidden { display: none !important; }

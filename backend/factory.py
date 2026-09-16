@@ -16,6 +16,7 @@ from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
 from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
+from backend.routes.api_supervised import create_api_supervised_blueprint
 from backend.routes.api_search import create_api_search_blueprint
 from backend.routes.api_similar import create_api_similar_blueprint
 from backend.routes.api_structure import create_api_structure_blueprint
@@ -225,6 +226,12 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             broadcaster=deps.broadcaster,
             sse_response=deps.sse_response,
             maest_mod=deps.maest_mod,
+        )
+    )
+    app.register_blueprint(
+        create_api_supervised_blueprint(
+            analysis_deps=deps.analysis_deps,
+            build_track_infos_fn=deps.build_track_infos_fn,
         )
     )
     app.register_blueprint(

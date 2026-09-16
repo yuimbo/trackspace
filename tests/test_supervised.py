@@ -8,6 +8,9 @@ cluster revisions, or cached coordinates from the previous head would be served.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -18,6 +21,7 @@ from backend.jobs import KIND_MAEST, Job, JobQueue
 from backend.services.analysis_pipeline import (
     AnalysisDeps,
     enqueue_library_work,
+    fanout_supervised,
     make_maest_handler,
     make_supervised_handler,
     project_supervised_missing,
@@ -426,3 +430,218 @@ def test_supervised_handler_skips_without_folders(tmp_path):
     out = handler([job])
     assert out[1].ok is True
     assert out[1].detail.get("skipped") is True
+
+
+# ── centroids, folder prediction, and the portable bundle ──────
+
+
+def test_compute_centroids_aligns_with_classes_and_flags_empty():
+    z = np.array(
+        [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0], [0.0, 1.0]], dtype=np.float32
+    )
+    y = np.array([0, 0, 1, 1], dtype=np.int64)
+    centroids, counts = sup.compute_centroids(z, y, 2)
+    assert counts.tolist() == [2, 2]
+    np.testing.assert_allclose(np.linalg.norm(centroids, axis=1), 1.0, atol=1e-6)
+    # A class with no labelled row stays a zero row, not a spurious direction.
+    empty, counts3 = sup.compute_centroids(z, y, 3)
+    assert counts3.tolist() == [2, 2, 0]
+    np.testing.assert_allclose(empty[2], 0.0)
+
+
+def test_predict_folders_nearest_centroid():
+    centroids = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    mat = np.array([[0.9, 0.1], [0.1, 0.9]], dtype=np.float32)
+    idx, sim = sup.predict_folders(centroids, mat)
+    assert idx.tolist() == [0, 1]
+    assert (sim > 0.9).all()
+    # A dimension mismatch cannot be scored → -1, never a bogus class.
+    bad, _ = sup.predict_folders(centroids, np.ones((1, 3), np.float32))
+    assert bad.tolist() == [-1]
+
+
+def test_folder_subpath_strips_training_root():
+    assert sup.folder_subpath("3f2a/Techno") == "Techno"
+    assert sup.folder_subpath("3f2a/Techno/Deep") == "Techno/Deep"
+    # A class that is a root itself maps to the target root, not a subfolder.
+    assert sup.folder_subpath("3f2a") == ""
+
+
+def _trained_head(tmp_path: Path, *, dim: int = 8, n_classes: int = 3):
+    """Train a small real head on synthetic blobs and return its bundle."""
+    x, y = _blobs(n_classes=n_classes, per_class=20, dim=dim)
+    result = sup.train_head(x, y, epochs=3, patience=3, seed=6)
+    z = sup.project_from_state(
+        result["state_dict"],
+        in_dim=result["in_dim"],
+        hidden_dim=result["hidden_dim"],
+        out_dim=result["out_dim"],
+        mat=x,
+    )
+    centroids, _ = sup.compute_centroids(z, y, n_classes)
+    meta = sup.build_meta(
+        run_id=1,
+        in_dim=result["in_dim"],
+        hidden_dim=result["hidden_dim"],
+        out_dim=result["out_dim"],
+        input_sources=["maest"],
+        input_weights={"maest": 1.0},
+        class_names=[f"Root/F{c}" for c in range(n_classes)],
+        source_versions={"maest": 1},
+        stats=result["stats"],
+    )
+    sup.save_head(
+        str(tmp_path), result["state_dict"], meta, centroids=centroids
+    )
+    return sup.head_bundle(str(tmp_path))
+
+
+def test_head_bundle_roundtrip_and_install(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    bundle = _trained_head(src)
+    assert bundle is not None
+    assert bundle["format"] == sup.HEAD_BUNDLE_FORMAT
+    assert bundle["centroids"] is not None
+
+    path = str(tmp_path / "head.pt")
+    sup.write_head_bundle(path, bundle)
+    read = sup.read_head_bundle(path)
+
+    # The imported head gets a fresh local run id, never the source's id — the
+    # id is the cache version, so reusing it would serve stale rows.
+    installed = sup.install_head_bundle(str(dst), read)
+    assert installed["run_id"] == 1
+    assert sup.current_run_id(str(dst)) == 1
+    loaded = sup.load_head(str(dst))
+    assert loaded is not None
+    np.testing.assert_allclose(
+        loaded["payload"]["centroids"], bundle["centroids"], atol=1e-6
+    )
+    # A second import bumps the local run id so the cache invalidates again.
+    assert sup.install_head_bundle(str(dst), read)["run_id"] == 2
+
+
+def test_read_head_bundle_rejects_foreign_file(tmp_path):
+    import torch
+
+    path = str(tmp_path / "not-a-bundle.pt")
+    torch.save({"hello": "world"}, path)
+    with pytest.raises(ValueError):
+        sup.read_head_bundle(path)
+
+
+def _bundle(names, centroids, *, dim: int = 2, source_versions=None):
+    return {
+        "format": sup.HEAD_BUNDLE_FORMAT,
+        "in_dim": dim,
+        "state_dict": {},
+        "meta": {
+            "run_id": 1,
+            "class_names": list(names),
+            "input_sources": ["maest"],
+            "source_versions": source_versions or {"maest": 1},
+        },
+        "centroids": np.asarray(centroids, dtype=np.float32),
+    }
+
+
+def test_compare_heads_scores_shared_folders_only():
+    a = _bundle(["Root/A", "Root/B"], [[1, 0], [0, 1]])
+    b = _bundle(["Root/A", "Root/C"], [[1, 0], [1, 0]])
+    out = sup.compare_heads(a, b)
+    assert out["compatible"] is True
+    assert out["shared_classes"] == ["Root/A"]
+    assert out["only_a"] == ["Root/B"]
+    assert out["only_b"] == ["Root/C"]
+    assert out["per_class"] == [{"folder": "Root/A", "cosine": pytest.approx(1.0)}]
+    assert out["mean_cosine"] == pytest.approx(1.0)
+
+
+def test_compare_heads_flags_incompatible_input_space():
+    a = _bundle(["Root/A"], [[1, 0]], dim=2)
+    b = _bundle(["Root/A"], [[1, 0]], dim=16)
+    out = sup.compare_heads(a, b)
+    assert out["compatible"] is False
+    assert out["per_class"] == []
+    assert out["mean_cosine"] is None
+
+
+def _fanout_deps(tmp_path: Path, fc: FeatureCache, root: Path) -> AnalysisDeps:
+    """Deps that map a real temp tree so fan-out can actually move files."""
+    return AnalysisDeps(
+        feature_cache=fc,
+        track_cache=None,
+        cached_read_all=lambda _p: {"fingerprint": "fp"},
+        resolve_virtual_path=lambda v: str(root / v) if v else str(root),
+        virtual_from_abs=lambda a: os.path.relpath(a, root),
+        list_mp3s=lambda f, _r: sorted(
+            str(p) for p in (root / f if f else root).glob("*.mp3")
+        ),
+        maest_mod=_FakeMaest(),
+        rhythm_mod=None,
+        audio_features_mod=None,
+        maest_version=1,
+        rhythm_version=1,
+        features_version=1,
+        data_dir=str(tmp_path),
+    )
+
+
+def test_fanout_plans_then_moves_into_predicted_folders(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    # Class-distinguishable *directions*: constant per-class rows would normalise
+    # to the same unit vector and leave the head nothing to separate.
+    rng = np.random.default_rng(0)
+    centers = [rng.normal(size=768).astype(np.float32) for _ in range(2)]
+    infos = []
+    for c, center in enumerate(centers):
+        for i in range(10):
+            fp = f"train-{c}-{i}"
+            fc.put_maest(
+                fp,
+                center + 0.05 * rng.normal(size=768).astype(np.float32),
+                np.ones(519, np.float32),
+                version=1,
+            )
+            infos.append({"path": f"Root/Folder{c}/t{i}.mp3", "fingerprint": fp})
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    root = tmp_path / "lib"
+    loose = root / "loose"
+    loose.mkdir(parents=True)
+    fanout_infos = []
+    for c, center in enumerate(centers):
+        fp = f"loose-{c}"
+        fc.put_maest(fp, center, np.ones(519, np.float32), version=1)
+        (loose / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
+        fanout_infos.append({"path": f"loose/t{c}.mp3", "fingerprint": fp})
+
+    fdeps = _fanout_deps(tmp_path, fc, root)
+    plan = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=False,
+    )
+    assert plan["ok"] is True
+    assert plan["tracks"] == 2 and plan["moved"] == 0
+    # A dry run leaves every file exactly where it was.
+    assert (loose / "t0.mp3").exists()
+    assert {e["target"] for e in plan["plan"]} == {
+        "loose/Folder0/t0.mp3",
+        "loose/Folder1/t1.mp3",
+    }
+
+    applied = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=True,
+    )
+    assert applied["moved"] == 2
+    assert (loose / "Folder0" / "t0.mp3").exists()
+    assert (loose / "Folder1" / "t1.mp3").exists()
+    assert not (loose / "t0.mp3").exists()

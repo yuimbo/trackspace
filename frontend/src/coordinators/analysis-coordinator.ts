@@ -17,7 +17,7 @@ import {
   formatSourceWeight,
 } from "../model";
 import { toast, clusterColor } from "../lib/toast";
-import { api, postJSON } from "../lib/api";
+import { api, postJSON, postForm } from "../lib/api";
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
@@ -31,6 +31,10 @@ export interface AnalysisDeps {
   canvas: { hoverTarget: HoverTarget | null };
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): void;
+  /** Approximate the layout for a live slider drag (optional in tests). */
+  applyApproximateWeights?(weights: Record<string, number>): boolean;
+  /** Fetch the source-weight Jacobian the approximation needs (optional). */
+  fetchWeightJacobian?(): void;
 }
 
 /** Shape of ``GET /api/clusters``. */
@@ -118,7 +122,48 @@ export class AnalysisCoordinator {
       $train.addEventListener("click", () => void this._trainSupervised());
     }
 
+    const $export = document.getElementById("btn-export-head");
+    if ($export) {
+      $export.addEventListener("click", () => void this._exportHead());
+    }
+    const $import = document.getElementById("btn-import-head");
+    const $importFile = document.getElementById(
+      "head-import-file",
+    ) as HTMLInputElement | null;
+    if ($import && $importFile) {
+      $import.addEventListener("click", () => $importFile.click());
+      $importFile.addEventListener("change", () =>
+        void this._importHead($importFile),
+      );
+    }
+    const $compare = document.getElementById("btn-compare-head");
+    const $compareFile = document.getElementById(
+      "head-compare-file",
+    ) as HTMLInputElement | null;
+    if ($compare && $compareFile) {
+      $compare.addEventListener("click", () => $compareFile.click());
+      $compareFile.addEventListener("change", () =>
+        void this._compareHead($compareFile),
+      );
+    }
+    const $fanout = document.getElementById("btn-fanout-head");
+    if ($fanout) {
+      $fanout.addEventListener("click", () => void this._fanoutHead());
+    }
+
     this._renderWeightSliders();
+
+    // Fetch the Jacobian when the panel is opened, not on every drag: it costs
+    // one projection per source, so it must be computed once and then applied
+    // linearly while a slider moves.
+    const $details = document.getElementById("cluster-weights-details");
+    if ($details) {
+      $details.addEventListener("toggle", () => {
+        if (($details as HTMLDetailsElement).open) {
+          this.deps.fetchWeightJacobian?.();
+        }
+      });
+    }
 
     const $apply = document.getElementById("btn-apply-weights");
     if ($apply) {
@@ -165,6 +210,9 @@ export class AnalysisCoordinator {
 
       input.addEventListener("input", () => {
         value.textContent = formatSourceWeight(input.valueAsNumber);
+        // Approximate the layout live; the full re-cluster + refit waits for
+        // Apply, so dragging never blocks on the expensive path.
+        this.deps.applyApproximateWeights?.(this._readWeightSliders());
       });
 
       row.append(name, input, value);
@@ -185,8 +233,8 @@ export class AnalysisCoordinator {
     }
   }
 
-  /** Read the live slider values into the model and re-cluster + re-layout. */
-  private async _applyWeights(): Promise<void> {
+  /** Read the live slider values into a complete weight map. */
+  private _readWeightSliders(): Record<string, number> {
     const m = this.deps.model;
     const weights: Record<string, number> = {};
     for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
@@ -197,6 +245,13 @@ export class AnalysisCoordinator {
         ? clamp(input.valueAsNumber, 0, 1)
         : m.clusterWeights[source] ?? 0;
     }
+    return weights;
+  }
+
+  /** Read the live slider values into the model and re-cluster + re-layout. */
+  private async _applyWeights(): Promise<void> {
+    const m = this.deps.model;
+    const weights = this._readWeightSliders();
     m.clusterWeights = weights;
     m.saveLS();
     try {
@@ -205,6 +260,9 @@ export class AnalysisCoordinator {
       // The layout is re-weighted independently of the cluster job, so refresh on
       // success only — a rejected vector would fail the projection the same way.
       this.deps.refreshProjection?.();
+      // The Jacobian was evaluated at the *old* weights, so the next drag would
+      // step from a stale base; refetch it at the applied weights.
+      this.deps.fetchWeightJacobian?.();
     } catch {
       /* api() already toasted */
     }
@@ -241,6 +299,144 @@ export class AnalysisCoordinator {
     try {
       await postJSON("/api/supervised/train", {});
       toast("Training folder-supervised view…", "ok");
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  private _setHeadNote(text: string): void {
+    const el = document.getElementById("head-note");
+    if (el) el.textContent = text;
+  }
+
+  /** Download this library's trained head as a portable bundle. */
+  private async _exportHead(): Promise<void> {
+    try {
+      const res = await fetch("/api/supervised/export");
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as { error?: string };
+        toast(body.error || `${res.status} ${res.statusText}`, "error");
+        return;
+      }
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "trackspace_head.pt";
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      toast("Export failed", "error");
+    }
+  }
+
+  /** Install an uploaded head, then re-project the library through it. */
+  private async _importHead(input: HTMLInputElement): Promise<void> {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    const form = new FormData();
+    form.append("bundle", file);
+    try {
+      const res = await postForm<{
+        ok: boolean;
+        head?: { run_id?: number; n_classes?: number };
+      }>("/api/supervised/import", form);
+      this._setHeadNote(
+        `Imported head: run ${res.head?.run_id ?? "?"}, ` +
+          `${res.head?.n_classes ?? "?"} folders.`,
+      );
+      toast("Imported folder head — re-projecting…", "ok");
+      // The imported run id invalidates every cached supervised row, so the map
+      // must be refetched (and the next cluster pass re-embeds).
+      this.deps.refreshProjection?.();
+      void this.fetchClusters();
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  /** Compare an uploaded head with this one and render the summary. */
+  private async _compareHead(input: HTMLInputElement): Promise<void> {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    const form = new FormData();
+    form.append("bundle", file);
+    try {
+      const res = await postForm<{
+        ok: boolean;
+        compare?: {
+          compatible: boolean;
+          shared_classes: string[];
+          only_a: string[];
+          only_b: string[];
+          mean_cosine: number | null;
+        };
+      }>("/api/supervised/compare", form);
+      const c = res.compare;
+      if (!c) {
+        this._setHeadNote("No comparison returned.");
+        return;
+      }
+      if (!c.compatible) {
+        this._setHeadNote("Heads are not comparable (different input space).");
+        return;
+      }
+      const mean = c.mean_cosine == null ? "—" : c.mean_cosine.toFixed(3);
+      this._setHeadNote(
+        `Shared ${c.shared_classes.length} folders · mean centroid cosine ` +
+          `${mean} · ${c.only_a.length} only here, ${c.only_b.length} only there.`,
+      );
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  /** Plan or apply a fan-out of one folder into the head's folders. */
+  private async _fanoutHead(): Promise<void> {
+    const $folder = document.getElementById(
+      "head-fanout-folder",
+    ) as HTMLInputElement | null;
+    const $apply = document.getElementById(
+      "head-fanout-apply",
+    ) as HTMLInputElement | null;
+    const folder = $folder?.value.trim() ?? "";
+    if (!folder) {
+      toast("Enter a folder to sort", "error");
+      return;
+    }
+    const apply = $apply?.checked ?? false;
+    if (
+      apply &&
+      !window.confirm(
+        `Move every track under "${folder}" into the head's folders? ` +
+          "This moves files on disk and cannot be undone from here.",
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await postJSON<{
+        ok: boolean;
+        tracks?: number;
+        moved?: number;
+        error?: string;
+      }>("/api/supervised/fanout", { folder, apply });
+      if (!res.ok) {
+        this._setHeadNote(res.error || "Fan out failed");
+        return;
+      }
+      const tracks = res.tracks ?? 0;
+      this._setHeadNote(
+        apply
+          ? `Moved ${res.moved ?? 0} / ${tracks} tracks.`
+          : `Planned ${tracks} tracks — tick "Move files" and Fan out to apply.`,
+      );
+      toast(apply ? `Moved ${res.moved ?? 0} tracks` : `Planned ${tracks} tracks`, "ok");
+      if (apply) {
+        this.deps.refreshProjection?.();
+        void this.fetchClusters();
+      }
     } catch {
       /* api() already toasted */
     }

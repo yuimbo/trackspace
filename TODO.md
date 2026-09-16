@@ -29,6 +29,21 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
   `buildTooltip` is pure; the canvas renders it. The flag is excerpt dispersion
   (intro vs drop ≥ 0.25), not cluster-centroid distance — the badge's hover text says so.
 
+- ✅ **Head bundles + folder fan-out.** The head now stores per-folder centroids
+  in the 128-D space, so it can be exported/imported as a self-describing bundle
+  and compared (`compare_heads`). `POST /api/supervised/fanout` predicts a folder
+  per track and, on `apply`, moves the files into the head's folder subfolders
+  (dry-run by default; collisions get a ` (n)` suffix). UI under *Folder head*.
+- ✅ **Source-weight Jacobian for live drags.** `compute_projection(...,
+  with_jacobian=True)` returns a first-order finite-difference
+  `d(position)/d(weight)`; the *Source weights* panel fetches it on open and applies
+  it linearly while a slider moves, so the map responds before the full recompute on
+  **Apply**.
+- ✅ **Supervised-training progress.** The status bar and canvas pill now drive the
+  bar from the tail stage's own steps instead of the queue-wide fraction (a singleton
+  among thousands sat pinned near 100 %), and `gather`/`projecting` report real
+  counts; an opaque phase renders an indeterminate bar rather than 0 %.
+
 ## Deferred / optional
 
 ### Frontend
@@ -91,6 +106,22 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       queue's per-kind stats already report structure progress, and `SourceVersions`
       feeds the layout revision hash, where a metadata-only source must not appear).
       Add a separate count if the status UI ever needs it.
+- [ ] **Jacobian cost for t-SNE.** `_weight_jacobian` runs one projection per
+      source, and with the default backend each perturbation is a *full refit*
+      (`_project_tsne`'s fit cache keys on the weight config), so a 5-source drag
+      start can take minutes at library scale. Reuse the fitted openTSNE embedding's
+      `transform` for the perturbations (guarding its in-place recentring) so the
+      Jacobian is S+1 cheap transforms; PCA is already cheap.
+- [ ] **Imported heads do not check `source_versions`.** `project_supervised_missing`
+      refuses on `input_sources`/`in_dim` mismatch but not on a different
+      `source_versions` (e.g. a head trained before a CLAP checkpoint switch, same
+      dim). `compare_heads` reports `compatible: false` for that case; make the
+      projection path refuse it too, or re-project through an imported head whose
+      versions differ.
+- [ ] **Fan-out has no undo.** `fanout_supervised(apply=True)` moves files with no
+      move log, so a wrong import or a bad head cannot be rolled back from the app.
+      Record the plan (old → new path) and add an "undo last fan-out" action, or
+      make the plan a persisted artifact rather than only a response body.
 
 ## Product roadmap (analysis)
 

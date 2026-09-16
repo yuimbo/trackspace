@@ -143,6 +143,11 @@ export class Controller {
       // Deferred: `embedding` is constructed just below. Applying weights
       // re-clusters on the server *and* refits the 2-D layout.
       refreshProjection: () => this.embedding.refreshProjection(),
+      // Live slider drags use the cached source-weight Jacobian; the full
+      // re-cluster + refit still runs on Apply.
+      applyApproximateWeights: (weights) =>
+        this.embedding.applyApproximateWeights(weights),
+      fetchWeightJacobian: () => void this.embedding.fetchWeightJacobian(),
     });
 
     this.embedding = new EmbeddingCoordinator({

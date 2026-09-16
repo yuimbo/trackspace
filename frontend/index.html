@@ -137,6 +137,49 @@
     >
       Train folder view
     </button>
+    <details id="head-tools-details">
+      <summary>Folder head</summary>
+      <div class="head-actions">
+        <button
+          id="btn-export-head"
+          type="button"
+          title="Download this library's trained folder head"
+        >
+          Export
+        </button>
+        <button id="btn-import-head" type="button" title="Load someone else's head">
+          Import
+        </button>
+        <button id="btn-compare-head" type="button" title="Compare a head with this one">
+          Compare
+        </button>
+        <input type="file" id="head-import-file" accept=".pt" hidden />
+        <input type="file" id="head-compare-file" accept=".pt" hidden />
+      </div>
+      <label class="head-fanout-folder">
+        <span>Sort folder</span>
+        <input
+          id="head-fanout-folder"
+          type="text"
+          placeholder="e.g. 3f2a/Downloads"
+          title="A virtual folder to sort into the head's folder paths"
+        />
+      </label>
+      <div class="cluster-weight-actions">
+        <label class="head-fanout-apply">
+          <input type="checkbox" id="head-fanout-apply" />
+          Move files
+        </label>
+        <button
+          id="btn-fanout-head"
+          type="button"
+          title="Sort that folder's tracks into the head's folders"
+        >
+          Fan out
+        </button>
+      </div>
+      <p id="head-note" class="cluster-weights-note"></p>
+    </details>
   </section>
 
   <section id="features-section" x-data>

@@ -530,6 +530,44 @@ projected through the current head at the top of every cluster pass (a cheap mat
 they get a row without a retrain. A retrain is an explicit user action — folder
 reorganisation is invisible to the filesystem watcher.
 
+### Head bundles: export, import, compare, fan-out
+
+The head is a **portable artifact**, not just local state. Training also computes
+per-folder **centroids** in the 128-D supervised space (`compute_centroids`) and stores
+them in the head payload, so a nearest-centroid lookup can assign a track to a folder
+without a retrain (`predict_folders`).
+
+- **Export** (`GET /api/supervised/export`) writes a self-describing bundle
+  (`HEAD_BUNDLE_FORMAT`, versioned) holding the weights, the meta sidecar and the
+  centroids.
+- **Import** (`POST /api/supervised/import`) installs an uploaded bundle under a
+  **fresh local run id**. The run id is the cache version for every `supervised`
+  row, so reusing the source library's id would make the imported head collide with
+  rows already cached here; a fresh id forces a clean re-projection.
+- **Compare** (`POST /api/supervised/compare`) scores shared folders by centroid
+  cosine. It reports `compatible: false` — and no similarity — when the two heads
+  differ in `in_dim`, `input_sources` or `source_versions`, because a cosine across
+  two different encoder spaces is meaningless.
+- **Fan-out** (`POST /api/supervised/fanout`) predicts a folder per track by
+  nearest centroid and moves the files into subfolders of the target folder. Class
+  names are virtual paths that include the *training* root id, so
+  `folder_subpath` strips the first component before using it as a subfolder; a
+  class that is a root itself maps to the target root and is skipped. It is
+  **dry-run by default** — `apply` is the only step that touches disk — and a name
+  collision gets a ` (n)` suffix rather than overwriting a file.
+
+### Source-weight Jacobian (live slider drag)
+
+The layout is a non-linear function of the source weights, so a slider drag cannot
+re-project without a full t-SNE refit. `compute_projection(..., with_jacobian=True)`
+returns a first-order finite-difference Jacobian `d(position)/d(weight)` around the
+current weights (`_weight_jacobian`: one projection per source). The *Source weights*
+panel fetches it once when opened and applies it linearly while a slider moves; the full
+re-cluster + refit still runs on **Apply**. The approximation is only valid for the
+small deltas of a drag — the sign and direction are right, the magnitude only to first
+order — and a source already at weight 0 has no derivative, so raising it from 0 is a step
+the linearisation cannot describe.
+
 ---
 
 ## Analysis pipeline: durable job queue

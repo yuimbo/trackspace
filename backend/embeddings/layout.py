@@ -9,8 +9,8 @@ the PCA / t-SNE backends in `projection_backends`. Re-exported from
 
 import hashlib
 import logging
-import time
 from collections import OrderedDict
+from collections.abc import Callable
 import numpy as np
 
 from .clap import (
@@ -262,7 +262,7 @@ def _gather_composite_vecs(
     features_blend: float = 0.42,
     source_weights: dict[str, float] | None = None,
     required_sources: tuple[str, ...] | None = None,
-) -> tuple[list[str], np.ndarray, int, int, str, str]:
+) -> tuple[list[str], np.ndarray, int, int, str, str, dict[str, tuple[int, int]]]:
     """Stack cached per-source rows into one weighted matrix.
 
     A track is placed on the map when it has every *required_sources* entry;
@@ -272,6 +272,9 @@ def _gather_composite_vecs(
     Per-source weights are applied as ``sqrt(w)`` because squared Euclidean
     distance is additive across the concatenated blocks — scaling a block by
     ``sqrt(w)`` makes it contribute exactly ``w ×`` its distance (plan §8).
+
+    Also returns each source's ``(lo, hi)`` column span in the matrix, which the
+    weight Jacobian differentiates against.
     """
     from .librosa_audio_features import AUDIO_FEATURE_DIM
 
@@ -297,7 +300,7 @@ def _gather_composite_vecs(
             fp_order.append(fp)
 
     if not paths:
-        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", ""
+        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", "", {}
 
     if feature_mask is None:
         mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
@@ -317,14 +320,15 @@ def _gather_composite_vecs(
     )
     cached = _tier_cache_get(_composite_cache, comp_key)
     if cached is not None:
-        _p, _mat, _cd, _clo = cached
+        _p, _mat, _cd, _clo, _spans = cached
         log.debug("projection tier: composite cache hit")
-        return paths, _mat, _cd, _clo, comp_key, comp_config
+        return paths, _mat, _cd, _clo, comp_key, comp_config, _spans
 
     blocks: list[np.ndarray] = []
     clap_dim = 0
     clap_col_lo = 0
     col = 0
+    spans: dict[str, tuple[int, int]] = {}
     for s in sources:
         smap = source_maps.get(s, {})
         if not smap:
@@ -355,20 +359,21 @@ def _gather_composite_vecs(
         if s == "clap":
             clap_dim = block.shape[1]
             clap_col_lo = col
+        spans[s] = (col, col + block.shape[1])
         blocks.append(block)
         col += block.shape[1]
 
     if not blocks:
-        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", comp_config
+        return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", comp_config, {}
 
     mat = np.concatenate(blocks, axis=1).astype(np.float32)
     _tier_cache_put(
         _composite_cache,
         comp_key,
-        (list(paths), mat, clap_dim, clap_col_lo),
+        (list(paths), mat, clap_dim, clap_col_lo, spans),
         _COMPOSITE_CACHE_MAX,
     )
-    return paths, mat, clap_dim, clap_col_lo, comp_key, comp_config
+    return paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans
 
 
 def _source_block_dim(source: str, smap: dict[str, np.ndarray]) -> int:
@@ -385,6 +390,41 @@ def _normalise_coords(coords: np.ndarray) -> np.ndarray:
     ranges = maxs - mins
     ranges[ranges < 1e-9] = 1.0
     return (coords - mins) / ranges
+
+
+def _weight_jacobian(
+    project_fn: Callable[[dict[str, float]], tuple],
+    base_weights: dict[str, float],
+    sources: tuple[str, ...],
+    *,
+    delta: float = 1e-3,
+) -> dict[str, np.ndarray]:
+    """Finite-difference ``d(2-D coords) / d(source weight)`` at *base_weights*.
+
+    *project_fn(weights)* returns ``(result, normed, spans)`` for one weight
+    vector — :func:`compute_projection`'s own inner pipeline. One projection is
+    run per source, so the caller must compute this once (on drag start) and apply
+    it linearly for the small deltas of the drag; it is never a substitute for
+    the full recompute on release.
+
+    A source already at weight 0 has no block, so it has no derivative and is
+    skipped — raising its weight from 0 is a step the linearisation cannot describe.
+    """
+    _base, base_normed, _spans = project_fn(base_weights)
+    out: dict[str, np.ndarray] = {}
+    if base_normed.shape[0] < 2:
+        return out
+    for s in sources:
+        weight = float(base_weights.get(s, 1.0))
+        if weight <= 0.0:
+            continue
+        stepped = dict(base_weights)
+        stepped[s] = weight + float(delta)
+        _res, moved, _sp = project_fn(stepped)
+        if moved.shape != base_normed.shape:
+            continue
+        out[s] = ((moved - base_normed) / float(delta)).astype(np.float32)
+    return out
 
 
 def parse_audio_feature_mask(raw: str | None) -> np.ndarray:
@@ -441,121 +481,104 @@ def compute_projection(
     layout_revision: str | None = None,
     source_weights: dict[str, float] | None = None,
     required_sources: tuple[str, ...] | None = None,
-) -> list[dict]:
+    with_jacobian: bool = False,
+) -> list[dict] | tuple[list[dict], dict[str, np.ndarray]]:
     if layout_revision and method == "tsne":
         hit = _tier_cache_get(_revision_layout_cache, layout_revision)
         if hit is not None:
             log.debug("projection: revision cache hit (tsne)")
             return hit
 
-    t0 = time.perf_counter()
-    paths, mat, clap_dim, clap_col_lo, comp_key, comp_config = _gather_composite_vecs(
-        track_infos,
-        feature_cache,
-        sources=sources,
-        feature_mask=feature_mask,
-        features_blend=features_blend,
-        source_weights=source_weights,
-        required_sources=required_sources,
-    )
-    t_after_gather = time.perf_counter()
+    weights0 = dict(source_weights or {})
 
-    # `mat.shape[0] < 2` guards the degenerate all-zero-weight case, where every
-    # source block is dropped and no row can be projected. The HTTP routes reject
-    # that vector before reaching here; this keeps the function safe regardless.
-    if len(paths) < 2 or mat.shape[0] < 2:
-        if log.isEnabledFor(logging.DEBUG):
-            log.debug(
-                "compute_projection method=%s n=%d gather=%.1fms (short-circuit)",
-                method,
-                len(paths),
-                (t_after_gather - t0) * 1000,
+    def _project_at(w: dict[str, float]):
+        """Gather → weight → project → normalise for one weight vector.
+
+        Returns ``(result, normed, spans)``. The composite gather is keyed on
+        the weights, so a perturbation re-runs only the projection.
+        """
+        paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans = (
+            _gather_composite_vecs(
+                track_infos,
+                feature_cache,
+                sources=sources,
+                feature_mask=feature_mask,
+                features_blend=features_blend,
+                source_weights=w,
+                required_sources=required_sources,
             )
-        return [{"path": p, "x": 0.5, "y": 0.5} for p in paths]
-
-    if scale_folders:
-        folder_seeds = (
-            list(context_folders) if context_folders else _folder_seeds_from_track_paths(paths)
         )
-    else:
-        folder_seeds = None
+        # `mat.shape[0] < 2` guards the degenerate all-zero-weight case, where
+        # every block is dropped. The HTTP routes reject that vector before
+        # reaching here; this keeps the function safe regardless.
+        if len(paths) < 2 or mat.shape[0] < 2:
+            flat = [{"path": p, "x": 0.5, "y": 0.5} for p in paths]
+            return flat, np.empty((0, 2), dtype=np.float32), spans
 
-    needs_weight = is_model_ready() and (bool(context_tags) or bool(folder_seeds))
-
-    t_before_weight = time.perf_counter()
-    mat_proj = mat
-    basis_key = ""
-    if needs_weight:
-        basis_key = f"{comp_key}|{_semantic_basis_param_key(context_tags, folder_seeds)}"
-        basis = _tier_cache_get(_semantic_basis_cache, basis_key)
-        if basis is None:
-            clap_hi = clap_col_lo + clap_dim
-            tags_for_weight = context_tags if clap_dim > 0 else None
-            T_n, exp = _build_semantic_basis(
-                mat,
-                paths,
-                tags_for_weight,
-                folder_seeds,
-                clap_col_lo,
-                clap_hi,
-            )
-            _tier_cache_put(
-                _semantic_basis_cache,
-                basis_key,
-                (T_n, exp),
-                _SEMANTIC_BASIS_CACHE_MAX,
+        if scale_folders:
+            folder_seeds = (
+                list(context_folders)
+                if context_folders
+                else _folder_seeds_from_track_paths(paths)
             )
         else:
-            T_n, exp = basis
-            log.debug("projection tier: semantic basis cache hit")
-        mat_proj = _apply_low_rank_semantic_weight(
-            mat, T_n, exp, folder_boost, folder_depth_boost,
-        )
-    t_after_weight = time.perf_counter()
+            folder_seeds = None
 
-    t_before_proj = time.perf_counter()
-    if method == "pca":
-        coords = _project_pca(mat_proj, paths)
-    else:
-        if method != "tsne":
-            log.debug("unknown projection method %r; using t-SNE", method)
-        # The fit cache keys on the vector config (not the track set), so an
-        # openTSNE embedding fitted for the same sources/mask/weighting is reused
-        # and only newly added tracks are transformed into it.
-        tsne_config = comp_config
+        needs_weight = is_model_ready() and (bool(context_tags) or bool(folder_seeds))
+        mat_proj = mat
+        basis_key = ""
         if needs_weight:
-            tsne_config = (
-                f"{comp_config}|{basis_key}"
-                f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
+            basis_key = (
+                f"{comp_key}|{_semantic_basis_param_key(context_tags, folder_seeds)}"
             )
-        coords = _project_tsne(mat_proj, paths=paths, config_key=tsne_config)
-    t_after_proj = time.perf_counter()
+            basis = _tier_cache_get(_semantic_basis_cache, basis_key)
+            if basis is None:
+                clap_hi = clap_col_lo + clap_dim
+                tags_for_weight = context_tags if clap_dim > 0 else None
+                T_n, exp = _build_semantic_basis(
+                    mat, paths, tags_for_weight, folder_seeds, clap_col_lo, clap_hi,
+                )
+                _tier_cache_put(
+                    _semantic_basis_cache, basis_key, (T_n, exp),
+                    _SEMANTIC_BASIS_CACHE_MAX,
+                )
+            else:
+                T_n, exp = basis
+            mat_proj = _apply_low_rank_semantic_weight(
+                mat, T_n, exp, folder_boost, folder_depth_boost,
+            )
 
-    t_before_norm = time.perf_counter()
-    normed = _normalise_coords(coords)
-    t_end = time.perf_counter()
+        if method == "pca":
+            coords = _project_pca(mat_proj, paths)
+        else:
+            if method != "tsne":
+                log.debug("unknown projection method %r; using t-SNE", method)
+            # The fit cache keys on the vector config (not the track set), so an
+            # openTSNE embedding fitted for the same sources/mask/weighting is
+            # reused and only newly added tracks are transformed into it.
+            tsne_config = comp_config
+            if needs_weight:
+                tsne_config = (
+                    f"{comp_config}|{basis_key}"
+                    f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
+                )
+            coords = _project_tsne(mat_proj, paths=paths, config_key=tsne_config)
 
-    if log.isEnabledFor(logging.DEBUG):
-        log.debug(
-            "compute_projection method=%s n=%d gather=%.1fms weight=%.1fms "
-            "project=%.1fms norm=%.1fms total=%.1fms",
-            method,
-            len(paths),
-            (t_after_gather - t0) * 1000,
-            (t_after_weight - t_before_weight) * 1000,
-            (t_after_proj - t_before_proj) * 1000,
-            (t_end - t_before_norm) * 1000,
-            (t_end - t0) * 1000,
-        )
+        normed = _normalise_coords(coords)
+        result = [
+            {"path": paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
+            for i in range(len(paths))
+        ]
+        return result, normed, spans
 
-    result = [
-        {"path": paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
-        for i in range(len(paths))
-    ]
+    result, _normed, _spans = _project_at(weights0)
 
     if layout_revision and method == "tsne":
         _tier_cache_put(
             _revision_layout_cache, layout_revision, result, _REVISION_LAYOUT_CACHE_MAX,
         )
 
+    if with_jacobian:
+        jacobian = _weight_jacobian(_project_at, weights0, sources)
+        return result, jacobian
     return result

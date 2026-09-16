@@ -20,6 +20,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import shutil
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -904,14 +905,15 @@ def train_supervised(
         if on_progress is not None:
             on_progress(phase, done, total)
 
-    _progress("gather")
     infos = build_track_infos("", True)
+    _progress("gather", 0, len(infos))
     paths, blocks, _logits = gather_source_blocks(
         deps, infos, clap_version=deps.clap_version
     )
     if not paths:
         log.info("Supervised training skipped: no tracks with MAEST data")
         return {"skipped": True, "reason": "no tracks with MAEST data yet"}
+    _progress("gather", len(paths), len(infos))
 
     labels, class_names = supervised_mod.derive_folder_labels(paths)
     if len(class_names) < 2:
@@ -952,6 +954,19 @@ def train_supervised(
         on_epoch=lambda e, n: _progress("training", e, n),
     )
 
+    projected = supervised_mod.project_from_state(
+        result["state_dict"],
+        in_dim=result["in_dim"],
+        hidden_dim=result["hidden_dim"],
+        out_dim=result["out_dim"],
+        mat=mat,
+    )
+    # Per-folder centroids in the projected space, stored with the head so a
+    # nearest-centroid folder assignment (and the export bundle) needs no retrain.
+    centroids, _centroid_counts = supervised_mod.compute_centroids(
+        projected, labels, len(class_names)
+    )
+
     run_id = supervised_mod.new_run_id(deps.data_dir)
     meta = supervised_mod.build_meta(
         run_id=run_id,
@@ -969,17 +984,12 @@ def train_supervised(
         },
         stats=result["stats"],
     )
-    supervised_mod.save_head(deps.data_dir, result["state_dict"], meta)
+    supervised_mod.save_head(
+        deps.data_dir, result["state_dict"], meta, centroids=centroids
+    )
     deps.feature_cache.set_meta(supervised_mod.RUN_ID_META_KEY, run_id)
 
-    projected = supervised_mod.project_from_state(
-        result["state_dict"],
-        in_dim=result["in_dim"],
-        hidden_dim=result["hidden_dim"],
-        out_dim=result["out_dim"],
-        mat=mat,
-    )
-    _progress("projecting")
+    _progress("projecting", 0, len(paths))
     fp_by_path = {t["path"]: t.get("fingerprint") for t in infos}
     written = 0
     for i, path in enumerate(paths):
@@ -988,6 +998,9 @@ def train_supervised(
             continue
         deps.feature_cache.put("supervised", fp, projected[i], version=run_id)
         written += 1
+        if written % 500 == 0:
+            _progress("projecting", written, len(paths))
+    _progress("projecting", written, len(paths))
 
     stats = dict(result["stats"])
     stats.update(
@@ -1098,6 +1111,164 @@ def make_supervised_handler(
         return out
 
     return handle
+
+
+# ──────────────────────────────────────────────────────────────
+# Head bundles: export / import / compare, and folder fan-out
+# ──────────────────────────────────────────────────────────────
+
+
+def supervised_head_info(deps: AnalysisDeps) -> dict[str, Any]:
+    """Metadata for the installed head, for the UI's head controls."""
+    head = supervised_mod.load_head(deps.data_dir)
+    if head is None:
+        return {"available": False}
+    meta = head["meta"]
+    payload = head["payload"]
+    return {
+        "available": True,
+        "run_id": meta.get("run_id"),
+        "trained_at": meta.get("trained_at"),
+        "imported_at": meta.get("imported_at"),
+        "n_classes": len(meta.get("class_names", [])),
+        "in_dim": meta.get("in_dim"),
+        "input_sources": list(meta.get("input_sources", [])),
+        "source_versions": dict(meta.get("source_versions", {})),
+        "has_centroids": payload.get("centroids") is not None,
+    }
+
+
+def export_supervised_head(deps: AnalysisDeps) -> dict | None:
+    """Portable bundle of the installed head, or ``None`` when there is none."""
+    return supervised_mod.head_bundle(deps.data_dir)
+
+
+def import_supervised_head(deps: AnalysisDeps, bundle: dict) -> dict:
+    """Install a bundle under a fresh local run id and re-project the library.
+
+    The new run id makes every cached ``supervised`` row stale, so the next
+    cluster pass re-projects the whole library through the imported head.
+    """
+    meta = supervised_mod.install_head_bundle(deps.data_dir, bundle)
+    deps.feature_cache.set_meta(
+        supervised_mod.RUN_ID_META_KEY, int(meta["run_id"])
+    )
+    return meta
+
+
+def _unique_target(path: str) -> str:
+    """A path that does not clobber an existing file, ``" (n)"``-suffixed."""
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    n = 1
+    while os.path.exists(f"{base} ({n}){ext}"):
+        n += 1
+    return f"{base} ({n}){ext}"
+
+
+def fanout_supervised(
+    deps: AnalysisDeps,
+    *,
+    build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+    folder_vpath: str,
+    recursive: bool = False,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Sort the tracks in *folder_vpath* into the head's folder subpaths.
+
+    The plan is always computed; *apply* is the only step that touches disk, so
+    the caller can review the moves first. A track already in its predicted folder
+    is skipped, a class that is the training root itself maps to no subfolder and
+    is skipped, and a name collision gets a `` (n)`` suffix rather than
+    overwriting a file.
+    """
+    head = supervised_mod.load_head(deps.data_dir)
+    if head is None:
+        return {"ok": False, "error": "no trained head to fan out with"}
+    centroids = supervised_mod.head_centroids(deps.data_dir)
+    if centroids is None:
+        return {"ok": False, "error": "head has no folder centroids; retrain it"}
+    meta = head["meta"]
+    class_names = list(meta.get("class_names", []))
+    if centroids.shape[0] != len(class_names):
+        return {"ok": False, "error": "head centroids do not match its folders"}
+
+    infos = build_track_infos(folder_vpath, recursive)
+    if not infos:
+        return {
+            "ok": True,
+            "folder": folder_vpath,
+            "tracks": 0,
+            "moved": 0,
+            "applied": bool(apply),
+            "plan": [],
+        }
+
+    paths, blocks, _logits = gather_source_blocks(
+        deps, infos, clap_version=deps.clap_version
+    )
+    mat, used = supervised_mod.build_input_matrix(blocks, SUPERVISED_INPUT_WEIGHTS)
+    if (
+        not paths
+        or used != list(meta.get("input_sources", []))
+        or mat.shape[1] != int(meta.get("in_dim", 0))
+    ):
+        return {
+            "ok": False,
+            "error": "input space does not match the head; retrain it here first",
+        }
+
+    projected = supervised_mod.project(head, mat)
+    idx, sim = supervised_mod.predict_folders(centroids, projected)
+    root_abs = deps.resolve_virtual_path(folder_vpath)
+
+    plan: list[dict[str, Any]] = []
+    moved = 0
+    errors: list[str] = []
+    for i, vpath in enumerate(paths):
+        c = int(idx[i])
+        if c < 0:
+            continue
+        sub = supervised_mod.folder_subpath(class_names[c])
+        if not sub:
+            continue
+        src = deps.resolve_virtual_path(vpath)
+        target = os.path.normpath(os.path.join(root_abs, sub, os.path.basename(src)))
+        entry = {
+            "path": vpath,
+            "folder": class_names[c],
+            "target": deps.virtual_from_abs(target),
+            "similarity": float(sim[i]),
+        }
+        if target == src:
+            entry["status"] = "in-place"
+            plan.append(entry)
+            continue
+        if apply:
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                target = _unique_target(target)
+                shutil.move(src, target)
+                moved += 1
+                entry["target"] = deps.virtual_from_abs(target)
+                entry["status"] = "moved"
+            except OSError as e:
+                entry["status"] = "error"
+                errors.append(f"{vpath}: {e}")
+        else:
+            entry["status"] = "planned"
+        plan.append(entry)
+
+    return {
+        "ok": True,
+        "folder": folder_vpath,
+        "tracks": len(paths),
+        "moved": moved,
+        "applied": bool(apply),
+        "errors": errors,
+        "plan": plan,
+    }
 
 
 # ──────────────────────────────────────────────────────────────
