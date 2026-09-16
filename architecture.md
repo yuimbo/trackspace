@@ -216,10 +216,14 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
   see `/api/tracks/tags` and `/api/tracks/move`.  The frontend's `api()` /
   `postJSON` read `error` from the JSON body into the toast, so messages must stay
   client-safe (never include a traceback or absolute paths).
-- **Analysis reads are read-only over `FeatureCache`.**  `/api/search` (CLAP text
-  ranking) and `/api/tracks/structure` (cached intro/drop/break + genre-spanning
-  flag) never run an encoder or decode on a request thread; expensive analysis goes
-  through the queue.
+- **Analysis reads are read-only over `FeatureCache`.** `/api/search` (CLAP text
+  ranking), `/api/tracks/structure` (cached intro/drop/break + genre-spanning
+  flag) and `/api/tracks/similar` (nearest/anti-track over the composite vectors)
+  never run an encoder or decode on a request thread; expensive analysis goes
+  through the queue. `/api/tracks/similar` is the one exception to "reads are
+  cheap": it rebuilds the weighted matrix that clustering/layout use, cached by
+  `(clustering revision, weights, library mtime)` with a TTL — see
+  `services/similarity.py`.
 
 ---
 

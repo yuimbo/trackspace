@@ -17,6 +17,7 @@ from backend.routes.api_folders import create_api_folders_blueprint
 from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
 from backend.routes.api_search import create_api_search_blueprint
+from backend.routes.api_similar import create_api_similar_blueprint
 from backend.routes.api_structure import create_api_structure_blueprint
 from backend.routes.api_tags import create_api_tags_blueprint
 from backend.routes.static_audio import create_static_audio_blueprint
@@ -105,6 +106,7 @@ class TrackspaceBlueprintDeps:
     job_queue: Any
     workers: Any
     clusters: Any
+    similarity_index: Any
     enqueue_library_work: Callable[..., dict[str, int]]
     enqueue_clustering: Callable[..., int]
     enqueue_supervised: Callable[..., int]
@@ -152,6 +154,15 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             feature_cache=deps.feature_cache,
             embedding_version=deps.embedding_version,
             build_track_infos_fn=deps.build_track_infos_fn,
+        )
+    )
+    app.register_blueprint(
+        create_api_similar_blueprint(
+            analysis_deps=deps.analysis_deps,
+            index=deps.similarity_index,
+            clusters=deps.clusters,
+            build_track_infos_fn=deps.build_track_infos_fn,
+            library_mtime_signature=deps.library_mtime_signature,
         )
     )
     app.register_blueprint(

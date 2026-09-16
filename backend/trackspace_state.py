@@ -15,6 +15,7 @@ from backend.jobs import JobQueue, WorkerPool
 from backend.services.analysis_pipeline import ClusterStore
 from backend.services.embedding_broadcaster import EmbeddingBroadcaster
 from backend.services.embedding_status_cache import EmbeddingStatusCache
+from backend.services.similarity import SimilarityIndex
 
 PKG_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(PKG_DIR)
@@ -39,6 +40,8 @@ class TrackspaceState:
     workers: WorkerPool
     #: Latest multi-resolution clustering of the library.
     clusters: ClusterStore
+    #: Lazily-built cosine index over the composite vectors (inspect card).
+    similarity: SimilarityIndex
     observer: Observer | None = None
     root_watches: dict[str, object] = field(default_factory=dict)
     music_root: str = ""
@@ -72,4 +75,5 @@ class TrackspaceState:
             job_queue=JobQueue(os.path.join(data_dir, "jobs.db")),
             workers=WorkerPool(),
             clusters=ClusterStore(),
+            similarity=SimilarityIndex(),
         )

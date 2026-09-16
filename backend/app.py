@@ -657,6 +657,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             job_queue=state.job_queue,
             workers=state.workers,
             clusters=state.clusters,
+            similarity_index=state.similarity,
             enqueue_library_work=enqueue_library_work,
             enqueue_clustering=enqueue_clustering,
             enqueue_supervised=enqueue_supervised,
