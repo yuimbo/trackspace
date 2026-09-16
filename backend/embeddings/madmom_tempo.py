@@ -13,12 +13,16 @@ librosa features at 44.1 kHz).
 The default beat tracker loads an **8× BLSTM** ensemble; set env
 ``TRACKSPACE_MADMOM_FAST=1`` to use a single network (~4× faster per excerpt,
 slightly less robust).
+
+**Threading:** the BLSTM layers are stateful, so processors are *per thread* — see
+:data:`_local`. Never share one processor instance between analysis workers.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import threading
 
 import librosa
 import numpy as np
@@ -28,8 +32,13 @@ log = logging.getLogger(__name__)
 # Must match ``RNNBeatProcessor``'s internal ``SignalProcessor(sample_rate=…)``.
 _MADMOM_TARGET_SR = 44100
 
-_beat_proc = None
-_tempo_proc = None
+#: madmom's BLSTM layers carry mutable hidden state across frames
+#: (``RecurrentLayer.activate(data, reset=...)`` / ``reset()``), so one processor
+#: instance cannot be called from two threads at once — concurrent activations
+#: interleave the state and silently produce wrong beat activations. Each analysis
+#: worker therefore owns its own processor pair. This also removes the lazy-init race.
+_local = threading.local()
+
 _madmom_checked: bool | None = None
 _madmom_ok = False
 
@@ -76,10 +85,11 @@ def is_madmom_tempo_available() -> bool:
 
 
 def _get_processors():
-    global _beat_proc, _tempo_proc
+    """This thread's ``(beat, tempo)`` processors, built once on first use."""
     if not is_madmom_tempo_available():
         raise RuntimeError("madmom not available")
-    if _beat_proc is None:
+    procs = getattr(_local, "processors", None)
+    if procs is None:
         _apply_madmom_runtime_shims()
         from madmom.features.beats import RNNBeatProcessor
         from madmom.features.tempo import TempoEstimationProcessor
@@ -88,9 +98,9 @@ def _get_processors():
         nn_kw = {}
         if _env_truthy("TRACKSPACE_MADMOM_FAST"):
             nn_kw["nn_files"] = [BEATS_BLSTM[0]]
-        _beat_proc = RNNBeatProcessor(**nn_kw)
-        _tempo_proc = TempoEstimationProcessor(fps=100)
-    return _beat_proc, _tempo_proc
+        procs = (RNNBeatProcessor(**nn_kw), TempoEstimationProcessor(fps=100))
+        _local.processors = procs
+    return procs
 
 
 def estimate_tempo_bpm(audio: np.ndarray, sr: int) -> float | None:

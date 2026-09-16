@@ -57,16 +57,29 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 ### Parallelism
 
-- [ ] **Scale the `features` stage horizontally.** One worker, `batch_size=2`
-      (`backend/app.py`), and the work is CPU-bound (librosa + madmom) and
-      independent per track. Run N workers for the kind and measure the wall-clock
-      curve; the durable queue already leases per job, so this is a wiring change
-      plus a check that concurrent SQLite WAL writers do not contend.
+- ✅ **Scale the `features` stage horizontally.** Done, but *not* with threads:
+  the work is CPU-bound and independent per track, yet madmom's BLSTM forward pass
+  is GIL-bound, so more features *threads* are slower, not faster (one track:
+  0.8 s at 1 thread → 2.5 s at 2 → 10.5 s at 4; the decode is ~10 ms, so it is
+  not the cause). The stage now runs each track in a **process** pool
+  (`backend/services/features_worker.py`; `TRACKSPACE_FEATURES_WORKERS`, default
+  4). Measured on a 64-track real sample: 51 → 91 → 134 → 140 tracks/min at
+  1/2/4/8 processes (`tests/profile_features_workers.py`). The pool uses `spawn`
+  (not `fork`) because the parent is multi-threaded, and each child re-imports
+  `backend.app` (~3.5 s, once, parallel) before `warm()` builds its processors.
 - [ ] **Measure `_DECODE_LOCK` contention.** The decode lock serialises every
-      native MP3 open, and now also covers CLAP's 48 kHz decodes alongside
-      `features` / `maest`. Instrument the wait time in
-      `decode_stderr.librosa_load`; if it is a material fraction of the stage wall
-      time, prioritise the torchaudio-decode item under *Acceleration*.
+  native MP3 open, and now also covers CLAP's 48 kHz decodes alongside
+  `features` / `maest`. It is per-process, so the features pool does not share it;
+  within a process, `librosa_get_duration` holds it across the whole call and a VBR
+  MP3 with no Xing header costs a ~1.2 s whole-file scan on the first probe
+  (measured; librosa caches it after). Instrument the wait time in
+  `decode_stderr.librosa_load`; if it is a material fraction of the stage wall
+  time, prioritise the torchaudio-decode item under *Acceleration*.
+- [ ] **Features process pool: cut child startup.** Each spawned child re-imports
+  `backend.app` (hence torch, ~3.5 s) before `warm()` builds its madmom
+  processors. A `forkserver` pool with a lightweight preload, or a dedicated
+  worker entrypoint, would remove that; only worth it if the server is restarted
+  often relative to library size.
 - [ ] **Tune `scan`.** `batch_size=8` with `TRACKSPACE_FPCALC_CONCURRENCY`
       (default `min(8, cpus)`). Measure whether fpcalc subprocesses or the SQLite
       writes are the limit and raise only the one that is.

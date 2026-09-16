@@ -50,6 +50,8 @@ class TrackCache:
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
+        # Wait on the WAL write lock instead of raising "database is locked".
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _lru_put(self, key: tuple, data: dict) -> None:

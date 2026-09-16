@@ -17,11 +17,13 @@ Handler contract worth remembering when adding a stage:
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import as_completed
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +44,7 @@ from backend.jobs import (
     KIND_SCAN,
     KIND_SUPERVISED,
 )
+from backend.services import features_worker
 
 log = logging.getLogger(__name__)
 
@@ -199,11 +202,116 @@ def make_scan_handler(deps: AnalysisDeps) -> Callable[[Sequence[Job]], dict[int,
     return handle
 
 
-def make_features_handler(deps: AnalysisDeps) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
-    """Classical 6-D descriptors + the 14-D rhythm vector, both cached by fingerprint."""
+def make_features_handler(
+    deps: AnalysisDeps,
+    *,
+    pool_size: int = 1,
+    pool_factory: Callable[[int], Any] | None = None,
+    compute_fn: Callable[..., dict[str, Any]] | None = None,
+) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
+    """Classical 6-D descriptors + the 14-D rhythm vector, both cached by fingerprint.
+
+    madmom's BLSTM forward pass is GIL-bound, so a *thread* pool cannot run this
+    stage in parallel — more features threads are slower, not faster (measured 0.8 s
+    at 1 thread vs 10.5 s at 4 for one track). With ``pool_size > 1`` the
+    per-track decode+compute runs in a **process** pool instead, which scales
+    near-linearly; the parent keeps the cache writes and the warning relay.
+
+    ``pool_factory`` / ``compute_fn`` exist so tests can inject fakes without
+    spawning real processes.
+    """
+
+    def _compute_in_process(
+        abs_path: str, *, want_features: bool, want_rhythm: bool
+    ) -> dict[str, Any]:
+        """Serial fallback using the injected modules (also what tests fake)."""
+        out: dict[str, Any] = {
+            "features": None, "rhythm": None, "warnings": {}, "error": None,
+        }
+        try:
+            if want_features:
+                warns: dict[str, str] = {}
+                out["features"] = deps.audio_features_mod.generate_audio_features_batch(
+                    [abs_path], decode_warnings=warns
+                ).get(abs_path)
+                out["warnings"].update(warns)
+            if want_rhythm:
+                warns = {}
+                out["rhythm"] = deps.rhythm_mod.generate_rhythm_features_batch(
+                    [abs_path], decode_warnings=warns
+                ).get(abs_path)
+                out["warnings"].update(warns)
+        except Exception as e:  # noqa: BLE001 — reported per job, never raised
+            out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+    compute = compute_fn or (
+        features_worker.compute_track_features
+        if pool_size > 1
+        else _compute_in_process
+    )
+
+    executor: Any = None
+    executor_lock = threading.Lock()
+
+    def _get_executor() -> Any:
+        nonlocal executor
+        if pool_size <= 1:
+            return None
+        with executor_lock:
+            if executor is None:
+                executor = (pool_factory or _default_pool_factory)(pool_size)
+            return executor
+
+    def _reset_executor() -> None:
+        """Drop a broken pool so the next batch rebuilds it."""
+        nonlocal executor
+        with executor_lock:
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    log.debug("features pool shutdown failed", exc_info=True)
+                executor = None
+
+    def _store(
+        job: Job,
+        abs_path: str,
+        fp: str,
+        want_features: bool,
+        want_rhythm: bool,
+        res: dict[str, Any],
+    ) -> JobResult:
+        if res.get("error"):
+            return JobResult.failure(str(res["error"]))
+        produced: list[str] = []
+        failed: list[str] = []
+        if want_features:
+            vec = res.get("features")
+            if vec is not None:
+                deps.feature_cache.put(
+                    "features", fp, vec, version=deps.features_version
+                )
+                produced.append("features")
+            else:
+                failed.append("features")
+        if want_rhythm:
+            vec = res.get("rhythm")
+            if vec is not None:
+                deps.feature_cache.put("rhythm", fp, vec, version=deps.rhythm_version)
+                produced.append("rhythm")
+            else:
+                failed.append("rhythm")
+        _relay_warnings(deps, res.get("warnings") or {})
+        if failed and not produced:
+            return JobResult.failure(
+                f"extraction failed: {', '.join(failed)}", sources=failed
+            )
+        return JobResult.success(sources=produced, partial=failed or None)
 
     def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
         out: dict[int, JobResult] = {}
+        targets: list[tuple[Job, str, str, bool, bool]] = []
         for job in jobs:
             vpath = job.path
             if not vpath:
@@ -216,47 +324,69 @@ def make_features_handler(deps: AnalysisDeps) -> Callable[[Sequence[Job]], dict[
             if not fp:
                 out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
                 continue
+            want_features = not deps.feature_cache.has(
+                "features", fp, version=deps.features_version
+            )
+            want_rhythm = not deps.feature_cache.has(
+                "rhythm", fp, version=deps.rhythm_version
+            )
+            if not want_features and not want_rhythm:
+                out[job.id] = JobResult.success(cached=True)
+                continue
+            targets.append((job, abs_path, fp, want_features, want_rhythm))
 
-            produced: list[str] = []
-            failed: list[str] = []
+        if not targets:
+            return out
 
-            if not deps.feature_cache.has("features", fp, version=deps.features_version):
-                warns: dict[str, str] = {}
-                vec = deps.audio_features_mod.generate_audio_features_batch(
-                    [abs_path], decode_warnings=warns
-                ).get(abs_path)
-                _relay_warnings(deps, warns)
-                if vec is not None:
-                    deps.feature_cache.put(
-                        "features", fp, vec, version=deps.features_version
-                    )
-                    produced.append("features")
-                else:
-                    failed.append("features")
+        executor = _get_executor()
+        if executor is None:
+            results = {
+                abs_path: compute(abs_path, want_features=wf, want_rhythm=wr)
+                for _, abs_path, _, wf, wr in targets
+            }
+        else:
+            try:
+                futures = {
+                    executor.submit(
+                        compute, abs_path, want_features=wf, want_rhythm=wr
+                    ): abs_path
+                    for _, abs_path, _, wf, wr in targets
+                }
+                results = {}
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+            except Exception:
+                log.exception("features worker pool failed")
+                _reset_executor()
+                for job, *_rest in targets:
+                    out[job.id] = JobResult.failure("features worker pool failed")
+                return out
 
-            if not deps.feature_cache.has("rhythm", fp, version=deps.rhythm_version):
-                warns = {}
-                vec = deps.rhythm_mod.generate_rhythm_features_batch(
-                    [abs_path], decode_warnings=warns
-                ).get(abs_path)
-                _relay_warnings(deps, warns)
-                if vec is not None:
-                    deps.feature_cache.put(
-                        "rhythm", fp, vec, version=deps.rhythm_version
-                    )
-                    produced.append("rhythm")
-                else:
-                    failed.append("rhythm")
-
-            if failed and not produced:
-                out[job.id] = JobResult.failure(
-                    f"extraction failed: {', '.join(failed)}", sources=failed
-                )
-            else:
-                out[job.id] = JobResult.success(sources=produced, partial=failed or None)
+        for job, abs_path, fp, wf, wr in targets:
+            out[job.id] = _store(job, abs_path, fp, wf, wr, results.get(abs_path) or {})
         return out
 
     return handle
+
+
+def _default_pool_factory(pool_size: int) -> Any:
+    """A spawn-based process pool, warmed once per child.
+
+    ``spawn`` (not ``fork``) is required: the parent is multi-threaded (Flask,
+    workers, watchdog) and forking it would hand children locks held by other
+    threads. ``warm`` builds each child's madmom processors on start, so the first
+    track in a child does not pay the model-load cost.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing as mp
+
+    executor = ProcessPoolExecutor(
+        max_workers=pool_size,
+        mp_context=mp.get_context("spawn"),
+        initializer=features_worker.warm,
+    )
+    atexit.register(executor.shutdown, wait=False, cancel_futures=True)
+    return executor
 
 
 def make_maest_handler(

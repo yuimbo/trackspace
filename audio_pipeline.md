@@ -61,6 +61,12 @@ per-handle state, so the expensive decode still runs in parallel. `librosa_load`
 the open out of `librosa.load` (which accepts a pre-opened `soundfile.SoundFile`) to
 achieve this; `librosa_get_duration` takes the lock for the whole (cheap) call.
 
+The lock is **per process**, so it does not serialise the `features` stage's process
+pool (each child has its own). It does mean one process's `librosa_get_duration` calls
+are serial with each other — for a VBR MP3 with no Xing header libsndfile scans the
+whole file on the first probe (measured ~1.2 s on a 6-minute track, cached by librosa
+afterwards), so that probe is worth avoiding per track.
+
 A one-time single-threaded warmup does **not** fix it — the init runs on every open.
 Reproduced standalone against the real library: 10/10 crashes unlocked, 0/10 with the open
 serialised. `tests/test_decode_stderr.py` pins the contract.
@@ -470,7 +476,7 @@ global "running" flag. The change matters for correctness, not just tidiness:
 
 ```
 scan      → ID3 tags + Chromaprint fingerprint   (CPU, batch 8)
-features  → classical 6-D + rhythm 14-D          (CPU, batch 2)
+features  → classical 6-D + rhythm 14-D          (CPU, N processes, batch = N)
 maest     → MAEST embedding + 519 style logits   (GPU, batch 4, gated on model)
 clap      → CLAP audio embedding                 (GPU, batch 4, gated on model)
 supervise → folder-supervised projection head    (CPU, singleton, whole-library)
@@ -484,14 +490,30 @@ drift apart.
 renders while the (decode-dominated) CLAP backfill continues; its drain triggers a
 re-cluster like any other per-track stage.
 
+**The `features` stage parallelises across processes, not threads.**
+`backend/services/features_worker.py` is the pool child; `make_features_handler`
+runs each claimed track there and the parent keeps the cache write and the
+decode-warning relay. madmom's BLSTM forward pass is GIL-bound: several features
+*threads* do not run in parallel and actively convoy — measured on one track,
+0.8 s at 1 thread, 2.5 s at 2, 10.5 s at 4 — while a process pool scales
+near-linearly (51 → 134 → 140 tracks/min at 1/4/8 processes on the real
+library). `TRACKSPACE_FEATURES_WORKERS` sets the process count (default 4).
+The pool uses `spawn`, not `fork`: the parent is multi-threaded (Flask, workers,
+watchdog) and forking it would hand children locks held by other threads.
+Consequently `_DECODE_LOCK` is per-process, and the madmom processors are
+per-thread inside each process (`backend/embeddings/madmom_tempo.py`) — the BLSTM
+layers carry hidden state across frames, so a shared processor corrupts tempo
+values. `warm()` in the child module builds each child's processors on start.
+
 ### Rules when adding a stage
 
 1. **Never raise for one bad track.** Return `JobResult.failure(...)`; the rest
    of the batch still commits and the queue owns the retry decision.
 2. **Use `retry=False` for permanent errors** (missing file, unsupported codec)
    so a dead track does not consume three attempts *and* three model runs.
-3. **Batch only at the GPU boundary.** MAEST and CLAP batch across tracks; CPU
-   stages stay per-track so one slow decode cannot stall a whole batch.
+3. **Batch only at the GPU boundary.** MAEST and CLAP batch across tracks. The
+   CPU `features` stage claims a batch only to keep its process pool fed; each track
+   is decoded and computed in one child, so a slow decode does not stall the pool.
 4. **Filter against the cache before enqueueing**, so the queue reflects
    *outstanding* work. This is what makes the progress numbers meaningful.
 5. **Gate on model readiness** with `JobWorker(gate=...)` rather than letting

@@ -90,6 +90,38 @@ from backend.trackspace_state import PKG_DIR, TrackspaceState
 
 log = logging.getLogger(__name__)
 
+#: Processes used to drain the CPU-bound ``features`` stage. madmom's BLSTM
+#: forward pass is GIL-bound, so this stage scales across *processes*, not threads
+#: (see ``backend/services/features_worker.py``). Measured on a 64-track real
+#: sample: 51 → 134 tracks/min at 1 → 4 processes, with 8 adding little more.
+#: Override with ``TRACKSPACE_FEATURES_WORKERS``.
+DEFAULT_FEATURES_WORKERS = 4
+
+
+def _features_worker_count() -> int:
+    """``TRACKSPACE_FEATURES_WORKERS`` if valid, else the measured default."""
+    raw = (os.environ.get("TRACKSPACE_FEATURES_WORKERS") or "").strip()
+    if not raw:
+        return DEFAULT_FEATURES_WORKERS
+    try:
+        n = int(raw)
+    except ValueError:
+        log.warning(
+            "TRACKSPACE_FEATURES_WORKERS=%r is not an integer; using %d",
+            raw,
+            DEFAULT_FEATURES_WORKERS,
+        )
+        return DEFAULT_FEATURES_WORKERS
+    if n < 1:
+        log.warning(
+            "TRACKSPACE_FEATURES_WORKERS=%d < 1; using %d",
+            n,
+            DEFAULT_FEATURES_WORKERS,
+        )
+        return DEFAULT_FEATURES_WORKERS
+    return n
+
+
 def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
     """NULL out cached blobs older than current version constants.
 
@@ -435,12 +467,14 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 on_event=_job_event_sink,
             )
         )
+        features_workers = _features_worker_count()
         state.workers.add(
             JobWorker(
                 state.job_queue,
                 KIND_FEATURES,
-                make_features_handler(ANALYSIS_DEPS),
-                batch_size=2,
+                make_features_handler(ANALYSIS_DEPS, pool_size=features_workers),
+                # Claim enough to keep every pool process busy in one batch.
+                batch_size=max(2, features_workers),
                 on_event=_job_event_sink,
             )
         )

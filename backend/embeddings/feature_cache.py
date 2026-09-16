@@ -173,6 +173,10 @@ class FeatureCache:
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, check_same_thread=False)
         conn.execute("PRAGMA journal_mode=WAL")
+        # Writers (analysis workers + request threads) serialise on the WAL write
+        # lock; wait rather than raising "database is locked" and silently
+        # dropping a put(). Matches JobQueue.
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     # ── Key/value metadata ─────────────────────────────────────
