@@ -8,6 +8,7 @@ Pipeline order (each stage's output feeds the next):
     scan      → ID3 tags + Chromaprint fingerprint (cheap, CPU, parallel)
     features  → classical DSP / rhythm descriptors (CPU, librosa + madmom)
     maest     → MAEST embedding + 519 genre logits (GPU, batched)
+    clap      → CLAP audio embedding (GPU, batched; text encoder shared with layout)
     supervise → folder-supervised projection head over cached vectors (CPU, singleton)
     cluster   → kNN graph + multi-resolution Leiden (whole-library, singleton)
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 KIND_SCAN = "scan"
 KIND_FEATURES = "features"
 KIND_MAEST = "maest"
+KIND_CLAP = "clap"
 KIND_SUPERVISED = "supervise"
 KIND_CLUSTER = "cluster"
 
@@ -25,6 +27,7 @@ JOB_KINDS: tuple[str, ...] = (
     KIND_SCAN,
     KIND_FEATURES,
     KIND_MAEST,
+    KIND_CLAP,
     KIND_SUPERVISED,
     KIND_CLUSTER,
 )
@@ -33,6 +36,7 @@ _LABELS: dict[str, str] = {
     KIND_SCAN: "Library scan",
     KIND_FEATURES: "Audio features",
     KIND_MAEST: "MAEST analysis",
+    KIND_CLAP: "CLAP analysis",
     KIND_SUPERVISED: "Folder supervision",
     KIND_CLUSTER: "Clustering",
 }

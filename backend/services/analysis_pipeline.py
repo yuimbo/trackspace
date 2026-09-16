@@ -35,6 +35,7 @@ from backend.jobs import (
     Job,
     JobQueue,
     JobResult,
+    KIND_CLAP,
     KIND_CLUSTER,
     KIND_FEATURES,
     KIND_MAEST,
@@ -61,8 +62,13 @@ class AnalysisDeps:
     maest_version: int
     rhythm_version: int
     features_version: int
+    clap_mod: Any = None
     clap_version: int = 0
     effnet_version: int = 0
+    #: False when the server was started with ``--no-clap`` — the CLAP stage is
+    #: then never enqueued, so a disabled server cannot accumulate pending jobs
+    #: behind a model that will never load.
+    clap_enabled: bool = True
     #: Root of the runtime ``data/`` dir — where the supervised head lives.
     data_dir: str = ""
     emit_decode_warning: Callable[[str, str], None] | None = None
@@ -327,6 +333,76 @@ def make_maest_handler(
                 out[job.id] = JobResult.failure(f"cache write failed: {e}")
                 continue
             out[job.id] = JobResult.success(excerpts=analysis.num_excerpts)
+        return out
+
+    return handle
+
+
+def make_clap_handler(
+    deps: AnalysisDeps, *, batch_size: int = 4
+) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
+    """CLAP audio embedding, batched across the claimed jobs.
+
+    CLAP is optional but not ornamental: its audio block is the column span the
+    semantic weighting in ``layout`` projects tag text directions onto, so without it
+    tag-based weighting is inert (see ``audio_pipeline.md``).
+    """
+
+    def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
+        out: dict[int, JobResult] = {}
+        targets: list[tuple[Job, str, str]] = []  # (job, abs_path, fingerprint)
+
+        for job in jobs:
+            vpath = job.path
+            if not vpath:
+                out[job.id] = JobResult.failure("job payload has no path", retry=False)
+                continue
+            fp, abs_path = _fingerprint_for(deps, vpath)
+            if abs_path is None:
+                out[job.id] = JobResult.failure("file not found", retry=False)
+                continue
+            if not fp:
+                out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
+                continue
+            if deps.feature_cache.has("clap", fp, version=deps.clap_version):
+                out[job.id] = JobResult.success(cached=True)
+                continue
+            targets.append((job, abs_path, fp))
+
+        if not targets:
+            return out
+
+        if not deps.clap_mod.is_model_ready():
+            deps.clap_mod.load_model()
+        if not deps.clap_mod.is_model_ready():
+            err = deps.clap_mod.load_error() or "CLAP model unavailable"
+            for job, _, _ in targets:
+                out[job.id] = JobResult.failure(err)
+            return out
+
+        warns: dict[str, str] = {}
+
+        def _warn(path: str, message: str) -> None:
+            warns[path] = message
+
+        results = deps.clap_mod.analyze_batch(
+            [abs_path for _, abs_path, _ in targets],
+            on_decode_warning=_warn,
+            max_batch=max(1, batch_size * deps.clap_mod.NUM_SEGMENTS),
+        )
+        _relay_warnings(deps, warns)
+
+        for job, abs_path, fp in targets:
+            emb = results.get(abs_path)
+            if emb is None:
+                out[job.id] = JobResult.failure("CLAP produced no embedding")
+                continue
+            try:
+                deps.feature_cache.put("clap", fp, emb, version=deps.clap_version)
+            except Exception as e:
+                out[job.id] = JobResult.failure(f"cache write failed: {e}")
+                continue
+            out[job.id] = JobResult.success()
         return out
 
     return handle
@@ -791,6 +867,11 @@ def enqueue_library_work(
         if KIND_FEATURES in kinds
         else set()
     )
+    have_clap = (
+        set(fc.get_all("clap", fps, version=deps.clap_version))
+        if KIND_CLAP in kinds
+        else set()
+    )
 
     if KIND_SCAN in kinds:
         items = [(t["path"], {"path": t["path"]}) for t in infos]
@@ -828,10 +909,23 @@ def enqueue_library_work(
             KIND_MAEST, items, priority=100, requeue_terminal=force
         )
 
+    # CLAP is skipped entirely when the server runs with --no-clap: the worker
+    # gates on model readiness, so enqueueing would leave jobs pending forever.
+    if KIND_CLAP in kinds and deps.clap_enabled:
+        items = [
+            (t["path"], {"path": t["path"]})
+            for t in infos
+            if t.get("fingerprint")
+            and (force or t["fingerprint"] not in have_clap)
+        ]
+        queued[KIND_CLAP] = queue.enqueue_many(
+            KIND_CLAP, items, priority=110, requeue_terminal=force
+        )
+
     if priority_paths:
         wanted = list(priority_paths)
-        for kind in (KIND_FEATURES, KIND_MAEST):
-            if kind in kinds:
+        for kind in (KIND_FEATURES, KIND_MAEST, KIND_CLAP):
+            if kind in kinds and (kind != KIND_CLAP or deps.clap_enabled):
                 queue.prioritize(kind, wanted, priority=0)
 
     return queued

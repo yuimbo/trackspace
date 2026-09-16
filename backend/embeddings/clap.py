@@ -1,8 +1,16 @@
 """Laion CLAP (``larger_clap_music``) — audio + text embeddings for Trackspace.
 
 Segment decode uses `load_resilient_audio_segments` from `audio_decode`.
-`inference_lock` is shared with `layout` so mlx-vis (Metal) never runs
-concurrently with PyTorch CLAP on another thread — see `audio_pipeline.md`.
+`inference_lock` is the process-wide GPU/accelerator serialisation point: it is
+shared with `layout` (mlx-vis on Metal), `maest` (its transformer), and the CLAP
+text encoder, so no two frameworks dispatch to the accelerator concurrently — see
+`audio_pipeline.md`.
+
+Audio embeddings are produced by `analyze_batch`, which decodes per track and then
+runs *one* forward pass per batch of segments (the feature extractor pads each
+segment independently, so variable-length inputs batch safely). This mirrors
+`maest.analyze_batch` and cuts lock acquisitions from three per track to one per
+batch.
 """
 
 from __future__ import annotations
@@ -33,35 +41,46 @@ _model_lock = threading.Lock()
 # Serialises CLAP on MPS/CUDA *and* mlx-vis on Metal from `layout` module.
 inference_lock = threading.Lock()
 _loaded = False
+_load_failed: str | None = None
 
 
 def is_model_ready() -> bool:
     return _loaded
 
 
+def load_error() -> str | None:
+    """Reason CLAP is unavailable, or ``None`` when it loaded (or is untried)."""
+    return _load_failed
+
+
 def load_model() -> None:
-    """Load the CLAP model and processor into GPU/CPU memory."""
-    global _model, _processor, _loaded
+    """Load the CLAP model and processor into GPU/CPU memory (never raises)."""
+    global _model, _processor, _loaded, _load_failed
     if _loaded:
         return
     with _model_lock:
         if _loaded:
             return
-        token = os.environ.get("HF_TOKEN")
-        log.info("Loading CLAP model %s …", CLAP_MODEL_ID)
-        _processor = ClapProcessor.from_pretrained(CLAP_MODEL_ID, token=token)
-        _model = ClapModel.from_pretrained(CLAP_MODEL_ID, token=token)
-        _model.eval()
-        if torch.cuda.is_available():
-            _model = _model.cuda()
-            log.info("Using CUDA acceleration")
-        elif torch.backends.mps.is_available():
-            _model = _model.to("mps")
-            log.info("Using MPS acceleration (Apple Silicon)")
-        else:
-            log.info("Using CPU inference")
-        _loaded = True
-        log.info("CLAP model loaded.")
+        try:
+            token = os.environ.get("HF_TOKEN")
+            log.info("Loading CLAP model %s …", CLAP_MODEL_ID)
+            _processor = ClapProcessor.from_pretrained(CLAP_MODEL_ID, token=token)
+            _model = ClapModel.from_pretrained(CLAP_MODEL_ID, token=token)
+            _model.eval()
+            if torch.cuda.is_available():
+                _model = _model.cuda()
+                log.info("Using CUDA acceleration")
+            elif torch.backends.mps.is_available():
+                _model = _model.to("mps")
+                log.info("Using MPS acceleration (Apple Silicon)")
+            else:
+                log.info("Using CPU inference")
+            _loaded = True
+            _load_failed = None
+            log.info("CLAP model loaded.")
+        except Exception as e:
+            _load_failed = f"{type(e).__name__}: {e}"
+            log.exception("CLAP model load failed")
 
 
 def _load_audio_segments(path: str) -> tuple[list[np.ndarray], str | None]:
@@ -75,31 +94,84 @@ def _load_audio_segments(path: str) -> tuple[list[np.ndarray], str | None]:
         return [], None
 
 
-def _embed_single(audio: np.ndarray) -> np.ndarray | None:
-    try:
-        with inference_lock:
-            inputs = _processor(
-                audio=audio,
-                sampling_rate=CLAP_SR,
-                return_tensors="pt",
-            )
-            device = next(_model.parameters()).device
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+def _extract_tensor(outputs) -> "torch.Tensor":
+    """Pooler output when present, else the CLS token, else the raw output."""
+    if hasattr(outputs, "pooler_output"):
+        return outputs.pooler_output
+    if hasattr(outputs, "last_hidden_state"):
+        return outputs.last_hidden_state[:, 0]
+    return outputs
 
-            with torch.no_grad():
-                outputs = _model.get_audio_features(**inputs)
 
-        if hasattr(outputs, "pooler_output"):
-            tensor = outputs.pooler_output
-        elif hasattr(outputs, "last_hidden_state"):
-            tensor = outputs.last_hidden_state[:, 0]
-        else:
-            tensor = outputs
+def analyze_batch(
+    paths: list[str],
+    *,
+    on_decode_warning: Callable[[str, str], None] | None = None,
+    max_batch: int = 12,
+) -> dict[str, np.ndarray | None]:
+    """Embed several tracks, batching segment inference across tracks.
 
-        return tensor.squeeze(0).cpu().numpy().astype(np.float32)
-    except Exception as e:
-        log.warning("CLAP segment inference failed: %s", e)
-        return None
+    Decoding happens per track on the calling thread; inference is grouped into
+    batches of at most *max_batch* segments so the accelerator is entered once per
+    batch instead of once per segment. The feature extractor pads/truncates each
+    segment independently, so variable-length segments batch safely.
+    """
+    results: dict[str, np.ndarray | None] = {p: None for p in paths}
+    if not paths:
+        return results
+
+    if not _loaded:
+        load_model()
+    if not _loaded:
+        return results
+
+    # ── decode all segments, remembering which track each belongs to ──
+    flat: list[np.ndarray] = []
+    owner: list[str] = []
+    for p in paths:
+        segments, warn = _load_audio_segments(p)
+        if warn and on_decode_warning:
+            on_decode_warning(p, warn)
+        for seg in segments[:NUM_SEGMENTS]:
+            if seg.size == 0:
+                continue
+            flat.append(np.asarray(seg, dtype=np.float32))
+            owner.append(p)
+
+    if not flat:
+        return results
+
+    per_track: dict[str, list[np.ndarray]] = {p: [] for p in paths}
+
+    for start in range(0, len(flat), max_batch):
+        chunk = flat[start : start + max_batch]
+        chunk_owner = owner[start : start + max_batch]
+        try:
+            with inference_lock:
+                inputs = _processor(
+                    audio=chunk,
+                    sampling_rate=CLAP_SR,
+                    return_tensors="pt",
+                )
+                device = next(_model.parameters()).device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                with torch.no_grad():
+                    outputs = _model.get_audio_features(**inputs)
+                tensor = _extract_tensor(outputs)
+                emb = tensor.detach().cpu().numpy().astype(np.float32)
+        except Exception as e:
+            log.warning("CLAP batch inference failed (%d segments): %s", len(chunk), e)
+            continue
+
+        for i, p in enumerate(chunk_owner):
+            per_track[p].append(emb[i])
+
+    for p in paths:
+        seg_embs = per_track.get(p) or []
+        if seg_embs:
+            results[p] = np.mean(seg_embs, axis=0).astype(np.float32)
+
+    return results
 
 
 def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
@@ -113,13 +185,8 @@ def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
             inputs = {k: v.to(device) for k, v in inputs.items()}
             with torch.no_grad():
                 outputs = _model.get_text_features(**inputs)
-        if hasattr(outputs, "pooler_output"):
-            tensor = outputs.pooler_output
-        elif hasattr(outputs, "last_hidden_state"):
-            tensor = outputs.last_hidden_state[:, 0]
-        else:
-            tensor = outputs
-        return tensor.cpu().numpy().astype(np.float32)
+            tensor = _extract_tensor(outputs)
+            return tensor.detach().cpu().numpy().astype(np.float32)
     except Exception as e:
         log.warning("CLAP text embedding failed: %s", e)
         return None
@@ -131,25 +198,13 @@ def generate_embedding(
     on_decode_warning: Callable[[str], None] | None = None,
 ) -> np.ndarray | None:
     """Mean-pooled multi-segment CLAP audio embedding, or None on failure."""
-    if not _loaded:
-        load_model()
+    def _warn(_p: str, message: str) -> None:
+        on_decode_warning(message)
 
-    segments, decode_warn = _load_audio_segments(path)
-    if decode_warn and on_decode_warning:
-        on_decode_warning(decode_warn)
-    if not segments:
-        return None
-
-    segment_embs: list[np.ndarray] = []
-    for audio in segments:
-        emb = _embed_single(audio)
-        if emb is not None:
-            segment_embs.append(emb)
-
-    if not segment_embs:
-        return None
-
-    return np.mean(segment_embs, axis=0).astype(np.float32)
+    results = analyze_batch(
+        [path], on_decode_warning=_warn if on_decode_warning else None
+    )
+    return results.get(path)
 
 
 def batch_ensure_embeddings(

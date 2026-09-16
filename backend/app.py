@@ -24,6 +24,7 @@ from backend.tags import read_all
 from backend.fingerprint import compute_fingerprint
 from backend import audio_features
 from backend import embeddings
+from backend.embeddings import clap as clap_mod
 from backend.embeddings import maest as maest_mod
 from backend.embeddings import rhythm_features as rhythm_mod
 from backend.embeddings import supervised as supervised_mod
@@ -39,6 +40,7 @@ from backend.embeddings.coverage import (
 )
 from backend.jobs import (
     JobWorker,
+    KIND_CLAP,
     KIND_CLUSTER,
     KIND_FEATURES,
     KIND_MAEST,
@@ -50,6 +52,7 @@ from backend.services.analysis_pipeline import (
     enqueue_clustering,
     enqueue_library_work,
     enqueue_supervised,
+    make_clap_handler,
     make_cluster_handler,
     make_features_handler,
     make_maest_handler,
@@ -105,12 +108,15 @@ def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
     return {src: fc.purge_old_versions(src, ver) for src, ver in versions.items()}
 
 
-def build_app(state: TrackspaceState) -> Flask:
+def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
     """Wire helpers, workers, and blueprints around *state*; return the app.
 
     ``main()`` builds the state after CLI parsing and calls this, so importing
     ``backend.app`` has no side effects (no caches, thread pool, or purge) and
     tests can inject a scratch state.
+
+    *clap_enabled* mirrors ``--no-clap``: when False the CLAP stage is never
+    enqueued, so a disabled server cannot accumulate jobs that will never run.
     """
     def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
         """Cheap fingerprint of mp3 set under one virtual folder (or all roots)."""
@@ -353,6 +359,7 @@ def build_app(state: TrackspaceState) -> Flask:
         virtual_from_abs=_virtual_from_abs,
         list_mp3s=_list_mp3s,
         maest_mod=maest_mod,
+        clap_mod=clap_mod,
         rhythm_mod=rhythm_mod,
         audio_features_mod=audio_features,
         maest_version=MAEST_VERSION,
@@ -360,6 +367,7 @@ def build_app(state: TrackspaceState) -> Flask:
         features_version=FEATURES_VERSION,
         clap_version=EMBEDDING_VERSION,
         effnet_version=EFFNET_VERSION,
+        clap_enabled=clap_enabled,
         data_dir=state.data_dir,
         emit_decode_warning=lambda rel, msg: _broadcast_embed_event(
             {"type": "decode_warning", "path": rel, "message": msg}
@@ -411,7 +419,7 @@ def build_app(state: TrackspaceState) -> Flask:
             state.job_queue,
             infos,
             deps=ANALYSIS_DEPS,
-            kinds=(KIND_FEATURES, KIND_MAEST),
+            kinds=(KIND_FEATURES, KIND_MAEST, KIND_CLAP),
             priority_paths=priority_paths or [],
             force=force,
         )
@@ -449,6 +457,18 @@ def build_app(state: TrackspaceState) -> Flask:
                 # Idle until the model has finished loading rather than failing
                 # every claimed job during the first minute after startup.
                 gate=maest_mod.is_model_ready,
+            )
+        )
+        state.workers.add(
+            JobWorker(
+                state.job_queue,
+                KIND_CLAP,
+                make_clap_handler(ANALYSIS_DEPS, batch_size=4),
+                batch_size=4,
+                on_event=_job_event_sink,
+                # Idle until the model has finished loading rather than failing
+                # every claimed job during the first minute after startup.
+                gate=clap_mod.is_model_ready,
             )
         )
         state.workers.add(
@@ -591,7 +611,7 @@ def main():
     # importing ``backend.app`` has no side effects, and purge stale cache rows
     # before the app starts serving.
     state = TrackspaceState.create()
-    app = build_app(state)
+    app = build_app(state, clap_enabled=not args.no_clap)
     lifecycle = app.extensions["trackspace_lifecycle"]
     startup_purges = _purge_stale_embedding_cache_rows(state)
 
@@ -653,7 +673,12 @@ def main():
         def _bg_load_clap():
             print("Loading CLAP model in background (this may take a moment on first run)…")
             embeddings.load_model()
-            print("CLAP model ready.")
+            if clap_mod.is_model_ready():
+                print("CLAP model ready.")
+            else:
+                print(f"CLAP not available: {clap_mod.load_error()}")
+            # Workers gate on model readiness; nudge them once it flips.
+            state.workers.wake(KIND_CLAP)
         threading.Thread(target=_bg_load_clap, daemon=True).start()
     if not args.no_effnet:
         def _bg_load_effnet():

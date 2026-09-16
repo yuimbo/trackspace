@@ -18,6 +18,7 @@ from flask import Blueprint, jsonify, request
 from backend.embeddings.clustering import DEFAULT_WEIGHTS
 from backend.jobs import (
     JOB_KINDS,
+    KIND_CLAP,
     KIND_CLUSTER,
     KIND_FEATURES,
     KIND_MAEST,
@@ -111,7 +112,7 @@ def create_api_jobs_blueprint(
         recursive = opt_bool(data, "recursive", True)
         force = opt_bool(data, "force", False)
         priority_paths = opt_str_list(data, "priority_paths")
-        kinds = opt_str_list(data, "kinds", [KIND_FEATURES, KIND_MAEST])
+        kinds = opt_str_list(data, "kinds", [KIND_FEATURES, KIND_MAEST, KIND_CLAP])
         for kind in kinds:
             one_of(kind, JOB_KINDS, field="kinds")
 

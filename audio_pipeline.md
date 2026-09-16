@@ -16,6 +16,7 @@ audio features**). Expensive analysis runs through a durable SQLite-backed job q
 scan      → ID3 tags + Chromaprint fingerprint
 features  → classical 6-D + rhythm 14-D
 maest     → MAEST embedding + 519 style logits + per-excerpt vectors
+clap      → CLAP audio embedding (the column span text directions project onto)
 supervise → folder-supervised 128-D projection head over the cached vectors
 cluster   → weighted blocks → PCA → cosine kNN → multi-resolution Leiden
 ```
@@ -134,19 +135,19 @@ empty-blob-as-absent rule or it will resurrect purged rows.
 
 - Model: `laion/larger_clap_music` loaded in a background thread at server startup
   (does not block Flask from accepting requests).
-- **Inference lock:** `clap.inference_lock` (imported by `embeddings` as `_inference_lock`)
-  serialises all CLAP forward passes (audio + text).  MPS and CUDA are not safe
-  for concurrent dispatches from multiple threads; without the lock, a Flask
-  request running semantic-weighting text inference while the generation thread
-  is producing audio embeddings would crash or hang.
-- **Projection lock sharing:** The same lock also wraps mlx-vis (`UMAP` / `TSNE`)
-  runs on Apple Metal in `embeddings/layout.py`.  Running PyTorch MPS (CLAP) and MLX
-  command buffers concurrently from separate Flask threads can hit IOGPU
-  assertion failures (e.g. `commit command buffer with uncommitted encoder`).
+- **Inference lock:** `clap.inference_lock` is the single process-wide accelerator
+  lock. It serialises every forward pass that touches MPS/CUDA: CLAP audio, CLAP
+  text, MAEST's transformer (which imports the same lock rather than defining its
+  own), and mlx-vis (`UMAP` / `TSNE`) on Apple Metal. MPS/CUDA are not safe for
+  concurrent dispatches from multiple threads; without one shared lock, a CLAP worker
+  and the MAEST worker dispatching to MPS at the same time, or a Flask request
+  running semantic-weighting text inference while a worker produces audio
+  embeddings, would crash or hang (IOGPU `commit command buffer with uncommitted
+  encoder` assertions).
 - **Rule for new GPU code paths:** If a path dispatches work to MPS/Metal/CUDA
   from request threads, either (1) guard it with `clap.inference_lock`, or
   (2) prove the backend is thread-safe under mixed-framework load before
-  allowing concurrent execution.
+  allowing concurrent execution. Do not define a second lock.
 - **Rule for env-toggle tests:** Backend enable flags are cached lazily; after
   changing `TRACKSPACE_CUML` / `TRACKSPACE_MLX_VIS` in tests, call
   `reset_projection_backend_cache()` before running a projection.
@@ -154,10 +155,21 @@ empty-blob-as-absent rule or it will resurrect purged rows.
 - Audio is loaded via librosa at 48 kHz.  Three 15 s segments (at 20 %/50 %/80 %
   through the file) are embedded independently and averaged for robustness.
   Short tracks (≤ 22.5 s) use the whole file as a single segment.
-- Generation runs in a background thread.  Progress is streamed to the frontend
-  via SSE (`/api/embeddings/stream`) so tracks appear incrementally.
-- The frontend sends `priority_paths` when kicking off generation so that tracks
-  currently visible on screen are processed first.
+- **The queue stage.** `KIND_CLAP` (`backend/jobs/kinds.py`) drains one job per
+  track through `make_clap_handler`. `clap.analyze_batch` decodes per track on the
+  worker thread, then runs one forward pass per batch of segments (the feature
+  extractor pads each segment independently, so variable-length segments batch
+  safely) — one `inference_lock` acquisition per batch instead of one per segment.
+  Progress is streamed via the queue's SSE feed (`/api/jobs/stream`), so tracks
+  appear incrementally. The frontend sends `priority_paths` so tracks currently
+  visible on screen are processed first. A CLAP drain triggers a re-cluster, so the
+  map and clusters pick up the new block without a manual rebuild.
+- **The block is load-bearing.** The audio embedding is not just a low-weight
+  texture signal: it is the column span that `layout`'s semantic weighting projects
+  tag/folder-name text directions onto. With no cached CLAP rows, the block is absent
+  and tag-based weighting is silently inert. `--no-clap` therefore skips the stage
+  entirely (the enqueue filter and worker gate both key off it) rather than queueing
+  jobs behind a model that will never load.
 
 ### Embedding versioning
 
@@ -471,6 +483,7 @@ global "running" flag. The change matters for correctness, not just tidiness:
 scan      → ID3 tags + Chromaprint fingerprint   (CPU, batch 8)
 features  → classical 6-D + rhythm 14-D          (CPU, batch 2)
 maest     → MAEST embedding + 519 style logits   (GPU, batch 4, gated on model)
+clap      → CLAP audio embedding                 (GPU, batch 4, gated on model)
 supervise → folder-supervised projection head    (CPU, singleton, whole-library)
 cluster   → kNN graph + multi-resolution Leiden  (whole-library singleton)
 ```
@@ -478,20 +491,27 @@ cluster   → kNN graph + multi-resolution Leiden  (whole-library singleton)
 Names live in `backend/jobs/kinds.py` so enqueuers, workers, and routes cannot
 drift apart.
 
+`clap` sits after `maest` so the primary genre signal lands first and the map
+renders while the (decode-dominated) CLAP backfill continues; its drain triggers a
+re-cluster like any other per-track stage.
+
 ### Rules when adding a stage
 
 1. **Never raise for one bad track.** Return `JobResult.failure(...)`; the rest
    of the batch still commits and the queue owns the retry decision.
 2. **Use `retry=False` for permanent errors** (missing file, unsupported codec)
    so a dead track does not consume three attempts *and* three model runs.
-3. **Batch only at the GPU boundary.** MAEST batches across tracks; CPU stages
-   stay per-track so one slow decode cannot stall a whole batch.
+3. **Batch only at the GPU boundary.** MAEST and CLAP batch across tracks; CPU
+   stages stay per-track so one slow decode cannot stall a whole batch.
 4. **Filter against the cache before enqueueing**, so the queue reflects
    *outstanding* work. This is what makes the progress numbers meaningful.
 5. **Gate on model readiness** with `JobWorker(gate=...)` rather than letting
    the worker claim jobs and fail them while a model is still loading.
 6. **Library-wide work uses one dedupe key** (`"library"` for clustering), so a
    burst of filesystem events collapses into at most one pending re-run.
+7. **A `--no-*` flag must also skip its enqueue**, not just eager loading:
+   a stage whose model never loads would otherwise leave jobs pending forever
+   (the `clap_enabled` gate on `enqueue_library_work`).
 
 `--no-maest` / `--no-clap` / `--no-effnet` skip eager model loading. Flask runs
 with `use_reloader=False`: the reloader would fork a second set of worker

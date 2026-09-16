@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .audio_decode import load_resilient_audio_segments
+from .clap import inference_lock
 
 log = logging.getLogger(__name__)
 
@@ -48,8 +49,9 @@ _model = None
 _mel = None
 _device = "cpu"
 _model_lock = threading.Lock()
-#: Serialises MAEST GPU work against CLAP/mlx-vis — see audio_pipeline.md.
-inference_lock = threading.Lock()
+#: Shared process-wide accelerator lock (defined in ``clap``): serialises MAEST
+#: against CLAP audio/text and mlx-vis so no two frameworks dispatch to MPS/Metal
+#: concurrently — see ``audio_pipeline.md``. Imported, not redefined, on purpose.
 _loaded = False
 _load_failed: str | None = None
 

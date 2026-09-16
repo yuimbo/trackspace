@@ -14,7 +14,7 @@ from backend.embeddings.projection_config import (
     FROZEN_SOURCE_WEIGHTS,
     REQUIRED_SOURCES,
 )
-from backend.jobs import KIND_FEATURES, KIND_MAEST
+from backend.jobs import KIND_CLAP, KIND_FEATURES, KIND_MAEST
 from backend.services.embedding_status_cache import EmbeddingStatusCache
 from backend.services.request_validation import (
     opt_bool,
@@ -129,7 +129,7 @@ def create_api_embeddings_blueprint(
         by_kind = job_queue.stats_by_kind()
         done = 0
         total = 0
-        for kind in (KIND_FEATURES, KIND_MAEST):
+        for kind in (KIND_FEATURES, KIND_MAEST, KIND_CLAP):
             st = by_kind.get(kind)
             if st is None:
                 continue
@@ -137,7 +137,7 @@ def create_api_embeddings_blueprint(
             total += st.total
         running = any(
             (by_kind.get(k).outstanding if by_kind.get(k) else 0) > 0
-            for k in (KIND_FEATURES, KIND_MAEST)
+            for k in (KIND_FEATURES, KIND_MAEST, KIND_CLAP)
         )
         return running, ({"done": done, "total": total} if total else None)
 

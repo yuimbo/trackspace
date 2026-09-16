@@ -7,6 +7,7 @@ the pipeline stages so enqueuers and workers cannot drift apart.
 
 from .kinds import (
     JOB_KINDS,
+    KIND_CLAP,
     KIND_CLUSTER,
     KIND_FEATURES,
     KIND_MAEST,
@@ -21,6 +22,7 @@ __all__ = [
     "DONE",
     "FAILED",
     "JOB_KINDS",
+    "KIND_CLAP",
     "KIND_CLUSTER",
     "KIND_FEATURES",
     "KIND_MAEST",
