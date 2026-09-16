@@ -606,6 +606,14 @@ dg_i/dw_s = −(1/tau) sum_l a_il Delta_ils (c_l − g_i)
 - The preview is the residual form `y~_i(w) = y_i^0 + g_i(w) − g_i(w0)`, so it
   reproduces the base layout *exactly* at `w = w0`. The frontend's `y^0 + J dw` is
   its first-order truncation.
+- **The translation + uniform-zoom component is projected out** of each source's Jacobian
+  (`_remove_gauge`): fit `J_i ≈ α + β·(y_i^0 − centroid)` and keep the residual. A
+  Jacobian that only offsets or scales the whole map carries no shape information — the
+  canvas refits the view anyway — so it reads as "nothing happened". Only the shape change
+  is returned, and the extremes of the map define the frame.
+- The frontend **re-normalises every preview state to the unit square**, matching the
+  server's min-max normalisation of every layout, so a drag cannot drift or zoom the map
+  out of frame.
 - Cost is `O(N*M*S)` after the `Delta` cache (128 landmarks: ~51 MB at 20k
   tracks). The route uses it for `?jacobian=1` and falls back to the refit-FD when
   the chart cannot be fit (too few tracks).

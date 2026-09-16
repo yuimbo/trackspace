@@ -54,16 +54,25 @@ const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
  *  Always steps from the Jacobian's own base positions, never from the current
  *  map: re-basing on an already-approximated map while ``dw`` stays relative to
  *  the fetch-time weights would compound each drag event's delta.
+ *
+ *  The result is renormalised to the unit square, matching the server's min-max
+ *  normalisation of every layout, so a drag cannot drift or zoom the map out of
+ *  frame. The Jacobian already has its translation/uniform-zoom component removed,
+ *  so the visible change is the shape change.
  */
 export function approximatePositions(
   jac: WeightJacobian,
   weights: Record<string, number>,
 ): Map<string, { x: number; y: number }> {
-  const out = new Map<string, { x: number; y: number }>();
   const steps = Object.entries(jac.jacobian).map(([source, deltas]) => ({
     deltas,
     dw: (weights[source] ?? 0) - (jac.weights[source] ?? 0),
   }));
+  const moved: { path: string; x: number; y: number }[] = [];
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
   for (let i = 0; i < jac.paths.length; i++) {
     const pos = jac.base[i];
     if (!pos) continue;
@@ -76,7 +85,19 @@ export function approximatePositions(
       dx += d.dx * step.dw;
       dy += d.dy * step.dw;
     }
-    out.set(jac.paths[i], { x: clamp01(pos.x + dx), y: clamp01(pos.y + dy) });
+    const x = pos.x + dx;
+    const y = pos.y + dy;
+    moved.push({ path: jac.paths[i], x, y });
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  const spanX = maxX - minX || 1;
+  const spanY = maxY - minY || 1;
+  const out = new Map<string, { x: number; y: number }>();
+  for (const p of moved) {
+    out.set(p.path, { x: clamp01((p.x - minX) / spanX), y: clamp01((p.y - minY) / spanY) });
   }
   return out;
 }

@@ -65,6 +65,8 @@ class LandmarkModel:
     delta: dict[str, np.ndarray]
     #: ``(M, 2)`` landmark coordinates fitted against the base layout.
     coeffs: np.ndarray
+    #: ``(N, 2)`` base layout the coefficients were fitted against.
+    base: np.ndarray
     #: Softmax bandwidth, fixed per chart.
     tau: float
     #: The weights the coefficients were fitted at.
@@ -86,7 +88,7 @@ class LandmarkModel:
         """``(N, 2)`` extension values ``g_i(w)`` at *weights*."""
         return self.affinities(weights) @ self.coeffs
 
-    def jacobian(self, weights: dict[str, float]) -> dict[str, np.ndarray]:
+    def raw_jacobian(self, weights: dict[str, float]) -> dict[str, np.ndarray]:
         """Exact ``dg_i/dw_s`` as ``source -> (N, 2)``, at *weights*.
 
         Closed form: ``dg/dw_s = -(1/tau) sum_l a_il Delta_ils (c_l - g_i)``.
@@ -104,6 +106,18 @@ class LandmarkModel:
             q = weighted.sum(axis=1)
             out[s] = (-(p - q[:, None] * g) / self.tau).astype(np.float32)
         return out
+
+    def jacobian(self, weights: dict[str, float]) -> dict[str, np.ndarray]:
+        """``raw_jacobian`` with the translation + uniform-zoom component removed.
+
+        A Jacobian that only offsets or scales the whole map carries no shape
+        information (the canvas refits the view anyway), so it reads as "nothing
+        happened"; the returned field is the shape change.
+        """
+        return {
+            s: _remove_gauge(arr, self.base)
+            for s, arr in self.raw_jacobian(weights).items()
+        }
 
     def preview(self, weights: dict[str, float]) -> dict[str, Any]:
         """Positions at *weights* plus the exact Jacobian at *weights*.
@@ -208,6 +222,31 @@ def _tau_from(delta: dict[str, np.ndarray], quantile: float) -> float:
     return float(max(np.quantile(vals, float(quantile)), 1e-6))
 
 
+def _remove_gauge(jac: np.ndarray, base: np.ndarray) -> np.ndarray:
+    """Project the translation + uniform-zoom component out of a movement field.
+
+    A field that only translates or uniformly scales the whole map carries no shape
+    information — the canvas refits the view regardless — so it reads as "nothing
+    happened". Fit ``J_i ~= alpha + beta * r_i`` with ``r_i = base_i - centroid``
+    (2 intercepts + one shared zoom) and keep the residual, which is the shape change.
+    """
+    n = int(base.shape[0])
+    if n < 4:
+        return jac
+    r = base - base.mean(axis=0)
+    design = np.zeros((2 * n, 3), dtype=np.float64)
+    design[:n, 0] = 1.0
+    design[:n, 2] = r[:, 0]
+    design[n:, 1] = 1.0
+    design[n:, 2] = r[:, 1]
+    target = np.concatenate([jac[:, 0], jac[:, 1]]).astype(np.float64)
+    coef, *_ = np.linalg.lstsq(design, target, rcond=None)
+    fitted = np.empty((n, 2), dtype=np.float64)
+    fitted[:, 0] = coef[0] + coef[2] * r[:, 0]
+    fitted[:, 1] = coef[1] + coef[2] * r[:, 1]
+    return (jac - fitted).astype(np.float32)
+
+
 def build_landmark_model(
     track_infos: list[dict],
     feature_cache: Any,
@@ -266,6 +305,7 @@ def build_landmark_model(
         sources=tuple(sources),
         delta=delta,
         coeffs=coeffs,
+        base=y0,
         tau=tau,
         weights0=w0,
     )

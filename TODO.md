@@ -29,20 +29,15 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
   `buildTooltip` is pure; the canvas renders it. The flag is excerpt dispersion
   (intro vs drop ≥ 0.25), not cluster-centroid distance — the badge's hover text says so.
 
-- ✅ **Head bundles + folder fan-out.** The head now stores per-folder centroids
-  in the 128-D space, so it can be exported/imported as a self-describing bundle
-  and compared (`compare_heads`). `POST /api/supervised/fanout` predicts a folder
-  per track and, on `apply`, moves the files into the head's folder subfolders
-  (dry-run by default; collisions get a ` (n)` suffix). UI under *Folder head*.
-- ✅ **Source-weight Jacobian for live drags.** `compute_projection(...,
-  with_jacobian=True)` returns a first-order finite-difference
-  `d(position)/d(weight)`; the *Source weights* panel fetches it on open and applies
-  it linearly while a slider moves, so the map responds before the full recompute on
-  **Apply**.
-- ✅ **Supervised-training progress.** The status bar and canvas pill now drive the
-  bar from the tail stage's own steps instead of the queue-wide fraction (a singleton
-  among thousands sat pinned near 100 %), and `gather`/`projecting` report real
-  counts; an opaque phase renders an indeterminate bar rather than 0 %.
+- [ ] Whacko idea! Allow exporting / importing / comparing the trained folder heads between directory trees.
+  Think being able to "steal" someones organization system, and imprint it on a new unsorted set of tracks
+  Even have a feature where you point it at a huge folder and then automatically fan out all the tracks inside to their corresponding folder path in the trained head
+
+- [ ] "Source weights"
+  Show more info around the underlying models (what kind of information do they encode?) when hovering them
+  If the sliders have moved, allow resetting them (separate "Reset" from "Load default config")
+  The models might have different "global" behaviour overall? Should we maybe somehow "normalize" them first? So they have matching distirbutions or something, and better "co-correlate" in a shared space? Is this something normal to do in AI/ML when merging embedding spaces? ((in that case what is it called so i can learn more about it?))
+  
 
 ## Deferred / optional
 
@@ -62,12 +57,12 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       rejection). Unreproduced in headless Chromium, so unconfirmed: if a user reports a
       silent first hover after a reload, catch `NotAllowedError` and show a one-time
       "click to enable preview audio" hint, then retry on the next gesture.
-- [ ] **Projection refit progress is phase-level only.** The layout now streams
-      its phase on `layout_progress` (`compute_projection`'s `on_progress`), so the
-      pill and status bar show "laying out" / "Jacobian k / S" instead of a static
-      "Computing layout…". The base `layout` phase itself is still one opaque step:
-      neither the sklearn fallback nor mlx-vis exposes iteration callbacks, so a
-      percent needs a custom optimize loop (openTSNE's `optimize` is a generator).
+- [ ] **Projection refit progress.** The t-SNE/UMAP refit is still opaque: the
+      canvas shows a static "Computing layout…" pill (`canvas-view.ts`,
+      `_embeddingWaitLabel`) while `/api/embeddings/projection` runs for seconds.
+      openTSNE exposes iteration callbacks; a phase/percent on the same
+      `stage_progress` channel would cover it. Only worth it if the refit is a
+      visible fraction of a first run.
 
 - [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1040 lines, the
       largest frontend file). The ~200 lines of fit-view math (`_vpFromWorldBounds`,
@@ -106,40 +101,6 @@ Concrete, actionable work and deferred items. Design rules live in the docs:
       queue's per-kind stats already report structure progress, and `SourceVersions`
       feeds the layout revision hash, where a metadata-only source must not appear).
       Add a separate count if the status UI ever needs it.
-- ✅ **Weight-aware landmark extension for the slider Jacobian.** The refit
-      finite difference was not a derivative (t-SNE lands in a different local
-      optimum; measured `cos ≈ −0.17` vs PCA's `0.9998`). `?jacobian=1` now uses
-      `landmark_projection.py`: a fixed smooth `g_i(w)` over cached landmark
-      squared distances, with the exact analytic derivative
-      `dg_i/dw_s = −(1/τ) Σ_l a_il Δ_ils (c_l − g_i)`. The chart is fitted
-      once per `layout_revision` and cached; the refit-FD remains the fallback.
-      See `audio_pipeline.md` → *Smooth landmark extension*.
-- [ ] **Landmark 2-D fidelity is unmeasured.** The construction's derivative is
-      exact (checked against central differences of the same `g`), but whether the
-      2-D layout tracks the *real* t-SNE chart across the weight range is an
-      empirical question. The naive comparison is confounded — a refit is not a
-      smooth function and Procrustes cannot align its cluster rearrangements — so
-      the right experiment is the researcher's §8 harness: neighbourhood
-      recall/trustworthiness at k=10/30/100 and weight hold-out generalization,
-      against a fixed chart. Tune `n_landmarks` (default 128) and `tau`
-      (median of `D²`) on the real library.
-- [ ] **Chart revision vs layout revision.** `landmark_model_for` caches by
-      `layout_revision`, which mixes the chart artifact with the track set. The
-      researcher's §6 asks for a separate `chart_revision` (reference data,
-      preprocessing, semantic transform, landmark artifact, algorithm config) so a
-      layout from insertion stays deterministic *conditional on the same chart*. Also
-      split the semantic correction: `_weight_jacobian` re-runs it per perturbation,
-      and the cross-source terms (`∝√(w_s w_t)`) are not in `Σ_s w_s Δ_s`.
-- [ ] **Imported heads do not check `source_versions`.** `project_supervised_missing`
-      refuses on `input_sources`/`in_dim` mismatch but not on a different
-      `source_versions` (e.g. a head trained before a CLAP checkpoint switch, same
-      dim). `compare_heads` reports `compatible: false` for that case; make the
-      projection path refuse it too, or re-project through an imported head whose
-      versions differ.
-- [ ] **Fan-out has no undo.** `fanout_supervised(apply=True)` moves files with no
-      move log, so a wrong import or a bad head cannot be rolled back from the app.
-      Record the plan (old → new path) and add an "undo last fan-out" action, or
-      make the plan a persisted artifact rather than only a response body.
 
 ## Product roadmap (analysis)
 

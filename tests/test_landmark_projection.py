@@ -12,6 +12,7 @@ import numpy as np
 
 from backend.embeddings.landmark_projection import (
     LandmarkModel,
+    _remove_gauge,
     build_landmark_model,
 )
 
@@ -27,16 +28,17 @@ def _model(seed: int = 0, n: int = 80, m: int = 8) -> LandmarkModel:
         sources=sources,
         delta=delta,
         coeffs=rng.normal(size=(m, 2)),
+        base=rng.random((n, 2)).astype(np.float32),
         tau=1.0,
         weights0={"a": 0.4, "b": 0.35, "c": 0.25},
     )
 
 
-def test_jacobian_matches_central_differences_of_g():
+def test_raw_jacobian_matches_central_differences_of_g():
     """The closed form must equal a central difference of the *same* g."""
     model = _model()
     w0 = dict(model.weights0)
-    jac = model.jacobian(w0)
+    jac = model.raw_jacobian(w0)
     assert set(jac) == set(model.sources)
     for s in model.sources:
         h = 1e-4
@@ -45,6 +47,31 @@ def test_jacobian_matches_central_differences_of_g():
         dn[s] -= h
         fd = (model.evaluate(up) - model.evaluate(dn)) / (2 * h)
         assert np.abs(jac[s] - fd).max() / (np.abs(fd).max() + 1e-12) < 1e-3
+
+
+def test_remove_gauge_kills_translation_and_zoom():
+    """A pure offset/zoom field carries no shape change and must vanish."""
+    rng = np.random.default_rng(0)
+    base = rng.random((50, 2))
+    r = base - base.mean(axis=0)
+    # alpha + beta * r  ==  translation + uniform zoom about the centroid.
+    gauge = 0.7 + 0.4 * r
+    assert np.abs(_remove_gauge(gauge, base)).max() < 1e-6
+    # A genuine shape change survives.
+    shape = rng.normal(size=(50, 2))
+    kept = _remove_gauge(gauge + shape, base)
+    assert np.abs(kept).max() > 0
+
+
+def test_jacobian_is_the_gauge_projected_raw_field():
+    model = _model(seed=5)
+    w0 = dict(model.weights0)
+    raw = model.raw_jacobian(w0)
+    projected = model.jacobian(w0)
+    for s in model.sources:
+        np.testing.assert_allclose(
+            projected[s], _remove_gauge(raw[s], model.base), atol=1e-6
+        )
 
 
 def test_first_order_residual_shrinks_with_the_step():
@@ -62,9 +89,7 @@ def test_first_order_residual_shrinks_with_the_step():
             s: max(0.05, w0[s] + h * float(direction[i]))
             for i, s in enumerate(model.sources)
         }
-        pred = g0 + sum(
-            jac[s] * (w[s] - w0[s]) for s in model.sources
-        )
+        pred = g0 + sum(jac[s] * (w[s] - w0[s]) for s in model.sources)
         errs.append(float(np.abs(model.evaluate(w) - pred).max()))
 
     # Residual falls with the step; 10x smaller step -> ~100x smaller residual.

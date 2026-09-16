@@ -276,6 +276,7 @@ def create_api_embeddings_blueprint(
         # separate, slower pass. The landmark extension differentiates a *fixed*,
         # smooth function of the weights, so its derivative is exact rather than
         # refit noise (an independent refit lands in a different local optimum).
+        _layout_progress("chart", 0, 0)
         model = landmark_mod.landmark_model_for(
             revision,
             infos,
@@ -309,6 +310,7 @@ def create_api_embeddings_blueprint(
                 with_jacobian=True,
             )
         else:
+            _layout_progress("jacobian", 0, 0)
             jacobian = model.jacobian(weights0)
         return jsonify({
             "positions": positions,

@@ -50,6 +50,7 @@ const PHASE_LABELS: Record<string, string> = {
   done: "done",
   // Layout phases (streamed as `layout_progress`, not a queued job).
   layout: "laying out",
+  chart: "landmarks",
   jacobian: "Jacobian",
 };
 
