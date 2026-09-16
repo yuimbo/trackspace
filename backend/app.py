@@ -93,6 +93,16 @@ from backend.trackspace_state import PKG_DIR, TrackspaceState
 
 log = logging.getLogger(__name__)
 
+#: Versioned cache sources and the constant that owns each version. One map so the
+#: startup purge and its report can never disagree about which sources exist.
+SOURCE_VERSIONS: dict[str, int] = {
+    "clap": EMBEDDING_VERSION,
+    "features": FEATURES_VERSION,
+    "maest": MAEST_VERSION,
+    "rhythm": RHYTHM_VERSION,
+    "structure": STRUCTURE_VERSION,
+}
+
 #: Processes used to drain the CPU-bound ``features`` stage. madmom's BLSTM
 #: forward pass is GIL-bound, so this stage scales across *processes*, not threads
 #: (see ``backend/services/features_worker.py``). Measured on a 64-track real
@@ -162,14 +172,10 @@ def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
     module must not touch the filesystem, so this is not run at import time.
     """
     fc = ts.feature_cache
-    versions = {
-        "clap": EMBEDDING_VERSION,
-        "features": FEATURES_VERSION,
-        "maest": MAEST_VERSION,
-        "rhythm": RHYTHM_VERSION,
-        "structure": STRUCTURE_VERSION,
+    return {
+        src: fc.purge_old_versions(src, ver)
+        for src, ver in SOURCE_VERSIONS.items()
     }
-    return {src: fc.purge_old_versions(src, ver) for src, ver in versions.items()}
 
 
 def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
@@ -741,21 +747,16 @@ def main():
     pruned = state.track_cache.prune_missing()
     if pruned:
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
-    _version_labels = {
-        "clap": EMBEDDING_VERSION,
-        "features": FEATURES_VERSION,
-        "maest": MAEST_VERSION,
-        "rhythm": RHYTHM_VERSION,
-    }
     for name, n in startup_purges.items():
         if n:
             print(
-                f"{name}: purged {n} stale v<{_version_labels[name]} "
+                f"{name}: purged {n} stale v<{SOURCE_VERSIONS.get(name, '?')} "
                 f"entr{'y' if n == 1 else 'ies'} (on load)"
             )
     print(
         f"Versions: CLAP={EMBEDDING_VERSION} "
-        f"Features={FEATURES_VERSION} MAEST={MAEST_VERSION} Rhythm={RHYTHM_VERSION}"
+        f"Features={FEATURES_VERSION} MAEST={MAEST_VERSION} "
+        f"Rhythm={RHYTHM_VERSION} Structure={STRUCTURE_VERSION}"
     )
 
     # Any jobs left 'running' by a previous process are reclaimed so the queue

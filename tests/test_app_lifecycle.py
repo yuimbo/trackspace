@@ -53,3 +53,33 @@ def test_build_app_accepts_injected_state(tmp_path):
         assert "/api/search" in {r.rule for r in app.url_map.iter_rules()}
     finally:
         state.thread_pool.shutdown(wait=False)
+
+
+def test_source_versions_covers_every_versioned_cache_source():
+    """The startup purge and its report share one map, so they cannot disagree.
+
+    A version bump used to add a source to the purge map but not the report map,
+    which crashed ``main()`` with a ``KeyError`` on the first start after the bump.
+    """
+    from backend.app import SOURCE_VERSIONS
+
+    assert set(SOURCE_VERSIONS) == {
+        "clap",
+        "features",
+        "maest",
+        "rhythm",
+        "structure",
+    }
+    assert all(isinstance(v, int) and v >= 1 for v in SOURCE_VERSIONS.values())
+
+
+def test_purge_reports_one_entry_per_source(tmp_path):
+    from backend.app import SOURCE_VERSIONS, _purge_stale_embedding_cache_rows
+    from backend.trackspace_state import TrackspaceState
+
+    state = TrackspaceState.create(data_dir=str(tmp_path / "data"))
+    try:
+        purged = _purge_stale_embedding_cache_rows(state)
+        assert set(purged) == set(SOURCE_VERSIONS)
+    finally:
+        state.thread_pool.shutdown(wait=False)
