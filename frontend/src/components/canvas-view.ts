@@ -82,8 +82,9 @@ export class CanvasView {
   private _pinPos: { left: number; top: number } | null = null;
   /** Result row currently auditioning on hover (dedupes repeated mouseover). */
   private _previewRow: HTMLElement | null = null;
-  /** Inspect-card action clicked (``anti``/``near``/``solo``/``focus``/``close``). */
-  onInspectAction: ((action: string, path: string) => void) | null = null;
+  /** Inspect-card action clicked (``anti``/``near``/``proximity``/``focus``/``close``). */
+  onInspectAction: ((action: string, path: string, value?: number) => void) | null =
+    null;
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
@@ -113,6 +114,7 @@ export class CanvasView {
     this.ctx = this.$canvas.getContext("2d")!;
     this.$tip = document.getElementById("tooltip")!;
     this.$tip.addEventListener("click", (e) => this._onTipClick(e));
+    this.$tip.addEventListener("input", (e) => this._onTipInput(e));
     this.$tip.addEventListener("mouseover", (e) => this._onTipOver(e));
     this.$tip.addEventListener("mouseout", (e) => this._onTipOut(e));
     // Leaving the open card ends the audition it owns (the card is
@@ -1190,6 +1192,7 @@ export class CanvasView {
       message: null,
       mode: null,
       results: [],
+      proximity: 100,
     };
     this._tipKey = "";
     this.scheduleDraw();
@@ -1242,6 +1245,25 @@ export class CanvasView {
         this.inspect?.path ?? "",
       );
     }
+  }
+
+  /**
+   * Neighbourhood-slider drag. The card is *not* re-rendered here (the slider is
+   * absent from the inspect re-render key), so the input keeps the pointer and the
+   * readout updates in place; the coordinator applies the new neighbourhood.
+   */
+  private _onTipInput(e: Event): void {
+    const t = e.target as HTMLElement;
+    const range = t.closest<HTMLInputElement>("[data-inspect-proximity]");
+    if (!range) return;
+    const value = Number(range.value);
+    if (!Number.isFinite(value)) return;
+    const readout = this.$tip.querySelector<HTMLElement>(
+      "[data-inspect-proximity-value]",
+    );
+    if (readout) readout.textContent = `${Math.round(value)}%`;
+    if (this.inspect) this.inspect.proximity = value;
+    this.onInspectAction?.("proximity", this.inspect?.path ?? "", value);
   }
 
   /**

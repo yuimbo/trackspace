@@ -37,6 +37,7 @@ import {
 } from "./coordinators/search-coordinator";
 import {
   InspectCoordinator,
+  PROXIMITY_ALL,
   type SimilarResponse,
 } from "./coordinators/inspect-coordinator";
 
@@ -223,7 +224,8 @@ export class Controller {
       },
       fetchSimilar: (path, mode, k) =>
         api<SimilarResponse>(
-          `/api/tracks/similar?path=${encodeURIComponent(path)}&mode=${mode}&k=${k}`,
+          `/api/tracks/similar?path=${encodeURIComponent(path)}&mode=${mode}` +
+            (k === PROXIMITY_ALL ? "&all=1" : `&k=${k}`),
           undefined,
           true,
         ),
@@ -235,8 +237,8 @@ export class Controller {
       },
       stopPreview: () => this._stopPreview(),
     });
-    canvasView.onInspectAction = (action, path) =>
-      void this.inspect.action(action, path);
+    canvasView.onInspectAction = (action, path, value) =>
+      void this.inspect.action(action, path, value);
 
     this.folders = new FolderTreeCoordinator({
       model,

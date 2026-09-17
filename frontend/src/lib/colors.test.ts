@@ -53,9 +53,9 @@ describe("dirColor", () => {
       "abc12345/GENRES/Rock/70s",
       "abc12345/GENRES/Rock/70s/Live",
     ].map((p) => Math.abs(lightness(dirColor(p)) - 60));
-    expect(devs[0]).toBeLessThanOrEqual(10);
-    expect(devs[1]).toBeLessThanOrEqual(5);
-    expect(devs[2]).toBeLessThanOrEqual(3);
+    expect(devs[0]).toBeLessThanOrEqual(30);
+    expect(devs[1]).toBeLessThanOrEqual(15);
+    expect(devs[2]).toBeLessThanOrEqual(8);
   });
 
   it("gives sibling subfolders distinct tints", () => {

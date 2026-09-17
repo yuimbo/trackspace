@@ -49,6 +49,14 @@ def create_api_similar_blueprint(
         k = opt_int(request.args, "k", DEFAULT_K, lo=1, hi=MAX_K)
         assert k is not None  # a default was supplied
         mode = one_of(request.args.get("mode", "near"), ("near", "far"), field="mode")
+        # ``all=1`` returns the full near ranking (paths only, no scores) so the
+        # inspect card's proximity slider can filter locally as it is dragged
+        # instead of paying one request per step.
+        all_scores = request.args.get("all", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
 
         result = clusters.get()
         # The weights actually used by the current clusters are the weights the map
@@ -87,6 +95,18 @@ def create_api_similar_blueprint(
                     {"ok": False, "error": "This track has no cached embedding"}
                 ),
                 404,
+            )
+
+        if all_scores:
+            ranked = index.rank(paths, matrix, idx, len(paths), mode)
+            return jsonify(
+                {
+                    "ok": True,
+                    "path": path,
+                    "mode": mode,
+                    "n_tracks": len(paths),
+                    "ranking": [r["path"] for r in ranked],
+                }
             )
 
         results = index.rank(paths, matrix, idx, k, mode)

@@ -119,6 +119,8 @@ def test_partial_renders_external_section():
     assert 'data-root-role="external"' in html
     assert "folder-section-label" in html
     assert "folder-role-btn" in html
+    # The External section is recessed so it reads as a separate space.
+    assert "folder-section-external" in html
     # The root row carries its absolute path for removal/imprint affordances.
     assert 'data-root-abs="/music/ext"' in html
     assert "folder-remove-btn" in html

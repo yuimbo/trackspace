@@ -171,6 +171,7 @@ describe("buildTooltip", () => {
       message: null,
       mode: "far",
       results: [{ path: "b.mp3", score: -0.42 }],
+      proximity: 100,
     });
     expect(card.inspect?.mode).toBe("far");
     expect(card.results).toEqual([
@@ -185,6 +186,7 @@ describe("buildTooltip", () => {
       message: null,
       mode: "near",
       results: [{ path: "new.mp3", score: 0.5 }],
+      proximity: 100,
     });
     expect(card.results[0]).toMatchObject({ path: "new.mp3", title: "new.mp3" });
   });
@@ -280,6 +282,7 @@ describe("renderTooltip", () => {
         message: null,
         mode: "far",
         results: [{ path: "b.mp3", score: -0.42 }],
+        proximity: 100,
       }),
     );
     // The hint is for the plain card; a pinned card is already interactive.
@@ -356,13 +359,23 @@ describe("renderTooltip", () => {
         message: null,
         mode: "far",
         results: [{ path: "b.mp3", score: -0.42 }],
+        proximity: 100,
       }),
     );
 
     const actions = [...host.querySelectorAll(".tt-nav-btn")].map(
       (b) => (b as HTMLElement).dataset.inspectAction,
     );
-    expect(actions).toEqual(["anti", "near", "solo"]);
+    expect(actions).toEqual(["anti", "near"]);
+    // The neighbourhood is a slider now, not a discrete top-N "solo" button.
+    const range = host.querySelector<HTMLInputElement>(
+      "[data-inspect-proximity]",
+    );
+    expect(range).not.toBeNull();
+    expect(range?.value).toBe("100");
+    expect(
+      host.querySelector("[data-inspect-proximity-value]")?.textContent,
+    ).toBe("100%");
     // The anti-track ranking is shown directly, with no expand button.
     expect(
       host.querySelector<HTMLElement>("[data-inspect-action='anti-more']"),
@@ -396,6 +409,7 @@ describe("renderTooltip", () => {
         message: null,
         mode: null,
         results: [],
+        proximity: 100,
       }),
     );
     expect(host.querySelector(".tt-note")?.textContent).toContain("Searching");
@@ -414,6 +428,7 @@ describe("renderTooltip", () => {
         message: "No analysed tracks yet",
         mode: null,
         results: [],
+        proximity: 100,
       }),
     );
     expect(host.querySelector(".tt-note-error")?.textContent).toBe(

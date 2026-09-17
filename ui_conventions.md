@@ -360,9 +360,14 @@ same seam as `SearchCoordinator`:
   most distant tracks in the composite embedding space (what the map/clusters
   describe), listed directly.
 - **Nearest** — `mode=near`, the `NEAR_K` closest tracks.
-- **Solo** — isolate to the neighbourhood (the inspected track plus `SOLO_K`
-  neighbours) and fit the view to it, reusing `Model.focusPaths` and
-  `fitViewToPaths`.
+- **Neighbourhood slider** — replaces the old discrete top-N *Solo*. It ranges 0–100 %
+  and starts at 100 % (the whole library is visible). Narrowing keeps the closest
+  *proximity*% of the ranked library, hides the rest, and re-homes the view to the
+  remaining set, so the camera moves gradually instead of snapping to ten neighbours.
+  The full ranking is fetched once per inspected track (`…&all=1`, paths only, no
+  scores) and cached, so a drag never hits the network; widening reveals exactly what
+  the previous step hid (`Model.setProximityKeep`). The slider is excluded from the
+  card's re-render key, so dragging does not rebuild the input under the pointer.
 - **Result row** — click focuses it: select alone, fit the view, audition it (only
   when hover preview is on). **Hovering** a row glows that track in the map
   (`{kind: "track", path}` hover target) and auditions it immediately, like a

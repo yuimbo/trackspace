@@ -130,6 +130,17 @@ def test_similar_excludes_the_queried_track():
     assert len(body["results"]) == 3  # k is capped by the library size
 
 
+def test_similar_all_returns_the_full_near_ranking():
+    """``all=1`` powers the proximity slider: every other track, nearest first."""
+    client, _ = _app()
+    body = client.get("/api/tracks/similar?path=t0.mp3&all=1").get_json()
+    assert body["ok"] is True
+    assert body["mode"] == "near"
+    assert body["ranking"] == ["t1.mp3", "t3.mp3", "t2.mp3"]
+    # The slider only needs the order, so no per-row scores are sent.
+    assert "results" not in body
+
+
 def test_similar_reuses_the_cached_index():
     build_calls: list[int] = []
     client, _ = _app(build_calls=build_calls)

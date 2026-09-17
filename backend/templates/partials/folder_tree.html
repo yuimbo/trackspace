@@ -50,8 +50,10 @@
 {{ branch(tree, 0, active_folders, pending_rename) }}
 {% endfor %}
 {% if external_trees %}
-<div class="folder-section-label" title="Analysed, but not part of My library">External</div>
-{% for tree in external_trees %}
-{{ branch(tree, 0, active_folders, pending_rename) }}
-{% endfor %}
+<div class="folder-section-external">
+  <div class="folder-section-label" title="Analysed, but not part of My library">External</div>
+  {% for tree in external_trees %}
+  {{ branch(tree, 0, active_folders, pending_rename) }}
+  {% endfor %}
+</div>
 {% endif %}

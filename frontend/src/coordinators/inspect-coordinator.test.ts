@@ -5,7 +5,7 @@ import {
   ANTI_K,
   InspectCoordinator,
   NEAR_K,
-  SOLO_K,
+  PROXIMITY_ALL,
   type SimilarResponse,
 } from "./inspect-coordinator";
 
@@ -99,13 +99,10 @@ describe("InspectCoordinator", () => {
     });
   });
 
-  it("soloes the neighbourhood, keeping the inspected track", async () => {
+  it("narrows the neighbourhood with the proximity slider", async () => {
     const h = makeHarness({
       ok: true,
-      results: [
-        { path: "b.mp3", score: 0.9 },
-        { path: "c.mp3", score: 0.8 },
-      ],
+      ranking: ["b.mp3", "c.mp3", "d.mp3"],
     });
     h.model.setAllTracks([
       makeTrack({ path: "a.mp3" }),
@@ -114,11 +111,52 @@ describe("InspectCoordinator", () => {
       makeTrack({ path: "d.mp3" }),
     ]);
 
-    await h.coord.action("solo", "a.mp3");
-    expect(h.fetchSimilar).toHaveBeenCalledWith("a.mp3", "near", SOLO_K);
+    await h.coord.action("proximity", "a.mp3", 50);
+    // One fetch of the full ranking, then local filtering.
+    expect(h.fetchSimilar).toHaveBeenCalledWith("a.mp3", "near", PROXIMITY_ALL);
+    // 50 % of 3 ranked → the closest 2 (b, c); d is hidden, a stays.
     expect(h.model.isTrackHidden(h.model.trackByPath("d.mp3")!)).toBe(true);
     expect(h.model.isTrackHidden(h.model.trackByPath("a.mp3")!)).toBe(false);
-    expect(h.fitToPaths).toHaveBeenCalledWith(["a.mp3", "b.mp3", "c.mp3"]);
+    expect(h.model.isTrackHidden(h.model.trackByPath("b.mp3")!)).toBe(false);
+    expect(h.fitToPaths).toHaveBeenCalledWith(
+      new Set(["a.mp3", "b.mp3", "c.mp3"]),
+    );
+  });
+
+  it("reveals everything again at 100 %", async () => {
+    const h = makeHarness({ ok: true, ranking: ["b.mp3", "c.mp3", "d.mp3"] });
+    h.model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+      makeTrack({ path: "d.mp3" }),
+    ]);
+    await h.coord.action("proximity", "a.mp3", 10);
+    expect(h.model.isTrackHidden(h.model.trackByPath("d.mp3")!)).toBe(true);
+
+    await h.coord.action("proximity", "a.mp3", 100);
+    expect(h.model.isTrackHidden(h.model.trackByPath("d.mp3")!)).toBe(false);
+  });
+
+  it("fetches the full ranking once across slider steps", async () => {
+    const h = makeHarness({ ok: true, ranking: ["b.mp3", "c.mp3"] });
+    h.model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    await h.coord.action("proximity", "a.mp3", 60);
+    await h.coord.action("proximity", "a.mp3", 30);
+    expect(h.fetchSimilar).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a message when no ranking is available", async () => {
+    const h = makeHarness({ ok: false, error: "No analysed tracks yet" });
+    await h.coord.action("proximity", "a.mp3", 50);
+    expect(lastInspect(h.view)).toMatchObject({
+      busy: false,
+      message: "No analysed tracks yet",
+    });
   });
 
   it("focuses a result: select it alone, fit the view, audition it", async () => {

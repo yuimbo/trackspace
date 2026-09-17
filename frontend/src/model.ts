@@ -615,6 +615,33 @@ export class Model extends EventBus {
     return false;
   }
 
+  /**
+   * Neighbourhood-slider isolation: reveal what the previous slider step hid, then
+   * hide every visible track outside *keep* — one update, so a drag stays smooth
+   * (the alternative, `revealPaths` + `focusPaths`, emits "change" twice per step).
+   * Returns the paths it hid, for the next step to reveal.
+   */
+  setProximityKeep(
+    keep: ReadonlySet<string>,
+    previouslyHidden: ReadonlySet<string>,
+  ): Set<string> {
+    const next = new Set(this.hiddenPaths);
+    for (const p of previouslyHidden) next.delete(p);
+    const newlyHidden = new Set<string>();
+    for (const t of this.allTracks) {
+      if (!this.trackInViewUnion(t)) continue;
+      if (keep.has(t.path)) continue;
+      if (next.has(t.path)) continue;
+      next.add(t.path);
+      newlyHidden.add(t.path);
+    }
+    this.hiddenPaths = next;
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+    return newlyHidden;
+  }
+
   /** Every known track in *paths* is excluded (and at least one exists). */
   pathsFullyHidden(paths: Iterable<string>): boolean {
     let any = false;

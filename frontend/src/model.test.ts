@@ -46,6 +46,36 @@ describe("Model external-root view", () => {
   });
 });
 
+describe("Model proximity keep", () => {
+  beforeEach(() => localStorage.clear());
+
+  function fourTracks(m: Model): void {
+    m.setAllTracks([
+      track("a.mp3", "x"),
+      track("b.mp3", "x"),
+      track("c.mp3", "x"),
+    ]);
+  }
+
+  it("hides everything outside the keep-set and returns what it hid", () => {
+    const m = new Model();
+    fourTracks(m);
+    const hidden = m.setProximityKeep(new Set(["a.mp3"]), new Set());
+    expect(hidden).toEqual(new Set(["b.mp3", "c.mp3"]));
+    expect(m.isTrackHidden(m.trackByPath("b.mp3")!)).toBe(true);
+    expect(m.isTrackHidden(m.trackByPath("a.mp3")!)).toBe(false);
+  });
+
+  it("reveals the previous step's hides when the neighbourhood widens", () => {
+    const m = new Model();
+    fourTracks(m);
+    const hidden = m.setProximityKeep(new Set(["a.mp3"]), new Set());
+    m.setProximityKeep(new Set(["a.mp3", "b.mp3"]), hidden);
+    expect(m.isTrackHidden(m.trackByPath("b.mp3")!)).toBe(false);
+    expect(m.isTrackHidden(m.trackByPath("c.mp3")!)).toBe(true);
+  });
+});
+
 describe("Model right-panel tab", () => {
   beforeEach(() => localStorage.clear());
 

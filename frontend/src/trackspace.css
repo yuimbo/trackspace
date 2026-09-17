@@ -111,7 +111,15 @@ body { display: flex; }
   opacity: 0.4;
 }
 
-/* "External" section: analysed, but not part of My library. */
+/* "External" section: analysed, but not part of My library. Recessed background
+   so the section reads as a separate space from My library at a glance. */
+.folder-section-external {
+  margin-top: 6px;
+  padding: 2px 4px 4px;
+  border-radius: 5px;
+  background: #0000003d;
+  box-shadow: inset 0 0 0 1px #ffffff0a;
+}
 .folder-section-label {
   margin: 6px 0 2px;
   padding-left: 4px;
@@ -1400,6 +1408,34 @@ kbd {
 }
 
 .tt-nav-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* Neighbourhood proximity slider: 100 % = whole library, narrower = closer. */
+.tt-proximity {
+  margin: 2px 0 4px;
+}
+
+.tt-proximity-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 10px;
+  color: var(--fg-dim);
+  margin-bottom: 1px;
+}
+
+.tt-proximity-value {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+}
+
+.tt-proximity-range {
+  width: 100%;
+  margin: 0;
+  accent-color: #7dffb3;
+  cursor: ew-resize;
+}
+
+.tt-proximity-range:disabled { opacity: 0.4; cursor: default; }
 
 .tt-note {
   color: var(--fg-dim);

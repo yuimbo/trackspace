@@ -53,6 +53,13 @@ export interface InspectState {
   /** Which ranking produced ``results`` (``far`` = anti-track). */
   mode: "near" | "far" | null;
   results: TooltipResult[];
+  /**
+   * Neighbourhood slider, 0–100 %. 100 = the whole library is visible; lowering
+   * it hides everything but the closest *proximity*% of the ranked library and
+   * re-homes the view as it narrows. Excluded from the re-render key so a drag
+   * does not rebuild the slider under the pointer.
+   */
+  proximity: number;
 }
 
 export interface TooltipCard {
@@ -232,7 +239,11 @@ function resolveResult(result: TooltipResult, m: Model): ResultRow {
   };
 }
 
-/** Identity of the inspect state, so the card re-renders when a ranking lands. */
+/** Identity of the inspect state, so the card re-renders when a ranking lands.
+ *
+ * ``proximity`` is deliberately absent: the slider updates it live, and rebuilding
+ * the card mid-drag would replace the input under the pointer.
+ */
 function inspectKey(inspect: InspectState): string {
   return [
     inspect.path,
@@ -364,7 +375,6 @@ function inspectSection(
   const actions: [string, string, string][] = [
     ["anti", "Anti-track", "The track furthest away in the embedding space"],
     ["near", "Nearest", "The closest tracks in the embedding space"],
-    ["solo", "Solo", "Isolate to this track's neighbourhood and fit the view"],
   ];
   for (const [action, label, hint] of actions) {
     const btn = el("button", "tt-nav-btn", label) as HTMLButtonElement;
@@ -374,6 +384,33 @@ function inspectSection(
     buttons.appendChild(btn);
   }
   section.appendChild(buttons);
+
+  // Neighbourhood slider: 100 % = the whole library, narrower = the closest
+  // fraction of it. Replaces the old discrete "Solo" (top-N) jump; dragging the
+  // view re-homes gradually instead of snapping to ten neighbours.
+  const proximity = el("div", "tt-proximity");
+  const proxHead = el("div", "tt-proximity-head");
+  proxHead.appendChild(el("span", "tt-proximity-label", "Neighbourhood"));
+  const proxValue = el(
+    "span",
+    "tt-proximity-value",
+    `${Math.round(inspect.proximity)}%`,
+  );
+  proxValue.dataset.inspectProximityValue = "";
+  proxHead.appendChild(proxValue);
+  proximity.appendChild(proxHead);
+  const range = document.createElement("input");
+  range.type = "range";
+  range.className = "tt-proximity-range";
+  range.min = "0";
+  range.max = "100";
+  range.step = "1";
+  range.value = String(Math.round(inspect.proximity));
+  range.dataset.inspectProximity = "";
+  range.title = "Drag to grow or shrink the neighbourhood around this track";
+  range.disabled = inspect.busy;
+  proximity.appendChild(range);
+  section.appendChild(proximity);
 
   if (inspect.busy) {
     section.appendChild(el("div", "tt-note", "Searching the embedding space…"));

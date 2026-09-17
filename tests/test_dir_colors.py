@@ -68,9 +68,9 @@ def test_lightness_deviation_halves_per_level() -> None:
             "abc12345/GENRES/Rock/70s/Live",
         ]
     ]
-    assert devs[0] <= 10
-    assert devs[1] <= 5
-    assert devs[2] <= 3
+    assert devs[0] <= 30
+    assert devs[1] <= 15
+    assert devs[2] <= 8
 
 
 def test_sibling_subfolders_get_distinct_tints() -> None:

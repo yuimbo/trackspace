@@ -38,10 +38,12 @@ export function dirColor(folderPath: string): string {
   if (depth <= 1) return `hsl(${base % 360},65%,60%)`;
 
   const hue = hashPath(`${segments[0]}/${segments[1]}`, 31, 0) % 360;
-  // Depth 2 is the widest tint; each level past it halves the deviation.
+  // Depth 2 is the widest tint; each level past it halves the deviation. The
+  // amplitude is deliberately wide (lightness ±30, saturation ±18 at depth 2) so
+  // sibling subgenres stay separable on the map.
   const f = Math.pow(0.5, depth - 2);
-  const dl = signedUnit(hashPath(folderPath, 7, 11)) * 10 * f;
-  const ds = signedUnit(hashPath(folderPath, 13, 23)) * 6 * f;
+  const dl = signedUnit(hashPath(folderPath, 7, 11)) * 30 * f;
+  const ds = signedUnit(hashPath(folderPath, 13, 23)) * 18 * f;
   const light = roundHalfUp(60 + dl);
   const sat = roundHalfUp(65 + ds);
   return `hsl(${hue},${sat}%,${light}%)`;
