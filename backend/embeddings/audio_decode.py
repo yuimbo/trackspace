@@ -252,3 +252,56 @@ def load_resilient_audio_segments(
         path, sr=sr, segment_seconds=segment_seconds,
     )
     return segments, warn
+
+
+#: Window length for the chunked whole-track fallback, in seconds.
+CHUNKED_DECODE_SECONDS = 60.0
+
+
+def load_resilient_full_mono(
+    path: str,
+    *,
+    sr: int,
+    chunk_seconds: float = CHUNKED_DECODE_SECONDS,
+) -> np.ndarray | None:
+    """Whole-track mono decode that survives the MP3 full-read failure.
+
+    ``librosa_load``'s whole-file read can fail on a perfectly valid MP3 whose
+    container metadata lies about the frame count: libsndfile reads past the data and
+    raises ("Unspecified internal error"), while a windowed read of the same file
+    succeeds. When the full read fails, decode fixed windows from the start up to the
+    metadata duration and concatenate them. Returns ``None`` when even that fails.
+
+    Used by the ``structure`` stage, whose loudness envelope needs the whole timeline
+    (the segment loader above cannot serve it).
+    """
+    try:
+        audio, _sr = librosa_load(path, sr=sr, mono=True)
+        arr = np.asarray(audio, dtype=np.float32)
+        if arr.size:
+            return arr
+    except Exception:
+        pass
+
+    meta_dur = float(librosa_get_duration(path=path))
+    if not math.isfinite(meta_dur) or meta_dur <= 0:
+        return None
+    step = max(1.0, float(chunk_seconds))
+    chunks: list[np.ndarray] = []
+    offset = 0.0
+    while offset < meta_dur - 0.05:
+        read = min(step, meta_dur - offset)
+        try:
+            chunk, _ = librosa_load(
+                path, sr=sr, mono=True, offset=offset, duration=read
+            )
+        except Exception:
+            break
+        arr = np.asarray(chunk, dtype=np.float32)
+        if arr.size == 0:
+            break
+        chunks.append(arr)
+        offset += read
+    if not chunks:
+        return None
+    return np.concatenate(chunks)

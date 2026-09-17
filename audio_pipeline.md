@@ -72,6 +72,14 @@ A one-time single-threaded warmup does **not** fix it — the init runs on every
 Reproduced standalone against the real library: 10/10 crashes unlocked, 0/10 with the open
 serialised. `tests/test_decode_stderr.py` pins the contract.
 
+**Whole-track reads can fail on valid MP3s.** libsndfile's *full* read can raise
+("Unspecified internal error") on an MP3 whose container metadata lies about the frame
+count, while a *windowed* read (`offset` + `duration`) of the same file succeeds.
+`audio_decode.load_resilient_full_mono` tries the full read, then falls back to decoding
+fixed windows up to the metadata duration and concatenating them. The `structure` stage uses it
+(the segment loader cannot serve a whole-track loudness envelope); without the fallback those
+files were permanent structure gaps while `features`/`maest`, which decode segments, succeeded.
+
 **Why this regressed:** the durable job queue replaced a single generation thread with one
 worker thread per stage, so decode that was serial by construction now overlaps.
 

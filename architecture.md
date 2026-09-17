@@ -285,7 +285,8 @@ Structural refactors already completed. Kept as a record of where the seams land
   `analysis_pipeline`), so the job handler owns the cache gathering and the module
   stays unit-testable.
 - `embeddings/structure.py` — intro/drop/break detection. A pure envelope detector
-  plus a fixed-length cache blob; it depends only on `decode_stderr` / `librosa`, so
+  plus a fixed-length cache blob; it decodes through
+  `audio_decode.load_resilient_full_mono` (which itself only needs `decode_stderr`), so
   the `structure` stage handler owns the cache write and the thread pool.
 
 **Frontend** — `controller.ts` went from ~2250 to ~700 lines. Extracted, in order, each

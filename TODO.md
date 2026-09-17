@@ -129,10 +129,6 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       and its raw fingerprint is discarded (only the hash is kept). If chromaprint can
       expose its 16-band frame image, the envelope could ride the scan pass and the
       structure stage would need no decode at all.
-- [ ] **Structure on damaged files.** `analyze_structure` calls `librosa_load`
-      directly; the resilient probe in `audio_decode.load_resilient_audio_segments`
-      tolerates bad MP3 metadata and broken seeks. Reuse it if damaged files show up
-      as structure gaps.
 - [ ] **Structure coverage in `/api/embeddings/status`.** Deliberately omitted (the
       queue's per-kind stats already report structure progress, and `SourceVersions`
       feeds the layout revision hash, where a metadata-only source must not appear).

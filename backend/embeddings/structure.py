@@ -31,7 +31,7 @@ from typing import Any
 import librosa
 import numpy as np
 
-from backend.decode_stderr import librosa_load
+from .audio_decode import load_resilient_full_mono
 
 log = logging.getLogger(__name__)
 
@@ -251,15 +251,20 @@ def detect_sections(envelope: np.ndarray, frame_rate: float) -> TrackStructure:
 
 
 def analyze_structure(path: str) -> TrackStructure | None:
-    """Decode *path* and detect its coarse sections; ``None`` when undecodable."""
+    """Decode *path* and detect its coarse sections; ``None`` when undecodable.
+
+    Uses the resilient whole-track decode: a plain ``librosa_load`` fails outright on
+    valid MP3s whose container metadata lies about the frame count, while a windowed
+    read of the same file works (see :func:`audio_decode.load_resilient_full_mono`).
+    """
     try:
-        y, sr = librosa_load(path, sr=STRUCTURE_SR, mono=True)
+        y = load_resilient_full_mono(path, sr=STRUCTURE_SR)
     except Exception as e:  # noqa: BLE001 — reported per job, never raised
         log.warning("Structure: failed to decode %s: %s", path, e)
         return None
     if y is None or np.asarray(y).size == 0:
         return None
-    env = rms_envelope(y, int(sr))
+    env = rms_envelope(y, STRUCTURE_SR)
     return detect_sections(env, FRAME_RATE)
 
 

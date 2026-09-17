@@ -156,6 +156,34 @@ def test_analyze_structure_returns_none_for_missing_file(tmp_path):
     assert analyze_structure(str(tmp_path / "nope.mp3")) is None
 
 
+def test_analyze_structure_falls_back_to_chunked_decode(tmp_path, monkeypatch):
+    """A file whose whole-file read fails still yields structure via windowed reads.
+
+    This is the real-world case: libsndfile errors on a valid MP3 whose container
+    metadata lies about the frame count, while a windowed read of the same file works.
+    """
+    import backend.embeddings.audio_decode as audio_decode
+
+    calls: list[tuple[float | None, float | None]] = []
+
+    def fake_load(path, *, sr, mono, offset=None, duration=None):
+        calls.append((offset, duration))
+        if offset is None and duration is None:
+            raise RuntimeError("Unspecified internal error.")
+        n = int(round((duration or 1.0) * sr))
+        return np.full(n, 0.5, np.float32), sr
+
+    monkeypatch.setattr(audio_decode, "librosa_load", fake_load)
+    monkeypatch.setattr(audio_decode, "librosa_get_duration", lambda path: 12.0)
+
+    s = analyze_structure(str(tmp_path / "broken.mp3"))
+    assert s is not None
+    # The whole-file read is attempted first, then the windowed fallback.
+    assert calls[0] == (None, None)
+    assert any(off is not None for off, _ in calls[1:])
+
+
+
 # ── genre spanning ───────────────────────────────────────────
 
 
