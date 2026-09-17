@@ -55,6 +55,7 @@ const SHELL_HTML = `
   <div id="selected-folders-overlay" class="hidden"></div>
   <div id="root-add-modal" class="hidden">
     <input id="root-add-input" />
+    <input type="checkbox" id="root-add-external" />
     <button id="root-add-ok"></button>
     <button id="root-add-cancel"></button>
   </div>
@@ -467,7 +468,7 @@ describe("FolderTreeCoordinator hover", () => {
 // ─── Roots ─────────────────────────────────────────────
 
 describe("FolderTreeCoordinator roots", () => {
-  it("adds a root from a Finder drop and reloads", async () => {
+  it("opens the add-root modal prefilled on a Finder drop (role is explicit)", async () => {
     const { onRootsChanged, fetchSpy } = makeHarness(() => ({
       ok: true,
       changed: true,
@@ -480,9 +481,29 @@ describe("FolderTreeCoordinator roots", () => {
       },
     });
     document.getElementById("folder-section")!.dispatchEvent(ev);
+
+    // The drop no longer adds silently: it opens the modal with the path filled, so
+    // the user picks the role (a dropped download may be External, not library).
+    const input = document.getElementById("root-add-input") as HTMLInputElement;
+    expect(input.value).toBe("/music/root");
+    expect(
+      document.getElementById("root-add-modal")!.classList.contains("hidden"),
+    ).toBe(false);
+    expect(
+      fetchSpy.mock.calls.map(([u]) => String(u)),
+    ).not.toContain("/api/roots/add");
+
+    (document.getElementById("root-add-external") as HTMLInputElement).checked =
+      true;
+    document.getElementById("root-add-ok")!.click();
     await vi.waitFor(() => expect(onRootsChanged).toHaveBeenCalled());
-    const urls = fetchSpy.mock.calls.map(([u]) => String(u));
-    expect(urls).toContain("/api/roots/add");
+    const addCall = fetchSpy.mock.calls.find(
+      ([u]) => String(u) === "/api/roots/add",
+    );
+    expect(JSON.parse((addCall![1] as RequestInit).body as string)).toEqual({
+      path: "/music/root",
+      role: "external",
+    });
   });
 
   it("ignores a drop without an absolute path", () => {

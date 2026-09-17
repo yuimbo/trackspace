@@ -39,6 +39,8 @@ export interface AnalysisDeps {
   fetchWeightJacobian?(): void;
   /** The head panel, so the queue can disable Train while a run is queued. */
   head?: { syncTrainEnabled(disabled: boolean): void };
+  /** Select one track and fit the view to it (broken-files row click). */
+  focusTrack?(path: string): void;
 }
 
 /** Shape of ``GET /api/clusters``. */
@@ -85,6 +87,22 @@ interface CoverageRow {
   failed: number;
 }
 
+/** One track with a terminal job failure (``GET /api/analysis/problems``). */
+interface ProblemFailure {
+  path: string;
+  kinds: string[];
+  errors: string[];
+}
+
+/** Shape of ``GET /api/analysis/problems``. */
+interface ProblemsResponse {
+  ok: boolean;
+  /** Tracks fpcalc cannot read at all, so they never enter analysis. */
+  unfingerprinted?: string[];
+  /** Tracks with at least one permanently-failed stage job. */
+  failed?: ProblemFailure[];
+}
+
 /** Retriggerable stages, in pipeline order. */
 const RETRIGGER_STAGES: [string, string][] = [
   ["features", "Audio features"],
@@ -105,6 +123,7 @@ export class AnalysisCoordinator {
     void this.refreshQueueStatus();
     void this.fetchClusters();
     void this.fetchCoverage();
+    void this.fetchProblems();
   }
 
   stop(): void {
@@ -238,6 +257,7 @@ export class AnalysisCoordinator {
       toast(`Queued ${label}`, "ok");
       await this.refreshQueueStatus();
       await this.fetchCoverage();
+      await this.fetchProblems();
     } catch {
       /* api() already toasted */
     }
@@ -252,6 +272,112 @@ export class AnalysisCoordinator {
       this._renderCoverage(d);
     } catch {
       /* transient; the next drain refreshes it */
+    }
+  }
+
+  /** Fetch the actionable "broken files" list behind the coverage counts. */
+  async fetchProblems(): Promise<void> {
+    try {
+      const d = await api<ProblemsResponse>("/api/analysis/problems");
+      this._renderProblems(d);
+    } catch {
+      /* transient; the next drain refreshes it */
+    }
+  }
+
+  /** Render the collapsible broken-files list; empty when nothing is broken. */
+  private _renderProblems(d: ProblemsResponse): void {
+    const host = document.getElementById("analysis-problems");
+    if (!host) return;
+    const unfingerprinted = d.unfingerprinted ?? [];
+    const failed = d.failed ?? [];
+    host.replaceChildren();
+    if (unfingerprinted.length + failed.length === 0) return;
+
+    const details = document.createElement("details");
+    details.className = "analysis-problems";
+    const summary = document.createElement("summary");
+    summary.textContent = `Broken files (${unfingerprinted.length + failed.length})`;
+    summary.title =
+      "Tracks that cannot be analysed: unreadable audio, or a stage that failed. " +
+      "Click a row to find it on the map.";
+    details.appendChild(summary);
+
+    const list = document.createElement("div");
+    list.className = "analysis-problem-list";
+    for (const path of unfingerprinted)
+      list.appendChild(this._problemRow(path, "unreadable (no fingerprint)", []));
+    for (const f of failed)
+      list.appendChild(this._problemRow(f.path, `${f.kinds.join(", ")} failed`, f.kinds));
+    details.appendChild(list);
+    host.appendChild(details);
+  }
+
+  /** One broken-file row: click to locate it, reveal in Finder, or retry its stages. */
+  private _problemRow(
+    path: string,
+    reason: string,
+    kinds: string[],
+  ): HTMLElement {
+    const row = document.createElement("div");
+    row.className = "analysis-problem";
+    row.title = path;
+
+    const track = this.deps.model.trackByPath(path);
+    const text = document.createElement("div");
+    text.className = "analysis-problem-text";
+    const name = document.createElement("span");
+    name.className = "analysis-problem-name";
+    name.textContent = track?.filename || path.split("/").pop() || path;
+    const where = document.createElement("span");
+    where.className = "analysis-problem-folder";
+    where.textContent = [track?.folder, reason].filter(Boolean).join(" · ");
+    text.append(name, where);
+    text.addEventListener("click", () => this.deps.focusTrack?.(path));
+    row.appendChild(text);
+
+    const reveal = document.createElement("button");
+    reveal.type = "button";
+    reveal.className = "analysis-problem-btn";
+    reveal.textContent = "↗";
+    reveal.title = "Reveal in Finder";
+    reveal.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const folder = track?.folder ?? path.split("/").slice(0, -1).join("/");
+      void postJSON("/api/folders/reveal", { path: folder });
+    });
+    row.appendChild(reveal);
+
+    if (kinds.length) {
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "analysis-problem-btn";
+      retry.textContent = "↻";
+      retry.title = `Retry ${kinds.join(", ")}`;
+      retry.addEventListener("click", (e) => {
+        e.stopPropagation();
+        void this._retryTrack(path, kinds);
+      });
+      row.appendChild(retry);
+    }
+    return row;
+  }
+
+  /** Re-enqueue the failed stages for one track only. */
+  private async _retryTrack(path: string, kinds: string[]): Promise<void> {
+    try {
+      await postJSON("/api/embeddings/generate", {
+        folder: "",
+        recursive: true,
+        stages: kinds,
+        paths: [path],
+      });
+      toast("Retrying analysis…", "ok");
+      await this.refreshQueueStatus();
+      await this.fetchCoverage();
+      await this.fetchProblems();
+    } catch {
+      /* api() already toasted */
     }
   }
 
@@ -602,6 +728,7 @@ export class AnalysisCoordinator {
           toast("Analysis complete", "ok");
         }
         void this.fetchCoverage();
+        void this.fetchProblems();
       });
     }) as EventListener);
 

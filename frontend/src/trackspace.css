@@ -1648,6 +1648,58 @@ kbd {
 }
 .analysis-retrigger .analysis-retrigger-all { margin-left: auto; }
 
+/* Broken files: the actionable list behind the coverage counts. */
+.analysis-problems { margin-top: 6px; }
+.analysis-problems > summary {
+  cursor: pointer;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #ff8e9d;
+}
+.analysis-problem-list {
+  margin-top: 4px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.analysis-problem {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
+  border-bottom: 1px solid #ffffff08;
+}
+.analysis-problem-text { flex: 1; min-width: 0; cursor: pointer; }
+.analysis-problem-name {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg);
+}
+.analysis-problem-folder {
+  display: block;
+  font-size: 9px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.analysis-problem-btn {
+  flex: 0 0 auto;
+  border: 1px solid #ffffff2e;
+  border-radius: 3px;
+  background: #ffffff0d;
+  color: var(--fg-dim);
+  font-size: 10px;
+  padding: 1px 4px;
+  cursor: pointer;
+}
+.analysis-problem-btn:hover {
+  color: var(--accent-hi);
+  border-color: var(--accent-hi);
+}
+
 /* ── Shortcuts modal ──────────────────────────────────────── */
 #shortcuts-modal {
   position: fixed;

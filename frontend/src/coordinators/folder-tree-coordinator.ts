@@ -184,24 +184,29 @@ export class FolderTreeCoordinator {
       if (!$modal) return;
       $modal.classList.add("hidden");
     };
-    const openModal = async () => {
+    /** Open the modal; *prefill* (a Finder drop) skips the clipboard guess. */
+    const openModal = async (prefill?: string) => {
       if (!$modal) return;
       $modal.classList.remove("hidden");
       if ($external) $external.checked = false;
       if ($input) {
-        $input.value = "";
-        try {
-          const clip = (await navigator.clipboard.readText()).trim();
-          const firstLine = clip.split(/\r?\n/, 1)[0]?.trim() ?? "";
-          const normalized = firstLine.startsWith("file://")
-            ? decodeURIComponent(firstLine.replace(/^file:\/\//, ""))
-            : firstLine;
-          if (normalized.startsWith("/")) {
-            $input.value = normalized;
-            $input.select();
+        $input.value = prefill ?? "";
+        if (prefill) {
+          $input.select();
+        } else {
+          try {
+            const clip = (await navigator.clipboard.readText()).trim();
+            const firstLine = clip.split(/\r?\n/, 1)[0]?.trim() ?? "";
+            const normalized = firstLine.startsWith("file://")
+              ? decodeURIComponent(firstLine.replace(/^file:\/\//, ""))
+              : firstLine;
+            if (normalized.startsWith("/")) {
+              $input.value = normalized;
+              $input.select();
+            }
+          } catch {
+            // Clipboard access may be blocked; keep the input blank.
           }
-        } catch {
-          // Clipboard access may be blocked; keep the input blank.
         }
         $input.focus();
       }
@@ -214,7 +219,7 @@ export class FolderTreeCoordinator {
       void this._addRootPath(raw, role);
     };
 
-    if ($addRoot) $addRoot.addEventListener("click", openModal);
+    if ($addRoot) $addRoot.addEventListener("click", () => void openModal());
     if ($ok) $ok.addEventListener("click", submitModal);
     if ($cancel) $cancel.addEventListener("click", closeModal);
     if ($modal) {
@@ -261,7 +266,9 @@ export class FolderTreeCoordinator {
         toast("Drop a folder from Finder, or paste an absolute path.", "warn");
         return;
       }
-      void this._addRootPath(first, "library");
+      // Confirm the role in the modal rather than silently adding a library root:
+      // a dropped folder may be a download/reference root the user wants External.
+      void openModal(first);
     });
   }
 

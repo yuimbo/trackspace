@@ -265,6 +265,11 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   cheap": it rebuilds the weighted matrix that clustering/layout use, cached by
   `(clustering revision, weights, library mtime)` with a TTL — see
   `services/similarity.py`.
+- **`/api/analysis/problems` is the actionable counterpart to the coverage counts.**
+  It lists tracks fpcalc cannot fingerprint at all plus per-path terminal job failures
+  (aggregated across kinds), so the UI can surface the damaged files behind a short
+  coverage bar. `/api/embeddings/generate` accepts a `paths` list to restrict an
+  enqueue to specific tracks (the per-row retry).
 
 ---
 

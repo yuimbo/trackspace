@@ -174,6 +174,11 @@ export class Controller {
       fetchWeightJacobian: () => void this.embedding.fetchWeightJacobian(),
       // The queue owns Train's disabled state; the head panel renders it.
       head: this.head,
+      // A broken-files row click selects the track and fits the view to it.
+      focusTrack: (path) => {
+        model.replaceSelection([path]);
+        this.interaction.fitViewToPaths([path]);
+      },
     });
 
     this.embedding = new EmbeddingCoordinator({

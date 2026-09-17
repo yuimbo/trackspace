@@ -86,6 +86,7 @@ const PANEL_HTML = `
   <p id="cluster-weights-note"></p>
   <div id="analysis-coverage"></div>
   <div id="analysis-retrigger"></div>
+  <div id="analysis-problems"></div>
   <button id="btn-apply-weights"></button>
   <button id="btn-reset-weights"></button>
   <button id="btn-default-weights"></button>
@@ -759,6 +760,73 @@ describe("AnalysisCoordinator coverage panel", () => {
       recursive: true,
       stages: ["structure"],
       force: false,
+    });
+  });
+});
+
+// ─── Broken files ───────────────────────────────────────────
+
+describe("AnalysisCoordinator broken files", () => {
+  it("lists unfingerprinted and failed tracks with reasons", async () => {
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/analysis/problems")
+        ? {
+            ok: true,
+            unfingerprinted: ["b.mp3"],
+            failed: [
+              { path: "a.mp3", kinds: ["structure"], errors: ["decode failed"] },
+            ],
+          }
+        : {},
+    );
+    await coord.fetchProblems();
+
+    const details = document.querySelector("#analysis-problems details");
+    expect(details?.querySelector("summary")?.textContent).toContain(
+      "Broken files (2)",
+    );
+    const rows = [...document.querySelectorAll(".analysis-problem")];
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain("no fingerprint");
+    expect(rows[1].textContent).toContain("structure failed");
+  });
+
+  it("hides the section when nothing is broken", async () => {
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/analysis/problems")
+        ? { ok: true, unfingerprinted: [], failed: [] }
+        : {},
+    );
+    await coord.fetchProblems();
+    expect(document.getElementById("analysis-problems")?.children).toHaveLength(0);
+  });
+
+  it("retries only the failed track's stages", async () => {
+    const { coord, fetchSpy } = makeHarness((url) =>
+      url.startsWith("/api/analysis/problems")
+        ? {
+            ok: true,
+            unfingerprinted: [],
+            failed: [
+              { path: "a.mp3", kinds: ["structure", "maest"], errors: ["x"] },
+            ],
+          }
+        : {},
+    );
+    await coord.fetchProblems();
+    const retry = document.querySelector<HTMLButtonElement>(
+      ".analysis-problem .analysis-problem-btn:last-child",
+    );
+    retry?.click();
+    await flush();
+    const post = fetchSpy.mock.calls.find(
+      ([url, init]) =>
+        String(url) === "/api/embeddings/generate" &&
+        (init as RequestInit)?.method === "POST",
+    );
+    expect(JSON.parse((post![1] as RequestInit).body as string)).toMatchObject({
+      paths: ["a.mp3"],
+      stages: ["structure", "maest"],
     });
   });
 });

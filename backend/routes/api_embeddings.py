@@ -237,6 +237,12 @@ def create_api_embeddings_blueprint(
             one_of(stage, RETRIGGER_STAGES, field="stages")
 
         infos = build_track_infos_fn(folder, recursive)
+        # ``paths`` restricts the request to specific tracks (the broken-files view's
+        # per-row retry); an empty list means the whole folder.
+        paths = opt_str_list(data, "paths")
+        if paths:
+            wanted = set(paths)
+            infos = [t for t in infos if t.get("path") in wanted]
         queued = enqueue_analysis(
             infos=infos,
             priority_paths=priority_paths,
@@ -244,6 +250,32 @@ def create_api_embeddings_blueprint(
             kinds=tuple(stages) or None,
         )
         return jsonify({"ok": True, "queued": queued})
+
+    @bp.route("/api/analysis/problems")
+    def api_analysis_problems():
+        """Tracks that cannot be analysed: no fingerprint, or a terminal job failure.
+
+        The coverage panel shows only *counts*; this is the actionable list behind them,
+        so a damaged file can be found, re-encoded, or deleted.
+        """
+        infos = build_track_infos_fn("", True)
+        unfingerprinted = [t["path"] for t in infos if not t.get("fingerprint")]
+        by_path: dict[str, dict[str, Any]] = {}
+        for f in job_queue.failures(None, limit=1000):
+            entry = by_path.setdefault(
+                f["key"], {"path": f["key"], "kinds": [], "errors": []}
+            )
+            if f["kind"] not in entry["kinds"]:
+                entry["kinds"].append(f["kind"])
+            if f.get("error") and f["error"] not in entry["errors"]:
+                entry["errors"].append(f["error"])
+        return jsonify(
+            {
+                "ok": True,
+                "unfingerprinted": unfingerprinted,
+                "failed": list(by_path.values()),
+            }
+        )
 
     @bp.route("/api/embeddings/projection")
     @bp.route("/api/embeddings/umap")  # backward compat alias

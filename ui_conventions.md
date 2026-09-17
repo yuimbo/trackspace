@@ -87,6 +87,11 @@ means the track sits directly at the root.
   re-adding restores it; dragging a root row out of the sidebar does the same without a
   button. `.folder-imprint-btn` (external roots only) prefills the head panel's imprint
   target with the root's absolute path through the controller's `onImprintRoot` dep.
+- **Adding a root is always an explicit role choice.** *+ Root* opens the modal (path from the
+  clipboard); a **Finder drop** on the sidebar opens the same modal with the dropped path
+  prefilled rather than silently adding a library root — a dropped folder may be a download the
+  user wants **External**. The modal's *External (not My library)* checkbox sets the `role` sent
+  to `POST /api/roots/add`.
 - `#show-external-toggle` (in `#folder-controls`, hidden while no external roots exist)
   is bound to `model.showExternal`; toggling it redraws the canvas without a rescan.
   When on, external dots are drawn at half alpha (`CanvasView._dot`) so they read as
@@ -329,6 +334,13 @@ produced per track, and the way to re-run one stage.
   `stages: ["<kind>"]`, queueing only tracks missing that stage; **Re-run all**
   sends every stage with `force: true`. The durable queue then reports progress in
   the status bar and the on-canvas pill as usual.
+- **Broken files.** `AnalysisCoordinator.fetchProblems()` reads
+  `/api/analysis/problems` (unfingerprinted tracks + per-path terminal job failures) and
+  renders a collapsible **Broken files (N)** list under the coverage bars. A row click
+  selects the track and fits the view to it; `↗` reveals its folder in Finder; `↻` retries
+  just that track's failed stages (`POST /api/embeddings/generate` with `paths: [path]`,
+  which restricts the enqueue to that track). This is where a damaged file that can never be
+  analysed is found and dealt with.
 - **Every long-running process must show progress.** The status bar and the canvas
   pill render the queue's per-stage counts and the library-wide `stage` phases; the
   overlay (`#loading-bar`) and the centre canvas pill (`_drawCenterStatusPill`) render
