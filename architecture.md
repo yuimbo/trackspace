@@ -32,7 +32,7 @@ backend/
     supervised.py         folder-supervised 128-D projection head (weak supervision)
     rhythm_features.py    14-D rhythm/DSP descriptors
     clap.py               CLAP audio + text encoder
-    feature_cache.py      content-addressed SQLite cache (7 vector sources)
+    feature_cache.py      content-addressed SQLite cache (versioned sources)
     ...                   audio_decode, librosa features, coverage, revision
   templates/partials/     Jinja templates served by Flask (HTMX)
 frontend/src/

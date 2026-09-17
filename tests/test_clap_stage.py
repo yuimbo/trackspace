@@ -41,6 +41,21 @@ class _FakeClap:
         self.calls.append(list(paths))
         return {p: np.full(CLAP_DIM, len(p), np.float32) for p in paths}
 
+    def analyze_batch_segments(self, paths, *, on_decode_warning=None, max_batch=12):
+        self.calls.append(list(paths))
+        return {
+            p: (
+                np.stack(
+                    [
+                        np.full(CLAP_DIM, len(p), np.float32),
+                        np.full(CLAP_DIM, len(p) + 1, np.float32),
+                    ]
+                ),
+                np.array([0.2, 0.8], np.float32),
+            )
+            for p in paths
+        }
+
 
 def _deps(tmp_path, fc: FeatureCache, *, clap=None, clap_enabled: bool = True) -> AnalysisDeps:
     track = tmp_path / "track.mp3"
@@ -96,6 +111,10 @@ def test_clap_handler_writes_embedding_then_serves_cache(tmp_path):
     assert out[1].ok is True
     assert fc.has("clap", "fp", version=1)
     assert fc.get("clap", "fp", version=1).shape == (CLAP_DIM,)
+    # The per-segment vectors and their positions are written together, so a
+    # search hit can be auditioned at the best-matching section.
+    assert fc.get("clap_segments", "fp", version=1).shape == (2, CLAP_DIM)
+    assert fc.get("clap_segment_pos", "fp", version=1).shape == (2,)
 
     # Second run is served from the cache — no model call.
     again = handler([_clap_job(2)])
@@ -150,14 +169,28 @@ def test_clap_handler_reports_model_unavailable(tmp_path):
 # ── enqueue filter ──────────────────────────────────────────
 
 
-def test_enqueue_clap_queues_only_missing_rows(tmp_path):
+def test_enqueue_clap_skips_fully_cached_rows(tmp_path):
     fc = FeatureCache(str(tmp_path / "features.db"))
     fc.put("clap", "fp1", np.ones(CLAP_DIM, np.float32), version=1)
+    fc.put("clap_segments", "fp1", np.ones((2, CLAP_DIM), np.float32), version=1)
+    fc.put("clap_segment_pos", "fp1", np.array([0.2, 0.8], np.float32), version=1)
     queue = JobQueue(str(tmp_path / "jobs.db"))
     infos = [
         {"path": "a.mp3", "fingerprint": "fp1"},
         {"path": "b.mp3", "fingerprint": "fp2"},
     ]
+    queued = enqueue_library_work(
+        queue, infos, deps=_deps(tmp_path, fc), kinds=(KIND_CLAP,)
+    )
+    assert queued[KIND_CLAP] == 1
+
+
+def test_enqueue_clap_backfills_missing_segments(tmp_path):
+    """A pooled CLAP row without segment vectors is re-queued once."""
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    fc.put("clap", "fp1", np.ones(CLAP_DIM, np.float32), version=1)
+    queue = JobQueue(str(tmp_path / "jobs.db"))
+    infos = [{"path": "a.mp3", "fingerprint": "fp1"}]
     queued = enqueue_library_work(
         queue, infos, deps=_deps(tmp_path, fc), kinds=(KIND_CLAP,)
     )

@@ -42,6 +42,17 @@ describe("previewStartSeconds", () => {
       100 * DEFAULT_PREVIEW_FRACTION,
     );
   });
+
+  it("prefers a search hit's matching section over the drop", () => {
+    expect(previewStartSeconds(structure({ peak_start: 96 }), 200, 0.8)).toBe(160);
+  });
+
+  it("clamps a matching section near the end", () => {
+    expect(previewStartSeconds(undefined, 100, 1)).toBe(99);
+    expect(previewStartSeconds(undefined, 100, NaN)).toBe(
+      100 * DEFAULT_PREVIEW_FRACTION,
+    );
+  });
 });
 
 describe("formatTimestamp", () => {

@@ -29,14 +29,19 @@ def test_fingerprint():
 def test_audio_segment_loading():
     from backend.embeddings import _load_audio_segments, CLAP_SR
 
-    segments, _warn = _load_audio_segments(TEST_TRACK)
+    segments, positions, _warn = _load_audio_segments(TEST_TRACK)
     print(f"Segments: count={len(segments)}")
     assert len(segments) >= 1, "_load_audio_segments returned empty"
+    assert len(positions) == len(segments)
     for i, seg in enumerate(segments):
-        print(f"  segment {i}: shape={seg.shape}, dtype={seg.dtype}, sr={CLAP_SR}")
+        print(
+            f"  segment {i}: shape={seg.shape}, dtype={seg.dtype}, "
+            f"sr={CLAP_SR}, pos={positions[i]:.2f}"
+        )
         assert seg.ndim == 1
         assert len(seg) > 0
         assert seg.dtype == np.float32
+        assert 0.0 <= positions[i] <= 1.0
 
 
 def test_clap_embedding():

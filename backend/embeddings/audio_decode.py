@@ -10,6 +10,11 @@ import numpy as np
 
 from backend.decode_stderr import librosa_get_duration, librosa_load
 
+#: Centre of each excerpt as a fraction of the track duration, in list order.
+#: The same fractions drive the on-disk seek path below, so a segment's position
+#: always matches the audio it was decoded from.
+SEGMENT_FRACTIONS: tuple[float, ...] = (0.2, 0.5, 0.8)
+
 
 def decode_reliability_user_message(meta_seconds: float, decoded_seconds: float) -> str:
     """Human-readable note when container metadata and decoded audio length disagree."""
@@ -32,18 +37,19 @@ def _three_segments_from_samples(
     *,
     segment_seconds: float,
     sr: int,
-) -> list[np.ndarray]:
+) -> tuple[list[np.ndarray], list[float]]:
     n = int(y.shape[0])
     if n <= 0:
-        return []
+        return [], []
     w = int(round(float(segment_seconds) * float(sr)))
     if w <= 0:
-        return [y]
+        return [y], [0.5]
     total_dur = n / float(sr)
     if total_dur <= segment_seconds * 1.5:
-        return [y]
+        return [y], [0.5]
     out: list[np.ndarray] = []
-    for pos in (0.2, 0.5, 0.8):
+    positions: list[float] = []
+    for pos in SEGMENT_FRACTIONS:
         centre = int(round(pos * (n - 1)))
         start = max(0, centre - w // 2)
         end = min(n, start + w)
@@ -51,7 +57,8 @@ def _three_segments_from_samples(
         chunk = y[start:end]
         if chunk.size > 0:
             out.append(chunk)
-    return out
+            positions.append(pos)
+    return out, positions
 
 
 def _mono_full_short_metadata_decode(
@@ -158,16 +165,21 @@ def _mono_centered_window_or_full(
     return audio, sr_o, warn
 
 
-def load_resilient_audio_segments(
+def load_resilient_audio_segments_with_positions(
     path: str,
     *,
     sr: int,
     segment_seconds: float,
-) -> tuple[list[np.ndarray], str | None]:
-    """Decode one or three segments; tolerate bad MP3 metadata and broken seeks."""
+) -> tuple[list[np.ndarray], list[float], str | None]:
+    """Decode one or three segments; tolerate bad MP3 metadata and broken seeks.
+
+    Returns the segments plus each one's centre as a fraction of the track
+    duration (``0.5`` for a whole-track segment). The fractions are what lets a
+    caller map a per-segment embedding back to a playback position.
+    """
     meta_dur = float(librosa_get_duration(path=path))
     if not math.isfinite(meta_dur) or meta_dur <= 0:
-        return [], None
+        return [], [], None
 
     done, audio, sr_a, warn = _mono_full_short_metadata_decode(
         path,
@@ -177,28 +189,27 @@ def load_resilient_audio_segments(
     )
     if done:
         if audio is None:
-            return [], None
-        return [audio], warn
+            return [], [], None
+        return [audio], [0.5], warn
 
     kind, audio, sr_a, warn = _probe_long_track_decode(
         path, sr=sr, meta_dur=meta_dur, segment_seconds=segment_seconds,
     )
     if kind == "empty":
-        return [], None
+        return [], [], None
     if kind == "full":
         assert audio is not None and sr_a is not None
         tot_dur = float(audio.shape[0]) / float(sr_a)
         if tot_dur <= segment_seconds * 1.5:
-            return [audio], warn
-        return (
-            _three_segments_from_samples(
-                audio, segment_seconds=segment_seconds, sr=int(sr_a),
-            ),
-            warn,
+            return [audio], [0.5], warn
+        segments, positions = _three_segments_from_samples(
+            audio, segment_seconds=segment_seconds, sr=int(sr_a),
         )
+        return segments, positions, warn
 
     segments: list[np.ndarray] = []
-    for pos in (0.2, 0.5, 0.8):
+    positions: list[float] = []
+    for pos in SEGMENT_FRACTIONS:
         centre = meta_dur * pos
         offset = max(0.0, centre - segment_seconds / 2)
         offset = min(offset, max(0.0, meta_dur - segment_seconds))
@@ -210,22 +221,34 @@ def load_resilient_audio_segments(
         )
         if audio.size > 0:
             segments.append(audio)
+            positions.append(pos)
 
     if len(segments) >= 2:
-        return segments, None
+        return segments, positions, None
 
     audio, sr_a = librosa_load(path, sr=sr, mono=True)
     if audio.size == 0:
-        return [], None
+        return [], [], None
     tot_dur = float(audio.shape[0]) / float(sr_a)
     warn = None
     if meta_dur > segment_seconds * 1.5 and tot_dur < meta_dur * 0.35:
         warn = decode_reliability_user_message(meta_dur, tot_dur)
     if tot_dur <= segment_seconds * 1.5:
-        return [audio], warn
-    return (
-        _three_segments_from_samples(
-            audio, segment_seconds=segment_seconds, sr=int(sr_a),
-        ),
-        warn,
+        return [audio], [0.5], warn
+    segments, positions = _three_segments_from_samples(
+        audio, segment_seconds=segment_seconds, sr=int(sr_a),
     )
+    return segments, positions, warn
+
+
+def load_resilient_audio_segments(
+    path: str,
+    *,
+    sr: int,
+    segment_seconds: float,
+) -> tuple[list[np.ndarray], str | None]:
+    """Decode one or three segments; tolerate bad MP3 metadata and broken seeks."""
+    segments, _positions, warn = load_resilient_audio_segments_with_positions(
+        path, sr=sr, segment_seconds=segment_seconds,
+    )
+    return segments, warn

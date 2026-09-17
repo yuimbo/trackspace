@@ -12,6 +12,11 @@ import type { Model } from "../model";
 export interface SearchResult {
   path: string;
   score: number;
+  /**
+   * Best-matching CLAP segment centre as a fraction of the track duration, or
+   * ``null`` for a pooled-only hit. The hover preview seeks here.
+   */
+  section?: number | null;
 }
 
 export interface SearchMeta {

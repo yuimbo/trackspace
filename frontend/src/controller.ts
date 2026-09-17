@@ -571,12 +571,19 @@ export class Controller {
     this.previewPath = track.path;
     this.model.previewTrackPath = track.path;
     this.model.previewSection = null;
+    // A search hit auditions the section that matched the query; otherwise the
+    // preview seeks to the detected drop (structure lands asynchronously).
+    const matchSection = this.model.searchSections.get(track.path);
     this.$audio.volume = previewGain(this.model.previewVolume);
     this.$audio.src = `/api/audio/${encodeURIComponent(track.path)}`;
     this.$audio.onloadedmetadata = () => {
       const s = this.model.trackStructure.get(track.path);
       this.model.previewSection = s?.peak_start != null ? "drop" : null;
-      this.$audio.currentTime = previewStartSeconds(s, this.$audio.duration);
+      this.$audio.currentTime = previewStartSeconds(
+        s,
+        this.$audio.duration,
+        matchSection,
+      );
       this.canvas.scheduleDraw();
     };
     this.$audio.play().catch(() => {});
@@ -639,6 +646,7 @@ export class Controller {
         this.previewPath === path &&
         s?.peak_start != null &&
         this.$audio.duration > 0 &&
+        !this.model.searchSections.has(path) &&
         (this.model.previewSection == null || this.model.previewSection === "drop")
       ) {
         this.model.previewSection = "drop";

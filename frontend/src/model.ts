@@ -352,6 +352,13 @@ export class Model extends EventBus {
    */
   trackStructure: Map<string, TrackStructure> = new Map();
 
+  /* ── Search match sections ─────────────────────────────────
+   * Per path, the best-matching CLAP segment centre as a fraction of the track
+   * duration, set by the current search. The hover preview seeks there instead of
+   * the drop so a hit auditions the part that actually matched the query.
+   */
+  searchSections: Map<string, number> = new Map();
+
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
 

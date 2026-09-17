@@ -81,6 +81,13 @@ class _SourceSpec:
 #: clustering/projection source.
 _SOURCES: dict[str, _SourceSpec] = {
     "clap": _SourceSpec("clap_embedding", "version", "clap:"),
+    #: Per-segment CLAP vectors (flat ``(n_segments, dim)``); shares the CLAP
+    #: version column so bumping the encoder blanks both. Read back by
+    #: ``/api/search`` to rank a query against the individual sections.
+    "clap_segments": _SourceSpec("clap_segments", "version", "clapseg:"),
+    #: Segment centre as a fraction of track duration, parallel to
+    #: ``clap_segments`` rows; shares the CLAP version column.
+    "clap_segment_pos": _SourceSpec("clap_segment_pos", "version", "clapsegpos:"),
     "features": _SourceSpec("features", "features_version", "feat:"),
     "maest": _SourceSpec(
         "maest_embedding",
@@ -175,6 +182,8 @@ class FeatureCache:
             )
             for col, default in [
                 ("version", "INTEGER NOT NULL DEFAULT 0"),
+                ("clap_segments", "BLOB"),
+                ("clap_segment_pos", "BLOB"),
                 ("features", "BLOB"),
                 ("features_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("maest_embedding", "BLOB"),

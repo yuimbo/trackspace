@@ -165,6 +165,13 @@ empty-blob-as-absent rule or it will resurrect purged rows.
 - Audio is loaded via librosa at 48 kHz.  Three 15 s segments (at 20 %/50 %/80 %
   through the file) are embedded independently and averaged for robustness.
   Short tracks (≤ 22.5 s) use the whole file as a single segment.
+- **Per-segment vectors are cached too.** `analyze_batch_segments` returns each
+  segment's vector and its centre fraction; `make_clap_handler` stores them as the
+  `clap_segments` / `clap_segment_pos` blobs (sharing the CLAP `version` column)
+  alongside the pooled mean. Text search ranks against them so a hit auditions the
+  best-matching section (see *Text search* below). `analyze_batch` remains the
+  mean-pooled view for layout/clustering. A pooled row without segments is
+  re-queued once to backfill them.
 - **The queue stage.** `KIND_CLAP` (`backend/jobs/kinds.py`) drains one job per
   track through `make_clap_handler`. `clap.analyze_batch` decodes per track on the
   worker thread, then runs one forward pass per batch of segments (the feature
@@ -213,14 +220,18 @@ required; the supervised head also consumes the `clap` block and should be retra
 ### Text search (`backend/routes/api_search.py`)
 
 `GET /api/search?q=…&limit=50` encodes the query with CLAP's text tower and ranks
-every cached CLAP audio embedding by cosine similarity — the retrieval use of the same
-text encoder that semantic weighting already projects tag/folder names with. It is
-**read-only over `FeatureCache`** (no encoder re-runs over the library) and returns
-the top-N hits plus `searched` / `total_tracks` coverage counts. The text forward
-pass runs on the request thread under `clap.inference_lock`, exactly like semantic
-weighting during a projection request. The frontend turns the hits into the canvas
-selection and lists them (with score bars) in the Search panel; clicking a result
-selects it alone and fits the viewport to it.
+the cached per-segment CLAP audio vectors by cosine similarity — the retrieval use of
+the same text encoder that semantic weighting already projects tag/folder names with.
+Each track scores on its **best-matching segment** and the hit carries that segment's
+centre as a `section` fraction, so the hover preview auditions the part that actually
+matched the query rather than the track's drop. Tracks analysed before per-segment
+vectors existed fall back to the pooled mean (no `section`). It is **read-only over
+`FeatureCache`** (no encoder re-runs over the library) and returns the top-N hits plus
+`searched` / `total_tracks` coverage counts. The text forward pass runs on the request
+thread under `clap.inference_lock`, exactly like semantic weighting during a projection
+request. The frontend turns the hits into the canvas selection and lists them (with score
+bars) in the Search panel; clicking a result selects it alone and fits the viewport to
+it.
 
 Retrieval quality depends on the CLAP checkpoint above — with the working
 `larger_clap_music_and_speech` conversion the query ranking is meaningful; with the

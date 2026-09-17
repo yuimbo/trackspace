@@ -24,15 +24,6 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 
 ### UI/UX feedback round
 
-- [ ] **Search: audition the best-matching section, not just the drop.** CLAP caches
-  only the mean of the `NUM_SEGMENTS` (=3) segment vectors, so a hit carries no
-  per-section score and the hover preview can only start at the structure `peak`.
-  Decide whether to cache per-segment vectors (a new versioned source, ~3× the CLAP
-  row) or re-encode the query against segments on demand, then return a
-  `section`/`start` per `/api/search` hit and have `SearchView`/preview honour it.
-  Files: `backend/embeddings/clap.py`, `backend/embeddings/feature_cache.py`,
-  `backend/routes/api_search.py`, `frontend/src/coordinators/search-coordinator.ts`,
-  `frontend/src/controller.ts` (preview start).
 - [ ] **Analysis coverage panel + per-stage retrigger.** There is no UI over
   `/api/embeddings/status`: the user cannot see that `structure` (section
   timestamps) is missing — e.g. after the `STRUCTURE_VERSION` 1→2 backfill or for
@@ -230,6 +221,11 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       re-analyses the library once (~0.12 s/track, background). Until it drains,
       tooltip chips show `intro <end>` without the detected audio start; restart the
       backend to trigger it.
+- [ ] **CLAP per-segment backfill.** `clap_segments` / `clap_segment_pos` are blank
+      for pooled rows written before they existed, so `enqueue_library_work` re-runs
+      the CLAP stage once (decode-dominated — hours on the real library, same order
+      as the version-3 backfill above) to fill them. Until it drains, `/api/search`
+      falls back to the pooled mean and hits carry no `section`.
 - [ ] **Re-run the CLAP stage and retrain the supervised head.** The checkpoint switch
       bumped `EMBEDDING_VERSION` 2 → 3, so every cached `clap` row is purged on next
       startup and must be regenerated (decode-dominated — hours on the real library). The

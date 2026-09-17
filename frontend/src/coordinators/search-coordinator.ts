@@ -49,6 +49,7 @@ export class SearchCoordinator {
   /** Clear the result list (the box clears itself). */
   clear(): void {
     this._lastQuery = "";
+    this.deps.model.searchSections = new Map();
     this.deps.view.clear();
   }
 
@@ -84,6 +85,15 @@ export class SearchCoordinator {
     // resolve them, so they must not enter the selection.
     const results = (body.results ?? []).filter((r) => m.trackByPath(r.path));
     m.replaceSelection(results.map((r) => r.path));
+    // Remember where each hit matched so the preview auditions that section.
+    m.searchSections = new Map(
+      results
+        .filter(
+          (r): r is SearchResult & { section: number } =>
+            typeof r.section === "number" && Number.isFinite(r.section),
+        )
+        .map((r) => [r.path, r.section]),
+    );
     this.deps.view.renderResults(results, {
       searched: body.searched ?? 0,
       totalTracks: body.total_tracks ?? results.length,

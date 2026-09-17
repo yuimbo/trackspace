@@ -97,6 +97,8 @@ log = logging.getLogger(__name__)
 #: startup purge and its report can never disagree about which sources exist.
 SOURCE_VERSIONS: dict[str, int] = {
     "clap": EMBEDDING_VERSION,
+    "clap_segments": EMBEDDING_VERSION,
+    "clap_segment_pos": EMBEDDING_VERSION,
     "features": FEATURES_VERSION,
     "maest": MAEST_VERSION,
     "rhythm": RHYTHM_VERSION,

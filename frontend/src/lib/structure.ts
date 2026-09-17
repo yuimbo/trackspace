@@ -13,13 +13,26 @@ export const DEFAULT_PREVIEW_FRACTION = 0.4;
 /**
  * Where the hover preview should seek.
  *
- * The detected drop is the section worth auditioning; when it is absent (not yet
+ * A search hit's best-matching segment centre (*matchSection*, a fraction of the
+ * track duration) wins: that is the part that actually matched the query. Otherwise
+ * the detected drop is the section worth auditioning; when it is absent (not yet
  * analysed, or no clear drop) fall back to the fixed fraction of the track.
  */
 export function previewStartSeconds(
   structure: TrackStructure | undefined,
   duration: number,
+  matchSection?: number | null,
 ): number {
+  if (
+    matchSection != null &&
+    Number.isFinite(matchSection) &&
+    duration > 0
+  ) {
+    return Math.min(
+      Math.max(0, matchSection * duration),
+      Math.max(0, duration - 1),
+    );
+  }
   const peak = structure?.peak_start;
   if (peak != null && Number.isFinite(peak) && peak >= 0 && duration > 0) {
     // Keep a little audio after the seek so a seek near the end still plays.

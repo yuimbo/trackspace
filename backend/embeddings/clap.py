@@ -33,7 +33,7 @@ import numpy as np
 import torch
 from transformers import ClapModel, ClapProcessor
 
-from .audio_decode import load_resilient_audio_segments
+from .audio_decode import load_resilient_audio_segments_with_positions
 
 log = logging.getLogger(__name__)
 
@@ -94,15 +94,17 @@ def load_model() -> None:
             log.exception("CLAP model load failed")
 
 
-def _load_audio_segments(path: str) -> tuple[list[np.ndarray], str | None]:
+def _load_audio_segments(
+    path: str,
+) -> tuple[list[np.ndarray], list[float], str | None]:
     """Load segments for CLAP — see `NUM_SEGMENTS` / `SEGMENT_SECONDS`."""
     try:
-        return load_resilient_audio_segments(
+        return load_resilient_audio_segments_with_positions(
             path, sr=CLAP_SR, segment_seconds=SEGMENT_SECONDS,
         )
     except Exception as e:
         log.warning("Failed to load audio %s: %s", path, e)
-        return [], None
+        return [], [], None
 
 
 def _extract_tensor(outputs) -> "torch.Tensor":
@@ -120,14 +122,30 @@ def analyze_batch(
     on_decode_warning: Callable[[str, str], None] | None = None,
     max_batch: int = 12,
 ) -> dict[str, np.ndarray | None]:
-    """Embed several tracks, batching segment inference across tracks.
+    """Mean-pooled CLAP embedding per track (the layout/clustering source)."""
+    detailed = analyze_batch_segments(
+        paths, on_decode_warning=on_decode_warning, max_batch=max_batch,
+    )
+    out: dict[str, np.ndarray | None] = {}
+    for p, entry in detailed.items():
+        out[p] = None if entry is None else np.mean(entry[0], axis=0).astype(np.float32)
+    return out
 
-    Decoding happens per track on the calling thread; inference is grouped into
-    batches of at most *max_batch* segments so the accelerator is entered once per
-    batch instead of once per segment. The feature extractor pads/truncates each
-    segment independently, so variable-length segments batch safely.
+
+def analyze_batch_segments(
+    paths: list[str],
+    *,
+    on_decode_warning: Callable[[str, str], None] | None = None,
+    max_batch: int = 12,
+) -> dict[str, tuple[np.ndarray, np.ndarray] | None]:
+    """Embed several tracks, keeping each segment's vector and centre fraction.
+
+    Same batched inference as :func:`analyze_batch`, but returns per track
+    ``(segment_vectors (n, dim), segment_positions (n,))`` so search can rank a
+    query against the individual sections and audition the best one. The mean of the
+    segment vectors is exactly the :func:`analyze_batch` embedding.
     """
-    results: dict[str, np.ndarray | None] = {p: None for p in paths}
+    results: dict[str, tuple[np.ndarray, np.ndarray] | None] = {p: None for p in paths}
     if not paths:
         return results
 
@@ -139,20 +157,24 @@ def analyze_batch(
     # ── decode all segments, remembering which track each belongs to ──
     flat: list[np.ndarray] = []
     owner: list[str] = []
+    flat_positions: list[float] = []
     for p in paths:
-        segments, warn = _load_audio_segments(p)
+        segments, positions, warn = _load_audio_segments(p)
         if warn and on_decode_warning:
             on_decode_warning(p, warn)
-        for seg in segments[:NUM_SEGMENTS]:
+        for seg, pos in zip(segments[:NUM_SEGMENTS], positions[:NUM_SEGMENTS]):
             if seg.size == 0:
                 continue
             flat.append(np.asarray(seg, dtype=np.float32))
             owner.append(p)
+            flat_positions.append(float(pos))
 
     if not flat:
         return results
 
-    per_track: dict[str, list[np.ndarray]] = {p: [] for p in paths}
+    per_track: dict[str, tuple[list[np.ndarray], list[float]]] = {
+        p: ([], []) for p in paths
+    }
 
     for start in range(0, len(flat), max_batch):
         chunk = flat[start : start + max_batch]
@@ -175,12 +197,16 @@ def analyze_batch(
             continue
 
         for i, p in enumerate(chunk_owner):
-            per_track[p].append(emb[i])
+            per_track[p][0].append(emb[i])
+            per_track[p][1].append(flat_positions[start + i])
 
     for p in paths:
-        seg_embs = per_track.get(p) or []
+        seg_embs, seg_positions = per_track.get(p) or ([], [])
         if seg_embs:
-            results[p] = np.mean(seg_embs, axis=0).astype(np.float32)
+            results[p] = (
+                np.asarray(seg_embs, dtype=np.float32),
+                np.asarray(seg_positions, dtype=np.float32),
+            )
 
     return results
 

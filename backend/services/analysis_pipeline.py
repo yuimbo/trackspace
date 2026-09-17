@@ -619,7 +619,9 @@ def make_clap_handler(
             if not fp:
                 out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
                 continue
-            if deps.feature_cache.has("clap", fp, version=deps.clap_version):
+            if deps.feature_cache.has("clap", fp, version=deps.clap_version) and (
+                deps.feature_cache.has("clap_segments", fp, version=deps.clap_version)
+            ):
                 out[job.id] = JobResult.success(cached=True)
                 continue
             targets.append((job, abs_path, fp))
@@ -640,7 +642,7 @@ def make_clap_handler(
         def _warn(path: str, message: str) -> None:
             warns[path] = message
 
-        results = deps.clap_mod.analyze_batch(
+        results = deps.clap_mod.analyze_batch_segments(
             [abs_path for _, abs_path, _ in targets],
             on_decode_warning=_warn,
             max_batch=max(1, batch_size * deps.clap_mod.NUM_SEGMENTS),
@@ -648,12 +650,20 @@ def make_clap_handler(
         _relay_warnings(deps, warns)
 
         for job, abs_path, fp in targets:
-            emb = results.get(abs_path)
-            if emb is None:
+            entry = results.get(abs_path)
+            if entry is None:
                 out[job.id] = JobResult.failure("CLAP produced no embedding")
                 continue
+            seg_vecs, seg_positions = entry
+            mean = np.mean(seg_vecs, axis=0).astype(np.float32)
             try:
-                deps.feature_cache.put("clap", fp, emb, version=deps.clap_version)
+                deps.feature_cache.put("clap", fp, mean, version=deps.clap_version)
+                deps.feature_cache.put(
+                    "clap_segments", fp, seg_vecs, version=deps.clap_version
+                )
+                deps.feature_cache.put(
+                    "clap_segment_pos", fp, seg_positions, version=deps.clap_version
+                )
             except Exception as e:
                 out[job.id] = JobResult.failure(f"cache write failed: {e}")
                 continue
@@ -1520,6 +1530,13 @@ def enqueue_library_work(
         if KIND_CLAP in kinds
         else set()
     )
+    # Segment vectors shipped after the pooled CLAP mean, so a track can be
+    # "analysed" yet still lack them; the queue re-runs it once to backfill.
+    have_clap_segments = (
+        set(fc.get_all("clap_segments", fps, version=deps.clap_version))
+        if KIND_CLAP in kinds
+        else set()
+    )
     have_structure = (
         set(fc.get_all("structure", fps, version=deps.structure_version))
         if KIND_STRUCTURE in kinds
@@ -1580,7 +1597,11 @@ def enqueue_library_work(
             (t["path"], {"path": t["path"]})
             for t in infos
             if t.get("fingerprint")
-            and (force or t["fingerprint"] not in have_clap)
+            and (
+                force
+                or t["fingerprint"] not in have_clap
+                or t["fingerprint"] not in have_clap_segments
+            )
         ]
         queued[KIND_CLAP] = queue.enqueue_many(
             KIND_CLAP, items, priority=110, requeue_terminal=force

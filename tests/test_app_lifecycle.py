@@ -65,6 +65,8 @@ def test_source_versions_covers_every_versioned_cache_source():
 
     assert set(SOURCE_VERSIONS) == {
         "clap",
+        "clap_segments",
+        "clap_segment_pos",
         "features",
         "maest",
         "rhythm",

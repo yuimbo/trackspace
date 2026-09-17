@@ -29,33 +29,73 @@ def _app(*blueprints) -> Flask:
 
 
 def test_rank_orders_by_cosine_descending():
-    paths = ["a", "b", "c"]
-    vecs = np.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float32)
-    out = rank_by_similarity(np.array([1.0, 0.0]), paths, vecs, limit=3)
+    tracks = [
+        ("a", np.array([1.0, 0.0], dtype=np.float32), None),
+        ("b", np.array([0.0, 1.0], dtype=np.float32), None),
+        ("c", np.array([1.0, 1.0], dtype=np.float32), None),
+    ]
+    out = rank_by_similarity(np.array([1.0, 0.0]), tracks, limit=3)
     assert [r["path"] for r in out] == ["a", "c", "b"]
     assert out[0]["score"] == 1.0
+    assert out[0]["section"] is None
 
 
 def test_rank_normalises_unnormalised_inputs():
     """Cached CLAP rows are segment means, not unit vectors."""
-    vecs = np.array([[10.0, 0.0], [0.0, 3.0]], dtype=np.float32)
-    out = rank_by_similarity(np.array([5.0, 0.0]), ["a", "b"], vecs, limit=2)
+    tracks = [
+        ("a", np.array([10.0, 0.0], dtype=np.float32), None),
+        ("b", np.array([0.0, 3.0], dtype=np.float32), None),
+    ]
+    out = rank_by_similarity(np.array([5.0, 0.0]), tracks, limit=2)
     assert out[0]["path"] == "a"
     assert abs(out[0]["score"] - 1.0) < 1e-6
     assert abs(out[1]["score"]) < 1e-6
 
 
+def test_rank_uses_best_segment_and_reports_section():
+    tracks = [
+        (
+            "a",
+            np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+            np.array([0.2, 0.8], dtype=np.float32),
+        ),
+    ]
+    out = rank_by_similarity(np.array([1.0, 0.0]), tracks, limit=1)
+    assert out[0]["score"] == 1.0
+    assert abs(out[0]["section"] - 0.8) < 1e-6
+
+
+def test_rank_ignores_absent_segments():
+    """A NaN segment position must never win, even when its score is highest."""
+    tracks = [
+        (
+            "a",
+            np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32),
+            np.array([np.nan, 0.8], dtype=np.float32),
+        ),
+    ]
+    out = rank_by_similarity(np.array([0.0, 1.0]), tracks, limit=1)
+    assert abs(out[0]["section"] - 0.8) < 1e-6
+
+
 def test_rank_limit_and_empty():
-    vecs = np.array([[1.0, 0.0], [0.5, 0.5], [0.0, 1.0]], dtype=np.float32)
-    out = rank_by_similarity(np.array([1.0, 0.0]), ["a", "b", "c"], vecs, limit=2)
+    tracks = [
+        ("a", np.array([1.0, 0.0], dtype=np.float32), None),
+        ("b", np.array([0.5, 0.5], dtype=np.float32), None),
+        ("c", np.array([0.0, 1.0], dtype=np.float32), None),
+    ]
+    out = rank_by_similarity(np.array([1.0, 0.0]), tracks, limit=2)
     assert len(out) == 2
-    assert rank_by_similarity(np.array([1.0, 0.0]), [], np.empty((0, 2)), limit=5) == []
+    assert rank_by_similarity(np.array([1.0, 0.0]), [], limit=5) == []
 
 
 def test_rank_ties_keep_input_order():
     """Identical audio (same fingerprint, two paths) must not reorder nondeterministically."""
-    vecs = np.array([[1.0, 0.0], [1.0, 0.0]], dtype=np.float32)
-    out = rank_by_similarity(np.array([1.0, 0.0]), ["z.mp3", "a.mp3"], vecs, limit=2)
+    tracks = [
+        ("z.mp3", np.array([1.0, 0.0], dtype=np.float32), None),
+        ("a.mp3", np.array([1.0, 0.0], dtype=np.float32), None),
+    ]
+    out = rank_by_similarity(np.array([1.0, 0.0]), tracks, limit=2)
     assert [r["path"] for r in out] == ["z.mp3", "a.mp3"]
 
 
@@ -86,11 +126,23 @@ class _FakeClap:
 
 
 class _FakeCache:
-    def __init__(self, rows: dict[str, np.ndarray]):
+    def __init__(
+        self,
+        rows: dict[str, np.ndarray],
+        segments: dict[str, np.ndarray] | None = None,
+        positions: dict[str, np.ndarray] | None = None,
+    ):
         self.rows = rows
+        self.segments = segments or {}
+        self.positions = positions or {}
 
     def get_all(self, source, fps, version=None):
-        return {fp: self.rows[fp] for fp in fps if fp in self.rows}
+        src = {
+            "clap": self.rows,
+            "clap_segments": self.segments,
+            "clap_segment_pos": self.positions,
+        }[source]
+        return {fp: src[fp] for fp in fps if fp in src}
 
 
 _INFOS = [
@@ -107,10 +159,12 @@ _ROWS = {
 }
 
 
-def _client(*, clap=None, rows=None):
+def _client(*, clap=None, rows=None, segments=None, positions=None):
     bp = create_api_search_blueprint(
         clap_mod=clap or _FakeClap(),
-        feature_cache=_FakeCache(_ROWS if rows is None else rows),
+        feature_cache=_FakeCache(
+            _ROWS if rows is None else rows, segments, positions
+        ),
         embedding_version=2,
         build_track_infos_fn=lambda folder, recursive: list(_INFOS),
     )
@@ -126,6 +180,22 @@ def test_search_ranks_cached_tracks():
     assert [x["path"] for x in body["results"]] == ["a.mp3", "c.mp3", "b.mp3"]
     assert body["searched"] == 3
     assert body["total_tracks"] == 4
+
+
+def test_search_prefers_best_segment_and_reports_section():
+    segments = {"fp-a": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)}
+    positions = {"fp-a": np.array([0.2, 0.8], dtype=np.float32)}
+    c = _client(segments=segments, positions=positions)
+    body = c.get("/api/search?q=x").get_json()
+    assert body["results"][0]["path"] == "a.mp3"
+    assert body["results"][0]["score"] == 1.0
+    assert abs(body["results"][0]["section"] - 0.8) < 1e-6
+
+
+def test_search_falls_back_to_mean_without_segments():
+    c = _client()
+    body = c.get("/api/search?q=x").get_json()
+    assert body["results"][0]["section"] is None
 
 
 def test_search_passes_query_to_text_encoder():
