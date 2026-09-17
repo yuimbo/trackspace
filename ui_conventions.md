@@ -253,9 +253,12 @@ same seam as `SearchCoordinator`:
 - **Result row** — click focuses it: select alone, fit the view, audition it (only
   when hover preview is on). **Hovering** a row glows that track in the map
   (`{kind: "track", path}` hover target) and auditions it immediately, like a
-  canvas hover. Leaving the row does **not** stop the audition: the open card owns
-  it, so it keeps playing until the card closes (its `×`, Esc, a plain canvas
-  click, or another Alt press) or another row is hovered.
+  canvas hover. The audition lasts while the pointer is over the **track or the
+  card**: leaving the row (or the dot) does not stop it, and it ends when the
+  pointer leaves the card (`$tip` `mouseleave`), the card closes, or another row is
+  hovered. While the card is pinned the canvas hover does not stop it either
+  (`controller._handlePreview`), so crossing the gap from the dot to the card keeps
+  playing.
 
 Results are shown as title/artist/folder + similarity score, resolved against the
 loaded library (the endpoint returns only `path` + `score`). The card shows a

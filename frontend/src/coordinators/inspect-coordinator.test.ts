@@ -144,13 +144,15 @@ describe("InspectCoordinator", () => {
     expect(h.view.unpinInspect).toHaveBeenCalled();
   });
 
-  it("auditions a result row on hover, and keeps playing on leave", async () => {
+  it("auditions a result row on hover and keeps playing off the row", async () => {
     const h = makeHarness();
     await h.coord.action("hover", "b.mp3");
     expect(h.preview).toHaveBeenCalledWith("b.mp3");
-    // Leaving the row must not stop it: the open card owns the audition.
-    await h.coord.action("unhover", "b.mp3");
+    // Leaving the row does not stop it; leaving the *card* does.
+    await h.coord.action("hover", "c.mp3");
     expect(h.stopPreview).not.toHaveBeenCalled();
+    await h.coord.action("leave", "c.mp3");
+    expect(h.stopPreview).toHaveBeenCalled();
   });
 
   it("expands the anti-track to the most distant list", async () => {

@@ -67,9 +67,14 @@ export class InspectCoordinator {
     }
     if (action === "hover") {
       // Hovering a result row auditions it straight away, like a canvas hover.
-      // It deliberately does *not* stop on leave: the audition belongs to the
-      // open card, not to the pointer staying on the row.
+      // It deliberately does *not* stop on leaving the row: the audition lasts
+      // while the pointer is over the track *or* the card.
       this.deps.preview(path);
+      return;
+    }
+    if (action === "leave") {
+      // The pointer left the open card, so nothing is hovered any more.
+      this.deps.stopPreview();
       return;
     }
     if (action === "solo") {

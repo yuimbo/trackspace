@@ -533,8 +533,14 @@ export class Controller {
   private _handlePreview(): void {
     const m = this.model;
     const cv = this.canvas;
-    if (!m.hoverPreview || cv.hoveredIdx < 0) {
+    if (!m.hoverPreview) {
       this._stopPreview();
+      return;
+    }
+    if (cv.hoveredIdx < 0) {
+      // The pinned card owns the audition while it is open: moving off a dot (or
+      // across the gap to the card) must not end it. Closing the card does.
+      if (!cv.inspect) this._stopPreview();
       return;
     }
     this._startPreview(m.tracks[cv.hoveredIdx]);

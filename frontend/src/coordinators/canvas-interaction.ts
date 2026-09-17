@@ -157,7 +157,7 @@ export class CanvasInteractionController {
     $c.addEventListener("mousedown", (e) => this._onDown(e));
     $c.addEventListener("mousemove", (e) => this._onMove(e));
     $c.addEventListener("mouseup", (e) => this._onUp(e));
-    $c.addEventListener("mouseleave", () => this._onLeave());
+    $c.addEventListener("mouseleave", (e) => this._onLeave(e));
     $c.addEventListener("wheel", (e) => this._onWheel(e), {
       passive: false,
     });
@@ -631,7 +631,7 @@ export class CanvasInteractionController {
     this.deps.model.emit("change");
   }
 
-  private _onLeave(): void {
+  private _onLeave(e?: MouseEvent): void {
     const mouse = this.mouse;
     const cv = this.deps.canvas;
     if (mouse.mode === "drag" || mouse.mode === "txform") {
@@ -650,7 +650,10 @@ export class CanvasInteractionController {
     this._pointerOverCanvas = false;
     cv.clearHover();
     cv.$canvas.style.cursor = "";
-    this.deps.stopPreview();
+    // The audition lasts while the pointer is over the track *or* the open card:
+    // leaving the canvas into the card (or with a card pinned) keeps it playing.
+    const toTip = cv.$tip.contains((e?.relatedTarget as Node | null) ?? null);
+    if (!cv.inspect && !toTip) this.deps.stopPreview();
     cv.scheduleDraw();
     this.deps.onHoverFolderChanged();
   }

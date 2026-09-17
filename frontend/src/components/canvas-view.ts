@@ -115,6 +115,11 @@ export class CanvasView {
     this.$tip.addEventListener("click", (e) => this._onTipClick(e));
     this.$tip.addEventListener("mouseover", (e) => this._onTipOver(e));
     this.$tip.addEventListener("mouseout", (e) => this._onTipOut(e));
+    // Leaving the open card ends the audition it owns (the card is
+    // `pointer-events: none` until pinned, so this only fires while open).
+    this.$tip.addEventListener("mouseleave", () =>
+      this.onInspectAction?.("leave", this.inspect?.path ?? ""),
+    );
   }
 
   /* ── Coordinate transforms ──────────────────────────────── */
