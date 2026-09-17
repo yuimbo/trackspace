@@ -97,6 +97,7 @@ function makeHarness(): Harness {
     onHoverFolderChanged: vi.fn(),
     onHoverPreview: vi.fn(),
     stopPreview: vi.fn(),
+    tweenViewport: vi.fn(),
   } as CanvasInteractionDeps;
   const coord = new CanvasInteractionController(deps);
   coord.bind();
@@ -104,6 +105,16 @@ function makeHarness(): Harness {
 }
 
 // ─── Event helpers ────────────────────────────────────────────
+
+/** The viewport target the last fit tweened to. */
+function tweenTarget(deps: CanvasInteractionDeps): {
+  ox: number;
+  oy: number;
+  zoom: number;
+} {
+  const calls = (deps.tweenViewport as ReturnType<typeof vi.fn>).mock.calls;
+  return calls[calls.length - 1][0] as { ox: number; oy: number; zoom: number };
+}
 
 type XY = { x?: number; y?: number };
 
@@ -208,7 +219,7 @@ describe("CanvasInteractionController selection", () => {
 
 describe("CanvasInteractionController tag drag", () => {
   it("starts a document drag past the threshold and mutates tag values", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
     model.axisX = "tagA";
     canvas.hitTest.mockReturnValue(0);
@@ -327,7 +338,7 @@ describe("CanvasInteractionController folder drop", () => {
 
 describe("CanvasInteractionController gesture state", () => {
   it("reports pointer busy during a drag", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3", tags: { tagA: 0.5 } })]);
     model.axisX = "tagA";
     canvas.hitTest.mockReturnValue(0);
@@ -338,7 +349,7 @@ describe("CanvasInteractionController gesture state", () => {
   });
 
   it("cancels an active box selection and reports it", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
     canvas.hitTest.mockReturnValue(-1);
     down(canvas, 10, 10);
@@ -353,7 +364,7 @@ describe("CanvasInteractionController gesture state", () => {
   });
 
   it("resyncs hover only when idle and over the canvas", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
     canvas.hitTest.mockReturnValue(0);
     canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
@@ -412,14 +423,14 @@ describe("CanvasInteractionController gesture state", () => {
 
 describe("CanvasInteractionController fit view", () => {
   it("resets the viewport when no folder is hovered", () => {
-    const { model, coord } = makeHarness();
+    const { model, deps, coord } = makeHarness();
     model.vp = { ox: 0.4, oy: 0.4, zoom: 2 };
     coord.fitView();
-    expect(model.vp).toEqual({ ox: 0, oy: 0, zoom: 1 });
+    expect(tweenTarget(deps)).toEqual({ ox: 0, oy: 0, zoom: 1 });
   });
 
   it("fits to the hovered folder disc", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     canvas.hoverTarget = { kind: "folder", prefix: "House" };
     model.setAllTracks([
       makeTrack({ path: "House/a.mp3", folder: "House" }),
@@ -432,11 +443,11 @@ describe("CanvasInteractionController fit view", () => {
     model.vp = { ox: 0, oy: 0, zoom: 1 };
     coord.fitView();
     expect(canvas.scheduleDraw).toHaveBeenCalled();
-    expect(model.vp.zoom).not.toBe(1);
+    expect(tweenTarget(deps).zoom).not.toBe(1);
   });
 
   it("fits to the hovered cluster's members", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "a.mp3" }),
       makeTrack({ path: "b.mp3" }),
@@ -454,11 +465,11 @@ describe("CanvasInteractionController fit view", () => {
     }));
     model.vp = { ox: 0, oy: 0, zoom: 1 };
     coord.fitView();
-    expect(model.vp.zoom).not.toBe(1);
+    expect(tweenTarget(deps).zoom).not.toBe(1);
   });
 
   it("fits to the tracks sharing a hovered key", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "a.mp3", musical_key: "Am" }),
       makeTrack({ path: "b.mp3", musical_key: "Am" }),
@@ -471,11 +482,11 @@ describe("CanvasInteractionController fit view", () => {
     }));
     model.vp = { ox: 0, oy: 0, zoom: 1 };
     coord.fitView();
-    expect(model.vp.zoom).not.toBe(1);
+    expect(tweenTarget(deps).zoom).not.toBe(1);
   });
 
   it("falls back to the hovered dot's folder when no target is set", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "House/a.mp3", folder: "House" }),
       makeTrack({ path: "House/b.mp3", folder: "House" }),
@@ -487,7 +498,41 @@ describe("CanvasInteractionController fit view", () => {
     }));
     model.vp = { ox: 0, oy: 0, zoom: 1 };
     coord.fitView();
-    expect(model.vp.zoom).not.toBe(1);
+    expect(tweenTarget(deps).zoom).not.toBe(1);
+  });
+});
+
+// ─── Fit view to result paths ────────────────────────────
+
+describe("CanvasInteractionController fitViewToPaths", () => {
+  it("pans a single track at the current zoom instead of zooming in", () => {
+    const { model, canvas, deps, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.worldPosForTrack.mockReturnValue({ wx: 0.3, wy: 0.7 });
+    model.vp = { ox: 0, oy: 0, zoom: 4 };
+    coord.fitViewToPaths(["a.mp3"]);
+
+    const target = tweenTarget(deps);
+    // Zoom is retained; only the centre moves.
+    expect(target.zoom).toBe(4);
+    expect(target.ox).toBeCloseTo(0.3 - 1 / 8);
+    expect(target.oy).toBeCloseTo(0.7 - 1 / 8);
+  });
+
+  it("fits a multi-track result set and tweens the move", () => {
+    const { model, canvas, deps, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+    ]);
+    canvas.worldPosForTrack.mockImplementation((t: Track) => ({
+      wx: t.path === "a.mp3" ? 0.2 : 0.8,
+      wy: 0.5,
+    }));
+    model.vp = { ox: 0, oy: 0, zoom: 1 };
+    coord.fitViewToPaths(["a.mp3", "b.mp3"]);
+
+    expect(tweenTarget(deps).zoom).toBeGreaterThan(1);
   });
 });
 
@@ -495,7 +540,7 @@ describe("CanvasInteractionController fit view", () => {
 
 describe("CanvasInteractionController solo", () => {
   it("isolates to a hovered cluster", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "a.mp3" }),
       makeTrack({ path: "b.mp3" }),
@@ -513,7 +558,7 @@ describe("CanvasInteractionController solo", () => {
   });
 
   it("clears the exclusions when the hovered cluster is already soloed", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
     model.clusterAssignments = new Map([
       ["a.mp3", 1],
@@ -527,7 +572,7 @@ describe("CanvasInteractionController solo", () => {
   });
 
   it("isolates to a hovered folder and reveals it when fully hidden", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "House/a.mp3", folder: "House" }),
       makeTrack({ path: "Techno/b.mp3", folder: "Techno" }),
@@ -547,7 +592,7 @@ describe("CanvasInteractionController solo", () => {
   });
 
   it("isolates to the tracks sharing a hovered key", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "a.mp3", musical_key: "Am" }),
       makeTrack({ path: "b.mp3", musical_key: "Am" }),
@@ -561,7 +606,7 @@ describe("CanvasInteractionController solo", () => {
   });
 
   it("isolates tracks within the BPM tolerance of a hovered BPM chip", () => {
-    const { model, canvas, coord } = makeHarness();
+    const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([
       makeTrack({ path: "a.mp3", bpm: 128 }),
       makeTrack({ path: "b.mp3", bpm: 129.5 }),

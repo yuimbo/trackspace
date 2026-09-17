@@ -7,13 +7,17 @@
 // canvas view stays free of API calls — same seam as `SearchCoordinator`.
 
 import { type Model } from "../model";
-import type { InspectState, TooltipResult } from "../lib/tooltip";
+import {
+  ANTI_MORE_K,
+  type InspectState,
+  type TooltipResult,
+} from "../lib/tooltip";
 
 /** Neighbours requested for the "nearest" ranking. */
 export const NEAR_K = 5;
 /** Neighbours kept when soloing the neighbourhood. */
 export const SOLO_K = 10;
-/** The anti-track is the single furthest track. */
+/** The anti-track ranking: one on demand, expandable to the most distant list. */
 export const ANTI_K = 1;
 
 /** Shape of ``GET /api/tracks/similar``. */
@@ -42,6 +46,8 @@ export interface InspectCoordinatorDeps {
   fitToPaths(paths: string[]): void;
   /** Start the hover preview for a path (no-op when hover preview is off). */
   preview(path: string): void;
+  /** Stop the hover preview (the pointer left the previewing element). */
+  stopPreview(): void;
 }
 
 export class InspectCoordinator {
@@ -57,8 +63,22 @@ export class InspectCoordinator {
       this.focus(path);
       return;
     }
+    if (action === "hover") {
+      // Hovering a result row auditions it straight away, like a canvas hover.
+      this.deps.preview(path);
+      return;
+    }
+    if (action === "unhover") {
+      this.deps.stopPreview();
+      return;
+    }
     if (action === "solo") {
       await this.solo(path);
+      return;
+    }
+    if (action === "anti-more") {
+      // Expand the anti-track to the most distant list, in place.
+      await this.rank(path, "far", ANTI_MORE_K);
       return;
     }
     if (action === "anti" || action === "near") {
@@ -74,10 +94,14 @@ export class InspectCoordinator {
     this.deps.preview(path);
   }
 
-  private async rank(path: string, mode: "near" | "far"): Promise<void> {
-    const k = mode === "far" ? ANTI_K : NEAR_K;
+  private async rank(
+    path: string,
+    mode: "near" | "far",
+    k?: number,
+  ): Promise<void> {
+    const limit = k ?? (mode === "far" ? ANTI_K : NEAR_K);
     this.deps.view.setInspect({ busy: true, message: null, mode, results: [] });
-    const res = await this.fetch(path, mode, k);
+    const res = await this.fetch(path, mode, limit);
     if (!res.ok) {
       this.deps.view.setInspect({
         busy: false,

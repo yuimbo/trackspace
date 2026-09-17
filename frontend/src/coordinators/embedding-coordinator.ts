@@ -106,6 +106,42 @@ export class EmbeddingCoordinator {
     cancelAnimationFrame(this._animFrame);
   }
 
+  /**
+   * Animate the viewport (camera) to *target* on the shared animation frame.
+   *
+   * A viewport move is not a *dot* position animation, but it shares the one frame
+   * so a fit can never interleave with an in-flight position lerp. Re-fits during
+   * the tween cancel it and start from wherever the camera has reached.
+   */
+  tweenViewport(
+    target: { ox: number; oy: number; zoom: number },
+    ms = 420,
+  ): void {
+    const m = this.deps.model;
+    const cv = this.deps.canvas;
+    cancelAnimationFrame(this._animFrame);
+    const from = { ox: m.vp.ox, oy: m.vp.oy, zoom: m.vp.zoom };
+    const t0 = performance.now();
+    const step = () => {
+      const t = Math.min(1, (performance.now() - t0) / Math.max(1, ms));
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      m.vp.ox = from.ox + (target.ox - from.ox) * e;
+      m.vp.oy = from.oy + (target.oy - from.oy) * e;
+      m.vp.zoom = from.zoom + (target.zoom - from.zoom) * e;
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._animFrame = requestAnimationFrame(step);
+      } else {
+        m.vp.ox = target.ox;
+        m.vp.oy = target.oy;
+        m.vp.zoom = target.zoom;
+        m.saveLS();
+        cv.scheduleDraw();
+      }
+    };
+    this._animFrame = requestAnimationFrame(step);
+  }
+
   /** Stop background work: the model-ready poll and the generation SSE stream. */
   stop(): void {
     clearTimeout(this._embedPollTimer);

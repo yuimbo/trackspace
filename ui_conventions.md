@@ -183,6 +183,16 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   fits never contend with the base pass; a missing Jacobian falls back to the full
   recompute. The base layout streams its phase as `layout_progress`, rendered by the
   canvas pill and status bar (`model.layoutProgress`).
+- **Viewport moves tween.** Fitting to a result set (`fitViewToPaths`) and the
+  folder/cluster fit animate `m.vp` through
+  `EmbeddingCoordinator.tweenViewport`, which reuses the shared animation frame, so
+  the camera glides and the user can see *where* the view went. A single-track (or
+  degenerate) result set **pans only** at the current zoom — it has no extent to fit,
+  so homing one hit centres it instead of jumping to the ~16× a 0.05-wide window
+  would give.
+- **The pinned card follows its track.** While pinned, the card's anchor is the
+  inspected track's *current* screen position, so a tweened move carries the card with
+  it rather than leaving it at a stale screen position.
 
 ---
 
@@ -214,8 +224,9 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 ## Inspect card (pinned, interactive)
 
 The tooltip is `pointer-events: none` and follows the hover. **Alt** over a hovered
-dot pins it: `CanvasView.inspect` is set, the card anchors at the dot's position
-captured at pin time, gets `pointer-events: auto` and a `Navigate` section. It stays
+dot pins it: `CanvasView.inspect` is set, the card anchors to the dot's
+*current* screen position (so a viewport tween carries it along), gets
+`pointer-events: auto` and a `Navigate` section. It stays
 open when the pointer leaves the canvas (that is how you reach it), and closes on
 **Esc**, a plain click on empty canvas, the card's `×`, or another Alt press.
 `CanvasInteractionController._bindInspectKey` owns the Alt toggle; `CanvasView`
@@ -233,14 +244,19 @@ same seam as `SearchCoordinator`:
 
 - **Anti-track** — `GET /api/tracks/similar?path=…&mode=far&k=1`, the single
   furthest track in the composite embedding space (what the map/clusters describe).
+  A *Show 10 most distant* button re-ranks with `ANTI_MORE_K` and replaces the
+  list in place.
 - **Nearest** — `mode=near`, the `NEAR_K` closest tracks.
 - **Solo** — isolate to the neighbourhood (the inspected track plus `SOLO_K`
   neighbours) and fit the view to it, reusing `Model.focusPaths` and
   `fitViewToPaths`.
 - **Result row** — click focuses it: select alone, fit the view, audition it (only
-  when hover preview is on).
+  when hover preview is on). **Hovering** a row auditions it immediately, like a
+  canvas hover, and leaving stops it.
 
 Results are shown as title/artist/folder + similarity score, resolved against the
 loaded library (the endpoint returns only `path` + `score`). The card shows a
 "Searching…" note while a ranking is in flight and an inline error note when the
-endpoint fails (e.g. no analysed tracks yet).
+endpoint fails (e.g. no analysed tracks yet). The plain hover card carries a footer
+hint (*Hold ⌥ (Alt) to interact*); the pinned card omits it, being already
+interactive.

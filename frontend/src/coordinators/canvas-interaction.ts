@@ -106,6 +106,8 @@ export interface CanvasInteractionDeps {
   /** Start/stop the hover audio preview for the hovered track. */
   onHoverPreview(): void;
   stopPreview(): void;
+  /** Animate the viewport to *target* on the shared canvas animation frame. */
+  tweenViewport?(target: { ox: number; oy: number; zoom: number }): void;
 }
 
 export class CanvasInteractionController {
@@ -863,6 +865,17 @@ export class CanvasInteractionController {
   }
 
   /** Fit viewport to an 80th-percentile disc around the centroid of *subset*. */
+  /** Apply a fitted viewport: tweened when wired, else instant (tests, fallback). */
+  private _applyVp(target: { ox: number; oy: number; zoom: number }): void {
+    if (this.deps.tweenViewport) {
+      this.deps.tweenViewport(target);
+      return;
+    }
+    Object.assign(this.deps.model.vp, target);
+    this.deps.canvas.scheduleDraw();
+    this.deps.model.saveLS();
+  }
+
   private _fitViewToTracksPercentile(subset: Track[]): void {
     const m = this.deps.model;
     const pos: { wx: number; wy: number }[] = [];
@@ -896,15 +909,14 @@ export class CanvasInteractionController {
       if (p.wy > maxY) maxY = p.wy;
     }
     if (maxX - minX < 0.01 && maxY - minY < 0.01) {
-      Object.assign(m.vp, { ox: 0, oy: 0, zoom: 1 });
+      this._applyVp({ ox: 0, oy: 0, zoom: 1 });
       return;
     }
-    Object.assign(m.vp, this._vpFromWorldBounds(minX, maxX, minY, maxY));
+    this._applyVp(this._vpFromWorldBounds(minX, maxX, minY, maxY));
   }
 
   private _fitViewToTracks(): void {
-    const target = this._computeFitVP();
-    Object.assign(this.deps.model.vp, target);
+    this._applyVp(this._computeFitVP());
   }
 
   /**
@@ -946,9 +958,7 @@ export class CanvasInteractionController {
       Math.abs(vp.oy - fit.oy) < 0.002 &&
       Math.abs(vp.zoom - fit.zoom) < 0.05;
     if (atFit) {
-      vp.ox = 0;
-      vp.oy = 0;
-      vp.zoom = 1;
+      this._applyVp({ ox: 0, oy: 0, zoom: 1 });
     } else {
       this._fitViewToTracks();
     }
@@ -995,8 +1005,12 @@ export class CanvasInteractionController {
 
   /**
    * Fit the viewport to a specific set of track paths (semantic-search result
-   * focus). Unlike the folder fit, a single track is zoomed to rather than reset
-   * to the full view — focusing one hit is the whole point.
+   * focus). Unlike the folder fit, a single track is centred rather than reset to
+   * the full view — focusing one hit is the whole point.
+   *
+   * The move is tweened (`tweenViewport`), so the camera glides and the user can
+   * see where the view went; a pinned inspect card follows its track's screen
+   * position and stays attached.
    */
   fitViewToPaths(paths: Iterable<string>): void {
     const m = this.deps.model;
@@ -1020,14 +1034,23 @@ export class CanvasInteractionController {
     }
     const cx = (minX + maxX) / 2;
     const cy = (minY + maxY) / 2;
-    // A single hit has zero extent; give it a readable window, not max zoom.
-    const half = Math.max(maxX - minX, maxY - minY, 0.05) / 2;
-    Object.assign(
-      m.vp,
+    const extent = Math.max(maxX - minX, maxY - minY);
+    if (extent < 0.02) {
+      // A single track (or a degenerate set) has no extent to fit: keep the
+      // current zoom and only centre it, so homing one hit *pans* instead of
+      // jumping to the ~16x a 0.05-wide window would give.
+      const zoom = m.vp.zoom;
+      this._applyVp({
+        zoom,
+        ox: cx - 1 / (2 * zoom),
+        oy: cy - 1 / (2 * zoom),
+      });
+      return;
+    }
+    const half = extent / 2;
+    this._applyVp(
       this._vpFromWorldBounds(cx - half, cx + half, cy - half, cy + half),
     );
-    this.deps.canvas.scheduleDraw();
-    m.saveLS();
   }
 
   /**

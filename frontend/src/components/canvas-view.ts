@@ -80,6 +80,8 @@ export class CanvasView {
   inspect: InspectState | null = null;
   /** Anchor (page coords) captured when the card was pinned. */
   private _pinPos: { left: number; top: number } | null = null;
+  /** Result row currently auditioning on hover (dedupes repeated mouseover). */
+  private _previewRow: HTMLElement | null = null;
   /** Inspect-card action clicked (``anti``/``near``/``solo``/``focus``/``close``). */
   onInspectAction: ((action: string, path: string) => void) | null = null;
   lassoPoints: [number, number][] = [];
@@ -1065,7 +1067,16 @@ export class CanvasView {
         this.$tip.classList.add("hidden");
         return;
       }
-      anchor = this._pinPos;
+      // Follow the track: a tweened viewport move must carry the card with it,
+      // not leave it pinned to a stale screen position.
+      const idx = tracks.indexOf(track);
+      const pos = idx >= 0 ? this.positions.find((p) => p.idx === idx) : undefined;
+      if (pos) {
+        const r = this.$canvas.getBoundingClientRect();
+        anchor = { left: r.left + pos.sx, top: r.top + pos.sy };
+      } else {
+        anchor = this._pinPos;
+      }
     } else if (this.hoveredIdx >= 0 && this.tipReady) {
       track = tracks[this.hoveredIdx];
       const pos = this.positions.find((p) => p.idx === this.hoveredIdx);
@@ -1086,6 +1097,7 @@ export class CanvasView {
       renderTooltip(this.$tip, card);
       // The old target elements are gone; a stale hover would keep glowing.
       this.hoverTarget = null;
+      this._previewRow = null;
     }
     this.$tip.classList.toggle("pinned", pinned);
     this.$tip.classList.remove("hidden");
@@ -1127,6 +1139,7 @@ export class CanvasView {
     if (!this.inspect) return false;
     this.inspect = null;
     this._pinPos = null;
+    this._previewRow = null;
     this._tipKey = "";
     this.hoverTarget = null;
     this.$tip.classList.remove("pinned");
@@ -1174,9 +1187,14 @@ export class CanvasView {
    * the same `hoverTarget` a sidebar row would, so the glow and S/H agree.
    */
   private _onTipOver(e: MouseEvent): void {
-    const el = (e.target as HTMLElement).closest<HTMLElement>(
-      "[data-hover-target]",
-    );
+    const t = e.target as HTMLElement;
+    // A result row auditions its track on hover, straight away.
+    const preview = t.closest<HTMLElement>("[data-preview]");
+    if (preview && preview !== this._previewRow) {
+      this._previewRow = preview;
+      this.onInspectAction?.("hover", preview.dataset.preview!);
+    }
+    const el = t.closest<HTMLElement>("[data-hover-target]");
     const raw = el?.dataset.hoverTarget;
     if (!raw) return;
     try {
@@ -1188,11 +1206,18 @@ export class CanvasView {
   }
 
   private _onTipOut(e: MouseEvent): void {
-    const el = (e.target as HTMLElement).closest<HTMLElement>(
-      "[data-hover-target]",
+    const t = e.target as HTMLElement;
+    const preview = t.closest<HTMLElement>("[data-preview]");
+    // Moving between the row's own children is not a leave.
+    const previewTo = (e.relatedTarget as HTMLElement | null)?.closest?.(
+      "[data-preview]",
     );
+    if (preview && previewTo !== preview && preview === this._previewRow) {
+      this._previewRow = null;
+      this.onInspectAction?.("unhover", preview.dataset.preview!);
+    }
+    const el = t.closest<HTMLElement>("[data-hover-target]");
     if (!el) return;
-    // Moving between the target's own children is not a leave.
     const to = (e.relatedTarget as HTMLElement | null)?.closest?.(
       "[data-hover-target]",
     );

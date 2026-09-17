@@ -44,6 +44,9 @@ export interface TooltipResult {
   score: number;
 }
 
+/** How many most-distant tracks the anti-track list expands to. */
+export const ANTI_MORE_K = 10;
+
 /** Interactive inspect state, present only while the card is pinned. */
 export interface InspectState {
   /** The inspected track. */
@@ -74,6 +77,10 @@ export interface TooltipCard {
   inspect: InspectState | null;
   /** ``inspect.results`` resolved against the loaded library for display. */
   results: ResultRow[];
+  /** Footer hint on the plain hover card (how to pin it). */
+  hint: string | null;
+  /** Whether the anti-track list can expand to the most-distant ranking. */
+  canExpandAnti: boolean;
 }
 
 /** A ranked neighbour resolved against the loaded library for display. */
@@ -86,6 +93,9 @@ export interface ResultRow {
 
 const SPANNING_HINT =
   "Intro and drop excerpts disagree (embedding dispersion ≥ 0.25) — the track straddles genres";
+
+/** Footer hint on the plain hover card: how to open the interactive card. */
+const HOLD_ALT_HINT = "Hold ⌥ (Alt) to interact";
 
 const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
 
@@ -209,6 +219,9 @@ export function buildTooltip(
     activeSection,
     inspect,
     results,
+    // The hint only belongs on the plain card: once pinned it is interactive.
+    hint: inspect ? null : HOLD_ALT_HINT,
+    canExpandAnti: inspect?.mode === "far" && results.length < ANTI_MORE_K,
   };
 }
 
@@ -327,13 +340,19 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   if (card.features.length)
     root.appendChild(statSection("Features", card.features, "tt-features"));
 
-  if (card.inspect) root.appendChild(inspectSection(card.inspect, card.results));
+  if (card.inspect)
+    root.appendChild(inspectSection(card.inspect, card.results, card.canExpandAnti));
+  if (card.hint) root.appendChild(el("div", "tt-hint", card.hint));
 
   host.replaceChildren(root);
 }
 
 /** Navigate buttons + the last ranking's rows (pinned card only). */
-function inspectSection(inspect: InspectState, results: ResultRow[]): HTMLElement {
+function inspectSection(
+  inspect: InspectState,
+  results: ResultRow[],
+  canExpandAnti: boolean,
+): HTMLElement {
   const section = el("div", "tt-section tt-inspect");
   const head = el("div", "tt-inspect-head");
   head.appendChild(el("div", "tt-section-title", "Navigate"));
@@ -371,6 +390,16 @@ function inspectSection(inspect: InspectState, results: ResultRow[]): HTMLElemen
       ),
     );
     for (const r of results) section.appendChild(resultRow(r));
+    if (canExpandAnti) {
+      const more = el(
+        "button",
+        "tt-more",
+        `Show ${ANTI_MORE_K} most distant`,
+      ) as HTMLButtonElement;
+      more.dataset.inspectAction = "anti-more";
+      more.title = "Rank the whole library and list the furthest tracks";
+      section.appendChild(more);
+    }
   }
   return section;
 }
@@ -378,6 +407,8 @@ function inspectSection(inspect: InspectState, results: ResultRow[]): HTMLElemen
 function resultRow(result: ResultRow): HTMLElement {
   const row = el("div", "tt-result");
   row.dataset.inspectFocus = result.path;
+  // Hovering a row auditions it immediately, like hovering a canvas dot.
+  row.dataset.preview = result.path;
   row.title = "Select, fit the view, and audition";
 
   const text = el("div", "tt-result-text");

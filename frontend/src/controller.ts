@@ -174,6 +174,8 @@ export class Controller {
       onHoverFolderChanged: () => this.folders.updateHighlights(),
       onHoverPreview: () => this._handlePreview(),
       stopPreview: () => this._stopPreview(),
+      // Viewport moves (focus/homing) tween on the shared canvas frame.
+      tweenViewport: (target) => this.embedding.tweenViewport(target),
     });
 
     this.search = new SearchCoordinator({
@@ -206,6 +208,7 @@ export class Controller {
         const t = model.trackByPath(path);
         if (t) this._startPreview(t);
       },
+      stopPreview: () => this._stopPreview(),
     });
     canvasView.onInspectAction = (action, path) =>
       void this.inspect.action(action, path);

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Model, type Track } from "../model";
-import type { InspectState } from "../lib/tooltip";
+import { ANTI_MORE_K, type InspectState } from "../lib/tooltip";
 import {
   ANTI_K,
   InspectCoordinator,
@@ -26,6 +26,7 @@ interface Harness {
   view: { setInspect: ReturnType<typeof vi.fn>; unpinInspect: ReturnType<typeof vi.fn> };
   fitToPaths: ReturnType<typeof vi.fn>;
   preview: ReturnType<typeof vi.fn>;
+  stopPreview: ReturnType<typeof vi.fn>;
   fetchSimilar: ReturnType<typeof vi.fn>;
   coord: InspectCoordinator;
 }
@@ -35,6 +36,7 @@ function makeHarness(response: SimilarResponse = { ok: true, results: [] }): Har
   const view = { setInspect: vi.fn(), unpinInspect: vi.fn() };
   const fitToPaths = vi.fn();
   const preview = vi.fn();
+  const stopPreview = vi.fn();
   const fetchSimilar = vi.fn(async () => response);
   const coord = new InspectCoordinator({
     model,
@@ -42,8 +44,9 @@ function makeHarness(response: SimilarResponse = { ok: true, results: [] }): Har
     fetchSimilar,
     fitToPaths,
     preview,
+    stopPreview,
   });
-  return { model, view, fitToPaths, preview, fetchSimilar, coord };
+  return { model, view, fitToPaths, preview, stopPreview, fetchSimilar, coord };
 }
 
 /** The last patch passed to setInspect (busy/results/…). */
@@ -138,5 +141,23 @@ describe("InspectCoordinator", () => {
     const h = makeHarness();
     await h.coord.action("close", "a.mp3");
     expect(h.view.unpinInspect).toHaveBeenCalled();
+  });
+
+  it("auditions a result row on hover and stops on leave", async () => {
+    const h = makeHarness();
+    await h.coord.action("hover", "b.mp3");
+    expect(h.preview).toHaveBeenCalledWith("b.mp3");
+    await h.coord.action("unhover", "b.mp3");
+    expect(h.stopPreview).toHaveBeenCalled();
+  });
+
+  it("expands the anti-track to the most distant list", async () => {
+    const h = makeHarness({
+      ok: true,
+      results: [{ path: "far.mp3", score: -0.42 }],
+    });
+    await h.coord.action("anti-more", "a.mp3");
+    expect(h.fetchSimilar).toHaveBeenCalledWith("a.mp3", "far", ANTI_MORE_K);
+    expect(lastInspect(h.view)).toMatchObject({ mode: "far" });
   });
 });

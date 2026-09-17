@@ -263,6 +263,32 @@ describe("renderTooltip", () => {
     expect(host.querySelector(".tt-title")?.textContent).toBe("Two");
   });
 
+  it("shows the hold-Alt hint on the plain card only, and previews result rows", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    const plain = document.createElement("div");
+    renderTooltip(plain, buildTooltip(makeTrack({ path: "a.mp3" }), m));
+    expect(plain.querySelector(".tt-hint")?.textContent).toContain("⌥");
+    expect(plain.querySelectorAll("[data-preview]").length).toBe(0);
+
+    const pinned = document.createElement("div");
+    renderTooltip(
+      pinned,
+      buildTooltip(makeTrack({ path: "a.mp3" }), m, {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        mode: "far",
+        results: [{ path: "b.mp3", score: -0.42 }],
+      }),
+    );
+    // The hint is for the plain card; a pinned card is already interactive.
+    expect(pinned.querySelector(".tt-hint")).toBeNull();
+    expect(
+      pinned.querySelector<HTMLElement>("[data-preview]")?.dataset.preview,
+    ).toBe("b.mp3");
+  });
+
   it("omits the navigate section while the card is not pinned", () => {
     const host = document.createElement("div");
     renderTooltip(host, buildTooltip(makeTrack(), new Model()));
@@ -333,10 +359,14 @@ describe("renderTooltip", () => {
       }),
     );
 
-    const actions = [...host.querySelectorAll("[data-inspect-action]")].map(
+    const actions = [...host.querySelectorAll(".tt-nav-btn")].map(
       (b) => (b as HTMLElement).dataset.inspectAction,
     );
     expect(actions).toEqual(["anti", "near", "solo"]);
+    // The anti-track list expands to the most-distant ranking.
+    expect(
+      host.querySelector<HTMLElement>("[data-inspect-action='anti-more']"),
+    ).not.toBeNull();
     expect(host.querySelector("[data-inspect-close]")).not.toBeNull();
     expect(host.querySelector(".tt-section-title")?.textContent).not.toBe("Anti-track");
     expect(
