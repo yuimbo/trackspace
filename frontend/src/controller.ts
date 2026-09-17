@@ -14,7 +14,7 @@ import type {
   StatusView,
   SearchView,
 } from "./components";
-import { toast, showLoad, hideLoad } from "./lib/toast";
+import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
 import {
@@ -402,6 +402,7 @@ export class Controller {
         if (!firstFlushDone && (m.allTracks.length > 0 || final)) {
           firstFlushDone = true;
           if ($progress) $progress.textContent = "";
+          clearLoadBar();
           resolve();
         }
 
@@ -409,6 +410,7 @@ export class Controller {
           clearInterval(this._libFlushTimer);
           this._libFlushTimer = 0;
           m.libraryLoadProgress = null;
+          clearLoadBar();
           // Eligible paths / layout_revision depend on the track set; drop layout cache
           // so we never reuse coordinates after a full library rescan.
           this.embedding.invalidateLayoutCache();
@@ -440,6 +442,7 @@ export class Controller {
         if ($progress) {
           $progress.textContent = `Loading library… ${data.done} / ${data.total}`;
         }
+        setLoadBar(data.total > 0 ? data.done / data.total : null);
       }) as EventListener);
 
       es.addEventListener("done", (() => {
@@ -459,6 +462,7 @@ export class Controller {
 
   async init(): Promise<void> {
     showLoad();
+    setLoadBar(null);
     try {
       await Promise.all([this.folders.refresh(), this._loadLibrary()]);
     } finally {
@@ -484,6 +488,7 @@ export class Controller {
 
   private async _reloadLibraryAndTree(): Promise<void> {
     showLoad();
+    setLoadBar(null);
     try {
       await Promise.all([this.folders.refresh(), this._loadLibrary()]);
     } finally {

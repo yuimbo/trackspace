@@ -869,23 +869,29 @@ export class CanvasView {
   /* ── Mode badge ─────────────────────────────────────────── */
 
   /** Centred pill while embedding space has nothing to plot yet or layout is in flight. */
-  private _embeddingWaitLabel(m: Model): string | null {
+  private _embeddingWait(m: Model): { label: string; fraction: number | null } | null {
     if (m.viewMode !== "embeddings") return null;
     // The analysis pipeline owns its own progress pill (see _drawPipelinePill), so
     // these fallbacks only cover states the queue cannot describe.
     if (m.projectionPending) {
       const p = m.layoutProgress;
-      if (!p) return "Computing layout…";
+      if (!p) return { label: "Computing layout…", fraction: null };
       const phase = phaseLabel(p.phase);
-      return p.total > 1
-        ? `Computing layout… ${phase} ${p.done} / ${p.total}`
-        : `Computing layout… ${phase}`;
+      return {
+        label:
+          p.total > 1
+            ? `Computing layout… ${phase} ${p.done} / ${p.total}`
+            : `Computing layout… ${phase}`,
+        // The layout phases report no steps (no iteration callback), so the bar is
+        // indeterminate while it runs.
+        fraction: p.total > 1 ? p.done / p.total : null,
+      };
     }
     if (m.embeddingPositions.size > 0) return null;
     if (m.embeddingsReady) return null;
-    if (m.embeddingModelsLoading) return "loading models…";
-    if (m.embeddingsGenerating) return "generating embeddings…";
-    return "loading…";
+    if (m.embeddingModelsLoading) return { label: "loading models…", fraction: null };
+    if (m.embeddingsGenerating) return { label: "generating embeddings…", fraction: null };
+    return { label: "loading…", fraction: null };
   }
 
   /** Progress pill for the whole analysis pipeline, with a determinate bar.
@@ -953,7 +959,12 @@ export class CanvasView {
     ctx.textBaseline = "alphabetic";
   }
 
-  private _drawCenterStatusPill(w: number, h: number, label: string): void {
+  private _drawCenterStatusPill(
+    w: number,
+    h: number,
+    label: string,
+    fraction: number | null = null,
+  ): void {
     const ctx = this.ctx;
     const cx = w / 2;
     const cy = h / 2;
@@ -972,7 +983,45 @@ export class CanvasView {
     ctx.lineWidth = 1;
     ctx.stroke();
     ctx.fillStyle = "rgba(180,220,255,0.9)";
-    ctx.fillText(label, cx, cy);
+    ctx.fillText(label, cx, cy - 4);
+
+    // A bar under the label: determinate when the phase reports steps, an
+    // animated indeterminate track otherwise (the layout base phase is opaque).
+    const barW = Math.max(120, pw - 40);
+    const barH = 4;
+    const bx = cx - barW / 2;
+    const by = cy + ph / 2 - 12;
+    ctx.fillStyle = "rgba(255,255,255,0.14)";
+    ctx.beginPath();
+    ctx.roundRect(bx, by, barW, barH, barH / 2);
+    ctx.fill();
+    if (fraction != null && Number.isFinite(fraction)) {
+      const fw = Math.max(barH, barW * Math.max(0, Math.min(1, fraction)));
+      ctx.fillStyle = "rgba(120,200,255,0.9)";
+      ctx.beginPath();
+      ctx.roundRect(bx, by, fw, barH, barH / 2);
+      ctx.fill();
+    } else {
+      // Indeterminate: slide a short fill across the track so a phase with no
+      // step count still reads as "working", not stalled.
+      const slide = (performance.now() / 1100) % 1;
+      const fw = barW * 0.4;
+      const fx = bx - fw + slide * (barW + fw);
+      ctx.save();
+      ctx.beginPath();
+      ctx.roundRect(bx, by, barW, barH, barH / 2);
+      ctx.clip();
+      ctx.fillStyle = "rgba(120,200,255,0.55)";
+      ctx.beginPath();
+      ctx.roundRect(fx, by, fw, barH, barH / 2);
+      ctx.fill();
+      ctx.restore();
+      // Keep animating while the indeterminate phase is on screen.
+      this.scheduleDraw();
+    }
+
+    ctx.textAlign = "start";
+    ctx.textBaseline = "alphabetic";
   }
 
   private _drawModeBadge(w: number, h: number): void {
@@ -988,13 +1037,13 @@ export class CanvasView {
     ctx.fillStyle = "rgba(120,200,255,0.6)";
     ctx.fillText("EMBEDDING SPACE", w - 8, 8);
 
-    const wait = this._embeddingWaitLabel(m);
+    const wait = this._embeddingWait(m);
     const prog = pipelineProgress(m.queueStatus);
     if (prog) {
       // Docked once the map is drawn, so the indicator never covers the points.
       this._drawPipelinePill(w, h, prog, m.embeddingPositions.size > 0);
     } else if (wait) {
-      this._drawCenterStatusPill(w, h, wait);
+      this._drawCenterStatusPill(w, h, wait.label, wait.fraction);
     }
 
     ctx.restore();

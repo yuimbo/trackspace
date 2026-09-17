@@ -84,6 +84,8 @@ const PANEL_HTML = `
   <input id="cluster-resolution-range" type="range" />
   <div id="cluster-weights"></div>
   <p id="cluster-weights-note"></p>
+  <div id="analysis-coverage"></div>
+  <div id="analysis-retrigger"></div>
   <button id="btn-apply-weights"></button>
   <button id="btn-reset-weights"></button>
   <button id="btn-default-weights"></button>
@@ -656,5 +658,84 @@ describe("AnalysisCoordinator source weights", () => {
     const note = document.getElementById("cluster-weights-note")!.textContent!;
     expect(note).toContain("Rhythm");
     expect(note).not.toContain("Genre");
+  });
+});
+
+// ─── Coverage panel ─────────────────────────────────────────
+
+describe("AnalysisCoordinator coverage panel", () => {
+  const COVERAGE = {
+    tracks_total: 10,
+    tracks_with_fingerprint: 10,
+    tracks_with_audio_features: 8,
+    tracks_pending_audio_features: 2,
+    tracks_with_rhythm: 7,
+    tracks_pending_rhythm: 3,
+    tracks_with_structure: 6,
+    tracks_pending_structure: 4,
+    tracks_with_maest: 9,
+    tracks_pending_maest: 1,
+    tracks_with_clap: 5,
+    tracks_pending_clap: 5,
+    tracks_with_supervised: 0,
+    tracks_pending_supervised: 10,
+  };
+
+  it("renders one row per source with done / total", async () => {
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status") ? COVERAGE : {},
+    );
+    await coord.fetchCoverage();
+
+    const rows = [...document.querySelectorAll(".analysis-coverage-row")];
+    expect(rows).toHaveLength(6);
+    const names = rows.map(
+      (r) => r.querySelector(".analysis-coverage-name")?.textContent,
+    );
+    expect(names).toEqual([
+      "Audio features",
+      "Rhythm",
+      "Structure",
+      "MAEST",
+      "CLAP",
+      "Supervised",
+    ]);
+    const structure = rows[2];
+    expect(structure.querySelector(".analysis-coverage-count")?.textContent).toBe(
+      "6 / 10",
+    );
+    expect(
+      structure.querySelector<HTMLElement>(".analysis-coverage-bar i")?.style.width,
+    ).toBe("60%");
+  });
+
+  it("wires one retrigger button per stage plus a forced re-run", async () => {
+    const { coord, fetchSpy } = makeHarness();
+    coord.bindPanel();
+
+    const buttons = [
+      ...document.querySelectorAll<HTMLButtonElement>("#analysis-retrigger button"),
+    ];
+    expect(buttons.map((b) => b.textContent)).toEqual([
+      "Audio features",
+      "Structure",
+      "MAEST",
+      "CLAP",
+      "Re-run all",
+    ]);
+
+    buttons[1].click();
+    await flush();
+    const structurePost = fetchSpy.mock.calls.find(
+      ([url, init]) =>
+        String(url) === "/api/embeddings/generate" &&
+        (init as RequestInit)?.method === "POST",
+    );
+    expect(JSON.parse((structurePost![1] as RequestInit).body as string)).toEqual({
+      folder: "",
+      recursive: true,
+      stages: ["structure"],
+      force: false,
+    });
   });
 });

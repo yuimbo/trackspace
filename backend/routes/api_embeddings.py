@@ -15,9 +15,15 @@ from backend.embeddings.projection_config import (
     FROZEN_SOURCE_WEIGHTS,
     REQUIRED_SOURCES,
 )
-from backend.jobs import KIND_CLAP, KIND_FEATURES, KIND_MAEST
+from backend.jobs import (
+    KIND_CLAP,
+    KIND_FEATURES,
+    KIND_MAEST,
+    KIND_STRUCTURE,
+)
 from backend.services.embedding_status_cache import EmbeddingStatusCache
 from backend.services.request_validation import (
+    one_of,
     opt_bool,
     opt_str,
     opt_str_list,
@@ -25,6 +31,15 @@ from backend.services.request_validation import (
 )
 
 log = logging.getLogger(__name__)
+
+#: Per-track stages the coverage panel may retrigger individually. The
+#: library-wide tail stages (supervise/cluster) are triggered by their own routes.
+RETRIGGER_STAGES: tuple[str, ...] = (
+    KIND_FEATURES,
+    KIND_STRUCTURE,
+    KIND_MAEST,
+    KIND_CLAP,
+)
 
 
 class _Broadcaster(Protocol):
@@ -58,6 +73,7 @@ def create_api_embeddings_blueprint(
     job_queue: Any,
     maest_mod: Any,
     rhythm_version: int,
+    structure_version: int,
 ) -> Blueprint:
     bp = Blueprint("api_embeddings", __name__)
 
@@ -105,6 +121,7 @@ def create_api_embeddings_blueprint(
             maest_mod.MAEST_VERSION,
             rhythm_version,
             supervised_mod.cache_version(feature_cache),
+            structure_version,
         )
 
     def _version_tuple(versions: Any) -> tuple[int, ...]:
@@ -207,17 +224,24 @@ def create_api_embeddings_blueprint(
         the actual execution is owned by the durable job queue, so this is now
         an idempotent "make sure this work is scheduled" request rather than a
         "start a background thread" one. Repeated calls are harmless.
+
+        ``stages`` optionally restricts the request to specific per-track stages
+        (the coverage panel's per-stage retrigger); it defaults to every stage.
         """
         data = parse_json_body(required=False)
         folder = opt_str(data, "folder", "")
         recursive = opt_bool(data, "recursive", True)
         priority_paths = opt_str_list(data, "priority_paths")
+        stages = opt_str_list(data, "stages")
+        for stage in stages:
+            one_of(stage, RETRIGGER_STAGES, field="stages")
 
         infos = build_track_infos_fn(folder, recursive)
         queued = enqueue_analysis(
             infos=infos,
             priority_paths=priority_paths,
             force=opt_bool(data, "force", False),
+            kinds=tuple(stages) or None,
         )
         return jsonify({"ok": True, "queued": queued})
 

@@ -22,6 +22,9 @@ class SourceVersions:
     rhythm: int = 0
     #: Training-run id of the supervised head (0 = untrained/absent).
     supervised: int = 0
+    #: Structure is metadata-only (not a projection source) but still a versioned
+    #: cache row, so coverage reports it. It must never enter the layout revision.
+    structure: int = 0
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class CachedSourceMaps:
     maest_logits: Mapping[str, object] = field(default_factory=dict)
     rhythm: Mapping[str, object] = field(default_factory=dict)
     supervised: Mapping[str, object] = field(default_factory=dict)
+    structure: Mapping[str, object] = field(default_factory=dict)
 
     def for_source(self, source: str) -> Mapping[str, object]:
         return {
@@ -43,6 +47,7 @@ class CachedSourceMaps:
             "maest_logits": self.maest_logits,
             "rhythm": self.rhythm,
             "supervised": self.supervised,
+            "structure": self.structure,
         }[source]
 
 
@@ -61,6 +66,9 @@ def batch_fetch_maps(
         rhythm=feature_cache.get_all("rhythm", fingerprints, version=versions.rhythm),
         supervised=feature_cache.get_all(
             "supervised", fingerprints, version=versions.supervised
+        ),
+        structure=feature_cache.get_all(
+            "structure", fingerprints, version=versions.structure
         ),
     )
 
@@ -148,12 +156,14 @@ def coverage_payload(
     tracks_with_maest = tracks_with_fp_in_maps(infos, maps, "maest")
     tracks_with_rhythm = tracks_with_fp_in_maps(infos, maps, "rhythm")
     tracks_with_supervised = tracks_with_fp_in_maps(infos, maps, "supervised")
+    tracks_with_structure = tracks_with_fp_in_maps(infos, maps, "structure")
 
     pending_clap = pending_tracks_for_source(fingerprinted, tracks_with_clap)
     pending_features = pending_tracks_for_source(fingerprinted, tracks_with_features)
     pending_maest = pending_tracks_for_source(fingerprinted, tracks_with_maest)
     pending_rhythm = pending_tracks_for_source(fingerprinted, tracks_with_rhythm)
     pending_supervised = pending_tracks_for_source(fingerprinted, tracks_with_supervised)
+    pending_structure = pending_tracks_for_source(fingerprinted, tracks_with_structure)
 
     return {
         "tracks_total": total,
@@ -168,12 +178,15 @@ def coverage_payload(
         "tracks_pending_rhythm": pending_rhythm,
         "tracks_with_supervised": tracks_with_supervised,
         "tracks_pending_supervised": pending_supervised,
+        "tracks_with_structure": tracks_with_structure,
+        "tracks_pending_structure": pending_structure,
         "cache_versions": {
             "clap": versions.clap,
             "audio_features": versions.features,
             "maest": versions.maest,
             "rhythm": versions.rhythm,
             "supervised": versions.supervised,
+            "structure": versions.structure,
         },
         # Legacy names (same values as track-space counts above)
         "total": total,

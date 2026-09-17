@@ -231,11 +231,14 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 - **Hover preview** (**M** toggles, volume slider in Options) streams the track
   through `/api/audio/…`. It seeks to the **detected drop** when the track has a
   cached structure row, else to 40 % of the track — `previewStartSeconds` in
-  `lib/structure.ts` owns that choice. **D** cycles the preview between the
-  sections the track actually has (drop → break → intro) and re-seeks; the intro
-  seeks to `intro_start` (the detected audio start after lead-in silence), falling
-  back to `0`. `model.previewTrackPath` / `model.previewSection` are in-memory
-  preview state, not persisted.
+  `lib/structure.ts` owns that choice. A **search hit** overrides that: the hit's
+  best-matching CLAP segment centre (`model.searchSections`, a duration fraction)
+  wins, so hovering a result auditions the part that actually matched the query.
+  **D** cycles the preview between the sections the track actually has (drop →
+  break → intro) and re-seeks; the intro seeks to `intro_start` (the detected audio
+  start after lead-in silence), falling back to `0`.
+  `model.previewTrackPath` / `model.previewSection` are in-memory preview state,
+  not persisted.
 - Structure is **fetched lazily on first hover** (`/api/tracks/structure?paths=…`,
   silent, deduped per path) and cached on `model.trackStructure`. A missing row is
   the normal "not analysed yet" case; the preview keeps its fallback position and
@@ -250,6 +253,26 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   **Features**. Feature axis ids never render as tags. `buildTooltip` returns a
   `key`; the canvas re-renders the DOM only when that key changes, so pan/zoom
   frames do not rebuild the card.
+
+## Analysis panel (coverage + retrigger)
+
+The right panel's **Analysis** section is the overview of what the pipeline has
+produced per track, and the way to re-run one stage.
+
+- `AnalysisCoordinator.fetchCoverage()` reads `/api/embeddings/status` (whole
+  library) and renders one row per source (Audio features, Rhythm, Structure, MAEST,
+  CLAP, Supervised) as a determinate bar `done / total`; a pending count renders
+  red. The summary line is `fingerprinted / total`. This is how a missing
+  **structure** row (no section timestamps) becomes visible.
+- Each stage has a **retrigger** button that POSTs `/api/embeddings/generate` with
+  `stages: ["<kind>"]`, queueing only tracks missing that stage; **Re-run all**
+  sends every stage with `force: true`. The durable queue then reports progress in
+  the status bar and the on-canvas pill as usual.
+- **Every long-running process must show progress.** The status bar and the canvas
+  pill render the queue's per-stage counts and the library-wide `stage` phases; the
+  overlay (`#loading-bar`) and the centre canvas pill (`_drawCenterStatusPill`) render
+  a determinate bar when a count is known and an **indeterminate** one otherwise,
+  so a phase with no iteration callback (the layout base phase) never looks stalled.
 
 ## Inspect card (pinned, interactive)
 

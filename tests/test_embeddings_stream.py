@@ -81,6 +81,7 @@ def _stream(client_queue: _FakeQueue, broadcaster: _FakeBroadcaster):
         job_queue=client_queue,
         maest_mod=None,
         rhythm_version=1,
+        structure_version=1,
     )
     app = Flask(__name__)
     _register_error_handlers(app)

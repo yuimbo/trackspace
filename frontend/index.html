@@ -53,6 +53,13 @@
     <div id="properties-list"></div>
   </section>
 
+  <!-- component: analysis-panel (coverage + per-stage retrigger) -->
+  <section id="analysis-section" x-data>
+    <h2>Analysis</h2>
+    <div id="analysis-coverage"></div>
+    <div id="analysis-retrigger" class="analysis-retrigger"></div>
+  </section>
+
   <section id="batch-section" x-data>
     <h2>Batch Edit</h2>
     <div id="batch-list"></div>
@@ -283,6 +290,9 @@
 <div id="loading-overlay" class="hidden">
   <div class="spinner"></div>
   <p id="loading-progress"></p>
+  <div id="loading-bar" class="loading-bar hidden">
+    <div id="loading-bar-fill"></div>
+  </div>
 </div>
 
 <audio id="preview-audio" preload="none"></audio>

@@ -354,6 +354,7 @@ def embeddings_client():
         job_queue=None,
         maest_mod=None,
         rhythm_version=1,
+        structure_version=1,
     )
     return _app(bp).test_client()
 
@@ -376,6 +377,21 @@ def test_generate_valid_empty_body(embeddings_client):
     r = embeddings_client.post("/api/embeddings/generate")
     assert r.status_code == 200
     assert r.get_json()["ok"] is True
+
+
+def test_generate_unknown_stage_is_400(embeddings_client):
+    r = embeddings_client.post(
+        "/api/embeddings/generate", json={"stages": ["bogus"]}
+    )
+    assert r.status_code == 400
+    assert "stages" in r.get_json()["error"]
+
+
+def test_generate_stages_not_list_is_400(embeddings_client):
+    r = embeddings_client.post(
+        "/api/embeddings/generate", json={"stages": "clap"}
+    )
+    assert r.status_code == 400
 
 
 # ─── projection method enum ────────────────────────────────

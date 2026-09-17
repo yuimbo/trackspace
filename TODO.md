@@ -22,23 +22,6 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
   already reports `unmatched`), and re-measure the default on the real library.
   Files: `backend/embeddings/supervised.py`, `frontend/src/coordinators/head-coordinator.ts`.
 
-### UI/UX feedback round
-
-- [ ] **Analysis coverage panel + per-stage retrigger.** There is no UI over
-  `/api/embeddings/status`: the user cannot see that `structure` (section
-  timestamps) is missing — e.g. after the `STRUCTURE_VERSION` 1→2 backfill or for
-  tracks the stage never reached — nor re-run one stage. Add a coverage overview
-  (per-source with/pending, incl. structure) and per-stage retrigger buttons backed
-  by `/api/embeddings/generate` (`force`), and include the structure count in
-  `coverage_payload` (currently deliberately omitted).
-  Files: `backend/embeddings/coverage.py`, `backend/routes/api_embeddings.py`,
-  `frontend/src/coordinators/analysis-coordinator.ts`, `frontend/index.html`.
-- [ ] **Some slow stages still lack a progress bar.** The projection `layout` base
-  phase is one opaque step (no iteration callback) and the `structure` stage reports no
-  `stage_progress`; audit every long-running stage for a phase/percent event and add
-  the missing ones. Files: `backend/embeddings/projection_backends.py`,
-  `backend/services/analysis_pipeline.py`, `frontend/src/lib/pipeline.ts`.
-
 ### Source-weight comparability (normalising the source blocks)
 
 The rationale is in `audio_pipeline.md` → *Composite vector construction*.

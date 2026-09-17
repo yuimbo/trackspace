@@ -149,6 +149,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             job_queue=deps.job_queue,
             maest_mod=deps.maest_mod,
             rhythm_version=deps.rhythm_version,
+            structure_version=deps.structure_version,
         )
     )
     app.register_blueprint(

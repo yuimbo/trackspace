@@ -55,6 +55,41 @@ interface ClusterResponse {
   sources_used?: string[];
 }
 
+/** Per-track coverage from ``GET /api/embeddings/status``. */
+interface CoverageResponse {
+  tracks_total?: number;
+  tracks_with_fingerprint?: number;
+  tracks_with_clap?: number;
+  tracks_pending_clap?: number;
+  tracks_with_audio_features?: number;
+  tracks_pending_audio_features?: number;
+  tracks_with_rhythm?: number;
+  tracks_pending_rhythm?: number;
+  tracks_with_maest?: number;
+  tracks_pending_maest?: number;
+  tracks_with_supervised?: number;
+  tracks_pending_supervised?: number;
+  tracks_with_structure?: number;
+  tracks_pending_structure?: number;
+  generating?: boolean;
+}
+
+/** One coverage row: label, job kind to retrigger, done, pending, total. */
+interface CoverageRow {
+  label: string;
+  stage: string;
+  done: number;
+  pending: number;
+}
+
+/** Retriggerable stages, in pipeline order. */
+const RETRIGGER_STAGES: [string, string][] = [
+  ["features", "Audio features"],
+  ["structure", "Structure"],
+  ["maest", "MAEST"],
+  ["clap", "CLAP"],
+];
+
 export class AnalysisCoordinator {
   private _jobsEventSource: EventSource | null = null;
   private _clusterFetchPending = false;
@@ -66,6 +101,7 @@ export class AnalysisCoordinator {
     this._listenJobStream();
     void this.refreshQueueStatus();
     void this.fetchClusters();
+    void this.fetchCoverage();
   }
 
   stop(): void {
@@ -160,6 +196,143 @@ export class AnalysisCoordinator {
     }
 
     this._syncApplyEnabled();
+    this._bindRetrigger();
+  }
+
+  /* ── Analysis coverage + per-stage retrigger ─────────────── */
+
+  /** Wire the coverage panel's per-stage retrigger buttons. */
+  private _bindRetrigger(): void {
+    const host = document.getElementById("analysis-retrigger");
+    if (!host) return;
+    host.replaceChildren();
+    for (const [stage, label] of RETRIGGER_STAGES) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = label;
+      btn.title = `Analyse every track missing ${label.toLowerCase()}`;
+      btn.addEventListener("click", () => void this._retrigger(stage, label));
+      host.appendChild(btn);
+    }
+    const all = document.createElement("button");
+    all.type = "button";
+    all.className = "analysis-retrigger-all";
+    all.textContent = "Re-run all";
+    all.title = "Re-run every per-track analysis stage, even where cached";
+    all.addEventListener("click", () => void this._retrigger(null, "all stages"));
+    host.appendChild(all);
+  }
+
+  /** Queue missing (or forced) work for one stage, or all stages. */
+  private async _retrigger(stage: string | null, label: string): Promise<void> {
+    try {
+      await postJSON("/api/embeddings/generate", {
+        folder: "",
+        recursive: true,
+        stages: stage ? [stage] : [],
+        force: stage == null,
+      });
+      toast(`Queued ${label}`, "ok");
+      await this.refreshQueueStatus();
+      await this.fetchCoverage();
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  /** Fetch per-track analysis coverage for the coverage panel. */
+  async fetchCoverage(): Promise<void> {
+    try {
+      const d = await api<CoverageResponse>(
+        "/api/embeddings/status?folder=&recursive=1",
+      );
+      this._renderCoverage(d);
+    } catch {
+      /* transient; the next drain refreshes it */
+    }
+  }
+
+  /** Render one row per source: done / total with a progress bar. */
+  private _renderCoverage(d: CoverageResponse): void {
+    const host = document.getElementById("analysis-coverage");
+    if (!host) return;
+    const total = d.tracks_total ?? 0;
+    const fingerprinted = d.tracks_with_fingerprint ?? 0;
+    const rows: CoverageRow[] = [
+      {
+        label: "Audio features",
+        stage: "features",
+        done: d.tracks_with_audio_features ?? 0,
+        pending: d.tracks_pending_audio_features ?? 0,
+      },
+      {
+        label: "Rhythm",
+        stage: "features",
+        done: d.tracks_with_rhythm ?? 0,
+        pending: d.tracks_pending_rhythm ?? 0,
+      },
+      {
+        label: "Structure",
+        stage: "structure",
+        done: d.tracks_with_structure ?? 0,
+        pending: d.tracks_pending_structure ?? 0,
+      },
+      {
+        label: "MAEST",
+        stage: "maest",
+        done: d.tracks_with_maest ?? 0,
+        pending: d.tracks_pending_maest ?? 0,
+      },
+      {
+        label: "CLAP",
+        stage: "clap",
+        done: d.tracks_with_clap ?? 0,
+        pending: d.tracks_pending_clap ?? 0,
+      },
+      {
+        label: "Supervised",
+        stage: "supervise",
+        done: d.tracks_with_supervised ?? 0,
+        pending: d.tracks_pending_supervised ?? 0,
+      },
+    ];
+
+    const summary = document.createElement("div");
+    summary.className = "analysis-coverage-summary";
+    summary.textContent =
+      total > 0
+        ? `${fingerprinted} / ${total} fingerprinted`
+        : "No tracks in the library yet.";
+    host.replaceChildren(summary);
+
+    if (total === 0) return;
+
+    for (const row of rows) {
+      const line = document.createElement("div");
+      line.className = "analysis-coverage-row";
+
+      const name = document.createElement("span");
+      name.className = "analysis-coverage-name";
+      name.textContent = row.label;
+
+      const count = document.createElement("span");
+      count.className = "analysis-coverage-count";
+      count.textContent = `${row.done} / ${total}`;
+      if (row.pending > 0) count.classList.add("has-pending");
+
+      const bar = document.createElement("span");
+      bar.className = "analysis-coverage-bar";
+      const fill = document.createElement("i");
+      fill.style.width = `${Math.round((row.done / total) * 100)}%`;
+      if (row.pending > 0) fill.classList.add("has-pending");
+      bar.appendChild(fill);
+
+      line.append(name, bar, count);
+      line.title = `${row.done} of ${total} analysed${
+        row.pending > 0 ? `, ${row.pending} pending` : ""
+      }`;
+      host.appendChild(line);
+    }
   }
 
   /** Build one weight row per source, from the shared default/label maps. */
@@ -397,6 +570,7 @@ export class AnalysisCoordinator {
         if ((this.deps.model.queueStatus?.outstanding ?? 0) === 0) {
           toast("Analysis complete", "ok");
         }
+        void this.fetchCoverage();
       });
     }) as EventListener);
 

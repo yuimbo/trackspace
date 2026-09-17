@@ -28,6 +28,24 @@ def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
     assert p["pending"] == 1
 
 
+def test_coverage_payload_reports_structure():
+    """Structure is metadata-only but still versioned, so the coverage panel needs
+    its own count — this is how a missing section timestamp becomes visible."""
+    maps = CachedSourceMaps(
+        clap={"fp1": object()},
+        features={"fp1": object()},
+        structure={"fp1": object()},
+    )
+    infos = [
+        {"path": "a.mp3", "fingerprint": "fp1"},
+        {"path": "b.mp3", "fingerprint": "fp2"},
+    ]
+    p = coverage_payload(infos, maps, SourceVersions(2, 1, 1, structure=3))
+    assert p["tracks_with_structure"] == 1
+    assert p["tracks_pending_structure"] == 1
+    assert p["cache_versions"]["structure"] == 3
+
+
 def test_eligible_paths_requires_all_sources():
     maps = CachedSourceMaps(
         clap={"fp1": object()},

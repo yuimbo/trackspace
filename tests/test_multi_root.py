@@ -186,6 +186,7 @@ def client(roots, tmp_path):
         job_queue=_FakeQueue(),
         maest_mod=_FakeMaest(),
         rhythm_version=1,
+        structure_version=1,
     )
 
     app = Flask(__name__)

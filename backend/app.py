@@ -514,13 +514,18 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         infos: list[dict],
         priority_paths: list[str] | None = None,
         force: bool = False,
+        kinds: tuple[str, ...] | None = None,
     ) -> dict[str, int]:
-        """Queue per-track analysis and wake the workers."""
+        """Queue per-track analysis and wake the workers.
+
+        *kinds* restricts the request to specific stages (the coverage panel's
+        per-stage retrigger); ``None`` means every per-track stage.
+        """
         queued = enqueue_library_work(
             state.job_queue,
             infos,
             deps=ANALYSIS_DEPS,
-            kinds=(KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP),
+            kinds=kinds or (KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP),
             priority_paths=priority_paths or [],
             force=force,
         )
