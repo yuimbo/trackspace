@@ -73,22 +73,30 @@ def compute_fingerprint(path: str, duration: int = 120) -> str | None:
                     timeout=30,
                     stdin=subprocess.DEVNULL,
                 )
-            if proc.returncode != 0:
-                log.debug(
-                    "fpcalc failed (rc=%d) for %s: %s",
-                    proc.returncode,
-                    path,
-                    proc.stderr.strip(),
-                )
-                return None
             fp_line = ""
             for line in proc.stdout.splitlines():
                 if line.startswith("FINGERPRINT="):
                     fp_line = line[len("FINGERPRINT="):]
                     break
             if not fp_line:
-                log.debug("fpcalc produced no FINGERPRINT for %s", path)
+                log.debug(
+                    "fpcalc produced no FINGERPRINT (rc=%d) for %s: %s",
+                    proc.returncode,
+                    path,
+                    proc.stderr.strip(),
+                )
                 return None
+            if proc.returncode != 0:
+                # fpcalc exits 2/3 on a file it can only partially decode, but
+                # still writes a FINGERPRINT from the readable part. That is a
+                # stable content hash for this file, so keep it rather than
+                # dropping the track from analysis entirely.
+                log.warning(
+                    "fpcalc rc=%d for %s; using the partial fingerprint (%d frames)",
+                    proc.returncode,
+                    path,
+                    fp_line.count(",") + 1,
+                )
             return hashlib.sha256(fp_line.encode()).hexdigest()
         except subprocess.TimeoutExpired:
             log.warning("fpcalc timed out for %s", path)
