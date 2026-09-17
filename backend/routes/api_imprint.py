@@ -163,4 +163,36 @@ def create_api_imprint_blueprint(
         save_roots_state()
         return jsonify({"ok": True, "removed": True})
 
+    @bp.route("/api/supervised/imprint/temp_roots")
+    def api_imprint_temp_roots():
+        """Ephemeral imprint roots still registered (an unfinished imprint).
+
+        A browser closed mid-imprint leaves its root in ``roots.json``; the UI
+        lists these on startup so the user can discard them.
+        """
+        return jsonify(
+            {
+                "ok": True,
+                "roots": [
+                    {"root_id": rid, "path": roots[rid]}
+                    for rid in sorted(temp_roots)
+                    if rid in roots
+                ],
+            }
+        )
+
+    @bp.route("/api/supervised/imprint/discard", methods=["POST"])
+    def api_imprint_discard():
+        """Drop every ephemeral imprint root without touching the files."""
+        discarded = 0
+        for rid in sorted(temp_roots):
+            if rid in roots:
+                discarded += 1
+            temp_roots.discard(rid)
+            remove_root(rid)
+            unschedule_root_watch(rid)
+        if discarded:
+            save_roots_state()
+        return jsonify({"ok": True, "discarded": discarded})
+
     return bp

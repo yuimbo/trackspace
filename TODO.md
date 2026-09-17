@@ -7,21 +7,20 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 ## User feedback
 
 - [ ] Whacko idea? Add a 3d view for the embedding space?
-- [ ] **Fan-out / imprint undo.** Fan-out moves files on disk with no way to reverse
-  from Trackspace, and the imprint's ` (n)` collision suffix loses the original name.
-  A move journal (source, target) written before the moves would let an "Undo moves"
-  button (and the imprint finish step) restore the previous layout. Files:
-  `backend/services/analysis_pipeline.py` (`fanout_supervised`), a new journal table.
-- [ ] **Imprint cleanup on abandon.** If the user analyses an imprint target and then
-  never applies or finishes (browser closed), the ephemeral root persists in
-  `roots.json`. A "Discard" action (and a startup prompt for stale `temp_roots`)
-  would remove it; the `temp_roots` marker is already persisted.
-- [ ] **Imported head does not check `source_versions`.** `compare_heads` reports
-  compatibility but `install_head_bundle` installs regardless, so a head trained on an
-  older encoder checkpoint silently produces poor rows until the next retrain. Validate
-  `source_versions` on import and warn (or refuse) on a mismatch.
-  Files: `backend/embeddings/supervised.py` (`install_head_bundle`),
-  `backend/services/analysis_pipeline.py` (`import_supervised_head`).
+- [ ] **Undo leaves empty fan-out folders.** The move journal restores every
+  file but does not remove the subfolders a fan-out created (they are often empty
+  afterwards). Sweep empty directories on undo, bounded to the fan-out root so it can
+  never touch an unrelated tree. Files:
+  `backend/services/analysis_pipeline.py` (`undo_fanout_supervised`).
+- [ ] **The move journal is never pruned.** `fanout_journal` keeps every applied
+  batch forever (undone rows included). Prune batches older than the last N (or older
+  than a few weeks) on startup; the journal is only needed for the most recent undo.
+  Files: `backend/embeddings/feature_cache.py`.
+- [ ] **The match floor is a fixed 5th percentile.** `DEFAULT_MATCH_PERCENTILE` is
+  not user-tunable and there is no preview of what would be left unmatched. Consider
+  a slider in the imprint panel that re-plans against a given percentile (the plan
+  already reports `unmatched`), and re-measure the default on the real library.
+  Files: `backend/embeddings/supervised.py`, `frontend/src/coordinators/head-coordinator.ts`.
 
 ### Source-weight comparability (normalising the source blocks)
 
@@ -94,14 +93,6 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       `_computeFitVP`, `_p80Radius`, `_fitViewToFolderPercentile`, `_fitViewToTracks`,
       `fitView`, `effectiveHoveredFolderPrefix`) are the natural seam into a
       `canvas-fit-view.ts`.
-- [ ] **Optional: split the folder-head panel out of `analysis-coordinator.ts`.**
-      Head controls (train/export/import/compare, the training-folder tree, and the
-      imprint flow) are now a separate concern from the job queue + clusters; the
-      file is ~1050 lines. A `head-coordinator.ts` taking the same structural
-      deps would restore one-concern-per-file.
-- [ ] **Training-folder selection is not persisted.** `_trainFolders` resets to "all
-      roots" on reload, so a user who always trains on one root re-checks it every
-      session. Persist the checked virtual folders in `model.saveLS()`.
 - [ ] **Optional: `lib/event-bus.ts`, `model/persistence.ts`, `api/types.ts`.**
       Extract the EventBus base, localStorage persistence, and shared API response
       types out of `model.ts` / `lib/api.ts`.

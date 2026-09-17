@@ -32,6 +32,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -156,6 +157,22 @@ class FeatureCache:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fanout_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL,
+                    source TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    undone INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS fanout_journal_batch "
+                "ON fanout_journal (batch_id, undone)"
+            )
             for col, default in [
                 ("version", "INTEGER NOT NULL DEFAULT 0"),
                 ("features", "BLOB"),
@@ -212,6 +229,90 @@ class FeatureCache:
                 )
         except Exception:
             return
+
+    # ── Fan-out move journal ───────────────────────────────────
+    # A folder fan-out moves files on disk, so each move is journalled before
+    # it happens. The journal lets a single "Undo moves" restore the previous
+    # layout, including the original names that a `` (n)`` collision suffix
+    # would otherwise have changed.
+
+    def journal_begin(self) -> int:
+        """Reserve the next batch id for a fan-out apply; ``0`` on failure."""
+        try:
+            with self._lock:
+                with self._conn() as conn:
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(batch_id), 0) + 1 FROM fanout_journal"
+                    ).fetchone()
+                    return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def journal_add(self, batch_id: int, source: str, target: str) -> int:
+        """Record one pending move; returns its row id, or ``0`` on failure."""
+        if int(batch_id) <= 0:
+            return 0
+        try:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO fanout_journal "
+                    "(batch_id, source, target, created_at, undone) "
+                    "VALUES (?, ?, ?, ?, 0)",
+                    (int(batch_id), source, target, time.time()),
+                )
+                return int(cursor.lastrowid or 0)
+        except Exception:
+            return 0
+
+    def journal_remove(self, row_id: int) -> None:
+        """Drop one pending move (it failed and must not be undone)."""
+        if int(row_id) <= 0:
+            return
+        try:
+            with self._conn() as conn:
+                conn.execute("DELETE FROM fanout_journal WHERE id=?", (int(row_id),))
+        except Exception:
+            return
+
+    def latest_move_batch(self) -> dict | None:
+        """The most recent not-yet-undone batch, or ``None`` when there is none."""
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT batch_id, MAX(created_at) FROM fanout_journal "
+                    "WHERE undone=0 GROUP BY batch_id "
+                    "ORDER BY MAX(created_at) DESC, batch_id DESC LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return None
+                batch_id = int(row[0])
+                rows = conn.execute(
+                    "SELECT id, source, target FROM fanout_journal "
+                    "WHERE batch_id=? AND undone=0 ORDER BY id",
+                    (batch_id,),
+                ).fetchall()
+            return {
+                "batch_id": batch_id,
+                "created_at": float(row[1] or 0.0),
+                "moves": [
+                    {"id": int(r[0]), "source": str(r[1]), "target": str(r[2])}
+                    for r in rows
+                ],
+            }
+        except Exception:
+            return None
+
+    def mark_batch_undone(self, batch_id: int) -> int:
+        """Mark a whole batch undone; returns the number of rows flipped."""
+        try:
+            with self._conn() as conn:
+                cursor = conn.execute(
+                    "UPDATE fanout_journal SET undone=1 WHERE batch_id=?",
+                    (int(batch_id),),
+                )
+                return int(cursor.rowcount or 0)
+        except Exception:
+            return 0
 
     @staticmethod
     def _spec(source: str) -> _SourceSpec:

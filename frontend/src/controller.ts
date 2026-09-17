@@ -25,6 +25,7 @@ import {
 } from "./command";
 import { HotkeyManager } from "./hotkeys";
 import { AnalysisCoordinator } from "./coordinators/analysis-coordinator";
+import { HeadCoordinator } from "./coordinators/head-coordinator";
 import { EmbeddingCoordinator } from "./coordinators/embedding-coordinator";
 import { FolderTreeCoordinator } from "./coordinators/folder-tree-coordinator";
 import { CanvasInteractionController } from "./coordinators/canvas-interaction";
@@ -84,6 +85,9 @@ export class Controller {
   /** Queue stream, status polling, and the microgenre cluster panel. */
   private analysis: AnalysisCoordinator;
 
+  /** Folder-supervised head panel: train/export/import/compare, imprint, undo. */
+  private head: HeadCoordinator;
+
   /** Embedding-space view: layout cache, generation SSE, position animations. */
   private embedding: EmbeddingCoordinator;
 
@@ -135,6 +139,17 @@ export class Controller {
 
     this.$audio = document.getElementById("preview-audio") as HTMLAudioElement;
 
+    this.head = new HeadCoordinator({
+      model,
+      // The head and its rows are a projection source, so the map must follow a
+      // training run, an import, or a fan-out that moves tracks between folders.
+      refreshProjection: () => this.embedding.refreshProjection(),
+      refreshClusters: () => void this.analysis.fetchClusters(),
+      // An imprint registers/removes a root, so the library and tree must
+      // follow: the root set and the visible track set stay in step.
+      onRootsChanged: () => this._reloadLibraryAndTree(),
+    });
+
     this.analysis = new AnalysisCoordinator({
       model,
       status: statusView,
@@ -148,9 +163,8 @@ export class Controller {
       applyApproximateWeights: (weights) =>
         this.embedding.applyApproximateWeights(weights),
       fetchWeightJacobian: () => void this.embedding.fetchWeightJacobian(),
-      // An imprint registers/removes a root, so the library and tree must
-      // follow: the root set and the visible track set stay in step.
-      onRootsChanged: () => this._reloadLibraryAndTree(),
+      // The queue owns Train's disabled state; the head panel renders it.
+      head: this.head,
     });
 
     this.embedding = new EmbeddingCoordinator({
@@ -244,6 +258,7 @@ export class Controller {
     this.options.bind();
     this._bindTagControls();
     this.analysis.bindPanel();
+    this.head.bindPanel();
     this._bindKeyboard();
     this._bindResize();
     this._bindViewportChrome();
@@ -459,6 +474,8 @@ export class Controller {
     // Queue stream + clusters are independent of view mode: analysis runs in
     // the background regardless of what the user is currently looking at.
     this.analysis.start();
+    // The head panel checks for an imprint a closed browser left behind.
+    this.head.start();
 
     if (this.model.viewMode === "embeddings") {
       void this.embedding.ensureAndProject();

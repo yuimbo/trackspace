@@ -22,11 +22,13 @@ from backend.services.analysis_pipeline import (
     AnalysisDeps,
     enqueue_library_work,
     fanout_supervised,
+    import_supervised_head,
     make_maest_handler,
     make_supervised_handler,
     project_supervised_missing,
     supervised_imprint_status,
     train_supervised,
+    undo_fanout_supervised,
 )
 
 
@@ -553,6 +555,41 @@ def test_folder_subpath_strips_training_root():
     assert sup.folder_subpath("3f2a") == ""
 
 
+def test_compute_match_thresholds_is_per_class_percentile():
+    centroids = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
+    # Class 0 is tight (similarities near 1); class 1 is diffuse.
+    tight = np.tile(np.array([1.0, 0.0], np.float32), (10, 1))
+    diffuse = np.stack(
+        [sup._l2_normalize_rows(np.array([[1.0, s]], np.float32))[0] for s in np.linspace(0.0, 1.0, 10)]
+    )
+    z = np.vstack([tight, diffuse])
+    y = np.array([0] * 10 + [1] * 10, dtype=np.int64)
+    thresholds = sup.compute_match_thresholds(z, y, centroids, 2, percentile=10.0)
+    assert thresholds[0] > thresholds[1]
+    # A class with no training rows can never gate a track.
+    empty = sup.compute_match_thresholds(z, y, centroids, 3, percentile=10.0)
+    assert empty[2] == sup.MATCH_ALWAYS
+
+
+def test_matches_thresholds_gates_far_rows_only():
+    idx = np.array([0, 1, -1], dtype=np.int64)
+    sim = np.array([0.9, 0.2, 0.99], dtype=np.float32)
+    thresholds = np.array([0.5, 0.5, 0.0], dtype=np.float32)
+    assert sup.matches_thresholds(idx, sim, thresholds).tolist() == [True, False, False]
+    # No thresholds (an old head) matches everything, preserving old behaviour.
+    assert sup.matches_thresholds(idx, sim, None).tolist() == [True, True, True]
+
+
+def test_bundle_version_mismatches_reports_only_changed_sources():
+    bundle = {"meta": {"source_versions": {"maest": 1, "clap": 2}}}
+    assert sup.bundle_version_mismatches(bundle, {"maest": 1, "clap": 3}) == {
+        "clap": {"trained": 2, "current": 3}
+    }
+    assert sup.bundle_version_mismatches(bundle, {"maest": 1, "clap": 2}) == {}
+    # An unknown source in the current set is not a mismatch.
+    assert sup.bundle_version_mismatches(bundle, {"maest": 1}) == {}
+
+
 def _trained_head(tmp_path: Path, *, dim: int = 8, n_classes: int = 3):
     """Train a small real head on synthetic blobs and return its bundle."""
     x, y = _blobs(n_classes=n_classes, per_class=20, dim=dim)
@@ -731,3 +768,114 @@ def test_fanout_plans_then_moves_into_predicted_folders(tmp_path):
     assert (loose / "Folder0" / "t0.mp3").exists()
     assert (loose / "Folder1" / "t1.mp3").exists()
     assert not (loose / "t0.mp3").exists()
+
+
+def _fanout_scenario(tmp_path: Path, *, threshold_override: float | None = None):
+    """Train a real head on two class blobs and lay out two loose tracks."""
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    rng = np.random.default_rng(0)
+    centers = [rng.normal(size=768).astype(np.float32) for _ in range(2)]
+    infos = []
+    for c, center in enumerate(centers):
+        for i in range(10):
+            fp = f"train-{c}-{i}"
+            fc.put_maest(
+                fp,
+                center + 0.05 * rng.normal(size=768).astype(np.float32),
+                np.ones(519, np.float32),
+                version=1,
+            )
+            infos.append({"path": f"Root/Folder{c}/t{i}.mp3", "fingerprint": fp})
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+    if threshold_override is not None:
+        head = sup.load_head(str(tmp_path))
+        assert head is not None
+        head["meta"]["class_match_thresholds"] = [threshold_override] * 2
+        sup.save_head(
+            str(tmp_path),
+            head["payload"]["state_dict"],
+            head["meta"],
+            centroids=head["payload"].get("centroids"),
+        )
+
+    root = tmp_path / "lib"
+    loose = root / "loose"
+    loose.mkdir(parents=True)
+    fanout_infos = []
+    for c, center in enumerate(centers):
+        fp = f"loose-{c}"
+        fc.put_maest(fp, center, np.ones(519, np.float32), version=1)
+        (loose / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
+        fanout_infos.append({"path": f"loose/t{c}.mp3", "fingerprint": fp})
+    return fc, _fanout_deps(tmp_path, fc, root), loose, fanout_infos
+
+
+def test_fanout_leaves_a_track_far_from_every_folder(tmp_path):
+    # A threshold above any achievable cosine (max 1.0) gates everything: a
+    # track that resembles no learned folder must not be forced into one.
+    fc, fdeps, loose, fanout_infos = _fanout_scenario(
+        tmp_path, threshold_override=2.0
+    )
+    result = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=True,
+    )
+    assert result["ok"] is True
+    assert result["moved"] == 0
+    assert result["unmatched"] == 2
+    assert {e["status"] for e in result["plan"]} == {"unmatched"}
+    assert (loose / "t0.mp3").exists() and (loose / "t1.mp3").exists()
+    # Nothing moved, so there is nothing to undo.
+    assert fc.latest_move_batch() is None
+    assert undo_fanout_supervised(fdeps)["ok"] is False
+
+
+def test_fanout_journals_moves_and_undo_restores_them(tmp_path):
+    fc, fdeps, loose, fanout_infos = _fanout_scenario(tmp_path)
+    applied = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=True,
+    )
+    assert applied["moved"] == 2
+
+    batch = fc.latest_move_batch()
+    assert batch is not None and len(batch["moves"]) == 2
+    # The journal records the *actual* targets, so a collision suffix is undone
+    # back to the original name rather than left behind.
+    assert {m["source"] for m in batch["moves"]} == {
+        str(loose / "t0.mp3"),
+        str(loose / "t1.mp3"),
+    }
+
+    undone = undo_fanout_supervised(fdeps)
+    assert undone["ok"] is True and undone["restored"] == 2
+    assert (loose / "t0.mp3").exists() and (loose / "t1.mp3").exists()
+    assert not (loose / "Folder0" / "t0.mp3").exists()
+    assert not (loose / "Folder1" / "t1.mp3").exists()
+    # A batch is only undoable once.
+    assert fc.latest_move_batch() is None
+    assert undo_fanout_supervised(fdeps)["ok"] is False
+
+
+def test_import_refuses_a_stale_source_version(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    bundle = _trained_head(src)
+    assert bundle is not None
+    bundle["meta"]["source_versions"] = {"maest": 999}
+    with pytest.raises(sup.HeadVersionMismatch) as exc:
+        import_supervised_head(_deps(dst, FeatureCache(str(dst / "f.db"))), bundle)
+    assert exc.value.mismatches == {"maest": {"trained": 999, "current": 1}}
+    # The explicit override installs it anyway.
+    meta = import_supervised_head(
+        _deps(dst, FeatureCache(str(dst / "f.db"))),
+        bundle,
+        allow_mismatch=True,
+    )
+    assert meta["run_id"] == 1

@@ -83,19 +83,29 @@ means the track sits directly at the root.
 
 ## Folder head panel
 
-The right-column *Folder head* controls (`AnalysisCoordinator.bindPanel`):
+The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):
 
 - **Train folder view** sends the checked *Training folders* as `folders`; an empty
   selection means every root (the default). The checkbox tree is the folder tree from
   `GET /api/folders`, fetched lazily when the section is opened — never on startup —
   and rendered as `.head-folder-row` rows with collapsible children. *All roots*
-  clears the selection.
+  clears the selection. The checked folders are mirrored onto `model.trainFolders` and
+  persisted in `localStorage`, so a selection survives a reload.
 - **Imprint on a folder…** takes an absolute path, calls
   `POST /api/supervised/imprint/analyze`, then polls
   `GET /api/supervised/imprint/status` until `pending == 0` before *Review plan* and
   *Apply moves* run the ordinary `POST /api/supervised/fanout`. The ephemeral root is
   dropped via `POST /api/supervised/imprint/finish` after the moves land. *Apply moves*
-  is the only step that touches disk and always confirms first.
+  is the only step that touches disk and always confirms first. The plan note reports how
+  many tracks were left `unmatched` (too far from every learned folder to be placed).
+- **Undo moves** reverses the last applied fan-out batch through
+  `POST /api/supervised/fanout/undo`; it is enabled only while a batch is available
+  (`GET` on the same path) and disabled again after a successful undo.
+- **Discard** appears only when `GET /api/supervised/imprint/temp_roots` reports an
+  imprint a closed browser left behind; it drops those roots via
+  `POST /api/supervised/imprint/discard` without touching the files.
+- **Import** retries once with `force=1` when the server refuses a head trained on
+  different encoder versions, after a `confirm` explains the mismatch.
 - Head actions live in the collapsed *Folder head* `<details>`; the folder tree and the
   imprint controls are nested `<details>` so the panel stays short.
 

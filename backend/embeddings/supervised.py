@@ -81,6 +81,16 @@ DISPERSION_ALPHA = 2.0
 #: separate knob: the threshold is a display decision, not a loss weight.
 SPANNING_DISPERSION_THRESHOLD = 0.25
 
+#: Per-class match floor for folder prediction, as a percentile of the training
+#: rows' cosine to their own centroid. A fan-out only places a track whose winning
+#: similarity clears its class's floor, so a track that resembles none of the learned
+#: folders is left alone rather than forced into the nearest one.
+DEFAULT_MATCH_PERCENTILE = 5.0
+
+#: Sentinel match floor for a class with no training rows: cosine lives in
+#: ``[-1, 1]``, so ``-2`` can never gate a track (i.e. "always match").
+MATCH_ALWAYS = -2.0
+
 HEAD_FILENAME = "supervised_head.pt"
 META_FILENAME = "supervised_head.json"
 
@@ -705,11 +715,16 @@ def build_meta(
     source_versions: dict[str, int],
     stats: dict,
     train_folders: list[str] | None = None,
+    class_match_thresholds: Sequence[float] | None = None,
+    match_percentile: float = DEFAULT_MATCH_PERCENTILE,
 ) -> dict:
     """Sidecar payload; ``trained_at`` is informational, the rest is auditable.
 
     *train_folders* records which virtual folders the labels were drawn from
     (empty = the whole library), so a head can report what it was trained on.
+    *class_match_thresholds* is the per-class cosine floor (aligned with
+    ``class_names``) a fan-out uses to decide whether a track is close enough to
+    a learned folder to be placed in it.
     """
     return {
         "run_id": int(run_id),
@@ -724,6 +739,10 @@ def build_meta(
         "class_names": list(class_names),
         "train_folders": [str(f) for f in (train_folders or [])],
         "source_versions": {k: int(v) for k, v in source_versions.items()},
+        "class_match_thresholds": [
+            float(v) for v in (class_match_thresholds or [])
+        ],
+        "match_percentile": float(match_percentile),
         "stats": stats,
     }
 
@@ -792,6 +811,68 @@ def predict_folders(
         idx[start:stop] = best
         sim[start:stop] = s[np.arange(stop - start), best]
     return idx, sim
+
+
+def compute_match_thresholds(
+    projected: np.ndarray,
+    labels: np.ndarray,
+    centroids: np.ndarray,
+    n_classes: int,
+    *,
+    percentile: float = DEFAULT_MATCH_PERCENTILE,
+) -> np.ndarray:
+    """Per-class cosine floor from the training rows' similarity to their centroid.
+
+    For each class the floor is the *percentile* of its training rows' cosine to
+    that class's own centroid, so it is calibrated to how tightly the head actually
+    packs that folder. A diffuse class gets a lower floor than a tight one, and a
+    genuinely novel track — similar to no learned folder — falls below every class's
+    floor and is left unplaced. Classes with no training row get
+    :data:`MATCH_ALWAYS`, which can never gate a track.
+    """
+    x = np.asarray(projected, dtype=np.float32)
+    y = np.asarray(labels, dtype=np.int64).reshape(-1)
+    c = np.asarray(centroids, dtype=np.float32)
+    n = int(max(0, n_classes))
+    out = np.full(n, MATCH_ALWAYS, dtype=np.float32)
+    if (
+        x.ndim != 2
+        or c.ndim != 2
+        or x.shape[0] != y.shape[0]
+        or c.shape[0] != n
+    ):
+        return out
+    xn = _l2_normalize_rows(x)
+    for cls in range(n):
+        rows = xn[y == cls]
+        if rows.shape[0] == 0:
+            continue
+        sims = rows @ c[cls]
+        out[cls] = float(np.percentile(sims, float(percentile)))
+    return out
+
+
+def matches_thresholds(
+    idx: np.ndarray, sim: np.ndarray, thresholds: np.ndarray | None
+) -> np.ndarray:
+    """Per-row match decision: winning similarity clears its class's floor.
+
+    ``thresholds`` is aligned with the class list; a missing or short list (an old
+    head trained before the gate existed) matches everything, preserving the previous
+    fan-out behaviour. A row with no valid class never matches.
+    """
+    i = np.asarray(idx, dtype=np.int64).reshape(-1)
+    s = np.asarray(sim, dtype=np.float32).reshape(-1)
+    out = np.ones(i.shape[0], dtype=bool)
+    if thresholds is None:
+        return out
+    t = np.asarray(thresholds, dtype=np.float32).reshape(-1)
+    if t.size == 0:
+        return out
+    valid = (i >= 0) & (i < t.size)
+    out[valid] = s[valid] >= t[i[valid]]
+    out[~valid] = False
+    return out
 
 
 def folder_subpath(class_name: str) -> str:
@@ -863,6 +944,51 @@ def read_head_bundle(path: str) -> dict:
         if key not in payload:
             raise ValueError(f"head bundle is missing {key!r}")
     return payload
+
+
+def bundle_version_mismatches(
+    bundle: dict, current_versions: dict[str, int]
+) -> dict[str, dict[str, int]]:
+    """Sources whose recorded training version differs from *current_versions*.
+
+    A head trained before an encoder checkpoint bump produces rows in the wrong
+    space, so import must be able to refuse it. Only sources present in both the
+    bundle and the current set are compared; an unknown source is not a mismatch.
+    """
+    recorded = dict(bundle.get("meta", {}).get("source_versions", {}))
+    out: dict[str, dict[str, int]] = {}
+    for source, trained in recorded.items():
+        current = current_versions.get(source)
+        if current is None:
+            continue
+        try:
+            if int(current) != int(trained):
+                out[str(source)] = {
+                    "trained": int(trained),
+                    "current": int(current),
+                }
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+class HeadVersionMismatch(ValueError):
+    """An imported head was trained on different source versions.
+
+    Carries the per-source ``{trained, current}`` map so a caller can offer an
+    explicit override (``allow_mismatch``) rather than silently installing a head
+    that would produce poor rows.
+    """
+
+    def __init__(self, mismatches: dict[str, dict[str, int]]) -> None:
+        self.mismatches = mismatches
+        detail = ", ".join(
+            f"{s} (trained {v['trained']}, now {v['current']})"
+            for s, v in sorted(mismatches.items())
+        )
+        super().__init__(
+            f"head was trained on different encoder versions: {detail}"
+        )
 
 
 def install_head_bundle(

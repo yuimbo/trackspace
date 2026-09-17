@@ -906,6 +906,20 @@ def _source_version(deps: AnalysisDeps, source: str) -> int:
     return deps.maest_version
 
 
+def _current_source_versions(deps: AnalysisDeps) -> dict[str, int]:
+    """Encoder versions a freshly trained head records in its meta.
+
+    One owner for the source→version map so training and import compare against
+    exactly the same set (a mismatch on any of these makes a head stale).
+    """
+    return {
+        "clap": deps.clap_version,
+        "features": deps.features_version,
+        "maest": deps.maest_version,
+        "rhythm": deps.rhythm_version,
+    }
+
+
 def supervised_imprint_status(
     deps: AnalysisDeps, infos: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -1037,6 +1051,11 @@ def train_supervised(
     centroids, _centroid_counts = supervised_mod.compute_centroids(
         projected, labels, len(class_names)
     )
+    # Per-class cosine floor for the fan-out gate: a track is only placed when it
+    # is at least as close to a learned folder as that folder's own tracks are.
+    thresholds = supervised_mod.compute_match_thresholds(
+        projected, labels, centroids, len(class_names)
+    )
 
     run_id = supervised_mod.new_run_id(deps.data_dir)
     meta = supervised_mod.build_meta(
@@ -1048,12 +1067,8 @@ def train_supervised(
         input_weights=SUPERVISED_INPUT_WEIGHTS,
         class_names=class_names,
         train_folders=[str(f) for f in folders] if folders else [],
-        source_versions={
-            "clap": deps.clap_version,
-            "features": deps.features_version,
-            "maest": deps.maest_version,
-            "rhythm": deps.rhythm_version,
-        },
+        source_versions=_current_source_versions(deps),
+        class_match_thresholds=thresholds.tolist(),
         stats=result["stats"],
     )
     supervised_mod.save_head(
@@ -1220,6 +1235,8 @@ def supervised_head_info(deps: AnalysisDeps) -> dict[str, Any]:
         "input_sources": list(meta.get("input_sources", [])),
         "train_folders": list(meta.get("train_folders", [])),
         "source_versions": dict(meta.get("source_versions", {})),
+        "match_percentile": meta.get("match_percentile"),
+        "has_match_thresholds": bool(meta.get("class_match_thresholds")),
         "has_centroids": payload.get("centroids") is not None,
     }
 
@@ -1229,12 +1246,24 @@ def export_supervised_head(deps: AnalysisDeps) -> dict | None:
     return supervised_mod.head_bundle(deps.data_dir)
 
 
-def import_supervised_head(deps: AnalysisDeps, bundle: dict) -> dict:
+def import_supervised_head(
+    deps: AnalysisDeps, bundle: dict, *, allow_mismatch: bool = False
+) -> dict:
     """Install a bundle under a fresh local run id and re-project the library.
 
     The new run id makes every cached ``supervised`` row stale, so the next
     cluster pass re-projects the whole library through the imported head.
+
+    A head trained on a different encoder version would produce rows in the wrong
+    space, so the import is refused with
+    :class:`~backend.embeddings.supervised.HeadVersionMismatch` unless
+    *allow_mismatch* is set (the user has explicitly accepted it).
     """
+    mismatches = supervised_mod.bundle_version_mismatches(
+        bundle, _current_source_versions(deps)
+    )
+    if mismatches and not allow_mismatch:
+        raise supervised_mod.HeadVersionMismatch(mismatches)
     meta = supervised_mod.install_head_bundle(deps.data_dir, bundle)
     deps.feature_cache.set_meta(
         supervised_mod.RUN_ID_META_KEY, int(meta["run_id"])
@@ -1268,6 +1297,13 @@ def fanout_supervised(
     is skipped, a class that is the training root itself maps to no subfolder and
     is skipped, and a name collision gets a `` (n)`` suffix rather than
     overwriting a file.
+
+    A track only moves when it is *close enough* to a learned folder: its winning
+    similarity must clear that class's training-distance floor (see
+    :func:`supervised_mod.compute_match_thresholds`). A track that resembles no
+    learned folder is reported as ``unmatched`` and left where it is. On *apply*,
+    every move is journalled before it happens so :func:`undo_fanout_supervised`
+    can restore the previous layout.
     """
     head = supervised_mod.load_head(deps.data_dir)
     if head is None:
@@ -1279,6 +1315,12 @@ def fanout_supervised(
     class_names = list(meta.get("class_names", []))
     if centroids.shape[0] != len(class_names):
         return {"ok": False, "error": "head centroids do not match its folders"}
+    raw_thresholds = meta.get("class_match_thresholds")
+    thresholds = (
+        np.asarray(raw_thresholds, dtype=np.float32)
+        if isinstance(raw_thresholds, (list, tuple)) and raw_thresholds
+        else None
+    )
 
     infos = build_track_infos(folder_vpath, recursive)
     if not infos:
@@ -1287,6 +1329,7 @@ def fanout_supervised(
             "folder": folder_vpath,
             "tracks": 0,
             "moved": 0,
+            "unmatched": 0,
             "applied": bool(apply),
             "plan": [],
         }
@@ -1307,11 +1350,14 @@ def fanout_supervised(
 
     projected = supervised_mod.project(head, mat)
     idx, sim = supervised_mod.predict_folders(centroids, projected)
+    matched = supervised_mod.matches_thresholds(idx, sim, thresholds)
     root_abs = deps.resolve_virtual_path(folder_vpath)
 
     plan: list[dict[str, Any]] = []
     moved = 0
+    unmatched = 0
     errors: list[str] = []
+    batch_id = 0
     for i, vpath in enumerate(paths):
         c = int(idx[i])
         if c < 0:
@@ -1320,6 +1366,25 @@ def fanout_supervised(
         if not sub:
             continue
         src = deps.resolve_virtual_path(vpath)
+        if not bool(matched[i]):
+            # Too far from every learned folder to belong to one: leave it in
+            # place and report why, rather than force it into the nearest.
+            unmatched += 1
+            plan.append(
+                {
+                    "path": vpath,
+                    "folder": class_names[c],
+                    "target": vpath,
+                    "similarity": float(sim[i]),
+                    "threshold": (
+                        float(thresholds[c])
+                        if thresholds is not None and c < thresholds.size
+                        else None
+                    ),
+                    "status": "unmatched",
+                }
+            )
+            continue
         target = os.path.normpath(os.path.join(root_abs, sub, os.path.basename(src)))
         entry = {
             "path": vpath,
@@ -1332,14 +1397,19 @@ def fanout_supervised(
             plan.append(entry)
             continue
         if apply:
+            row_id = 0
             try:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
                 target = _unique_target(target)
+                if batch_id == 0:
+                    batch_id = deps.feature_cache.journal_begin()
+                row_id = deps.feature_cache.journal_add(batch_id, src, target)
                 shutil.move(src, target)
                 moved += 1
                 entry["target"] = deps.virtual_from_abs(target)
                 entry["status"] = "moved"
             except OSError as e:
+                deps.feature_cache.journal_remove(row_id)
                 entry["status"] = "error"
                 errors.append(f"{vpath}: {e}")
         else:
@@ -1351,9 +1421,51 @@ def fanout_supervised(
         "folder": folder_vpath,
         "tracks": len(paths),
         "moved": moved,
+        "unmatched": unmatched,
         "applied": bool(apply),
         "errors": errors,
         "plan": plan,
+    }
+
+
+def undo_fanout_supervised(deps: AnalysisDeps) -> dict[str, Any]:
+    """Reverse the most recent applied fan-out batch from the move journal.
+
+    Each moved file is restored to its original path, which also recovers the name
+    a collision suffix had changed. A target that is gone (already moved again) is
+    skipped, and an original path that is occupied is reported as an error rather
+    than clobbered. The batch is marked undone either way so a partial failure
+    does not strand the journal.
+    """
+    batch = deps.feature_cache.latest_move_batch()
+    if batch is None or not batch["moves"]:
+        return {"ok": False, "error": "no fan-out moves to undo"}
+
+    restored = 0
+    skipped = 0
+    errors: list[str] = []
+    for move in reversed(batch["moves"]):
+        source, target = move["source"], move["target"]
+        if not os.path.exists(target):
+            skipped += 1
+            continue
+        if os.path.exists(source):
+            errors.append(f"{target}: {source} already exists")
+            continue
+        try:
+            os.makedirs(os.path.dirname(source), exist_ok=True)
+            shutil.move(target, source)
+            restored += 1
+        except OSError as e:
+            errors.append(f"{target}: {e}")
+    deps.feature_cache.mark_batch_undone(batch["batch_id"])
+    return {
+        "ok": True,
+        "batch_id": batch["batch_id"],
+        "total": len(batch["moves"]),
+        "restored": restored,
+        "skipped": skipped,
+        "errors": errors,
     }
 
 

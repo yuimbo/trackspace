@@ -339,6 +339,11 @@ export class Model extends EventBus {
   clusterWeights: Record<string, number> = { ...DEFAULT_CLUSTER_WEIGHTS };
   clusterRevision: string | null = null;
   clustersAvailable = false;
+  /**
+   * Virtual folders the next head training run draws labels from; persisted.
+   * Empty means every root (the server's default).
+   */
+  trainFolders: string[] = [];
 
   /* ── Track structure ────────────────────────────────────────
    * Coarse intro/drop/break timestamps, fetched lazily per path (the structure
@@ -918,6 +923,7 @@ export class Model extends EventBus {
         clusterResolution: this.clusterResolution,
         colorByCluster: this.colorByCluster,
         clusterWeights: this.clusterWeights,
+        trainFolders: this.trainFolders,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -956,6 +962,10 @@ export class Model extends EventBus {
         this.clusterWeights = _migrateClusterWeights(
           (d as { clusterWeights?: unknown }).clusterWeights,
         );
+        const tf = (d as { trainFolders?: unknown }).trainFolders;
+        this.trainFolders = Array.isArray(tf)
+          ? tf.filter((p): p is string => typeof p === "string")
+          : [];
       }
     } catch {
       /* start fresh */

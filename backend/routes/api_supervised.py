@@ -87,7 +87,12 @@ def create_api_supervised_blueprint(
 
     @bp.route("/api/supervised/import", methods=["POST"])
     def api_supervised_import():
-        """Install an uploaded bundle under a fresh local run id."""
+        """Install an uploaded bundle under a fresh local run id.
+
+        A bundle trained on different encoder versions is refused with a 409 and a
+        ``source_mismatches`` map; the client can retry with ``force=1`` once the
+        user has accepted the mismatch.
+        """
         try:
             bundle, path = _read_upload("bundle")
         except ApiValidationError as e:
@@ -95,8 +100,26 @@ def create_api_supervised_blueprint(
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
         _cleanup_after(path)
+        force = (request.form.get("force") or "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
         try:
-            pipeline.import_supervised_head(analysis_deps, bundle)
+            pipeline.import_supervised_head(
+                analysis_deps, bundle, allow_mismatch=force
+            )
+        except supervised_mod.HeadVersionMismatch as e:
+            return (
+                jsonify(
+                    {
+                        "ok": False,
+                        "error": str(e),
+                        "source_mismatches": e.mismatches,
+                    }
+                ),
+                409,
+            )
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
         return jsonify({"ok": True, "head": pipeline.supervised_head_info(analysis_deps)})
@@ -141,6 +164,25 @@ def create_api_supervised_blueprint(
             )
         except ApiValidationError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
+        status = 200 if result.get("ok") else 400
+        return jsonify(result), status
+
+    @bp.route("/api/supervised/fanout/undo")
+    def api_supervised_fanout_undo_status():
+        """Whether a fan-out batch is available to undo, and how many moves."""
+        batch = analysis_deps.feature_cache.latest_move_batch()
+        return jsonify(
+            {
+                "ok": True,
+                "available": batch is not None and bool(batch["moves"]),
+                "total": len(batch["moves"]) if batch else 0,
+            }
+        )
+
+    @bp.route("/api/supervised/fanout/undo", methods=["POST"])
+    def api_supervised_fanout_undo():
+        """Reverse the most recent applied fan-out batch's moves on disk."""
+        result = pipeline.undo_fanout_supervised(analysis_deps)
         status = 200 if result.get("ok") else 400
         return jsonify(result), status
 

@@ -126,3 +126,25 @@ def test_imprint_status_requires_a_folder(tmp_path):
     r = client.get("/api/supervised/imprint/status")
     assert r.status_code == 400
     assert "folder" in r.get_json()["error"]
+
+
+def test_imprint_temp_roots_lists_and_discards_stale_roots(tmp_path):
+    external = tmp_path / "Downloads"
+    external.mkdir()
+    infos = [{"path": "d/t.mp3", "fingerprint": "fp"}]
+    client, roots, temp_roots, _ = _imprint_client(tmp_path, infos=infos)
+    body = client.post(
+        "/api/supervised/imprint/analyze", json={"path": str(external)}
+    ).get_json()
+    root_id = body["root_id"]
+
+    listed = client.get("/api/supervised/imprint/temp_roots").get_json()
+    assert listed == {
+        "ok": True,
+        "roots": [{"root_id": root_id, "path": str(external)}],
+    }
+
+    discarded = client.post("/api/supervised/imprint/discard").get_json()
+    assert discarded == {"ok": True, "discarded": 1}
+    assert root_id not in roots and root_id not in temp_roots
+    assert client.get("/api/supervised/imprint/temp_roots").get_json()["roots"] == []

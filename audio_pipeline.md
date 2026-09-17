@@ -598,7 +598,11 @@ without a retrain (`predict_folders`).
 - **Import** (`POST /api/supervised/import`) installs an uploaded bundle under a
   **fresh local run id**. The run id is the cache version for every `supervised`
   row, so reusing the source library's id would make the imported head collide with
-  rows already cached here; a fresh id forces a clean re-projection.
+  rows already cached here; a fresh id forces a clean re-projection. A bundle whose
+  recorded `source_versions` differ from the running encoders is **refused** with a
+  409 and a per-source `source_mismatches` map, because it would project the new
+  library into the wrong space; the client can retry with `force=1` once the user has
+  accepted the mismatch.
 - **Compare** (`POST /api/supervised/compare`) scores shared folders by centroid
   cosine. It reports `compatible: false` — and no similarity — when the two heads
   differ in `in_dim`, `input_sources` or `source_versions`, because a cosine across
@@ -611,6 +615,23 @@ without a retrain (`predict_folders`).
   **dry-run by default** — `apply` is the only step that touches disk — and a name
   collision gets a ` (n)` suffix rather than overwriting a file.
 
+**Only place a track that is close enough.** Nearest-centroid alone forces *every*
+track into *some* folder, even one that resembles none of the learned folders.
+Training therefore also stores a per-class **match floor**
+(`compute_match_thresholds`): the 5th percentile of that class's own training rows'
+cosine to its centroid. At fan-out, a track moves only when its winning similarity
+clears its class's floor; otherwise it is reported `unmatched` and left where it is.
+The floor is calibrated to how tightly the head packs each folder, so a diffuse folder
+gets a lower floor than a tight one, and an old head without floors (or a class with no
+training row) matches everything, preserving the previous behaviour.
+
+**Fan-out is journalled and undoable.** Every applied move is written to the
+`fanout_journal` table (source, target, batch id) *before* the file is moved, so
+`POST /api/supervised/fanout/undo` can restore the previous layout. The journal
+records the *actual* target, so a ` (n)` collision suffix is undone back to the
+original name; a batch is undoable once (`GET` on the same path reports whether one is
+available).
+
 **Imprinting an external folder.** A fan-out normally targets a folder inside the
 library. *Imprint* extends it to a folder elsewhere on disk: the target is registered as
 an **ephemeral root** so the scan/analysis/fan-out paths can resolve it, its tracks are
@@ -621,7 +642,9 @@ queues analysis, `GET /api/supervised/imprint/status` reports readiness, and
 `POST /api/supervised/imprint/finish` removes the root again. The ephemeral root is
 persisted by path in `roots.json` (`temp_roots`) so a restart mid-imprint can still
 finish and clean it up, and a target that contains an existing library root is refused
-rather than silently unregistering that root.
+rather than silently unregistering that root. `GET /api/supervised/imprint/temp_roots`
+lists the unfinished imprints a closed browser left behind and
+`POST /api/supervised/imprint/discard` drops them without touching the files.
 
 ### Source-weight Jacobian (live slider drag)
 

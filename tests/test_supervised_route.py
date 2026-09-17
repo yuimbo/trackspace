@@ -213,3 +213,70 @@ def test_fanout_plans_then_applies_folder_moves(tmp_path):
     ).get_json()
     assert applied["moved"] == 2
     assert not (loose / "t0.mp3").exists()
+
+
+def test_fanout_undo_route_reverses_the_last_moves(tmp_path):
+    fc, infos, centers = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    root = tmp_path / "lib"
+    loose = root / "loose"
+    loose.mkdir(parents=True)
+    fanout_infos = []
+    for c in (0, 1):
+        fp = f"loose-{c}"
+        fc.put_maest(fp, centers[c], np.ones(519, np.float32), version=1)
+        (loose / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
+        fanout_infos.append({"path": f"loose/t{c}.mp3", "fingerprint": fp})
+
+    deps = _deps(tmp_path, fc, root=root)
+    client, _ = _app(tmp_path, fc, fanout_infos, deps=deps)
+    client.post("/api/supervised/fanout", json={"folder": "loose", "apply": True})
+
+    status = client.get("/api/supervised/fanout/undo").get_json()
+    assert status == {"ok": True, "available": True, "total": 2}
+
+    undone = client.post("/api/supervised/fanout/undo").get_json()
+    assert undone["ok"] is True and undone["restored"] == 2
+    assert (loose / "t0.mp3").exists() and (loose / "t1.mp3").exists()
+    assert client.get("/api/supervised/fanout/undo").get_json()["available"] is False
+
+
+def test_import_refuses_a_stale_source_version(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    import torch
+
+    blob = client.get("/api/supervised/export").data
+    bundle = torch.load(io.BytesIO(blob), map_location="cpu", weights_only=False)
+    bundle["meta"]["source_versions"] = {"maest": 999}
+    buf = io.BytesIO()
+    torch.save(bundle, buf)
+    stale = buf.getvalue()
+
+    other = tmp_path / "other"
+    other.mkdir()
+    fc2, infos2, _ = _library(other)
+    client2, _ = _app(other, fc2, infos2)
+
+    refused = client2.post(
+        "/api/supervised/import",
+        data={"bundle": (io.BytesIO(stale), "head.pt")},
+        content_type="multipart/form-data",
+    )
+    assert refused.status_code == 409
+    body = refused.get_json()
+    assert body["ok"] is False
+    assert body["source_mismatches"]["maest"] == {"trained": 999, "current": 1}
+
+    # An explicit force imports it anyway.
+    forced = client2.post(
+        "/api/supervised/import",
+        data={"bundle": (io.BytesIO(stale), "head.pt"), "force": "1"},
+        content_type="multipart/form-data",
+    )
+    assert forced.status_code == 200
+    assert forced.get_json()["ok"] is True

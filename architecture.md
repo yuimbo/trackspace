@@ -42,6 +42,7 @@ frontend/src/
   command.ts              Command pattern (optimistic UI + undo)
   coordinators/           controller fragments, one concern per file:
                             analysis-coordinator   queue SSE + status polling + cluster panel
+                            head-coordinator       head train/export/import/compare + imprint + undo
                             embedding-coordinator  layout cache + SSE + position animations
                             folder-tree-coordinator HTMX tree, roots, highlights, overlay
                             canvas-interaction     pointer gestures + transforms + fit view
@@ -63,17 +64,18 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Backend entry + wiring | `backend/app.py` | ~640 | Helpers, deps assembly, `main()` |
 | Process state | `backend/trackspace_state.py` | ~75 | `TrackspaceState.create()` |
 | App factory | `backend/factory.py` | ~170 | `create_app()` + blueprints |
-| Analysis seam | `backend/services/analysis_pipeline.py` | ~1255 | Job handlers + `ClusterStore` + supervised training/projection |
+| Analysis seam | `backend/services/analysis_pipeline.py` | ~1630 | Job handlers + `ClusterStore` + supervised training/projection/undo |
 | Queue | `backend/jobs/` | ~900 | `queue.py` + `worker.py` + `kinds.py` |
 | ML / layout | `backend/embeddings/layout.py` | ~565 | Composite gather + orchestration |
 | Semantic weighting | `backend/embeddings/semantic_weighting.py` | ~265 | Folder/text directions |
-| Weak supervision | `backend/embeddings/supervised.py` | ~700 | Folder-labelled projection head + excerpt dispersion |
+| Weak supervision | `backend/embeddings/supervised.py` | ~1075 | Folder-labelled projection head, match floors, excerpt dispersion |
 | Track structure | `backend/embeddings/structure.py` | ~275 | Intro/drop/break from a loudness envelope |
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
-| Feature cache | `backend/embeddings/feature_cache.py` | ~380 | One generic `_SOURCES` registry |
+| Feature cache | `backend/embeddings/feature_cache.py` | ~560 | One generic `_SOURCES` registry + fan-out journal |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
-| Frontend orchestration | `frontend/src/controller.ts` | ~700 | Wiring, data loading, tag-write queue, preview, keyboard |
-| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~1050 | Queue SSE + clusters + folder-head controls |
+| Frontend orchestration | `frontend/src/controller.ts` | ~780 | Wiring, data loading, tag-write queue, preview, keyboard |
+| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~575 | Queue SSE + cluster panel + source weights |
+| Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | ~610 | Train/export/import/compare, imprint, fan-out undo |
 | Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~680 | Layout cache + SSE + animations |
 | Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | ~675 | HTMX tree + roots + highlights |
 | Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1040 | Pointer gestures + transforms |
@@ -253,7 +255,12 @@ with vitest coverage:
 - ✅ `lib/api.ts` — centralised `fetch` / `postJSON`; the controller stays the caller.
   Pulled forward so coordinators could import it without a circular dependency
   (`command.ts` shares it, passing `silent` where its manager toasts).
-- ✅ `AnalysisCoordinator` — job-queue SSE stream, status polling, cluster fetch/panel.
+- ✅ `AnalysisCoordinator` — job-queue SSE stream, status polling, cluster fetch/panel,
+  and the source-weight sliders.
+- ✅ `HeadCoordinator` — the folder-supervised head: train (and its persisted folder
+  selection), export/import/compare, the imprint flow, and the fan-out move undo. The
+  queue reaches it only through `syncTrainEnabled`, so the head panel is independent of
+  the queue + cluster panel.
 - ✅ `EmbeddingCoordinator` — layout cache, embedding SSE, projection polling, and all
   canvas position animations. Owns the shared `canvas.animPositions` overlay and the single
   animation frame, so tag-axis and embedding animations cannot fight over the overlay.
