@@ -1,60 +1,31 @@
 # Trackspace — engineering TODO
 
-Concrete, actionable work and deferred items. Design rules live in the docs:
-`architecture.md`, `ui_conventions.md`, `audio_pipeline.md`.
+Remaining, actionable work only. Completed work and the reasoning behind it live in
+the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
+`design-patterns.md`.
 
 ## User feedback
 
-- ✅ **Intro/drop/break detection, and a meaningful hover preview.** The `structure`
-  stage derives intro end, drop, and break timestamps from a whole-track loudness
-  envelope (no model) and caches them; the hover preview now seeks to the detected
-  drop instead of a fixed 40 %, and the tooltip shows the sections. See
-  `audio_pipeline.md` → *Track structure*.
-
 - [ ] Whacko idea? Add a 3d view for the embedding space?
-
-- ✅ **Structure chips + preview cycling.** The tooltip renders intro/drop/break as
-  chips (`lib/tooltip.ts`) and **D** cycles the hover preview through the sections a
-  track has (drop → break → intro), re-seeking the audio and highlighting the active
-  chip. The intro seeks to the newly detected `intro_start`, so lead-in silence is
-  skipped (`STRUCTURE_VERSION` 2).
-
-- ✅ **S/H over clusters, and S with nothing hovered.** `CanvasInteractionController.solo()`
-  isolates to a hovered cluster row like it already did for folders, `fitView()` fits the
-  cluster's members, and **s** with nothing hovered and no selection clears the
-  exclusions. See `ui_conventions.md` → *Hotkey system*.
-
-- ✅ **Hockey-card tooltip.** User tags (`4x`) and audio features get separate
-  stat-bar areas, and the genre-spanning flag sits with the cluster on its own line.
-  `buildTooltip` is pure; the canvas renders it. The flag is excerpt dispersion
-  (intro vs drop ≥ 0.25), not cluster-centroid distance — the badge's hover text says so.
-
-- ✅ **Head bundles + folder fan-out.** The head stores per-folder centroids in the
-  128-D space, so it exports/imports as a self-describing bundle, compares by
-  centroid cosine, and fans a folder out into the head's folder subfolders
-  (`POST /api/supervised/fanout`, dry-run by default). See `audio_pipeline.md` →
-  *Head bundles*. Open follow-ups: fan-out has no undo, and an imported head does
-  not check `source_versions`.
-
-- ✅ **Source weights panel: hover help + Reset split.** Each slider now carries a
-  hover description of what the source encodes
-  (`CLUSTER_WEIGHT_DESCRIPTIONS`), **Reset** undoes slider drags back to the
-  *applied* vector (local, no server round-trip), and **Defaults** loads
-  `DEFAULT_CLUSTER_WEIGHTS` and applies.
+- [ ] **Fan-out / imprint undo.** Fan-out moves files on disk with no way to reverse
+  from Trackspace, and the imprint's ` (n)` collision suffix loses the original name.
+  A move journal (source, target) written before the moves would let an "Undo moves"
+  button (and the imprint finish step) restore the previous layout. Files:
+  `backend/services/analysis_pipeline.py` (`fanout_supervised`), a new journal table.
+- [ ] **Imprint cleanup on abandon.** If the user analyses an imprint target and then
+  never applies or finishes (browser closed), the ephemeral root persists in
+  `roots.json`. A "Discard" action (and a startup prompt for stale `temp_roots`)
+  would remove it; the `temp_roots` marker is already persisted.
+- [ ] **Imported head does not check `source_versions`.** `compare_heads` reports
+  compatibility but `install_head_bundle` installs regardless, so a head trained on an
+  older encoder checkpoint silently produces poor rows until the next retrain. Validate
+  `source_versions` on import and warn (or refuse) on a mismatch.
+  Files: `backend/embeddings/supervised.py` (`install_head_bundle`),
+  `backend/services/analysis_pipeline.py` (`import_supervised_head`).
 
 ### Source-weight comparability (normalising the source blocks)
 
-The six source blocks have very different global geometry (a 519-D near-one-hot
-logit block vs a 14-D DSP block vs a 512-D CLAP embedding), so a weight of `0.5`
-does not mean the same thing per source. That is a plausible reason a slider can
-look inert: it is moving a block whose distances are already tiny (or huge) relative
-to the others.
-
-The layout currently only L2-normalises each row and scales by `sqrt(w)`; the
-clustering path additionally standardises each column first
-(`clustering.build_weighted_matrix`). The layout deliberately omits standardisation
-because column statistics depend on the current track set — a *stateful* recipe makes a
-track's projection drift as the library grows (see the `layout.py` docstring).
+The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 - [ ] **Frozen reference normalisation.** Fit the per-source transform once on a
   **frozen reference set** and cache it in a chart artifact, then apply it
@@ -118,12 +89,19 @@ track's projection drift as the library grows (see the `layout.py` docstring).
       "Computing layout…". The base `layout` phase itself is still one opaque step:
       neither the sklearn fallback nor mlx-vis exposes iteration callbacks, so a percent
       needs a custom optimize loop (openTSNE's `optimize` is a generator).
-
 - [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1040 lines, the
       largest frontend file). The ~200 lines of fit-view math (`_vpFromWorldBounds`,
       `_computeFitVP`, `_p80Radius`, `_fitViewToFolderPercentile`, `_fitViewToTracks`,
       `fitView`, `effectiveHoveredFolderPrefix`) are the natural seam into a
       `canvas-fit-view.ts`.
+- [ ] **Optional: split the folder-head panel out of `analysis-coordinator.ts`.**
+      Head controls (train/export/import/compare, the training-folder tree, and the
+      imprint flow) are now a separate concern from the job queue + clusters; the
+      file is ~1050 lines. A `head-coordinator.ts` taking the same structural
+      deps would restore one-concern-per-file.
+- [ ] **Training-folder selection is not persisted.** `_trainFolders` resets to "all
+      roots" on reload, so a user who always trains on one root re-checks it every
+      session. Persist the checked virtual folders in `model.saveLS()`.
 - [ ] **Optional: `lib/event-bus.ts`, `model/persistence.ts`, `api/types.ts`.**
       Extract the EventBus base, localStorage persistence, and shared API response
       types out of `model.ts` / `lib/api.ts`.
@@ -131,8 +109,7 @@ track's projection drift as the library grows (see the `layout.py` docstring).
       `coordinators/canvas-interaction.ts`, and `coordinators/analysis-coordinator.ts`.
 - [ ] **Structure preview follow-up.** `_fetchStructure` (`controller.ts`) fetches one
       path per hover — a batched request for the visible tracks would cut the
-      round-trips. (Cycling sections on **D** and the chip timeline are done; see
-      the ✅ entry under *User feedback*.)
+      round-trips.
 
 ### Backend
 
@@ -162,59 +139,32 @@ track's projection drift as the library grows (see the `layout.py` docstring).
 Ordered roughly by expected value. Each is additive to the cached feature store —
 none require re-running an encoder over the library.
 
-- ✅ **Weak supervision.** Folder labels now train a small 128-D projection head over
-  the cached vectors, exposed as the `supervised` source for both the map and the
-  clusters. Per-excerpt MAEST vectors are cached (`maest_excerpts`) and drive
-  hard-negative mining plus per-track label-confidence weighting. See
-  `audio_pipeline.md` → *Weak supervision*.
-- **Playlist labels.** Playlists do not exist in the product yet; when they do, they
-  are another noisy label source for the same head (the training recipe already takes
+- [ ] **Playlist labels.** Playlists do not exist in the product yet; when they do,
+  they are another noisy label source for the same head (the training recipe already takes
   a label vector, so this is a data-plumbing change, not a new model).
-- **Per-excerpt analysis.** Excerpt vectors are cached and used for mining, and the
-  *user-facing* genre-spanning flag (intro vs drop) now rides `/api/tracks/structure`
-  and the tooltip (`supervised.is_genre_spanning`).
-- ✅ **Text search.** `GET /api/search?q=…&limit=` encodes the query with CLAP's text
-  tower (`generate_text_embeddings`) and ranks cached CLAP audio embeddings by cosine
-  similarity; the Search panel turns the hits into the canvas selection and clicking a
-  result fits the viewport to it. Unblocked by the CLAP checkpoint fix below (re-run the
-  CLAP stage first).
-- **Search follow-ups.** Folder-scoped search (`folder` param), search-as-you-type
+- [ ] **Search follow-ups.** Folder-scoped search (`folder` param), search-as-you-type
   debounce, and a minimum-score threshold / "select all" affordance. Fit-on-focus is done
   (`CanvasInteractionController.fitViewToPaths`). Perf: `/api/search` calls the *uncached*
   `build_track_infos_fn` (`backend/routes/api_search.py`), so every query re-reads the
   whole library — use `track_infos_cached` (with `library_mtime_signature`) or resolve only
   the candidate paths, as `/api/tracks/structure` now does.
-- **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
+- [ ] **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
   6-genre validation it reached 96.6% purity.
-- **Persist cluster results.** `ClusterStore` is in-memory; a restart recomputes in
+- [ ] **Persist cluster results.** `ClusterStore` is in-memory; a restart recomputes in
   seconds at current library size. Persist only if that stops being true.
 
 ## Analysis performance
 
 Making the pipeline faster. Ordered roughly by expected value; measure before and after.
+Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage throughput*.
 
 ### Parallelism
 
-- ✅ **Scale the `features` stage horizontally.** Done, but *not* with threads:
-  the work is CPU-bound and independent per track, yet madmom's BLSTM forward pass
-  is GIL-bound, so more features *threads* are slower, not faster (one track:
-  0.8 s at 1 thread → 2.5 s at 2 → 10.5 s at 4; the decode is ~10 ms, so it is
-  not the cause). The stage now runs each track in a **process** pool
-  (`backend/services/features_worker.py`; `TRACKSPACE_FEATURES_WORKERS`, default
-  4). Measured on a 64-track real sample: 51 → 91 → 134 → 140 tracks/min at
-  1/2/4/8 processes (`tests/profile_features_workers.py`). The pool uses `spawn`
-  (not `fork`) because the parent is multi-threaded, and each child re-imports
-  `backend.app` (~3.5 s, once, parallel) before `warm()` builds its processors.
-- [x] **`_DECODE_LOCK` contention is not material — measured.** Decode is ~14 ms
-  per 15 s / 48 kHz segment and ~300–450 ms for a whole 6-minute track at 2205 Hz,
-  so even a fully serialised open is a small fraction of every stage (MAEST is
-  ~0.4 s/track, CLAP ~0.14). Do not instrument it; the lock's cost is the SIGBUS
-  it prevents, not throughput. See `audio_pipeline.md` → *Per-stage throughput*.
 - [ ] **Features process pool: cut child startup.** Each spawned child re-imports
-  `backend.app` (hence torch, ~3.5 s) before `warm()` builds its madmom
-  processors. A `forkserver` pool with a lightweight preload, or a dedicated
-  worker entrypoint, would remove that; only worth it if the server is restarted
-  often relative to library size.
+      `backend.app` (hence torch, ~3.5 s) before `warm()` builds its madmom
+      processors. A `forkserver` pool with a lightweight preload, or a dedicated
+      worker entrypoint, would remove that; only worth it if the server is restarted
+      often relative to library size.
 - [ ] **Tune `scan`.** `batch_size=8` with `TRACKSPACE_FPCALC_CONCURRENCY`
       (default `min(8, cpus)`). Measure whether fpcalc subprocesses or the SQLite
       writes are the limit and raise only the one that is.
@@ -254,19 +204,6 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 ### Dependencies
 
-- [x] **CLAP text/audio alignment was near-degenerate — fixed by switching the
-      checkpoint.** The `laion/larger_clap_music` HF conversion is broken: both towers
-      collapse to near-constant vectors (text-vs-text cosine ≈ 0.999, audio-vs-audio
-      ≈ 0.95–0.996, text-vs-audio ≈ 0.00), so the canonical HF
-      `zero-shot-audio-classification` pipeline returns a uniform softmax (0.0834 across
-      12 labels on a techno track; white noise, silence and a sine tone give *identical*
-      outputs). Confirmed to be the checkpoint, not us: exact weight loading, correct
-      `audio=` processor keyword, valid log-mel, CPU=MPS, transformers 4.57=5.3, and an
-      open upstream report (HF discussion #2, Dec 2023). `laion/clap-htsat-unfused` and
-      `laion/larger_clap_music_and_speech` both discriminate; the latter is the
-      music-trained one and is now `CLAP_MODEL_ID` (`EMBEDDING_VERSION` 2 → 3).
-      Real-track check: a techno track ranks "techno" 0.59 > "deep house" 0.36; a
-      deep-house track ranks "deep house" 0.55 > "ambient" 0.41 > "techno" 0.25.
 - [ ] **Structure v2 backfill.** `STRUCTURE_VERSION` 1 → 2 (added `intro_start`)
       blanks the cached v1 blobs on the next backend start, so the structure stage
       re-analyses the library once (~0.12 s/track, background). Until it drains,
@@ -280,7 +217,7 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
       CLAP backfill drains, or its `supervised` block is misleading.
 - [ ] **`transformers` is installed at 5.3** against a `>=4.40` floor — a major bump.
       Pin a tested floor and smoke-test the CLAP text/audio paths. (The
-      `larger_clap_music` checkpoint bug above reproduces on 4.57.1, so it is a broken
+      `larger_clap_music` checkpoint bug reproduces on 4.57.1, so it is a broken
       conversion, not a 5.x regression.)
 - [ ] **`madmom` is unmaintained** (last release 2020) and already emits
       `pkg_resources` (removal slated) and NumPy 2.4 `align=0` deprecations. It will
@@ -294,12 +231,6 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
 
 ### Profiling & benchmarks
 
-- ✅ **Per-stage throughput harness.** `tests/profile_pipeline.py` drives the real
-      handlers through the durable queue over a deterministic sample and reports
-      s/track + tracks/min per stage, with a best-run summary, skip reasons, and a
-      non-destructive scratch-cache design. Baseline (busy machine, relative only):
-      scan 0.16, features 0.39, structure 0.12, **maest 0.39–0.43**, clap 0.14
-      s/track. Recorded in `audio_pipeline.md` → *Per-stage throughput*.
 - [ ] **CLAP `max_batch` sweep.** Measured ~0.14 s/track (~446 tracks/min) at the
       default `batch_size=4` → 12 segments, so CLAP is *not* decode-dominated and
       is one of the fastest stages. Low priority; sweep `max_batch` vs MPS memory
@@ -323,9 +254,5 @@ Making the pipeline faster. Ordered roughly by expected value; measure before an
       *Acceleration*.
 - [ ] **Peak RSS / GPU memory.** No memory baseline exists; capture peak RSS and MPS
       allocation per stage before adding workers or batches.
-- ✅ **Decode cost breakdown.** ~14 ms per 15 s/48 kHz segment and ~300–450 ms for
-      a whole 6-minute track at 2205 Hz; an `ffmpeg` subprocess is equal on whole
-      tracks but ~2.7× slower per segment (process spawn). Decode is not the
-      bottleneck. See *Per-stage throughput* in `audio_pipeline.md`.
 - [ ] **Cluster/projection timing at scale.** `DEFAULT_RESOLUTIONS` and k=20 were
       calibrated at ~9.5k tracks; re-measure once the library doubles.

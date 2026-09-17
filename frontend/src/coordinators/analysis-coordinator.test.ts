@@ -89,6 +89,14 @@ const PANEL_HTML = `
   <button id="btn-default-weights"></button>
   <button id="btn-rebuild-clusters"></button>
   <button id="btn-train-supervised"></button>
+  <div id="head-train-folders"></div>
+  <details id="head-train-folders-details"></details>
+  <button id="btn-head-folders-all"></button>
+  <input id="head-imprint-path" />
+  <button id="btn-imprint-analyze"></button>
+  <button id="btn-imprint-plan"></button>
+  <button id="btn-imprint-apply"></button>
+  <p id="imprint-note"></p>
 `;
 
 interface Harness {
@@ -680,5 +688,111 @@ describe("AnalysisCoordinator source weights", () => {
       }),
     );
     expect($train.disabled).toBe(true);
+  });
+});
+
+// ─── Folder head: training selection + imprint ───────────────
+
+describe("AnalysisCoordinator folder head", () => {
+  function openTrainFolders(coord: AnalysisCoordinator): void {
+    coord.bindPanel();
+    const $details = document.getElementById(
+      "head-train-folders-details",
+    ) as HTMLDetailsElement;
+    $details.open = true;
+    $details.dispatchEvent(new Event("toggle"));
+  }
+
+  it("trains on the checked folders only", async () => {
+    const { coord, fetchSpy } = makeHarness((url) =>
+      url === "/api/folders"
+        ? {
+            roots: [
+              {
+                name: "Music",
+                path: "abc",
+                children: [{ name: "Techno", path: "abc/Techno" }],
+              },
+            ],
+          }
+        : {},
+    );
+    openTrainFolders(coord);
+    await flush();
+
+    const techno = document.querySelector<HTMLInputElement>(
+      '#head-train-folders input[data-folder="abc/Techno"]',
+    )!;
+    expect(techno).toBeTruthy();
+    techno.checked = true;
+    techno.dispatchEvent(new Event("change"));
+
+    document.getElementById("btn-train-supervised")!.click();
+    await flush();
+
+    const post = fetchSpy.mock.calls.find(
+      ([u, init]) =>
+        String(u) === "/api/supervised/train" &&
+        (init as RequestInit | undefined)?.method === "POST",
+    )!;
+    const body = JSON.parse((post[1] as RequestInit).body as string);
+    expect(body).toEqual({ folders: ["abc/Techno"] });
+  });
+
+  it("analyzes, plans and applies an imprint", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const { coord, fetchSpy } = makeHarness((url) => {
+      if (url.startsWith("/api/supervised/imprint/analyze")) {
+        return {
+          ok: true,
+          root_id: "tmp",
+          folder: "tmp/Downloads",
+          tracks: 3,
+          analyzed: 3,
+          pending: 0,
+        };
+      }
+      if (url.startsWith("/api/supervised/fanout")) {
+        return {
+          ok: true,
+          tracks: 3,
+          moved: 3,
+          plan: [{ target: "tmp/Downloads/Techno/a.mp3", folder: "abc/Techno" }],
+        };
+      }
+      return {};
+    });
+    coord.bindPanel();
+    const $path = document.getElementById(
+      "head-imprint-path",
+    ) as HTMLInputElement;
+    $path.value = "/tmp/Downloads";
+
+    document.getElementById("btn-imprint-analyze")!.click();
+    await flush();
+    expect(document.getElementById("imprint-note")!.textContent).toContain("ready");
+
+    document.getElementById("btn-imprint-plan")!.click();
+    await flush();
+    expect(document.getElementById("imprint-note")!.textContent).toContain(
+      "Planned 3 tracks",
+    );
+
+    document.getElementById("btn-imprint-apply")!.click();
+    await flush();
+    expect(document.getElementById("imprint-note")!.textContent).toContain(
+      "Moved 3",
+    );
+
+    const fanout = fetchSpy.mock.calls
+      .filter(([u]) => String(u).startsWith("/api/supervised/fanout"))
+      .at(-1)!;
+    const body = JSON.parse((fanout[1] as RequestInit).body as string);
+    expect(body).toEqual({ folder: "tmp/Downloads", apply: true });
+    // The ephemeral imprint root is dropped once the moves are done.
+    const finish = fetchSpy.mock.calls.find(
+      ([u]) => String(u) === "/api/supervised/imprint/finish",
+    );
+    expect(finish).toBeDefined();
   });
 });

@@ -14,6 +14,7 @@ from werkzeug.exceptions import HTTPException
 
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
+from backend.routes.api_imprint import create_api_imprint_blueprint
 from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
 from backend.routes.api_supervised import create_api_supervised_blueprint
@@ -90,6 +91,7 @@ class TrackspaceBlueprintDeps:
     emit_scan_progress_events: Callable[..., None]
     # Folders
     roots: MutableMapping[str, str]
+    temp_roots: set[str]
     folder_tree: Callable[..., dict[str, Any]]
     add_root: Callable[[str], tuple[bool, str]]
     remove_root: Callable[[str], bool]
@@ -232,6 +234,23 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
         create_api_supervised_blueprint(
             analysis_deps=deps.analysis_deps,
             build_track_infos_fn=deps.build_track_infos_fn,
+        )
+    )
+    app.register_blueprint(
+        create_api_imprint_blueprint(
+            analysis_deps=deps.analysis_deps,
+            roots=deps.roots,
+            temp_roots=deps.temp_roots,
+            add_root=deps.add_root,
+            remove_root=deps.remove_root,
+            schedule_root_watch=deps.schedule_root_watch,
+            unschedule_root_watch=deps.unschedule_root_watch,
+            save_roots_state=deps.save_roots_state,
+            build_track_infos_fn=deps.build_track_infos_fn,
+            enqueue_library_work_fn=deps.enqueue_library_work,
+            virtual_from_abs=deps.virtual_from_abs,
+            job_queue=deps.job_queue,
+            workers=deps.workers,
         )
     )
     app.register_blueprint(

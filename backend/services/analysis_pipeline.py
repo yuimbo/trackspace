@@ -887,13 +887,84 @@ def _excerpts_aligned(
     ]
 
 
+#: Sources the supervised head consumes: a track needs all of them before it can be
+#: placed, and an imprint must analyse the target folder for exactly these. ``features``
+#: is deliberately absent — its weight is 0 in ``SUPERVISED_INPUT_WEIGHTS``.
+SUPERVISED_INPUT_SOURCES: tuple[str, ...] = (
+    "maest",
+    "maest_logits",
+    "rhythm",
+    "clap",
+)
+
+
+def _source_version(deps: AnalysisDeps, source: str) -> int:
+    if source == "clap":
+        return deps.clap_version
+    if source == "rhythm":
+        return deps.rhythm_version
+    return deps.maest_version
+
+
+def supervised_imprint_status(
+    deps: AnalysisDeps, infos: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """How many of *infos* are fully analysed for a folder projection.
+
+    Readiness means every input source the head consumes is cached, because
+    :func:`build_input_matrix` zero-fills a missing source: a half-analysed track
+    would still be placed, just wrongly. The count drives the imprint progress UI.
+    """
+    fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
+    total = len(infos)
+    if not fps:
+        return {"tracks": total, "analyzed": 0, "pending": total, "ready": False}
+    have = set(fps)
+    for source in SUPERVISED_INPUT_SOURCES:
+        have &= set(
+            deps.feature_cache.get_all(
+                source, list(have), version=_source_version(deps, source)
+            )
+        )
+    return {
+        "tracks": total,
+        "analyzed": len(have),
+        "pending": total - len(have),
+        "ready": total > 0 and len(have) == total,
+    }
+
+
+def _gather_selected_infos(
+    build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+    folders: Sequence[str] | None,
+) -> list[dict[str, Any]]:
+    """Track infos for the union of *folders* (recursive), or the whole library.
+
+    Folders are virtual paths (a root id or a subtree). Overlapping selections
+    are deduped by path so a track under two selected folders is counted once.
+    """
+    if not folders:
+        return build_track_infos("", True)
+    by_path: dict[str, dict[str, Any]] = {}
+    for folder in folders:
+        for info in build_track_infos(str(folder), True):
+            by_path.setdefault(str(info.get("path", "")), info)
+    return sorted(by_path.values(), key=lambda t: t["path"])
+
+
 def train_supervised(
     deps: AnalysisDeps,
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+    folders: Sequence[str] | None = None,
     on_progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     """Train the folder-supervised head and (re)write every supervised row.
+
+    *folders* restricts the training labels to those virtual folders (a root id or
+    a subtree); ``None`` or empty trains on the whole library. Tracks outside the
+    selection still get a ``supervised`` row from the trained head — the selection
+    chooses what the head *learns* from, not what it is applied to.
 
     Returns handler detail: training stats on success, or ``{"skipped": True,
     "reason": ...}`` when there are too few labelled folders. Exceptions
@@ -905,7 +976,7 @@ def train_supervised(
         if on_progress is not None:
             on_progress(phase, done, total)
 
-    infos = build_track_infos("", True)
+    infos = _gather_selected_infos(build_track_infos, folders)
     _progress("gather", 0, len(infos))
     paths, blocks, _logits = gather_source_blocks(
         deps, infos, clap_version=deps.clap_version
@@ -976,6 +1047,7 @@ def train_supervised(
         input_sources=used,
         input_weights=SUPERVISED_INPUT_WEIGHTS,
         class_names=class_names,
+        train_folders=[str(f) for f in folders] if folders else [],
         source_versions={
             "clap": deps.clap_version,
             "features": deps.features_version,
@@ -1094,9 +1166,22 @@ def make_supervised_handler(
         out: dict[int, JobResult] = {}
         if not jobs:
             return out
+        # The folder selection rides on the singleton job's payload. A coalesced
+        # re-request keeps the pending row (and its selection), so the UI disables
+        # the Train button while a run is outstanding rather than relying on a
+        # second click to change it.
+        folders: list[str] | None = None
+        for job in jobs:
+            raw = job.payload.get("folders")
+            if isinstance(raw, list) and raw:
+                folders = [str(x) for x in raw]
+                break
         try:
             stats = train_supervised(
-                deps, build_track_infos=build_track_infos, on_progress=emit
+                deps,
+                build_track_infos=build_track_infos,
+                folders=folders,
+                on_progress=emit,
             )
         except Exception as e:
             log.exception("Supervised training failed")
@@ -1133,6 +1218,7 @@ def supervised_head_info(deps: AnalysisDeps) -> dict[str, Any]:
         "n_classes": len(meta.get("class_names", [])),
         "in_dim": meta.get("in_dim"),
         "input_sources": list(meta.get("input_sources", [])),
+        "train_folders": list(meta.get("train_folders", [])),
         "source_versions": dict(meta.get("source_versions", {})),
         "has_centroids": payload.get("centroids") is not None,
     }
@@ -1411,15 +1497,25 @@ def enqueue_clustering(queue: JobQueue, *, reason: str = "library-change") -> in
     )
 
 
-def enqueue_supervised(queue: JobQueue, *, reason: str = "manual") -> int:
-    """Request one library-wide supervised-head training run.
+def enqueue_supervised(
+    queue: JobQueue,
+    *,
+    reason: str = "manual",
+    folders: Sequence[str] | None = None,
+) -> int:
+    """Request one supervised-head training run.
 
-    Like clustering it is a singleton on the ``"library"`` dedupe key: retraining
-    is whole-library by nature, so repeated requests must coalesce.
+    Like clustering it is a singleton on the ``"library"`` dedupe key, because a
+    retrain is whole-head by nature and repeated requests must coalesce. *folders*
+    restricts the training labels to those virtual folders; the payload carries the
+    selection so the handler knows what to train on.
     """
+    payload: dict[str, Any] = {"reason": reason}
+    if folders:
+        payload["folders"] = [str(f) for f in folders]
     return queue.enqueue_many(
         KIND_SUPERVISED,
-        [("library", {"reason": reason})],
+        [("library", payload)],
         priority=150,
         requeue_terminal=True,
     )

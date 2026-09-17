@@ -237,12 +237,16 @@ def create_api_jobs_blueprint(
         """Queue one folder-supervised head training run.
 
         Library-wide and idempotent: the job dedupes on ``"library"``, so a
-        double-click cannot queue two training runs. Skipped (too few labelled
-        folders) is reported by the job's own detail, not here.
+        double-click cannot queue two training runs. ``folders`` (optional) restricts
+        the training labels to those virtual folders; omitted/empty trains on all
+        roots. Skipped (too few labelled folders) is reported by the job's own
+        detail, not here.
         """
-        n = enqueue_supervised(job_queue, reason="manual")
+        data = parse_json_body(required=False)
+        folders = opt_str_list(data, "folders", max_items=256)
+        n = enqueue_supervised(job_queue, reason="manual", folders=folders or None)
         workers.wake(KIND_SUPERVISED)
-        return jsonify({"ok": True, "queued": n})
+        return jsonify({"ok": True, "queued": n, "folders": folders})
 
     @bp.route("/api/clusters/track")
     def api_clusters_track():

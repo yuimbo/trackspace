@@ -269,11 +269,16 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
 
     def _save_roots_state() -> None:
-        roots_save(state.roots, state.roots_state_path)
+        roots_save(state.roots, state.roots_state_path, temp_roots=state.temp_roots)
 
 
     def _load_roots_state(default_root: str | None) -> None:
-        roots_load(state.roots, state.roots_state_path, default_root=default_root)
+        roots_load(
+            state.roots,
+            state.roots_state_path,
+            default_root=default_root,
+            temp_roots=state.temp_roots,
+        )
 
 
     def _root_and_rel_from_virtual(vpath: str) -> tuple[str, str]:
@@ -643,6 +648,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             build_track_list_service=build_track_list_service,
             emit_scan_progress_events=emit_scan_progress_events,
             roots=state.roots,
+            temp_roots=state.temp_roots,
             folder_tree=_folder_tree,
             add_root=_add_root,
             remove_root=_remove_root,

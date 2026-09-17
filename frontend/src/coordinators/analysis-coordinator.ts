@@ -36,6 +36,25 @@ export interface AnalysisDeps {
   applyApproximateWeights?(weights: Record<string, number>): boolean;
   /** Fetch the source-weight Jacobian the approximation needs (optional). */
   fetchWeightJacobian?(): void;
+  /** Refresh the folder tree after an imprint root is added or removed. */
+  onRootsChanged?(): Promise<void> | void;
+}
+
+/** One node of ``GET /api/folders`` — the training-folder selector's tree. */
+interface FolderNode {
+  name: string;
+  path: string;
+  children?: FolderNode[];
+}
+
+/** Shape of ``GET /api/supervised/imprint/status``. */
+interface ImprintStatus {
+  ok: boolean;
+  tracks?: number;
+  analyzed?: number;
+  pending?: number;
+  ready?: boolean;
+  error?: string;
 }
 
 /** Shape of ``GET /api/clusters``. */
@@ -57,6 +76,17 @@ export class AnalysisCoordinator {
   private _jobsEventSource: EventSource | null = null;
   private _clusterFetchPending = false;
 
+  /** Checked virtual folders for the next training run; empty = all roots. */
+  private _trainFolders = new Set<string>();
+  /** Last ``GET /api/folders`` roots, kept for re-render after "All roots". */
+  private _trainFolderRoots: FolderNode[] = [];
+  /** Ephemeral imprint root id, removed when the imprint finishes. */
+  private _imprintRootId: string | null = null;
+  /** Virtual folder of the current imprint target, for status/plan/apply. */
+  private _imprintFolder: string | null = null;
+  /** Analysis-status poll for the imprint target. */
+  private _imprintTimer: number | null = null;
+
   constructor(private deps: AnalysisDeps) {}
 
   /** Subscribe to the queue stream and pull the initial queue/cluster state. */
@@ -68,6 +98,7 @@ export class AnalysisCoordinator {
 
   stop(): void {
     this._closeJobStream();
+    this._stopImprintPoll();
   }
 
   /** Wire the cluster panel controls (colour toggle, resolution slider, rebuild). */
@@ -147,9 +178,36 @@ export class AnalysisCoordinator {
         void this._compareHead($compareFile),
       );
     }
-    const $fanout = document.getElementById("btn-fanout-head");
-    if ($fanout) {
-      $fanout.addEventListener("click", () => void this._fanoutHead());
+    const $foldersAll = document.getElementById("btn-head-folders-all");
+    if ($foldersAll) {
+      $foldersAll.addEventListener("click", () => {
+        this._trainFolders.clear();
+        this._renderTrainingFolders();
+      });
+    }
+    // The folder tree can be large, so fetch it when the selector is opened.
+    const $foldersDetails = document.getElementById("head-train-folders-details");
+    if ($foldersDetails) {
+      $foldersDetails.addEventListener("toggle", () => {
+        if (($foldersDetails as HTMLDetailsElement).open) {
+          void this._loadTrainingFolders();
+        }
+      });
+    }
+
+    const $imprintAnalyze = document.getElementById("btn-imprint-analyze");
+    if ($imprintAnalyze) {
+      $imprintAnalyze.addEventListener("click", () =>
+        void this._imprintAnalyze(),
+      );
+    }
+    const $imprintPlan = document.getElementById("btn-imprint-plan");
+    if ($imprintPlan) {
+      $imprintPlan.addEventListener("click", () => void this._imprintFanout(false));
+    }
+    const $imprintApply = document.getElementById("btn-imprint-apply");
+    if ($imprintApply) {
+      $imprintApply.addEventListener("click", () => void this._imprintFanout(true));
     }
 
     this._renderWeightSliders();
@@ -312,12 +370,242 @@ export class AnalysisCoordinator {
 
   /** Queue one folder-supervised head training run. */
   private async _trainSupervised(): Promise<void> {
+    const folders = [...this._trainFolders];
     try {
-      await postJSON("/api/supervised/train", {});
-      toast("Training folder-supervised view…", "ok");
+      await postJSON("/api/supervised/train", { folders });
+      toast(
+        folders.length
+          ? `Training on ${folders.length} folder(s)…`
+          : "Training folder-supervised view…",
+        "ok",
+      );
     } catch {
       /* api() already toasted */
     }
+  }
+
+  /* ── Training folders ─────────────────────────────────────── */
+
+  /** Load the folder tree and render the training-folder checkboxes. */
+  private async _loadTrainingFolders(): Promise<void> {
+    try {
+      const res = await api<{ roots: FolderNode[] }>("/api/folders");
+      this._trainFolderRoots = res.roots ?? [];
+      this._renderTrainingFolders();
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  /** Re-render the checkbox tree from the cached roots and checked set. */
+  private _renderTrainingFolders(): void {
+    const host = document.getElementById("head-train-folders");
+    if (!host) return;
+    host.replaceChildren();
+    for (const root of this._trainFolderRoots) {
+      host.appendChild(this._folderNodeEl(root, 0));
+    }
+  }
+
+  /** One checkbox row plus a collapsible children container. */
+  private _folderNodeEl(node: FolderNode, depth: number): HTMLElement {
+    const wrap = document.createElement("div");
+    const row = document.createElement("div");
+    row.className = "head-folder-row";
+    row.style.paddingLeft = `${depth * 12}px`;
+
+    const kids = node.children ?? [];
+    const toggle = document.createElement("span");
+    toggle.className = "head-folder-toggle" + (kids.length ? "" : " leaf");
+    toggle.textContent = kids.length ? "▸" : "·";
+
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.dataset.folder = node.path;
+    box.checked = this._trainFolders.has(node.path);
+    box.addEventListener("change", () => {
+      if (box.checked) this._trainFolders.add(node.path);
+      else this._trainFolders.delete(node.path);
+    });
+    const name = document.createElement("span");
+    name.className = "head-folder-name";
+    name.textContent = node.name;
+    label.append(box, name);
+    row.append(toggle, label);
+    wrap.appendChild(row);
+
+    if (kids.length) {
+      const children = document.createElement("div");
+      children.style.display = "none";
+      toggle.addEventListener("click", () => {
+        const open = children.style.display !== "none";
+        children.style.display = open ? "none" : "block";
+        toggle.textContent = open ? "▸" : "▾";
+      });
+      for (const child of kids) {
+        children.appendChild(this._folderNodeEl(child, depth + 1));
+      }
+      wrap.appendChild(children);
+    }
+    return wrap;
+  }
+
+  /* ── Imprint (fan-out an external folder) ─────────────────── */
+
+  private _setImprintNote(text: string): void {
+    const el = document.getElementById("imprint-note");
+    if (el) el.textContent = text;
+  }
+
+  /** Register the target folder and queue analysis for its tracks. */
+  private async _imprintAnalyze(): Promise<void> {
+    const $path = document.getElementById(
+      "head-imprint-path",
+    ) as HTMLInputElement | null;
+    const path = $path?.value.trim() ?? "";
+    if (!path) {
+      toast("Enter a folder path to imprint", "error");
+      return;
+    }
+    try {
+      const res = await postJSON<{
+        ok: boolean;
+        root_id?: string;
+        folder?: string;
+        tracks?: number;
+        analyzed?: number;
+        pending?: number;
+        error?: string;
+      }>("/api/supervised/imprint/analyze", { path });
+      if (!res.ok) {
+        this._setImprintNote(res.error || "Analyze failed");
+        return;
+      }
+      this._imprintRootId = res.root_id ?? null;
+      this._imprintFolder = res.folder ?? null;
+      const pending = res.pending ?? 0;
+      this._setImprintNote(
+        pending
+          ? `Analysing ${res.tracks ?? 0} tracks — ${res.analyzed ?? 0} done, ${pending} left…`
+          : `${res.tracks ?? 0} tracks ready — Review plan.`,
+      );
+      toast(`Imprint: ${res.tracks ?? 0} tracks`, "ok");
+      if (pending > 0) this._startImprintPoll();
+      void this.deps.onRootsChanged?.();
+      void this.fetchClusters();
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  private _startImprintPoll(): void {
+    this._stopImprintPoll();
+    this._imprintTimer = window.setInterval(
+      () => void this._pollImprint(),
+      2000,
+    );
+  }
+
+  private _stopImprintPoll(): void {
+    if (this._imprintTimer != null) {
+      window.clearInterval(this._imprintTimer);
+      this._imprintTimer = null;
+    }
+  }
+
+  /** Poll analysis readiness until the imprint target is fully analysed. */
+  private async _pollImprint(): Promise<void> {
+    if (!this._imprintFolder) return;
+    try {
+      const res = await api<ImprintStatus>(
+        `/api/supervised/imprint/status?folder=${encodeURIComponent(this._imprintFolder)}`,
+      );
+      if (!res.ok) {
+        this._stopImprintPoll();
+        this._setImprintNote(res.error || "Status failed");
+        return;
+      }
+      const pending = res.pending ?? 0;
+      this._setImprintNote(
+        pending
+          ? `Analysing ${res.tracks ?? 0} tracks — ${res.analyzed ?? 0} done, ${pending} left…`
+          : `${res.tracks ?? 0} tracks ready — Review plan.`,
+      );
+      if (pending === 0) {
+        this._stopImprintPoll();
+        this.deps.refreshProjection?.();
+        void this.fetchClusters();
+      }
+    } catch {
+      this._stopImprintPoll();
+    }
+  }
+
+  /** Plan (``apply=false``) or apply the imprint target's predicted moves. */
+  private async _imprintFanout(apply: boolean): Promise<void> {
+    if (!this._imprintFolder) {
+      toast("Analyze a folder first", "error");
+      return;
+    }
+    if (
+      apply &&
+      !window.confirm(
+        `Move every track under "${this._imprintFolder}" into the head's folders? ` +
+          "This moves files on disk and cannot be undone from here.",
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await postJSON<{
+        ok: boolean;
+        tracks?: number;
+        moved?: number;
+        plan?: { target: string; folder: string }[];
+        error?: string;
+      }>("/api/supervised/fanout", { folder: this._imprintFolder, apply });
+      if (!res.ok) {
+        this._setImprintNote(res.error || "Fan out failed");
+        return;
+      }
+      const tracks = res.tracks ?? 0;
+      if (apply) {
+        this._setImprintNote(`Moved ${res.moved ?? 0} / ${tracks} tracks.`);
+        toast(`Moved ${res.moved ?? 0} tracks`, "ok");
+        this.deps.refreshProjection?.();
+        void this.fetchClusters();
+        await this._finishImprint();
+      } else {
+        const folders = new Set(
+          (res.plan ?? [])
+            .map((e) => e.target)
+            .filter((t) => t.includes("/"))
+            .map((t) => t.slice(0, t.lastIndexOf("/"))),
+        );
+        this._setImprintNote(
+          `Planned ${tracks} tracks → ${folders.size} folders — Apply moves to run it.`,
+        );
+        toast(`Planned ${tracks} tracks`, "ok");
+      }
+    } catch {
+      /* api() already toasted */
+    }
+  }
+
+  /** Drop the ephemeral imprint root once the moves are done. */
+  private async _finishImprint(): Promise<void> {
+    const rootId = this._imprintRootId;
+    this._imprintRootId = null;
+    this._imprintFolder = null;
+    this._stopImprintPoll();
+    if (!rootId) return;
+    try {
+      await postJSON("/api/supervised/imprint/finish", { root_id: rootId });
+    } catch {
+      /* api() already toasted */
+    }
+    void this.deps.onRootsChanged?.();
   }
 
   private _setHeadNote(text: string): void {
@@ -403,56 +691,6 @@ export class AnalysisCoordinator {
         `Shared ${c.shared_classes.length} folders · mean centroid cosine ` +
           `${mean} · ${c.only_a.length} only here, ${c.only_b.length} only there.`,
       );
-    } catch {
-      /* api() already toasted */
-    }
-  }
-
-  /** Plan or apply a fan-out of one folder into the head's folders. */
-  private async _fanoutHead(): Promise<void> {
-    const $folder = document.getElementById(
-      "head-fanout-folder",
-    ) as HTMLInputElement | null;
-    const $apply = document.getElementById(
-      "head-fanout-apply",
-    ) as HTMLInputElement | null;
-    const folder = $folder?.value.trim() ?? "";
-    if (!folder) {
-      toast("Enter a folder to sort", "error");
-      return;
-    }
-    const apply = $apply?.checked ?? false;
-    if (
-      apply &&
-      !window.confirm(
-        `Move every track under "${folder}" into the head's folders? ` +
-          "This moves files on disk and cannot be undone from here.",
-      )
-    ) {
-      return;
-    }
-    try {
-      const res = await postJSON<{
-        ok: boolean;
-        tracks?: number;
-        moved?: number;
-        error?: string;
-      }>("/api/supervised/fanout", { folder, apply });
-      if (!res.ok) {
-        this._setHeadNote(res.error || "Fan out failed");
-        return;
-      }
-      const tracks = res.tracks ?? 0;
-      this._setHeadNote(
-        apply
-          ? `Moved ${res.moved ?? 0} / ${tracks} tracks.`
-          : `Planned ${tracks} tracks — tick "Move files" and Fan out to apply.`,
-      );
-      toast(apply ? `Moved ${res.moved ?? 0} tracks` : `Planned ${tracks} tracks`, "ok");
-      if (apply) {
-        this.deps.refreshProjection?.();
-        void this.fetchClusters();
-      }
     } catch {
       /* api() already toasted */
     }

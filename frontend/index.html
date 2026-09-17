@@ -167,28 +167,56 @@
         <input type="file" id="head-import-file" accept=".pt" hidden />
         <input type="file" id="head-compare-file" accept=".pt" hidden />
       </div>
-      <label class="head-fanout-folder">
-        <span>Sort folder</span>
-        <input
-          id="head-fanout-folder"
-          type="text"
-          placeholder="e.g. 3f2a/Downloads"
-          title="A virtual folder to sort into the head's folder paths"
-        />
-      </label>
-      <div class="cluster-weight-actions">
-        <label class="head-fanout-apply">
-          <input type="checkbox" id="head-fanout-apply" />
-          Move files
+      <details id="head-train-folders-details">
+        <summary>Training folders</summary>
+        <div id="head-train-folders" class="head-folder-tree"></div>
+        <div class="cluster-weight-actions">
+          <button
+            id="btn-head-folders-all"
+            type="button"
+            title="Train on every root (the default)"
+          >
+            All roots
+          </button>
+        </div>
+      </details>
+      <details id="head-imprint-details">
+        <summary>Imprint on a folder…</summary>
+        <label class="head-fanout-folder">
+          <span>Folder path</span>
+          <input
+            id="head-imprint-path"
+            type="text"
+            placeholder="/Users/me/Downloads"
+            spellcheck="false"
+            title="An absolute path to a folder outside your library"
+          />
         </label>
-        <button
-          id="btn-fanout-head"
-          type="button"
-          title="Sort that folder's tracks into the head's folders"
-        >
-          Fan out
-        </button>
-      </div>
+        <div class="cluster-weight-actions">
+          <button
+            id="btn-imprint-analyze"
+            type="button"
+            title="Scan and analyse that folder's tracks"
+          >
+            Analyze
+          </button>
+          <button
+            id="btn-imprint-plan"
+            type="button"
+            title="Review the predicted moves without touching disk"
+          >
+            Review plan
+          </button>
+          <button
+            id="btn-imprint-apply"
+            type="button"
+            title="Move the tracks into the head's folders"
+          >
+            Apply moves
+          </button>
+        </div>
+        <p id="imprint-note" class="cluster-weights-note"></p>
+      </details>
       <p id="head-note" class="cluster-weights-note"></p>
     </details>
   </section>

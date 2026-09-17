@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Iterable, Mapping, MutableMapping, MutableSet
 from typing import Any
 
 
@@ -46,9 +46,23 @@ def remove_root(root_id: str, roots: MutableMapping[str, str]) -> bool:
     return False
 
 
-def save_roots_state(roots: Mapping[str, str], state_path: str) -> None:
-    """Write unique root paths to JSON (ids are not persisted; recomputed on load)."""
-    payload = {"roots": list(roots.values())}
+def save_roots_state(
+    roots: Mapping[str, str],
+    state_path: str,
+    *,
+    temp_roots: Iterable[str] = (),
+) -> None:
+    """Write root paths to JSON (ids are not persisted; recomputed on load).
+
+    *temp_roots* are ids of ephemeral imprint roots; they are persisted by path so
+    a restart mid-imprint can still finish and remove them.
+    """
+    payload = {
+        "roots": list(roots.values()),
+        "temp_roots": [
+            roots[rid] for rid in sorted(temp_roots) if rid in roots
+        ],
+    }
     with open(state_path, "w", encoding="utf-8") as f:
         json.dump(payload, f)
 
@@ -58,14 +72,19 @@ def load_roots_state(
     state_path: str,
     *,
     default_root: str | None,
+    temp_roots: MutableSet[str] | None = None,
 ) -> None:
     """Load paths from JSON; optional *default_root* when file is empty or missing.
 
     Non-directories are skipped. After load, state is normalised and written back
-    (merges nested paths, drops stale entries).
+    (merges nested paths, drops stale entries). Persisted ephemeral-root paths are
+    mapped back to their ids so an interrupted imprint stays removable.
     """
     roots.clear()
+    if temp_roots is not None:
+        temp_roots.clear()
     loaded_any = False
+    temp_paths: list[str] = []
     try:
         with open(state_path, "r", encoding="utf-8") as f:
             data: dict[str, Any] = json.load(f)
@@ -74,10 +93,20 @@ def load_roots_state(
             if os.path.isdir(p):
                 add_root(p, roots)
                 loaded_any = True
+        temp_paths = [
+            os.path.abspath(str(raw)) for raw in data.get("temp_roots", [])
+        ]
     except Exception:
         loaded_any = False
 
     if not loaded_any and default_root is not None:
         add_root(default_root, roots)
 
-    save_roots_state(roots, state_path)
+    if temp_roots is not None:
+        by_path = {root_abs: rid for rid, root_abs in roots.items()}
+        for p in temp_paths:
+            rid = by_path.get(p)
+            if rid is not None:
+                temp_roots.add(rid)
+
+    save_roots_state(roots, state_path, temp_roots=temp_roots or ())

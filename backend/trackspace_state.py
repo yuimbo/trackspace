@@ -45,6 +45,9 @@ class TrackspaceState:
     observer: Observer | None = None
     root_watches: dict[str, object] = field(default_factory=dict)
     music_root: str = ""
+    #: Root ids registered only to imprint an external folder (scan/analyse/fan-out)
+    #: and removed when the imprint finishes — they are not part of the library.
+    temp_roots: set[str] = field(default_factory=set)
 
     @classmethod
     def create(cls, data_dir: str | None = None) -> TrackspaceState:

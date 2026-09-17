@@ -148,6 +148,9 @@ export class Controller {
       applyApproximateWeights: (weights) =>
         this.embedding.applyApproximateWeights(weights),
       fetchWeightJacobian: () => void this.embedding.fetchWeightJacobian(),
+      // An imprint registers/removes a root, so the library and tree must
+      // follow: the root set and the visible track set stay in step.
+      onRootsChanged: () => this._reloadLibraryAndTree(),
     });
 
     this.embedding = new EmbeddingCoordinator({

@@ -25,6 +25,7 @@ from backend.services.analysis_pipeline import (
     make_maest_handler,
     make_supervised_handler,
     project_supervised_missing,
+    supervised_imprint_status,
     train_supervised,
 )
 
@@ -432,8 +433,93 @@ def test_supervised_handler_skips_without_folders(tmp_path):
     assert out[1].detail.get("skipped") is True
 
 
-# ── centroids, folder prediction, and the portable bundle ──────
+def _two_root_infos(fc: FeatureCache):
+    """Two roots of three class-separated folders each, and their track infos."""
+    rng = np.random.default_rng(0)
+    infos = []
+    for root in ("A", "B"):
+        for c in range(3):
+            center = rng.normal(size=768).astype(np.float32)
+            for i in range(10):
+                fp = f"{root}-{c}-{i}"
+                fc.put_maest(
+                    fp, center, np.ones(519, np.float32), version=1
+                )
+                infos.append(
+                    {"path": f"{root}/Folder{c}/t{i}.mp3", "fingerprint": fp}
+                )
+    return infos
 
+
+def test_train_supervised_restricts_labels_to_selected_folders(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    infos = _two_root_infos(fc)
+
+    def build(folder: str, _recursive: bool) -> list[dict]:
+        prefix = f"{folder}/"
+        return [t for t in infos if t["path"].startswith(prefix)]
+
+    stats = train_supervised(
+        _deps(tmp_path, fc), build_track_infos=build, folders=["A"]
+    )
+    assert stats.get("skipped") is not True
+    assert stats["folders"] == 3
+
+    meta = sup.read_meta(str(tmp_path))
+    assert meta["train_folders"] == ["A"]
+    # Only the selected root's folders became classes, so the head cannot place
+    # anything into B's folders.
+    assert meta["class_names"] and all(
+        name.startswith("A/") for name in meta["class_names"]
+    )
+
+
+def test_supervised_handler_reads_folders_from_payload(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    infos = _two_root_infos(fc)
+
+    def build(folder: str, _recursive: bool) -> list[dict]:
+        prefix = f"{folder}/"
+        return [t for t in infos if t["path"].startswith(prefix)]
+
+    handler = make_supervised_handler(_deps(tmp_path, fc), build_track_infos=build)
+    job = Job(
+        id=1,
+        kind="supervise",
+        dedupe_key="library",
+        payload={"reason": "manual", "folders": ["B"]},
+        attempts=0,
+        priority=150,
+    )
+    assert handler([job])[1].ok is True
+    assert sup.read_meta(str(tmp_path))["train_folders"] == ["B"]
+
+
+def test_supervised_imprint_status_counts_ready_tracks(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    ready_fp, pending_fp = "ready", "pending"
+    for fp in (ready_fp, pending_fp):
+        fc.put_maest(
+            fp, np.ones(768, np.float32), np.ones(519, np.float32), version=1
+        )
+    fc.put("rhythm", ready_fp, np.ones(14, np.float32), version=1)
+    fc.put("clap", ready_fp, np.ones(512, np.float32), version=0)
+    infos = [
+        {"path": "A/ready.mp3", "fingerprint": ready_fp},
+        {"path": "A/pending.mp3", "fingerprint": pending_fp},
+    ]
+
+    status = supervised_imprint_status(_deps(tmp_path, fc), infos)
+    assert status == {"tracks": 2, "analyzed": 1, "pending": 1, "ready": False}
+
+    # The second track's missing rhythm + CLAP rows complete the imprint set.
+    fc.put("rhythm", pending_fp, np.ones(14, np.float32), version=1)
+    fc.put("clap", pending_fp, np.ones(512, np.float32), version=0)
+    status = supervised_imprint_status(_deps(tmp_path, fc), infos)
+    assert status["ready"] is True and status["pending"] == 0
+
+
+# ── centroids, folder prediction, and the portable bundle ──────
 
 def test_compute_centroids_aligns_with_classes_and_flags_empty():
     z = np.array(

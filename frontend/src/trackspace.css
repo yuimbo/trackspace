@@ -1660,12 +1660,38 @@ kbd {
   min-width: 0;
   font-size: 11px;
 }
-.head-fanout-apply {
+
+/* Training-folder checkbox tree: one row per folder, depth-indented. */
+.head-folder-tree {
+  margin-top: 6px;
+  max-height: 200px;
+  overflow: auto;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+.head-folder-row {
   display: flex;
   align-items: center;
   gap: 4px;
-  font-size: 11px;
-  color: var(--fg-dim);
+  padding: 1px 0;
+}
+.head-folder-toggle {
+  width: 12px;
+  flex: none;
+  cursor: pointer;
+  user-select: none;
+}
+.head-folder-toggle.leaf { cursor: default; }
+.head-folder-row label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  min-width: 0;
+}
+.head-folder-row .head-folder-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

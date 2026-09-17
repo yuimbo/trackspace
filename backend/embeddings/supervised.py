@@ -704,8 +704,13 @@ def build_meta(
     class_names: list[str],
     source_versions: dict[str, int],
     stats: dict,
+    train_folders: list[str] | None = None,
 ) -> dict:
-    """Sidecar payload; ``trained_at`` is informational, the rest is auditable."""
+    """Sidecar payload; ``trained_at`` is informational, the rest is auditable.
+
+    *train_folders* records which virtual folders the labels were drawn from
+    (empty = the whole library), so a head can report what it was trained on.
+    """
     return {
         "run_id": int(run_id),
         "trained_at": time.time(),
@@ -717,6 +722,7 @@ def build_meta(
         "input_weights": {k: float(v) for k, v in input_weights.items()},
         "n_classes": len(class_names),
         "class_names": list(class_names),
+        "train_folders": [str(f) for f in (train_folders or [])],
         "source_versions": {k: int(v) for k, v in source_versions.items()},
         "stats": stats,
     }

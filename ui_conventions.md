@@ -81,6 +81,26 @@ means the track sits directly at the root.
 
 ---
 
+## Folder head panel
+
+The right-column *Folder head* controls (`AnalysisCoordinator.bindPanel`):
+
+- **Train folder view** sends the checked *Training folders* as `folders`; an empty
+  selection means every root (the default). The checkbox tree is the folder tree from
+  `GET /api/folders`, fetched lazily when the section is opened — never on startup —
+  and rendered as `.head-folder-row` rows with collapsible children. *All roots*
+  clears the selection.
+- **Imprint on a folder…** takes an absolute path, calls
+  `POST /api/supervised/imprint/analyze`, then polls
+  `GET /api/supervised/imprint/status` until `pending == 0` before *Review plan* and
+  *Apply moves* run the ordinary `POST /api/supervised/fanout`. The ephemeral root is
+  dropped via `POST /api/supervised/imprint/finish` after the moves land. *Apply moves*
+  is the only step that touches disk and always confirms first.
+- Head actions live in the collapsed *Folder head* `<details>`; the folder tree and the
+  imprint controls are nested `<details>` so the panel stays short.
+
+---
+
 ## Command pattern (optimistic UI + undo)
 
 `frontend/src/command.ts` implements a command pattern for state-mutating operations.

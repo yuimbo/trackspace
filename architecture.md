@@ -13,7 +13,7 @@ backend/
   app.py                  CLI entry + wiring (helpers, ANALYSIS_DEPS, worker registration)
   factory.py              create_app() + blueprint registration
   trackspace_state.py     TrackspaceState: caches, roots, queue, workers, clusters
-  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, supervised, static_audio)
+  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, supervised, imprint, static_audio)
   tags.py                 ID3 tag read/write via mutagen
   cache.py                TrackCache (path+mtime → metadata, LRU + SQLite)
   fingerprint.py          Chromaprint audio fingerprinting (fpcalc)
@@ -73,7 +73,7 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Feature cache | `backend/embeddings/feature_cache.py` | ~380 | One generic `_SOURCES` registry |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
 | Frontend orchestration | `frontend/src/controller.ts` | ~700 | Wiring, data loading, tag-write queue, preview, keyboard |
-| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~310 | Queue SSE + clusters |
+| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~1050 | Queue SSE + clusters + folder-head controls |
 | Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~680 | Layout cache + SSE + animations |
 | Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | ~675 | HTMX tree + roots + highlights |
 | Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1040 | Pointer gestures + transforms |

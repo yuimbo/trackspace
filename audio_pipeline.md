@@ -339,6 +339,18 @@ i.e. MAEST); optional sources it lacks contribute a zero row. Requiring *all*
 enabled sources would hide every track until the slowest model had run over the
 whole library.
 
+**Weights are not comparable across sources.** The blocks have very different global
+geometry — a 519-D near-one-hot logit block vs a 14-D DSP block vs a 512-D CLAP
+embedding — so a weight of `0.5` does not mean the same thing per source; a slider
+can look inert because it is moving a block whose distances are already tiny or huge
+relative to the others. The clustering path standardises each column first
+(`clustering.build_weighted_matrix`); the layout deliberately does not, because column
+statistics depend on the current track set and a *stateful* recipe would make a track's
+projection drift as the library grows (see the `layout.py` docstring). Matching the
+distributions without that drift needs a transform fitted once on a **frozen reference
+set** and cached in a chart artifact — an open item in `TODO.md`, together with the
+`chart_revision` split the landmark extension needs.
+
 **Semantic weighting with composite vectors:** Folder centroid decomposition uses
 the **full** composite matrix.  CLAP text directions (tags, folder-name fallbacks)
 are placed in the **CLAP column span** (`clap_col_lo : clap_col_lo + clap_dim`),
@@ -523,6 +535,13 @@ and returns 0). Any change to `FROZEN_SOURCES` — e.g. adding the `clap` block 
 removing a source — therefore requires one manual retrain (the *Train folder view*
 button) before new tracks get supervised rows again.
 
+**Training scope is selectable.** `POST /api/supervised/train` takes an optional
+`folders` list of virtual folders (a root id or a subtree). Only tracks under those
+folders become training examples, so a head can be learned from one root while still
+being applied to the whole library. An omitted/empty list trains on every root. The
+selection rides on the singleton job's payload and is recorded in the head meta
+(`train_folders`).
+
 **Triggers and staleness.** Training is a library-wide singleton (`"library"` dedupe
 key). It is queued manually (the *Train folder view* button) or automatically once
 after the first MAEST pass drains while no head exists. New tracks analysed later are
@@ -555,6 +574,18 @@ without a retrain (`predict_folders`).
   class that is a root itself maps to the target root and is skipped. It is
   **dry-run by default** — `apply` is the only step that touches disk — and a name
   collision gets a ` (n)` suffix rather than overwriting a file.
+
+**Imprinting an external folder.** A fan-out normally targets a folder inside the
+library. *Imprint* extends it to a folder elsewhere on disk: the target is registered as
+an **ephemeral root** so the scan/analysis/fan-out paths can resolve it, its tracks are
+analysed for exactly the sources the head consumes (`SUPERVISED_INPUT_SOURCES`:
+`maest`, `maest_logits`, `rhythm`, `clap`), and the plan/apply then runs the ordinary
+fan-out against that root. `POST /api/supervised/imprint/analyze` registers the root and
+queues analysis, `GET /api/supervised/imprint/status` reports readiness, and
+`POST /api/supervised/imprint/finish` removes the root again. The ephemeral root is
+persisted by path in `roots.json` (`temp_roots`) so a restart mid-imprint can still
+finish and clean it up, and a target that contains an existing library root is refused
+rather than silently unregistering that root.
 
 ### Source-weight Jacobian (live slider drag)
 
