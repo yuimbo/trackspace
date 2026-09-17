@@ -709,6 +709,29 @@ describe("AnalysisCoordinator coverage panel", () => {
     ).toBe("60%");
   });
 
+  it("flags terminal failures so a short bar is not mistaken for pending", async () => {
+    const { coord, model } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status") ? COVERAGE : {},
+    );
+    model.queueStatus = {
+      kinds: { structure: { failed: 4 } },
+    } as unknown as typeof model.queueStatus;
+
+    await coord.fetchCoverage();
+
+    const rows = [...document.querySelectorAll(".analysis-coverage-row")];
+    const structure = rows[2];
+    expect(
+      structure
+        .querySelector(".analysis-coverage-count")
+        ?.classList.contains("has-failed"),
+    ).toBe(true);
+    expect(structure.getAttribute("title")).toContain("4 failed");
+    expect(
+      document.querySelector(".analysis-coverage-summary")?.textContent,
+    ).toContain("4 failed");
+  });
+
   it("wires one retrigger button per stage plus a forced re-run", async () => {
     const { coord, fetchSpy } = makeHarness();
     coord.bindPanel();

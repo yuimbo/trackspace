@@ -122,7 +122,7 @@ lives in one of four tabs, so the panel no longer scrolls to the brim:
 |-----|----------|---------|
 | **Analysis** | Analysis (coverage + per-stage retrigger), Microgenres | what the analysis says |
 | **Organise** | Folder head (train/export/import/compare, training folders, imprint) | the learned folder structure |
-| **Tracks** | Batch Edit, Features, Tags | the selection and its metadata |
+| **Tracks** | Batch Edit, Features, Personal tags | the selection and its metadata |
 | **View** | Options (hover preview, view mode, explode) | how the map is drawn |
 
 - Sections are tagged **in place** with `data-rp-panel="<tab>"`; their cross-tab DOM order
@@ -310,10 +310,10 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   BPM/key meta row, **structure chips** (`intro 0:12–0:32`, `drop 1:04`,
   `break 3:12`; the auditioned one is highlighted), the **genre group** (cluster
   swatch + name + a `genre-spanning` badge whose hover text explains that the
-  intro and drop excerpts disagree) and two stat-bar areas — user **Tags** and audio
-  **Features**. Feature axis ids never render as tags. `buildTooltip` returns a
-  `key`; the canvas re-renders the DOM only when that key changes, so pan/zoom
-  frames do not rebuild the card.
+  intro and drop excerpts disagree) and two stat-bar areas — user **Personal
+  tags** and audio **Features**. Feature axis ids never render as tags. `buildTooltip`
+  returns a `key`; the canvas re-renders the DOM only when that key changes, so
+  pan/zoom frames do not rebuild the card.
 
 ## Analysis panel (coverage + retrigger)
 

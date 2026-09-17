@@ -346,7 +346,7 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
     root.appendChild(genre);
   }
 
-  if (card.tags.length) root.appendChild(statSection("Tags", card.tags));
+  if (card.tags.length) root.appendChild(statSection("Personal tags", card.tags));
   if (card.features.length)
     root.appendChild(statSection("Features", card.features, "tt-features"));
 

@@ -81,6 +81,8 @@ interface CoverageRow {
   stage: string;
   done: number;
   pending: number;
+  /** Terminal failures for this stage (from the queue), so a stalled bar is explained. */
+  failed: number;
 }
 
 /** Retriggerable stages, in pipeline order. */
@@ -259,51 +261,70 @@ export class AnalysisCoordinator {
     if (!host) return;
     const total = d.tracks_total ?? 0;
     const fingerprinted = d.tracks_with_fingerprint ?? 0;
+    const failedFor = (stage: string): number =>
+      this.deps.model.queueStatus?.kinds?.[stage]?.failed ?? 0;
     const rows: CoverageRow[] = [
       {
         label: "Audio features",
         stage: "features",
         done: d.tracks_with_audio_features ?? 0,
         pending: d.tracks_pending_audio_features ?? 0,
+        failed: failedFor("features"),
       },
       {
         label: "Rhythm",
         stage: "features",
         done: d.tracks_with_rhythm ?? 0,
         pending: d.tracks_pending_rhythm ?? 0,
+        failed: failedFor("features"),
       },
       {
         label: "Structure",
         stage: "structure",
         done: d.tracks_with_structure ?? 0,
         pending: d.tracks_pending_structure ?? 0,
+        failed: failedFor("structure"),
       },
       {
         label: "MAEST",
         stage: "maest",
         done: d.tracks_with_maest ?? 0,
         pending: d.tracks_pending_maest ?? 0,
+        failed: failedFor("maest"),
       },
       {
         label: "CLAP",
         stage: "clap",
         done: d.tracks_with_clap ?? 0,
         pending: d.tracks_pending_clap ?? 0,
+        failed: failedFor("clap"),
       },
       {
         label: "Supervised",
         stage: "supervise",
         done: d.tracks_with_supervised ?? 0,
         pending: d.tracks_pending_supervised ?? 0,
+        failed: failedFor("supervise"),
       },
     ];
+
+    // Per-stage failure counts (deduped: features and rhythm share one stage).
+    const failedByStage = new Map<string, number>();
+    for (const row of rows) failedByStage.set(row.stage, row.failed);
+    const failedTotal = [...failedByStage.values()].reduce((a, b) => a + b, 0);
 
     const summary = document.createElement("div");
     summary.className = "analysis-coverage-summary";
     summary.textContent =
       total > 0
-        ? `${fingerprinted} / ${total} fingerprinted`
+        ? `${fingerprinted} / ${total} fingerprinted${
+            failedTotal > 0 ? ` · ${failedTotal} failed` : ""
+          }`
         : "No tracks in the library yet.";
+    if (failedTotal > 0)
+      summary.title =
+        "Some tracks could not be analysed (unreadable audio). " +
+        "Press a stage button below to retry its failed jobs.";
     host.replaceChildren(summary);
 
     if (total === 0) return;
@@ -320,6 +341,9 @@ export class AnalysisCoordinator {
       count.className = "analysis-coverage-count";
       count.textContent = `${row.done} / ${total}`;
       if (row.pending > 0) count.classList.add("has-pending");
+      // A drained queue with a short bar is almost always terminal failures, not
+      // pending work: flag the row and point at the retrigger button.
+      if (row.failed > 0) count.classList.add("has-failed");
 
       const bar = document.createElement("span");
       bar.className = "analysis-coverage-bar";
@@ -331,7 +355,7 @@ export class AnalysisCoordinator {
       line.append(name, bar, count);
       line.title = `${row.done} of ${total} analysed${
         row.pending > 0 ? `, ${row.pending} pending` : ""
-      }`;
+      }${row.failed > 0 ? `, ${row.failed} failed (retrigger to retry)` : ""}`;
       host.appendChild(line);
     }
   }

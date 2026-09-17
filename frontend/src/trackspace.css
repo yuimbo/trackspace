@@ -1634,6 +1634,7 @@ kbd {
   color: var(--fg-dim);
 }
 .analysis-coverage-count.has-pending { color: var(--dot); }
+.analysis-coverage-count.has-failed { color: #ff8e9d; }
 
 .analysis-retrigger {
   display: flex;
