@@ -1580,6 +1580,13 @@ def enqueue_library_work(
     Work is filtered against the cache *before* enqueueing so the queue reflects
     outstanding work rather than the whole library — which is what makes the
     progress numbers meaningful.
+
+    A track that is in that filtered list always gets a runnable job: a *terminal*
+    queue row for it (``done``/``failed``) is revived, because the cache — not the
+    queue — is the source of truth. Without this a source-version bump (which blanks
+    the stale rows on load) would never re-queue its backfill: the cache says the
+    work is missing while the queue still calls it done. *force* only widens the
+    cache filter to include already-cached tracks.
     """
     fc = deps.feature_cache
     queued: dict[str, int] = {}
@@ -1643,7 +1650,7 @@ def enqueue_library_work(
             )
         ]
         queued[KIND_FEATURES] = queue.enqueue_many(
-            KIND_FEATURES, items, priority=100, requeue_terminal=force
+            KIND_FEATURES, items, priority=100, requeue_terminal=True
         )
 
     if KIND_MAEST in kinds:
@@ -1658,7 +1665,7 @@ def enqueue_library_work(
             )
         ]
         queued[KIND_MAEST] = queue.enqueue_many(
-            KIND_MAEST, items, priority=100, requeue_terminal=force
+            KIND_MAEST, items, priority=100, requeue_terminal=True
         )
 
     if KIND_STRUCTURE in kinds:
@@ -1669,7 +1676,7 @@ def enqueue_library_work(
             and (force or t["fingerprint"] not in have_structure)
         ]
         queued[KIND_STRUCTURE] = queue.enqueue_many(
-            KIND_STRUCTURE, items, priority=105, requeue_terminal=force
+            KIND_STRUCTURE, items, priority=105, requeue_terminal=True
         )
 
     # CLAP is skipped entirely when the server runs with --no-clap: the worker
@@ -1686,7 +1693,7 @@ def enqueue_library_work(
             )
         ]
         queued[KIND_CLAP] = queue.enqueue_many(
-            KIND_CLAP, items, priority=110, requeue_terminal=force
+            KIND_CLAP, items, priority=110, requeue_terminal=True
         )
 
     if priority_paths:

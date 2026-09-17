@@ -305,6 +305,30 @@ def test_enqueue_structure_queues_only_missing_rows(tmp_path):
     assert queued[KIND_STRUCTURE] == 1
 
 
+def test_enqueue_structure_revives_a_terminal_job_when_the_cache_is_missing(tmp_path):
+    """A version bump blanks the cache row but leaves its queue row terminal.
+
+    The cache is the source of truth, so the job must be revived — otherwise the
+    backfill never runs and the Structure retrigger appears to do nothing.
+    """
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    queue = JobQueue(str(tmp_path / "jobs.db"))
+    infos = [{"path": "a.mp3", "fingerprint": "fp1"}]
+    deps = _deps(tmp_path, fc)
+
+    first = enqueue_library_work(queue, infos, deps=deps, kinds=(KIND_STRUCTURE,))
+    assert first[KIND_STRUCTURE] == 1
+    queue.complete(queue.claim(KIND_STRUCTURE)[0])
+    assert queue.stats(KIND_STRUCTURE).done == 1
+
+    # The cache row is absent (as after a version purge), so it must re-queue.
+    assert not fc.has("structure", "fp1", version=deps.structure_version)
+    again = enqueue_library_work(queue, infos, deps=deps, kinds=(KIND_STRUCTURE,))
+    assert again[KIND_STRUCTURE] == 1
+    assert queue.stats(KIND_STRUCTURE).pending == 1
+    assert queue.stats(KIND_STRUCTURE).done == 0
+
+
 # ── cache source ────────────────────────────────────────────
 
 

@@ -48,9 +48,26 @@ def test_build_app_accepts_injected_state(tmp_path):
         assert set(app.extensions["trackspace_lifecycle"]) == {
             "load_roots_state",
             "schedule_root_watch",
+            "backfill_outstanding_analysis",
         }
         # The search blueprint is registered with the existing deps (no new wiring).
         assert "/api/search" in {r.rule for r in app.url_map.iter_rules()}
+    finally:
+        state.thread_pool.shutdown(wait=False)
+
+
+def test_backfill_hook_queues_nothing_on_an_empty_library(tmp_path):
+    """The startup backfill hook is wired and a no-op with no tracks."""
+    from backend.app import build_app
+    from backend.trackspace_state import TrackspaceState
+
+    state = TrackspaceState.create(data_dir=str(tmp_path / "data"))
+    try:
+        app = build_app(state)
+        queued = app.extensions["trackspace_lifecycle"][
+            "backfill_outstanding_analysis"
+        ]()
+        assert sum(queued.values()) == 0
     finally:
         state.thread_pool.shutdown(wait=False)
 

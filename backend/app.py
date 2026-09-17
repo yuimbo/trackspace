@@ -546,6 +546,18 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         return queued
 
 
+    def _backfill_outstanding_analysis() -> dict[str, int]:
+        """Queue the per-track work the cache reports as missing, once.
+
+        A source-version bump blanks the stale cache rows on load, but the durable
+        queue still holds their jobs in a terminal state, so an ordinary enqueue would
+        skip them. Running this at startup makes the backfill self-healing instead of
+        waiting for the user to press a retrigger button. The cache filter keeps it to
+        genuinely missing work, so once it drains this enqueues nothing.
+        """
+        return _enqueue_analysis(infos=_build_track_infos("", True))
+
+
     def _register_workers() -> None:
         """Create one worker per pipeline stage (threads start in ``main()``)."""
         state.workers.add(
@@ -705,6 +717,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
     app.extensions["trackspace_lifecycle"] = {
         "load_roots_state": _load_roots_state,
         "schedule_root_watch": _schedule_root_watch,
+        "backfill_outstanding_analysis": _backfill_outstanding_analysis,
     }
     return app
 
@@ -801,6 +814,20 @@ def main():
         print(f"Queue: resuming {q_stats.outstanding} outstanding job(s)")
 
     state.workers.start_all()
+
+    def _bg_backfill_analysis():
+        """Self-heal a source-version bump: re-queue what the cache reports missing."""
+        try:
+            queued = lifecycle["backfill_outstanding_analysis"]()
+            outstanding = sum(int(v) for v in queued.values())
+            if outstanding:
+                detail = ", ".join(f"{k}={v}" for k, v in sorted(queued.items()))
+                print(f"Backfill: queued {outstanding} outstanding per-track job(s) ({detail})")
+        except Exception:
+            log.exception("startup analysis backfill failed")
+    threading.Thread(
+        target=_bg_backfill_analysis, daemon=True, name="trackspace-backfill"
+    ).start()
 
     if not args.no_clap:
         def _bg_load_clap():

@@ -5,14 +5,19 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 `design-patterns.md`.
 
 ## User feedback
+- [ ] Don't re-home when pressing "solo" in a card, feels a bit jumpy
+  make the "solo thing" more like a sort of "proximity slider"; so you can drag the size of the neighborhood you want to see (instea of top-N)
+  (If the slider starts from 100%, then we could actually re-home as we narrow it down; as the jump will be less sudden)
 
 - [ ] Whacko idea? Add a 3d view for the embedding space?
 
+- [ ] When projecting my library onto external tracks; those who don't fit into my paylists, can still end up in an Generic/${name}/ subdirectories; where "name" equals what that genre name that generic discogs model would give to them
+- [ ] If i want to project onto an external root which contains a bunch of subdirectories; allow me to just gather all of the nested files to reproject [[maybe stoer some metadata on the old relative folder structure?dd]]
+- [ ] How to remove a root folder from the analysis library? 
+      Though i might want tracks analyzed, but not be "my" tracks; i.e. a separate section for tracks which are in the system but not "My library" (folders which probably also contain things where i will project my learned folder structure on)
 - [ ] **Undo leaves empty fan-out folders.** The move journal restores every
   file but does not remove the subfolders a fan-out created (they are often empty
-  afterwards). The apply-side sweep now removes the *emptied source* directories
-  bounded to the fan-out root, but the learned folders a fan-out *created* are still
-  left behind on undo. Sweep them there too, bounded to the fan-out root so it can
+  afterwards). Sweep empty directories on undo, bounded to the fan-out root so it can
   never touch an unrelated tree. Files:
   `backend/services/analysis_pipeline.py` (`undo_fanout_supervised`).
 - [ ] **The move journal is never pruned.** `fanout_journal` keeps every applied
@@ -207,22 +212,14 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
 
 ### Dependencies
 
-- [ ] **Structure v2 backfill.** `STRUCTURE_VERSION` 1 → 2 (added `intro_start`)
-      blanks the cached v1 blobs on the next backend start, so the structure stage
-      re-analyses the library once (~0.12 s/track, background). Until it drains,
-      tooltip chips show `intro <end>` without the detected audio start; restart the
-      backend to trigger it.
-- [ ] **CLAP per-segment backfill.** `clap_segments` / `clap_segment_pos` are blank
-      for pooled rows written before they existed, so `enqueue_library_work` re-runs
-      the CLAP stage once (decode-dominated — hours on the real library, same order
-      as the version-3 backfill above) to fill them. Until it drains, `/api/search`
-      falls back to the pooled mean and hits carry no `section`.
-- [ ] **Re-run the CLAP stage and retrain the supervised head.** The checkpoint switch
+- [ ] **Retrain the supervised head after a CLAP backfill.** The checkpoint switch
       bumped `EMBEDDING_VERSION` 2 → 3, so every cached `clap` row is purged on next
-      startup and must be regenerated (decode-dominated — hours on the real library). The
-      supervised head consumes the `clap` block (`SUPERVISED_INPUT_WEIGHTS`), so its
-      weights are stale against the new vectors — retrain via *Train folder view* once the
-      CLAP backfill drains, or its `supervised` block is misleading.
+      startup and the queue's startup backfill regenerates it (decode-dominated — hours
+      on the real library). The supervised head consumes the `clap` block
+      (`SUPERVISED_INPUT_WEIGHTS`), so its weights are stale against the new vectors —
+      retrain via *Train folder view* once the CLAP backfill drains, or its
+      `supervised` block is misleading. (The backfill itself is now automatic: see
+      *Startup backfill* in `architecture.md`.)
 - [ ] **`transformers` is installed at 5.3** against a `>=4.40` floor — a major bump.
       Pin a tested floor and smoke-test the CLAP text/audio paths. (The
       `larger_clap_music` checkpoint bug reproduces on 4.57.1, so it is a broken
