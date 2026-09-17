@@ -10,7 +10,8 @@
 // coordinator is unit-testable without the DOM-heavy component classes.
 
 import { type HoverTarget, type Model } from "../model";
-import { toast, dirColor } from "../lib/toast";
+import { toast } from "../lib/toast";
+import { dirColor } from "../lib/colors";
 import { postJSON } from "../lib/api";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
 import htmx from "htmx.org";

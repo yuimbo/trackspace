@@ -15,7 +15,7 @@ import {
   LIBROSA_FEATURE_AXIS_IDS,
   isAudioFeatureAxisId,
 } from "../model";
-import { clusterColor } from "./toast";
+import { clusterColor } from "./colors";
 import { displayFolderPath } from "./path-presenter";
 import { structureChips, type StructureChip } from "./structure";
 

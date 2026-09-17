@@ -61,6 +61,7 @@ from backend.services.analysis_pipeline import (
     make_structure_handler,
     make_supervised_handler,
 )
+from backend.services.dir_colors import dir_color
 from backend.services.layout_revision_for_status import layout_revision_for_projection
 from backend.services.library_scan import emit_scan_progress_events
 from backend.services.roots_registry import (
@@ -337,16 +338,6 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             pass
         vpath = root_id if not rel_prefix else f"{root_id}/{rel_prefix}"
         return {"name": name, "path": vpath, "children": children, "root_id": root_id}
-
-
-    def _dir_color(folder_path: str) -> str:
-        """Deterministic folder swatch colour (matches frontend dirColor())."""
-        if not folder_path:
-            return "hsl(350,60%,55%)"
-        h = 0
-        for ch in folder_path:
-            h = (h * 31 + ord(ch)) & 0x3FFFF
-        return f"hsl({h % 360},65%,60%)"
 
 
     def _cached_read_all(path: str) -> dict:
@@ -663,7 +654,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             unschedule_root_watch=_unschedule_root_watch,
             save_roots_state=_save_roots_state,
             track_cache=state.track_cache,
-            dir_color_fn=_dir_color,
+            dir_color_fn=dir_color,
             resolve_virtual_path=_resolve,
             virtual_from_abs=_virtual_from_abs,
             dist_dir=state.dist_dir,

@@ -93,8 +93,8 @@ natural next split if it needs to shrink (see `TODO.md`).
 The frontend uses **Vite + TypeScript**, **Alpine.js**, and **HTMX**.
 
 - **UI modules:** `frontend/src/components/` — one file per view (`canvas-view.ts`,
-  `tag-panel-view.ts`, …). Shared DOM helpers (toast, loading overlay, `dirColor`) live in
-  `frontend/src/lib/toast.ts`.
+  `tag-panel-view.ts`, …). Shared DOM helpers (toast, loading overlay) live in
+  `frontend/src/lib/toast.ts`; folder/cluster colours live in `frontend/src/lib/colors.ts`.
 - **Alpine.js:** Declarative islands in `frontend/index.html` (e.g. shortcuts modal
   `x-data`, `x-cloak`). Heavier logic stays in TypeScript (controller, coordinators, canvas).
 - **HTMX:** The folder sidebar list is HTML from Flask (`GET /partials/folder-tree`) loaded

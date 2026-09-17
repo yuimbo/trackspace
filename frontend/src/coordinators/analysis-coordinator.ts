@@ -17,7 +17,8 @@ import {
   CLUSTER_WEIGHT_DESCRIPTIONS,
   formatSourceWeight,
 } from "../model";
-import { toast, clusterColor } from "../lib/toast";
+import { toast } from "../lib/toast";
+import { clusterColor } from "../lib/colors";
 import { api, postJSON } from "../lib/api";
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));

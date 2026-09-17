@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Model, type Track } from "../model";
-import { clusterColor } from "../lib/toast";
+import { clusterColor } from "../lib/colors";
 import { CanvasView } from "./canvas-view";
 
 function makeTrack(over: Partial<Track> = {}): Track {

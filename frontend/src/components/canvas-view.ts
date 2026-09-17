@@ -1,6 +1,6 @@
 import type { HoverTarget, Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
-import { clusterColor, dirColor } from "../lib/toast";
+import { clusterColor, dirColor } from "../lib/colors";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
 import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
 

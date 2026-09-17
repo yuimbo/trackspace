@@ -81,6 +81,22 @@ means the track sits directly at the root.
 
 ---
 
+## Folder colours (family tints)
+
+`dirColor` (`lib/colors.ts`) is a pure function of a virtual folder path, mirrored
+server-side by `backend/services/dir_colors.py` for the Jinja folder-tree swatches.
+
+- A root and its top-level folders keep the original path-hash hue (one vivid colour per
+  playlist), so existing colours do not move.
+- Folders deeper than the top level are tints/shades of their top-level ancestor's hue:
+  lightness/saturation deviate by a per-path hash, and the deviation halves per nesting
+  level (`0.5^(depth-2)`). A subtree therefore reads as one colour family that tightens
+  as it deepens. Hue is exactly the ancestor's — only lightness/saturation vary.
+- The two implementations must agree byte-for-byte; both suites assert the shared golden
+  vectors in `frontend/src/lib/dir-color-vectors.json`.
+
+---
+
 ## Folder head panel
 
 The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):

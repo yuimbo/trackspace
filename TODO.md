@@ -6,7 +6,10 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 
 ## User feedback
 
+- [ ] How to remove a root folder from the analysis library? 
+      Though i might want tracks analyzed, but not be "my" tracks; i.e. a separate section for tracks which are in the system but not "My library" (folders which probably also contain things where i will project my learned folder structure on)
 - [ ] Whacko idea? Add a 3d view for the embedding space?
+- [ ] When projecting my library onto external tracks; those who don't fit into my paylists, can still end up in an Generic/${name}/ subdirectories; where "name" equals what that genre name that generic discogs model would give to them
 - [ ] **Undo leaves empty fan-out folders.** The move journal restores every
   file but does not remove the subfolders a fan-out created (they are often empty
   afterwards). Sweep empty directories on undo, bounded to the fan-out root so it can
@@ -68,6 +71,11 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Frontend
 
+- [ ] **Optional sibling hue wiggle.** Family tints currently differ only in
+      lightness/saturation (`frontend/src/lib/colors.ts` / `backend/services/dir_colors.py`).
+      If same-depth siblings still read too alike on the canvas, add a small hue deviation
+      that also decays with depth; bump the shared golden vectors in
+      `frontend/src/lib/dir-color-vectors.json` (asserted by both suites).
 - [ ] **Inspect card follow-ups.** The pinned card (Alt over a dot) has anti-track,
       nearest, solo-neighbourhood and result focus, and its folder/cluster/key/BPM elements
       are navigation targets (glow + S/H/F/Shift+S) — see `design-patterns.md`. Still open:
