@@ -1184,8 +1184,14 @@ def make_supervised_handler(
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
     emit: ProgressFn | None = None,
+    default_folders: Callable[[], Sequence[str]] | None = None,
 ) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
-    """Train the supervised head once for the whole library (singleton job)."""
+    """Train the supervised head once for the whole library (singleton job).
+
+    *default_folders* supplies the label sources when the job carries no explicit
+    selection — the app wires the library roots here, so external roots are not
+    trained on unless the user checks them explicitly.
+    """
 
     def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
         out: dict[int, JobResult] = {}
@@ -1201,6 +1207,8 @@ def make_supervised_handler(
             if isinstance(raw, list) and raw:
                 folders = [str(x) for x in raw]
                 break
+        if folders is None and default_folders is not None:
+            folders = [str(f) for f in default_folders()] or None
         try:
             stats = train_supervised(
                 deps,

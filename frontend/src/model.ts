@@ -366,12 +366,28 @@ export class Model extends EventBus {
   hiddenPaths = new Set<string>();
   /** Hide every track in this folder and subfolders (normalised "", not "."). */
   hiddenFolderPrefixes = new Set<string>();
+  /** Root ids whose role is "external" (not My library); from `/api/folders`. */
+  externalRootIds = new Set<string>();
+  /** Include external-root tracks in the view (persisted, default off). */
+  showExternal = false;
 
   /* ── Computed ──────────────────────────────────────────────── */
 
-  /** True if the track is part of the main library list before hide rules (always yes). */
-  trackInViewUnion(_t: Track): boolean {
-    return true;
+  /**
+   * True when the track belongs to the current view scope. External roots are
+   * analysed and laid out like any other, but stay out of the default view until
+   * "Show external" is on — so the map still shows where they would land.
+   */
+  trackInViewUnion(t: Track): boolean {
+    return this.showExternal || !this.isExternalTrack(t);
+  }
+
+  /** True when *t* belongs to a root marked external (analysed, not My library). */
+  isExternalTrack(t: Track): boolean {
+    const folder = t.folder ?? "";
+    const slash = folder.indexOf("/");
+    const rootId = slash >= 0 ? folder.slice(0, slash) : folder;
+    return this.externalRootIds.has(rootId);
   }
 
   isTrackHidden(t: Track): boolean {
@@ -531,6 +547,28 @@ export class Model extends EventBus {
 
   hideFolderTree(prefixNorm: string): void {
     this.hiddenFolderPrefixes.add(prefixNorm);
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  /** Replace the external-root set (from `/api/folders`); no-op when unchanged. */
+  setExternalRoots(ids: Iterable<string>): void {
+    const next = new Set(ids);
+    if (
+      next.size === this.externalRootIds.size &&
+      [...next].every((id) => this.externalRootIds.has(id))
+    )
+      return;
+    this.externalRootIds = next;
+    this._cache = null;
+    this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  setShowExternal(show: boolean): void {
+    if (this.showExternal === show) return;
+    this.showExternal = show;
     this._cache = null;
     this._clearExclusionsIfNoneVisible();
     this.emit("change");
@@ -931,6 +969,7 @@ export class Model extends EventBus {
         colorByCluster: this.colorByCluster,
         clusterWeights: this.clusterWeights,
         trainFolders: this.trainFolders,
+        showExternal: this.showExternal,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -973,6 +1012,9 @@ export class Model extends EventBus {
         this.trainFolders = Array.isArray(tf)
           ? tf.filter((p): p is string => typeof p === "string")
           : [];
+        this.showExternal = Boolean(
+          (d as { showExternal?: boolean }).showExternal,
+        );
       }
     } catch {
       /* start fresh */

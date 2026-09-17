@@ -285,11 +285,13 @@ def test_jobs_status_carries_singleton_stage_phase(jobs_client):
 def folders_client():
     bp = create_api_folders_blueprint(
         roots={},
+        root_roles={},
         folder_tree=lambda *a, **k: {},
         resolve_virtual_path=lambda rel: "/music",
         virtual_from_abs=lambda p: p,
         add_root=lambda p: (True, "r"),
         remove_root=lambda rid: True,
+        set_root_role=lambda rid, role: None,
         schedule_root_watch=lambda rid: None,
         unschedule_root_watch=lambda rid: None,
         save_roots_state=lambda: None,

@@ -66,9 +66,11 @@ from backend.services.layout_revision_for_status import layout_revision_for_proj
 from backend.services.library_scan import emit_scan_progress_events
 from backend.services.roots_registry import (
     add_root as roots_add,
+    library_root_ids as roots_library_ids,
     load_roots_state as roots_load,
     remove_root as roots_remove,
     save_roots_state as roots_save,
+    set_root_role as roots_set_role,
 )
 from backend.services.parallel_reads import iter_parallel_reads, read_paths_parallel
 from backend.services.projection_request import (
@@ -240,7 +242,21 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
 
     def _remove_root(root_id: str) -> bool:
+        state.root_roles.pop(root_id, None)
         return roots_remove(root_id, state.roots)
+
+
+    def _set_root_role(root_id: str, role: str) -> None:
+        roots_set_role(root_id, role, state.root_roles)
+
+
+    def _library_root_ids() -> list[str]:
+        """Virtual ids of roots that are part of "my library" (not external).
+
+        The supervised head learns from these by default, so download/reference
+        roots do not pollute the folder labels; they still get predictions.
+        """
+        return roots_library_ids(state.roots, state.root_roles)
 
 
     def _schedule_root_watch(root_id: str) -> None:
@@ -272,7 +288,12 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
 
     def _save_roots_state() -> None:
-        roots_save(state.roots, state.roots_state_path, temp_roots=state.temp_roots)
+        roots_save(
+            state.roots,
+            state.roots_state_path,
+            temp_roots=state.temp_roots,
+            root_roles=state.root_roles,
+        )
 
 
     def _load_roots_state(default_root: str | None) -> None:
@@ -281,6 +302,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             state.roots_state_path,
             default_root=default_root,
             temp_roots=state.temp_roots,
+            root_roles=state.root_roles,
         )
 
 
@@ -589,6 +611,9 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                     ANALYSIS_DEPS,
                     build_track_infos=_build_track_infos,
                     emit=_stage_emit(KIND_SUPERVISED),
+                    # Labels come from "my library" roots only by default; external
+                    # roots still receive predictions from the trained head.
+                    default_folders=_library_root_ids,
                 ),
                 batch_size=1,
                 # Drain hook: a completed training run rewrites the supervised
@@ -647,9 +672,11 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             emit_scan_progress_events=emit_scan_progress_events,
             roots=state.roots,
             temp_roots=state.temp_roots,
+            root_roles=state.root_roles,
             folder_tree=_folder_tree,
             add_root=_add_root,
             remove_root=_remove_root,
+            set_root_role=_set_root_role,
             schedule_root_watch=_schedule_root_watch,
             unschedule_root_watch=_unschedule_root_watch,
             save_roots_state=_save_roots_state,

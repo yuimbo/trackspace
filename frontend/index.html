@@ -13,6 +13,9 @@
   <section id="folder-section" x-data>
     <h2>Folders</h2>
     <div id="folder-controls">
+      <label id="show-external-label" class="hidden" title="Show tracks from external roots on the canvas">
+        <input type="checkbox" id="show-external-toggle" /> External
+      </label>
       <button id="btn-add-root" type="button" title="Add root folder by path">+ Root</button>
     </div>
     <div id="root-drop-hint">Drop folders here to add roots. Drag a root row outside to remove.</div>
@@ -181,9 +184,9 @@
           <button
             id="btn-head-folders-all"
             type="button"
-            title="Train on every root (the default)"
+            title="Train on every My library root (the default)"
           >
-            All roots
+            All library folders
           </button>
         </div>
       </details>
@@ -278,6 +281,9 @@
   <div id="root-add-content">
     <h2>Add Root Folder</h2>
     <input id="root-add-input" type="text" placeholder="/absolute/path/to/music" spellcheck="false" />
+    <label id="root-add-external-label" title="Analyse it, but keep it out of My library">
+      <input type="checkbox" id="root-add-external" /> External (not My library)
+    </label>
     <div id="root-add-actions">
       <button id="root-add-cancel" type="button">Cancel</button>
       <button id="root-add-ok" type="button">OK</button>

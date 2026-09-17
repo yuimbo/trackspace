@@ -203,6 +203,30 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
 
 ---
 
+## Library roots and roles
+
+Roots are registered by absolute path in `data/roots.json`; ids are short hashes
+recomputed on load (`services/roots_registry.py`). Each root carries a role:
+
+- **`library`** (default) — the user's own tracks; the canvas, tags, search and the
+  supervised head's *labels* all use these.
+- **`external`** — downloads, reference material, or an imprint target. External roots
+  are scanned, analysed, embedded and laid out exactly like library roots (the
+  fingerprint-keyed `FeatureCache` never cares where a file lives), but the frontend
+  keeps their tracks out of the default view (`Model.trackInViewUnion`) until "External"
+  is toggled on, and the head does not learn from their folder labels by default.
+  Because analysis is content-addressed, marking a root external — or removing it —
+  never discards its cached embeddings; re-adding restores it instantly.
+
+Persistence stores only the *paths* whose role is external (`external_roots` in
+`roots.json`); library is the default so old files stay valid. The folder-tree partial
+renders a muted "External" section, root rows carry `data-root-role`, and
+`POST /api/roots/role` flips a root between the two. Ephemeral imprint roots
+(`temp_roots`) are a separate, shorter-lived concept — they are removed when the
+imprint finishes.
+
+---
+
 ## HTTP API: validation and error shape
 
 - **Every request is validated in one place.**  `backend/services/request_validation.py`

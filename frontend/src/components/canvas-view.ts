@@ -720,10 +720,16 @@ export class CanvasView {
     else if (hov) color = "#ff7eb3";
     else color = this.trackColor(track);
 
+    // External-root tracks (shown via the sidebar toggle) read as secondary.
+    const external = !sel && !hov && this.model.isExternalTrack(track);
+    if (external) ctx.globalAlpha = 0.5;
+
     ctx.beginPath();
     ctx.arc(sx, sy, r, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
+
+    if (external) ctx.globalAlpha = 1;
 
     if (sel) {
       ctx.strokeStyle = "#ffffffaa";

@@ -497,6 +497,58 @@ def test_supervised_handler_reads_folders_from_payload(tmp_path):
     assert sup.read_meta(str(tmp_path))["train_folders"] == ["B"]
 
 
+def test_supervised_handler_uses_default_folders_when_payload_empty(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    infos = _two_root_infos(fc)
+
+    def build(folder: str, _recursive: bool) -> list[dict]:
+        prefix = f"{folder}/"
+        return [t for t in infos if t["path"].startswith(prefix)]
+
+    handler = make_supervised_handler(
+        _deps(tmp_path, fc),
+        build_track_infos=build,
+        default_folders=lambda: ["B"],
+    )
+    job = Job(
+        id=1,
+        kind="supervise",
+        dedupe_key="library",
+        payload={"reason": "manual"},
+        attempts=0,
+        priority=150,
+    )
+    assert handler([job])[1].ok is True
+    # No selection in the payload: the app's library-roots default applies, so
+    # external roots are not trained on unless checked explicitly.
+    assert sup.read_meta(str(tmp_path))["train_folders"] == ["B"]
+
+
+def test_supervised_handler_payload_folders_win_over_default(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    infos = _two_root_infos(fc)
+
+    def build(folder: str, _recursive: bool) -> list[dict]:
+        prefix = f"{folder}/"
+        return [t for t in infos if t["path"].startswith(prefix)]
+
+    handler = make_supervised_handler(
+        _deps(tmp_path, fc),
+        build_track_infos=build,
+        default_folders=lambda: ["A"],
+    )
+    job = Job(
+        id=1,
+        kind="supervise",
+        dedupe_key="library",
+        payload={"reason": "manual", "folders": ["B"]},
+        attempts=0,
+        priority=150,
+    )
+    assert handler([job])[1].ok is True
+    assert sup.read_meta(str(tmp_path))["train_folders"] == ["B"]
+
+
 def test_supervised_imprint_status_counts_ready_tracks(tmp_path):
     fc = FeatureCache(str(tmp_path / "features.db"))
     ready_fp, pending_fp = "ready", "pending"

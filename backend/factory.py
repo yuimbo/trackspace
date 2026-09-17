@@ -92,9 +92,11 @@ class TrackspaceBlueprintDeps:
     # Folders
     roots: MutableMapping[str, str]
     temp_roots: set[str]
+    root_roles: MutableMapping[str, str]
     folder_tree: Callable[..., dict[str, Any]]
     add_root: Callable[[str], tuple[bool, str]]
     remove_root: Callable[[str], bool]
+    set_root_role: Callable[[str, str], None]
     schedule_root_watch: Callable[[str], None]
     unschedule_root_watch: Callable[[str], None]
     save_roots_state: Callable[[], None]
@@ -198,11 +200,13 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
     app.register_blueprint(
         create_api_folders_blueprint(
             roots=deps.roots,
+            root_roles=deps.root_roles,
             folder_tree=deps.folder_tree,
             resolve_virtual_path=deps.resolve_virtual_path,
             virtual_from_abs=deps.virtual_from_abs,
             add_root=deps.add_root,
             remove_root=deps.remove_root,
+            set_root_role=deps.set_root_role,
             schedule_root_watch=deps.schedule_root_watch,
             unschedule_root_watch=deps.unschedule_root_watch,
             save_roots_state=deps.save_roots_state,

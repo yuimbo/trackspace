@@ -78,6 +78,15 @@ means the track sits directly at the root.
   (`.folder-row`, `.folder-label`, `.folder-children`, `data-folder-toggle`, etc.).
 - Query params: `active` and `active_folders` = current `model.folder` (see `FolderTreeCoordinator.refresh()`);
   `pending_rename` = optional relative path for auto-opening rename after create.
+- Roots are grouped by role: My library first, then a muted **External** section
+  (`.folder-section-label`, `.folder-row-external`). Root rows carry `data-root-id` and
+  `data-root-role`; the `.folder-role-btn` flips a root via `POST /api/roots/role`.
+- `#show-external-toggle` (in `#folder-controls`, hidden while no external roots exist)
+  is bound to `model.showExternal`; toggling it redraws the canvas without a rescan.
+  When on, external dots are drawn at half alpha (`CanvasView._dot`) so they read as
+  secondary to My library. `FolderTreeCoordinator._syncExternalRoots` reads roles from
+  the swapped tree, so a role change only needs a tree `refresh()`, never the
+  expensive `onRootsChanged()` reload.
 
 ---
 
@@ -102,10 +111,12 @@ server-side by `backend/services/dir_colors.py` for the Jinja folder-tree swatch
 The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):
 
 - **Train folder view** sends the checked *Training folders* as `folders`; an empty
-  selection means every root (the default). The checkbox tree is the folder tree from
+  selection means every **My library** root (the default) — external roots are only
+  learned from when checked explicitly. The checkbox tree is the folder tree from
   `GET /api/folders`, fetched lazily when the section is opened — never on startup —
-  and rendered as `.head-folder-row` rows with collapsible children. *All roots*
-  clears the selection. The checked folders are mirrored onto `model.trainFolders` and
+  and rendered as `.head-folder-row` rows with collapsible children. *All library
+  folders* clears the selection. External roots are labelled `(external)`. The checked
+  folders are mirrored onto `model.trainFolders` and
   persisted in `localStorage`, so a selection survives a reload.
 - **Imprint on a folder…** takes an absolute path, calls
   `POST /api/supervised/imprint/analyze`, then polls

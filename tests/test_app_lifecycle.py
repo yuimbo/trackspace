@@ -55,6 +55,49 @@ def test_build_app_accepts_injected_state(tmp_path):
         state.thread_pool.shutdown(wait=False)
 
 
+def test_root_roles_roundtrip_through_the_app(tmp_path):
+    """Root roles flow from the API through roots.json and the tree sections."""
+    import json
+
+    from backend.app import build_app
+    from backend.services.roots_registry import load_roots_state
+    from backend.trackspace_state import TrackspaceState
+
+    lib = tmp_path / "lib"
+    ext = tmp_path / "ext"
+    (lib / "Album").mkdir(parents=True)
+    (ext / "Downloads").mkdir(parents=True)
+
+    state = TrackspaceState.create(data_dir=str(tmp_path / "data"))
+    try:
+        client = build_app(state).test_client()
+        lib_res = client.post("/api/roots/add", json={"path": str(lib)})
+        assert lib_res.get_json()["role"] == "library"
+        ext_res = client.post(
+            "/api/roots/add", json={"path": str(ext), "role": "external"}
+        )
+        assert ext_res.get_json()["role"] == "external"
+
+        # The partial splits roots into sections and tags each root row.
+        html = client.get("/partials/folder-tree").get_data(as_text=True)
+        assert 'data-root-role="external"' in html
+        assert 'data-root-role="library"' in html
+        assert "folder-section-label" in html
+
+        # Persisted as external *paths*; a reload restores the same role.
+        saved = json.loads((tmp_path / "data" / "roots.json").read_text())
+        assert saved["external_roots"] == [str(ext)]
+        roots: dict[str, str] = {}
+        roles: dict[str, str] = {}
+        load_roots_state(
+            roots, state.roots_state_path, default_root=None, root_roles=roles
+        )
+        ext_id = next(rid for rid, p in roots.items() if p == str(ext))
+        assert roles[ext_id] == "external"
+    finally:
+        state.thread_pool.shutdown(wait=False)
+
+
 def test_source_versions_covers_every_versioned_cache_source():
     """The startup purge and its report share one map, so they cannot disagree.
 

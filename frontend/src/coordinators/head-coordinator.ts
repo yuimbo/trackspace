@@ -28,6 +28,8 @@ interface FolderNode {
   name: string;
   path: string;
   children?: FolderNode[];
+  /** Present on root nodes only: ``"library"`` or ``"external"``. */
+  role?: string;
 }
 
 /** Shape of ``GET /api/supervised/imprint/status``. */
@@ -227,7 +229,8 @@ export class HeadCoordinator {
     });
     const name = document.createElement("span");
     name.className = "head-folder-name";
-    name.textContent = node.name;
+    name.textContent =
+      node.role === "external" ? `${node.name} (external)` : node.name;
     label.append(box, name);
     row.append(toggle, label);
     wrap.appendChild(row);

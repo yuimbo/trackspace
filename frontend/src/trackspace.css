@@ -111,6 +111,25 @@ body { display: flex; }
   opacity: 0.4;
 }
 
+/* "External" section: analysed, but not part of My library. */
+.folder-section-label {
+  margin: 6px 0 2px;
+  padding-left: 4px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  opacity: 0.7;
+}
+.folder-row-external .folder-label,
+.folder-row-external .folder-swatch {
+  opacity: 0.7;
+}
+.folder-row-external:hover .folder-label,
+.folder-row-external .folder-label.active {
+  opacity: 1;
+}
+
 .folder-label { user-select: none; }
 
 .folder-arrow {
@@ -204,6 +223,31 @@ body { display: flex; }
 .folder-add-btn:hover,
 .folder-reveal-btn:hover,
 .folder-rename-btn:hover { color: var(--accent-hi); }
+
+.folder-role-btn {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.folder-row:hover .folder-role-btn { opacity: 0.7; }
+.folder-role-btn:hover { color: var(--accent-hi); opacity: 1; }
+.folder-row-external .folder-role-btn { opacity: 0.5; }
+
+#folder-controls label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+#folder-controls label:hover { color: var(--fg); }
 
 .folder-create-label {
   flex: 1;

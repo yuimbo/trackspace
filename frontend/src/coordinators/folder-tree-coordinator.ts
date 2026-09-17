@@ -59,7 +59,21 @@ export class FolderTreeCoordinator {
   bind(): void {
     this._bindFolderTree();
     this._bindRootImport();
+    this._bindShowExternal();
     this._bindOverlay();
+  }
+
+  /** Toggle whether external-root tracks are drawn (persisted on the model). */
+  private _bindShowExternal(): void {
+    const $toggle = document.getElementById(
+      "show-external-toggle",
+    ) as HTMLInputElement | null;
+    if (!$toggle) return;
+    $toggle.checked = this.deps.model.showExternal;
+    $toggle.addEventListener("change", () => {
+      this.deps.model.setShowExternal($toggle.checked);
+      this.deps.model.saveLS();
+    });
   }
 
   private _bindFolderTree(): void {
@@ -129,9 +143,28 @@ export class FolderTreeCoordinator {
     }
     // Auto-opened state must be recomputed from scratch after a swap.
     this._autoOpenedFolders.clear();
+    this._syncExternalRoots();
     this.updateHighlights();
     this.syncActiveLabels();
     this._wireRootRowDrags();
+  }
+
+  /** Read root roles from the swapped-in tree and update the model + toggle. */
+  private _syncExternalRoots(): void {
+    const external = new Set<string>();
+    for (const row of this.$folderTree.querySelectorAll<HTMLElement>(
+      ".folder-row[data-root-role='external']",
+    )) {
+      const rid = row.dataset.rootId;
+      if (rid) external.add(rid);
+    }
+    this.deps.model.setExternalRoots(external);
+    const $toggle = document.getElementById(
+      "show-external-toggle",
+    ) as HTMLInputElement | null;
+    if ($toggle) $toggle.checked = this.deps.model.showExternal;
+    const $label = document.getElementById("show-external-label");
+    $label?.classList.toggle("hidden", external.size === 0);
   }
 
   /* ── Root import / removal ──────────────────────────────── */
@@ -141,6 +174,7 @@ export class FolderTreeCoordinator {
     const $addRoot = document.getElementById("btn-add-root");
     const $modal = document.getElementById("root-add-modal");
     const $input = document.getElementById("root-add-input") as HTMLInputElement | null;
+    const $external = document.getElementById("root-add-external") as HTMLInputElement | null;
     const $ok = document.getElementById("root-add-ok");
     const $cancel = document.getElementById("root-add-cancel");
 
@@ -151,6 +185,7 @@ export class FolderTreeCoordinator {
     const openModal = async () => {
       if (!$modal) return;
       $modal.classList.remove("hidden");
+      if ($external) $external.checked = false;
       if ($input) {
         $input.value = "";
         try {
@@ -172,8 +207,9 @@ export class FolderTreeCoordinator {
     const submitModal = () => {
       const raw = $input?.value.trim() ?? "";
       if (!raw) return;
+      const role = $external?.checked ? "external" : "library";
       closeModal();
-      void this._addRootPath(raw);
+      void this._addRootPath(raw, role);
     };
 
     if ($addRoot) $addRoot.addEventListener("click", openModal);
@@ -223,14 +259,14 @@ export class FolderTreeCoordinator {
         toast("Drop a folder from Finder, or paste an absolute path.", "warn");
         return;
       }
-      void this._addRootPath(first);
+      void this._addRootPath(first, "library");
     });
   }
 
-  private async _addRootPath(path: string): Promise<void> {
+  private async _addRootPath(path: string, role: string): Promise<void> {
     const res = await postJSON<{ ok: boolean; changed?: boolean; error?: string }>(
       "/api/roots/add",
-      { path },
+      { path, role },
     );
     if (!res.ok) {
       toast(res.error || "Failed to add root", "error");
@@ -279,6 +315,23 @@ export class FolderTreeCoordinator {
     toast("Root removed", "ok");
   }
 
+  /** Toggle a root between My library and External (analysed either way). */
+  private async _setRootRole(rootId: string, role: string): Promise<void> {
+    const res = await postJSON<{ ok: boolean; error?: string }>(
+      "/api/roots/role",
+      { root_id: rootId, role },
+    );
+    if (!res.ok) {
+      toast(res.error || "Failed to change root role", "error");
+      return;
+    }
+    await this.refresh();
+    toast(
+      role === "external" ? "Root marked external" : "Root is in My library",
+      "ok",
+    );
+  }
+
   /* ── Tree interaction ───────────────────────────────────── */
 
   private _onFolderTreeClick(e: MouseEvent): void {
@@ -317,6 +370,15 @@ export class FolderTreeCoordinator {
       const btn = t.closest(".folder-reveal-btn") as HTMLElement;
       const path = btn.dataset.path ?? ".";
       void postJSON("/api/folders/reveal", { path: path === "." ? "" : path });
+      return;
+    }
+
+    if (t.closest(".folder-role-btn")) {
+      e.stopPropagation();
+      const btn = t.closest(".folder-role-btn") as HTMLElement;
+      const rootId = btn.dataset.rootId ?? "";
+      const role = btn.dataset.role === "external" ? "library" : "external";
+      void this._setRootRole(rootId, role);
       return;
     }
 

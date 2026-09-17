@@ -11,10 +11,16 @@ from flask import Blueprint, abort, jsonify, render_template, request
 
 from backend.services.request_validation import (
     ApiValidationError,
+    one_of,
     opt_str,
     parse_json_body,
     require_str,
     require_str_list,
+)
+from backend.services.roots_registry import (
+    ROLES,
+    ROLE_LIBRARY,
+    root_role,
 )
 
 
@@ -35,11 +41,13 @@ def _safe_leaf_name(name: str) -> str:
 def create_api_folders_blueprint(
     *,
     roots: MutableMapping[str, str],
+    root_roles: MutableMapping[str, str],
     folder_tree: Callable[..., dict[str, Any]],
     resolve_virtual_path: Callable[[str], str],
     virtual_from_abs: Callable[[str], str],
     add_root: Callable[[str], tuple[bool, str]],
     remove_root: Callable[[str], bool],
+    set_root_role: Callable[[str, str], None],
     schedule_root_watch: Callable[[str], None],
     unschedule_root_watch: Callable[[str], None],
     save_roots_state: Callable[[], None],
@@ -47,6 +55,13 @@ def create_api_folders_blueprint(
     dir_color_fn: Callable[[str], str],
 ) -> Blueprint:
     bp = Blueprint("api_folders", __name__)
+
+    def _roots_payload() -> list[dict[str, Any]]:
+        """One tree per root, each tagged with its role for the sidebar sections."""
+        return [
+            {**folder_tree(root_abs, rid), "role": root_role(rid, root_roles)}
+            for rid, root_abs in roots.items()
+        ]
 
     @bp.route("/partials/folder-tree")
     def partial_folder_tree():
@@ -56,10 +71,9 @@ def create_api_folders_blueprint(
         if not active_folders:
             active_folders = [active if active != "" else "."]
         pending_rename = request.args.get("pending_rename", "")
-        trees = [folder_tree(root_abs, rid) for rid, root_abs in roots.items()]
         return render_template(
             "partials/folder_tree.html",
-            trees=trees,
+            trees=_roots_payload(),
             active_folders=active_folders,
             pending_rename=pending_rename,
             dir_color=dir_color_fn,
@@ -70,7 +84,7 @@ def create_api_folders_blueprint(
         """Return the folder tree for all roots (or a subpath)."""
         rel = request.args.get("root", "")
         if rel in ("", "."):
-            return jsonify({"roots": [folder_tree(root_abs, rid) for rid, root_abs in roots.items()]})
+            return jsonify({"roots": _roots_payload()})
         root_abs = resolve_virtual_path(rel)
         parts = rel.split("/", 1)
         root_id = parts[0]
@@ -81,6 +95,11 @@ def create_api_folders_blueprint(
     def api_roots_add():
         data = parse_json_body()
         path = require_str(data, "path").strip()
+        role = one_of(
+            opt_str(data, "role", ROLE_LIBRARY).strip() or ROLE_LIBRARY,
+            ROLES,
+            field="role",
+        )
         abs_path = os.path.abspath(path)
         if not os.path.isdir(abs_path):
             return jsonify({"ok": False, "error": "Directory not found"})
@@ -89,10 +108,20 @@ def create_api_folders_blueprint(
         after_ids = set(roots.keys())
         for rid in sorted(before_ids - after_ids):
             unschedule_root_watch(rid)
+            root_roles.pop(rid, None)
         for rid in sorted(after_ids - before_ids):
             schedule_root_watch(rid)
+        if changed:
+            set_root_role(root_id, role)
         save_roots_state()
-        return jsonify({"ok": True, "changed": changed, "root_id": root_id})
+        return jsonify(
+            {
+                "ok": True,
+                "changed": changed,
+                "root_id": root_id,
+                "role": root_role(root_id, root_roles),
+            }
+        )
 
     @bp.route("/api/roots/remove", methods=["POST"])
     def api_roots_remove():
@@ -100,9 +129,22 @@ def create_api_folders_blueprint(
         root_id = require_str(data, "root_id").strip()
         if not remove_root(root_id):
             return jsonify({"ok": False, "error": "Unknown root"})
+        root_roles.pop(root_id, None)
         unschedule_root_watch(root_id)
         save_roots_state()
         return jsonify({"ok": True})
+
+    @bp.route("/api/roots/role", methods=["POST"])
+    def api_roots_role():
+        """Set a root's role: ``library`` (default) or ``external``."""
+        data = parse_json_body()
+        root_id = require_str(data, "root_id").strip()
+        role = one_of(require_str(data, "role").strip(), ROLES, field="role")
+        if root_id not in roots:
+            return jsonify({"ok": False, "error": "Unknown root"})
+        set_root_role(root_id, role)
+        save_roots_state()
+        return jsonify({"ok": True, "root_id": root_id, "role": role})
 
     @bp.route("/api/folders/reveal", methods=["POST"])
     def api_reveal_folder():

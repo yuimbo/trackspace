@@ -48,6 +48,10 @@ class TrackspaceState:
     #: Root ids registered only to imprint an external folder (scan/analyse/fan-out)
     #: and removed when the imprint finishes — they are not part of the library.
     temp_roots: set[str] = field(default_factory=set)
+    #: Per-root role: ``"library"`` (default) or ``"external"``. External roots are
+    #: analysed and laid out like any other, but are kept out of the default view and
+    #: the supervised head's training labels. Missing ids mean ``"library"``.
+    root_roles: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def create(cls, data_dir: str | None = None) -> TrackspaceState:

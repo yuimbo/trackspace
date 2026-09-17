@@ -6,10 +6,11 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 
 ## User feedback
 
-- [ ] How to remove a root folder from the analysis library? 
-      Though i might want tracks analyzed, but not be "my" tracks; i.e. a separate section for tracks which are in the system but not "My library" (folders which probably also contain things where i will project my learned folder structure on)
 - [ ] Whacko idea? Add a 3d view for the embedding space?
+
 - [ ] When projecting my library onto external tracks; those who don't fit into my paylists, can still end up in an Generic/${name}/ subdirectories; where "name" equals what that genre name that generic discogs model would give to them
+- [ ] If i want to project onto an external root which contains a bunch of subdirectories; allow me to just gather all of the nested files to reproject [[maybe stoer some metadata on the old relative folder structure?]]
+
 - [ ] **Undo leaves empty fan-out folders.** The move journal restores every
   file but does not remove the subfolders a fan-out created (they are often empty
   afterwards). Sweep empty directories on undo, bounded to the fan-out root so it can
@@ -71,6 +72,12 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Frontend
 
+- [ ] **External-root follow-ups.** External roots are marked in the folder tree,
+      dimmed on the canvas, and hidden until `#show-external-toggle` is on. Still
+      open: an "Imprint this external root" action on the root row; and marking the
+      *ephemeral* imprint roots external too (`api_imprint.py`) so an in-flight
+      fan-out target is not drawn as library. Files:
+      `backend/routes/api_imprint.py`, `frontend/src/coordinators/folder-tree-coordinator.ts`.
 - [ ] **Optional sibling hue wiggle.** Family tints currently differ only in
       lightness/saturation (`frontend/src/lib/colors.ts` / `backend/services/dir_colors.py`).
       If same-depth siblings still read too alike on the canvas, add a small hue deviation
