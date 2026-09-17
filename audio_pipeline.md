@@ -251,6 +251,37 @@ Per-excerpt vectors are stored alongside the pooled pair (the `maest_excerpts`
 blob) so weak supervision can mine hard negatives and detect genre-spanning
 tracks without re-running inference.
 
+**Inference mode and opt-in compilation.** Every inference forward (MAEST, CLAP
+audio/text, the supervised head's validation and projection) runs under
+`torch.inference_mode()`, not `no_grad()`: the outputs go straight to numpy, so
+the weaker autograd guarantee costs nothing. `TRACKSPACE_MAEST_COMPILE=1` wraps
+the MAEST transformer in `torch.compile` on the accelerator — **off by default**.
+A quick (loaded-machine) smoke test showed inductor working on MPS and a
+promising steady-state signal — compiled forwards ran ~0.15–0.2 s/track on the
+short fixture track, with the ~15 s compile absorbed by `warmup()` at startup.
+That is not a measurement: the fixture track differs from the library sample, so the
+eager/compiled ratio still has to come from the paired run below. Two caveats to
+settle before defaulting it on:
+
+- **Shape thrash.** A drain's excerpt count varies per claim (1–12 excerpts for
+  `batch_size=4`), and both `dynamic=False` and `dynamic=True` recompiled on the
+  first unseen shape (~5 s). `warmup()` compiles shapes 1 and
+  `DEFAULT_BATCH_EXCERPTS` (12); a smaller partial batch can still recompile once.
+- **Fallback.** If the compiled model raises during `warmup()`, it is dropped for
+  the eager one and the flag is effectively ignored, so the stage cannot break.
+
+Decide it on an idle machine with the harness, comparing best-run numbers (the
+harness does **not** call `warmup`, so run 1 is the cold/compile run and run 2+ the
+steady state):
+
+```sh
+# eager baseline, then compiled (repeat 3, best run per stage)
+.venv/bin/python tests/profile_pipeline.py --root /path/to/music \
+    --sample 48 --stages maest --repeat 3
+TRACKSPACE_MAEST_COMPILE=1 .venv/bin/python tests/profile_pipeline.py \
+    --root /path/to/music --sample 48 --stages maest --repeat 3
+```
+
 ---
 
 ## Audio feature extraction (`librosa` + optional `madmom`)
@@ -733,10 +764,14 @@ them as relative, not absolute):
 | scan | 0.156 | 385 | ID3 + fpcalc |
 | features | 0.387 | 155 | 4-process pool, warm |
 | structure | 0.117 | 512 | 4-thread pool, whole-track decode |
-| maest | 0.388–0.43 | 139–155 | **slowest per-track stage** |
+| maest | 0.388–0.43 | 139–155 | **slowest per-track stage**; `TRACKSPACE_MAEST_COMPILE` off |
 | clap | 0.135 | 446 | 3 × 15 s decode + one batched forward |
 | supervise | — | — | whole-library, seconds (skips without MAEST rows) |
 | cluster | — | — | whole-library, seconds |
+
+A later 48-track run on the same loaded machine gave maest 0.595 / clap 0.162
+(best of 3) — the spread between the two sessions is the load, which is why only an
+idle-machine, best-run comparison can settle the `torch.compile` question.
 
 Two conclusions worth keeping in mind before optimising:
 
@@ -745,8 +780,11 @@ Two conclusions worth keeping in mind before optimising:
   fraction of any stage, and CLAP's "decode-dominated" label was wrong — CLAP is one of
   the *fast* stages. The decode lock's cost is the SIGBUS it prevents, not throughput.
 - **MAEST is the per-track bottleneck** (~0.4 s/track, ≈4× CLAP). Its transformer
-  forward, not decode, is where the end-to-end time goes; the batch-size default and
-  `torch.compile` / `inference_mode` are therefore the highest-leverage levers.
+  forward, not decode, is where the end-to-end time goes, so the batch-size default and
+  `torch.compile` are the highest-leverage levers. Inference now runs under
+  `torch.inference_mode()` unconditionally; `torch.compile` is opt-in via
+  `TRACKSPACE_MAEST_COMPILE` until the idle-machine comparison in *MAEST model
+  management* justifies defaulting it on.
 
 ### Rules when adding a stage
 

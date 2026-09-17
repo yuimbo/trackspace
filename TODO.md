@@ -187,14 +187,25 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       Measured: an `ffmpeg` subprocess is *not* faster (equal on whole tracks,
       ~2.7× slower per 15 s segment from process spawn), so the only win is
       dropping `_DECODE_LOCK` for the SIGBUS invariant.
-- [ ] **MAEST: `torch.compile` / `torch.inference_mode` — now the top item.** The
-      batched transformer is the measured per-track bottleneck (~0.4 s/track vs CLAP's
-      ~0.14; see *Per-stage throughput*). Try `inference_mode()` instead of
-      `no_grad()` (safe, tiny) and `torch.compile` on the model, measuring
-      cold-start vs steady-state on MPS on a quiet machine before enabling.
-- [ ] **MAEST mel front end.** The mel runs on CPU per excerpt; check whether the
-      three excerpts can share one batched `torchaudio` transform instead of three
-      separate calls.
+- [x] **MAEST `inference_mode` + opt-in `torch.compile`.** All inference forwards
+      (MAEST, CLAP audio/text, the supervised head) now use `torch.inference_mode()`.
+      `TRACKSPACE_MAEST_COMPILE=1` wraps the MAEST transformer in `torch.compile`,
+      **default off**; `warmup()` compiles the single-excerpt and job-shaped batches
+      and falls back to eager if compilation is unusable. Loaded-machine smoke test:
+      inductor works on MPS and compiled forwards on the short fixture ran
+      ~0.15–0.2 s/track, ~15 s compile absorbed at startup — promising, but a
+      different track, so not a measurement.
+- [ ] **Decide the MAEST compile default on an idle machine.** Run the eager/compiled
+      pair in `audio_pipeline.md` → *MAEST model management* and flip the default only
+      on a best-run steady-state win. Settle two things with it: the compiled model
+      recompiles on the first unseen excerpt-count shape (~5 s) even with
+      `dynamic=True` (warmup covers 1 and `DEFAULT_BATCH_EXCERPTS`; a smaller partial
+      batch recompiles once — padding the partial chunk would remove it), and
+      `TRACKSPACE_MAEST_COMPILE` is inert on CPU (`_device == "cpu"` skips it).
+- [ ] **MAEST mel front end.** Already batched: `analyze_batch` stacks every
+      excerpt of the claimed batch (up to `DEFAULT_BATCH_EXCERPTS`) into one
+      `_mel(wave)` call, not three per track. The remaining CPU mel cost is the
+      front end itself, which would need a different transform or device split.
 - [ ] **madmom tempo.** `TRACKSPACE_MADMOM_FAST=1` (one BLSTM) is ~4× faster but
       opt-in. Benchmark the tempo error on a labelled sample and consider making it the
       default (bump `FEATURES_VERSION` if the vector changes).
@@ -250,8 +261,9 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       ~70–150 tracks/min with no clean winner; the loaded machine's run-to-run
       spread exceeded the effect). Re-run
       `tests/profile_pipeline.py --stages maest --maest-batch N --repeat 3` when idle
-      and pair it with the `inference_mode` / `torch.compile` item under
-      *Acceleration*.
+      and pair it with the compile A/B above. If the machine never goes idle, an
+      interleaved eager/compiled or batch-N pair under identical load is still more
+      informative than one under-load run, because the ratio cancels the load.
 - [ ] **Peak RSS / GPU memory.** No memory baseline exists; capture peak RSS and MPS
       allocation per stage before adding workers or batches.
 - [ ] **Cluster/projection timing at scale.** `DEFAULT_RESOLUTIONS` and k=20 were
