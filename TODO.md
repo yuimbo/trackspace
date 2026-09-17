@@ -24,12 +24,6 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 
 ### UI/UX feedback round
 
-- [ ] **Right sidebar can overflow.** `#right-panel` is `overflow: hidden` and every
-  section is `flex-shrink: 0`, so once the cluster/head/imprint `<details>` are
-  expanded the lower sections are clipped with no way to reach them. Make the panel
-  scroll (`overflow-y: auto`) without breaking the inner `#properties-list` /
-  `#cluster-list` scroll areas or the `.rp-spacer` bottom-align behaviour.
-  Files: `frontend/src/trackspace.css`.
 - [ ] **Search: audition the best-matching section, not just the drop.** CLAP caches
   only the mean of the `NUM_SEGMENTS` (=3) segment vectors, so a hit carries no
   per-section score and the hover preview can only start at the structure `peak`.
