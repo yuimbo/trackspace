@@ -48,12 +48,30 @@ def test_build_app_accepts_injected_state(tmp_path):
         assert set(app.extensions["trackspace_lifecycle"]) == {
             "load_roots_state",
             "schedule_root_watch",
-            "backfill_outstanding_analysis",
+            "backfill_purged_analysis",
         }
         # The search blueprint is registered with the existing deps (no new wiring).
         assert "/api/search" in {r.rule for r in app.url_map.iter_rules()}
     finally:
         state.thread_pool.shutdown(wait=False)
+
+
+def test_purged_sources_fold_onto_the_stage_that_rewrites_them():
+    """A startup purge enqueues only the stages it actually blanked.
+
+    The map must cover every versioned source (a new source with no kind would be
+    silently un-backed-up), and several sources may share one stage.
+    """
+    from backend.app import PURGED_SOURCE_KINDS, SOURCE_VERSIONS, _kinds_for_purged_sources
+
+    assert set(PURGED_SOURCE_KINDS) == set(SOURCE_VERSIONS)
+    assert _kinds_for_purged_sources({}) == ()
+    assert _kinds_for_purged_sources({"structure": 0}) == ()
+    assert _kinds_for_purged_sources({"structure": 5}) == ("structure",)
+    # CLAP's pooled vector, segment vectors and positions share one stage.
+    assert _kinds_for_purged_sources(
+        {"clap": 3, "clap_segments": 3, "clap_segment_pos": 3}
+    ) == ("clap",)
 
 
 def test_backfill_hook_queues_nothing_on_an_empty_library(tmp_path):
@@ -64,10 +82,10 @@ def test_backfill_hook_queues_nothing_on_an_empty_library(tmp_path):
     state = TrackspaceState.create(data_dir=str(tmp_path / "data"))
     try:
         app = build_app(state)
-        queued = app.extensions["trackspace_lifecycle"][
-            "backfill_outstanding_analysis"
-        ]()
-        assert sum(queued.values()) == 0
+        hook = app.extensions["trackspace_lifecycle"]["backfill_purged_analysis"]
+        assert sum(hook({}).values()) == 0
+        # Even a purge is a no-op when there is no track to re-queue.
+        assert sum(hook({"structure": 4}).values()) == 0
     finally:
         state.thread_pool.shutdown(wait=False)
 

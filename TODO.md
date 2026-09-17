@@ -212,14 +212,20 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
 
 ### Dependencies
 
+- [ ] **CLAP per-segment backfill.** `clap_segments` / `clap_segment_pos` are blank
+      for pooled rows written before they existed (10 197 pooled vs. 112 with segments on
+      the real library), so the CLAP stage must re-run once (decode-dominated — hours) to
+      fill them. Until it drains, `/api/search` falls back to the pooled mean and hits carry
+      no `section`. This is a schema backlog, not a version purge, so the startup backfill
+      deliberately leaves it alone — press **CLAP** in the Analysis coverage panel to start it.
 - [ ] **Retrain the supervised head after a CLAP backfill.** The checkpoint switch
       bumped `EMBEDDING_VERSION` 2 → 3, so every cached `clap` row is purged on next
       startup and the queue's startup backfill regenerates it (decode-dominated — hours
       on the real library). The supervised head consumes the `clap` block
       (`SUPERVISED_INPUT_WEIGHTS`), so its weights are stale against the new vectors —
       retrain via *Train folder view* once the CLAP backfill drains, or its
-      `supervised` block is misleading. (The backfill itself is now automatic: see
-      *Startup backfill* in `architecture.md`.)
+      `supervised` block is misleading. (A version purge is now self-healing at startup:
+      see *Startup backfill* in `architecture.md`.)
 - [ ] **`transformers` is installed at 5.3** against a `>=4.40` floor — a major bump.
       Pin a tested floor and smoke-test the CLAP text/audio paths. (The
       `larger_clap_music` checkpoint bug reproduces on 4.57.1, so it is a broken

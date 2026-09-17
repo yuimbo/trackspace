@@ -191,13 +191,15 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
   (`tests/test_app_lifecycle.py`).
 - Root-watch / root-loading hooks are returned via
   `app.extensions["trackspace_lifecycle"]` so `main()` needs no module global.
-- **Startup backfill.** After the workers start, `main()` queues outstanding per-track
-  work in a background thread (`backfill_outstanding_analysis`). A source-version bump
-  blanks the stale cache rows on load, but the queue still holds their jobs in a terminal
-  state, so an ordinary enqueue would skip them — `enqueue_library_work` therefore revives
-  terminal rows for tracks the *cache* reports as missing (the cache, not the queue, is the
-  source of truth; `force` only widens the filter to already-cached tracks). Once the
-  backfill drains it enqueues nothing, so a restart is cheap.
+- **Startup backfill.** A source-version bump blanks the stale cache rows on load, but
+  the queue still holds their jobs in a terminal state, so an ordinary enqueue would skip
+  them: `enqueue_library_work` therefore revives terminal rows for tracks the *cache*
+  reports as missing (the cache, not the queue, is the source of truth; `force` only widens
+  the filter to already-cached tracks). `main()` then re-queues exactly what the purge
+  blanked (`backfill_purged_analysis`, a background thread), so a version bump self-heals.
+  A standing schema backlog that is *not* a version purge — e.g. the CLAP segment vectors
+  added later — is deliberately not swept into an unrelated restart; it is retriggered from the
+  coverage panel, whose per-stage buttons now revive terminal jobs too.
 - Flask runs with `use_reloader=False`: the reloader would fork a second set of worker
   threads competing for the same queue.
 - **Every cache connection goes through `sqlite_conn.ClosingConnection`.** The stdlib

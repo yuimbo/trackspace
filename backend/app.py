@@ -108,6 +108,19 @@ SOURCE_VERSIONS: dict[str, int] = {
     "structure": STRUCTURE_VERSION,
 }
 
+#: Which job kind re-runs each versioned cache source, so a startup purge can
+#: enqueue exactly the backfill it created. Several sources share one stage (CLAP
+#: writes its pooled vector, segment vectors and positions in one pass).
+PURGED_SOURCE_KINDS: dict[str, str] = {
+    "clap": KIND_CLAP,
+    "clap_segments": KIND_CLAP,
+    "clap_segment_pos": KIND_CLAP,
+    "features": KIND_FEATURES,
+    "maest": KIND_MAEST,
+    "rhythm": KIND_FEATURES,
+    "structure": KIND_STRUCTURE,
+}
+
 #: Processes used to drain the CPU-bound ``features`` stage. madmom's BLSTM
 #: forward pass is GIL-bound, so this stage scales across *processes*, not threads
 #: (see ``backend/services/features_worker.py``). Measured on a 64-track real
@@ -181,6 +194,21 @@ def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
         src: fc.purge_old_versions(src, ver)
         for src, ver in SOURCE_VERSIONS.items()
     }
+
+
+def _kinds_for_purged_sources(purged: dict[str, int]) -> tuple[str, ...]:
+    """Job kinds that rewrite the cache sources a purge just blanked, deduped.
+
+    Several sources share one stage, so the map is folded in stage order; a source
+    with nothing purged (or one not in the map) contributes no work.
+    """
+    return tuple(
+        dict.fromkeys(
+            PURGED_SOURCE_KINDS[src]
+            for src, n in purged.items()
+            if n and src in PURGED_SOURCE_KINDS
+        )
+    )
 
 
 def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
@@ -546,16 +574,20 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         return queued
 
 
-    def _backfill_outstanding_analysis() -> dict[str, int]:
-        """Queue the per-track work the cache reports as missing, once.
+    def _backfill_purged_analysis(purged: dict[str, int]) -> dict[str, int]:
+        """Re-queue the per-track work a startup version purge just blanked.
 
-        A source-version bump blanks the stale cache rows on load, but the durable
-        queue still holds their jobs in a terminal state, so an ordinary enqueue would
-        skip them. Running this at startup makes the backfill self-healing instead of
-        waiting for the user to press a retrigger button. The cache filter keeps it to
-        genuinely missing work, so once it drains this enqueues nothing.
+        The purge blanks stale cache rows, but the durable queue still holds their
+        jobs in a terminal state, so an ordinary enqueue would skip them. Scoping the
+        backfill to the sources that were *actually* purged keeps a standing schema
+        backlog (e.g. CLAP segment vectors added later) out of an unrelated restart
+        — that one is retriggered explicitly from the coverage panel. Once the
+        purged work drains this enqueues nothing.
         """
-        return _enqueue_analysis(infos=_build_track_infos("", True))
+        kinds = _kinds_for_purged_sources(purged)
+        if not kinds:
+            return {}
+        return _enqueue_analysis(infos=_build_track_infos("", True), kinds=kinds)
 
 
     def _register_workers() -> None:
@@ -717,7 +749,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
     app.extensions["trackspace_lifecycle"] = {
         "load_roots_state": _load_roots_state,
         "schedule_root_watch": _schedule_root_watch,
-        "backfill_outstanding_analysis": _backfill_outstanding_analysis,
+        "backfill_purged_analysis": _backfill_purged_analysis,
     }
     return app
 
@@ -816,13 +848,13 @@ def main():
     state.workers.start_all()
 
     def _bg_backfill_analysis():
-        """Self-heal a source-version bump: re-queue what the cache reports missing."""
+        """Self-heal a source-version bump: re-queue what the purge just blanked."""
         try:
-            queued = lifecycle["backfill_outstanding_analysis"]()
+            queued = lifecycle["backfill_purged_analysis"](startup_purges)
             outstanding = sum(int(v) for v in queued.values())
             if outstanding:
                 detail = ", ".join(f"{k}={v}" for k, v in sorted(queued.items()))
-                print(f"Backfill: queued {outstanding} outstanding per-track job(s) ({detail})")
+                print(f"Backfill: queued {outstanding} purged per-track job(s) ({detail})")
         except Exception:
             log.exception("startup analysis backfill failed")
     threading.Thread(
