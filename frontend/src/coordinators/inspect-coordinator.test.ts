@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Model, type Track } from "../model";
-import { ANTI_MORE_K, type InspectState } from "../lib/tooltip";
+import { type InspectState } from "../lib/tooltip";
 import {
   ANTI_K,
   InspectCoordinator,
@@ -56,7 +56,7 @@ function lastInspect(view: Harness["view"]): Partial<InspectState> {
 }
 
 describe("InspectCoordinator", () => {
-  it("ranks the anti-track as the single furthest neighbour", async () => {
+  it("ranks the anti-track as the most distant neighbours", async () => {
     const h = makeHarness({
       ok: true,
       results: [{ path: "far.mp3", score: -0.42 }],
@@ -153,15 +153,5 @@ describe("InspectCoordinator", () => {
     expect(h.stopPreview).not.toHaveBeenCalled();
     await h.coord.action("leave", "c.mp3");
     expect(h.stopPreview).toHaveBeenCalled();
-  });
-
-  it("expands the anti-track to the most distant list", async () => {
-    const h = makeHarness({
-      ok: true,
-      results: [{ path: "far.mp3", score: -0.42 }],
-    });
-    await h.coord.action("anti-more", "a.mp3");
-    expect(h.fetchSimilar).toHaveBeenCalledWith("a.mp3", "far", ANTI_MORE_K);
-    expect(lastInspect(h.view)).toMatchObject({ mode: "far" });
   });
 });

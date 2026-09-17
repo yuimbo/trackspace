@@ -272,10 +272,9 @@ dots and makes **S**/**H**/**F**/**Shift+S** act on that set, exactly like a sid
 `InspectCoordinator` (`coordinators/inspect-coordinator.ts`) owns the actions —
 same seam as `SearchCoordinator`:
 
-- **Anti-track** — `GET /api/tracks/similar?path=…&mode=far&k=1`, the single
-  furthest track in the composite embedding space (what the map/clusters describe).
-  A *Show 10 most distant* button re-ranks with `ANTI_MORE_K` and replaces the
-  list in place.
+- **Anti-track** — `GET /api/tracks/similar?path=…&mode=far&k=10`, the `ANTI_K`
+  most distant tracks in the composite embedding space (what the map/clusters
+  describe), listed directly.
 - **Nearest** — `mode=near`, the `NEAR_K` closest tracks.
 - **Solo** — isolate to the neighbourhood (the inspected track plus `SOLO_K`
   neighbours) and fit the view to it, reusing `Model.focusPaths` and

@@ -7,18 +7,14 @@
 // canvas view stays free of API calls — same seam as `SearchCoordinator`.
 
 import { type Model } from "../model";
-import {
-  ANTI_MORE_K,
-  type InspectState,
-  type TooltipResult,
-} from "../lib/tooltip";
+import { type InspectState, type TooltipResult } from "../lib/tooltip";
 
 /** Neighbours requested for the "nearest" ranking. */
 export const NEAR_K = 5;
 /** Neighbours kept when soloing the neighbourhood. */
 export const SOLO_K = 10;
-/** The anti-track ranking: one on demand, expandable to the most distant list. */
-export const ANTI_K = 1;
+/** The anti-track ranking: the most distant tracks, shown directly. */
+export const ANTI_K = 10;
 
 /** Shape of ``GET /api/tracks/similar``. */
 export interface SimilarResponse {
@@ -81,11 +77,6 @@ export class InspectCoordinator {
       await this.solo(path);
       return;
     }
-    if (action === "anti-more") {
-      // Expand the anti-track to the most distant list, in place.
-      await this.rank(path, "far", ANTI_MORE_K);
-      return;
-    }
     if (action === "anti" || action === "near") {
       await this.rank(path, action === "anti" ? "far" : "near");
     }
@@ -99,12 +90,8 @@ export class InspectCoordinator {
     this.deps.preview(path);
   }
 
-  private async rank(
-    path: string,
-    mode: "near" | "far",
-    k?: number,
-  ): Promise<void> {
-    const limit = k ?? (mode === "far" ? ANTI_K : NEAR_K);
+  private async rank(path: string, mode: "near" | "far"): Promise<void> {
+    const limit = mode === "far" ? ANTI_K : NEAR_K;
     this.deps.view.setInspect({ busy: true, message: null, mode, results: [] });
     const res = await this.fetch(path, mode, limit);
     if (!res.ok) {

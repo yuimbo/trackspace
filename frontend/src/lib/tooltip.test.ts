@@ -363,10 +363,10 @@ describe("renderTooltip", () => {
       (b) => (b as HTMLElement).dataset.inspectAction,
     );
     expect(actions).toEqual(["anti", "near", "solo"]);
-    // The anti-track list expands to the most-distant ranking.
+    // The anti-track ranking is shown directly, with no expand button.
     expect(
       host.querySelector<HTMLElement>("[data-inspect-action='anti-more']"),
-    ).not.toBeNull();
+    ).toBeNull();
     expect(host.querySelector("[data-inspect-close]")).not.toBeNull();
     expect(host.querySelector(".tt-section-title")?.textContent).not.toBe("Anti-track");
     expect(

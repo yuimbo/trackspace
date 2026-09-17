@@ -47,11 +47,6 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
   `stage_progress`; audit every long-running stage for a phase/percent event and add
   the missing ones. Files: `backend/embeddings/projection_backends.py`,
   `backend/services/analysis_pipeline.py`, `frontend/src/lib/pipeline.ts`.
-- [ ] **Anti-track hides the ranking behind a button.** The pinned card shows one
-  anti-track and a "Show 10 most distant" button; show the 10 most distant directly
-  (drop `ANTI_MORE_K` / the `anti-more` action / `canExpandAnti`).
-  Files: `frontend/src/coordinators/inspect-coordinator.ts`,
-  `frontend/src/lib/tooltip.ts`.
 
 ### Source-weight comparability (normalising the source blocks)
 

@@ -44,9 +44,6 @@ export interface TooltipResult {
   score: number;
 }
 
-/** How many most-distant tracks the anti-track list expands to. */
-export const ANTI_MORE_K = 10;
-
 /** Interactive inspect state, present only while the card is pinned. */
 export interface InspectState {
   /** The inspected track. */
@@ -79,8 +76,6 @@ export interface TooltipCard {
   results: ResultRow[];
   /** Footer hint on the plain hover card (how to pin it). */
   hint: string | null;
-  /** Whether the anti-track list can expand to the most-distant ranking. */
-  canExpandAnti: boolean;
 }
 
 /** A ranked neighbour resolved against the loaded library for display. */
@@ -221,7 +216,6 @@ export function buildTooltip(
     results,
     // The hint only belongs on the plain card: once pinned it is interactive.
     hint: inspect ? null : HOLD_ALT_HINT,
-    canExpandAnti: inspect?.mode === "far" && results.length < ANTI_MORE_K,
   };
 }
 
@@ -346,7 +340,7 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
     root.appendChild(statSection("Features", card.features, "tt-features"));
 
   if (card.inspect)
-    root.appendChild(inspectSection(card.inspect, card.results, card.canExpandAnti));
+    root.appendChild(inspectSection(card.inspect, card.results));
   if (card.hint) root.appendChild(el("div", "tt-hint", card.hint));
 
   host.replaceChildren(root);
@@ -356,7 +350,6 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
 function inspectSection(
   inspect: InspectState,
   results: ResultRow[],
-  canExpandAnti: boolean,
 ): HTMLElement {
   const section = el("div", "tt-section tt-inspect");
   const head = el("div", "tt-inspect-head");
@@ -395,16 +388,6 @@ function inspectSection(
       ),
     );
     for (const r of results) section.appendChild(resultRow(r));
-    if (canExpandAnti) {
-      const more = el(
-        "button",
-        "tt-more",
-        `Show ${ANTI_MORE_K} most distant`,
-      ) as HTMLButtonElement;
-      more.dataset.inspectAction = "anti-more";
-      more.title = "Rank the whole library and list the furthest tracks";
-      section.appendChild(more);
-    }
   }
   return section;
 }
