@@ -187,23 +187,16 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       Measured: an `ffmpeg` subprocess is *not* faster (equal on whole tracks,
       ~2.7× slower per 15 s segment from process spawn), so the only win is
       dropping `_DECODE_LOCK` for the SIGBUS invariant.
-- [x] **MAEST `inference_mode` + opt-in `torch.compile`.** All inference forwards
-      (MAEST, CLAP audio/text, the supervised head) now use `torch.inference_mode()`.
-      `TRACKSPACE_MAEST_COMPILE=1` wraps the MAEST transformer in `torch.compile`,
-      **default off**; `warmup()` compiles the single-excerpt and job-shaped batches
-      and falls back to eager if compilation is unusable. Loaded-machine smoke test:
-      inductor works on MPS and compiled forwards on the short fixture ran
-      ~0.15–0.2 s/track, ~15 s compile absorbed at startup — promising, but a
-      different track, so not a measurement.
-- [ ] **Decide the MAEST compile default on an idle machine.** Run the eager/compiled
-      pair in `audio_pipeline.md` → *MAEST model management* and flip the default only
-      on a best-run steady-state win. Settle two things with it: the compiled model
-      recompiles on the first unseen excerpt-count shape (~5 s) even with
-      `dynamic=True` (warmup covers 1 and `DEFAULT_BATCH_EXCERPTS`; a smaller partial
-      batch recompiles once — padding the partial chunk would remove it), and
-      `TRACKSPACE_MAEST_COMPILE` is inert on CPU (`_device == "cpu"` skips it).
+- [x] **MAEST `inference_mode`, and `torch.compile` rejected.** All inference
+      forwards (MAEST, CLAP audio/text, the supervised head) now use
+      `torch.inference_mode()`; measured neutral (0.96×/0.97× in an in-process,
+      interleaved A/B), kept for correctness of intent. `torch.compile` on the MAEST
+      transformer was measured and removed: 2.4× slower on MPS (batch 12: 4092 ms vs
+      1710 ms per forward; batch 3: 1077 vs 647) and the queue harness agreed
+      (~1.4–1.6 s/track vs 0.4–0.8 eager). Only retry on CUDA, with the paired
+      measurement in `audio_pipeline.md` → *MAEST model management*.
 - [ ] **MAEST mel front end.** Already batched: `analyze_batch` stacks every
-      excerpt of the claimed batch (up to `DEFAULT_BATCH_EXCERPTS`) into one
+      excerpt of the claimed batch (up to `batch_size * MAEST_NUM_SEGMENTS`) into one
       `_mel(wave)` call, not three per track. The remaining CPU mel cost is the
       front end itself, which would need a different transform or device split.
 - [ ] **madmom tempo.** `TRACKSPACE_MADMOM_FAST=1` (one BLSTM) is ~4× faster but
@@ -256,14 +249,14 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       ~3.5 h for 10.8k tracks), but a full `force` re-analysis wall-clock and a
       no-op re-run are still unrecorded; capture both.
 - [ ] **MAEST batch-size sweep — the top per-track lever.** MAEST is the slowest
-      stage (~0.4 s/track), so its batch/compile choices matter most. A sweep on a
-      **quiet** machine was inconclusive under load (batch 1/2/4/8/16 spread
-      ~70–150 tracks/min with no clean winner; the loaded machine's run-to-run
-      spread exceeded the effect). Re-run
-      `tests/profile_pipeline.py --stages maest --maest-batch N --repeat 3` when idle
-      and pair it with the compile A/B above. If the machine never goes idle, an
-      interleaved eager/compiled or batch-N pair under identical load is still more
-      informative than one under-load run, because the ratio cancels the load.
+      stage (~0.4 s/track), so its batch size is the remaining lever now that
+      `torch.compile` is ruled out. A sweep on a **quiet** machine was inconclusive
+      under load (batch 1/2/4/8/16 spread ~70–150 tracks/min with no clean winner;
+      the loaded machine's run-to-run spread exceeded the effect). Re-run
+      `tests/profile_pipeline.py --stages maest --maest-batch N --repeat 3` when idle.
+      If the machine never goes idle, an interleaved batch-N pair under identical load
+      is still more informative than one under-load run, because the ratio cancels the
+      load.
 - [ ] **Peak RSS / GPU memory.** No memory baseline exists; capture peak RSS and MPS
       allocation per stage before adding workers or batches.
 - [ ] **Cluster/projection timing at scale.** `DEFAULT_RESOLUTIONS` and k=20 were
