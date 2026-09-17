@@ -67,6 +67,7 @@ interface Harness {
   renameFolder: ReturnType<typeof vi.fn>;
   renderTagPanels: ReturnType<typeof vi.fn>;
   onRootsChanged: ReturnType<typeof vi.fn>;
+  onImprintRoot: ReturnType<typeof vi.fn>;
   isPointerBusy: ReturnType<typeof vi.fn>;
   coord: FolderTreeCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
@@ -87,6 +88,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const renameFolder = vi.fn();
   const renderTagPanels = vi.fn();
   const onRootsChanged = vi.fn(async () => {});
+  const onImprintRoot = vi.fn();
   const isPointerBusy = vi.fn(() => false);
   const coord = new FolderTreeCoordinator({
     model,
@@ -95,6 +97,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     renameFolder,
     renderTagPanels,
     onRootsChanged,
+    onImprintRoot,
   });
   coord.bind();
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
@@ -107,6 +110,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     renameFolder,
     renderTagPanels,
     onRootsChanged,
+    onImprintRoot,
     isPointerBusy,
     coord,
     fetchSpy,
@@ -507,5 +511,34 @@ describe("FolderTreeCoordinator roots", () => {
     await vi.waitFor(() => expect(onRootsChanged).toHaveBeenCalled());
     const urls = fetchSpy.mock.calls.map(([u]) => String(u));
     expect(urls).toContain("/api/roots/remove");
+  });
+
+  it("removes a root from its row's remove button", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const { onRootsChanged, fetchSpy } = makeHarness(() => ({ ok: true }));
+    $tree().innerHTML = `
+      <div class="folder-row" data-folder-path="r1" data-root-id="r1"
+           data-root-abs="/music/lib">
+        <span class="folder-label" data-path="r1">lib</span>
+        <span class="folder-remove-btn" data-root-id="r1"
+              data-root-abs="/music/lib">✕</span>
+      </div>`;
+    ($tree().querySelector(".folder-remove-btn") as HTMLElement).click();
+    await vi.waitFor(() => expect(onRootsChanged).toHaveBeenCalled());
+    const urls = fetchSpy.mock.calls.map(([u]) => String(u));
+    expect(urls).toContain("/api/roots/remove");
+  });
+
+  it("prefills the imprint target from an external root's row", () => {
+    const { onImprintRoot } = makeHarness();
+    $tree().innerHTML = `
+      <div class="folder-row folder-row-external" data-folder-path="r1"
+           data-root-id="r1" data-root-abs="/music/ext">
+        <span class="folder-label" data-path="r1">ext</span>
+        <span class="folder-imprint-btn" data-root-id="r1"
+              data-root-abs="/music/ext">⇥</span>
+      </div>`;
+    ($tree().querySelector(".folder-imprint-btn") as HTMLElement).click();
+    expect(onImprintRoot).toHaveBeenCalledWith("/music/ext");
   });
 });

@@ -5,7 +5,7 @@
   {%- set has_kids = node.children and node.children | length > 0 -%}
   {%- set expanded = depth < 1 -%}
   {%- set parent_for_create = '' if node.path == '.' else node.path -%}
-<div class="folder-row{% if depth == 0 and node.role == 'external' %} folder-row-external{% endif %}" style="padding-left: {{ depth * 14 }}px" data-folder-path="{{ node.path }}"{% if depth == 0 %} data-root-id="{{ node.root_id }}" data-root-role="{{ node.role }}"{% endif %}>
+<div class="folder-row{% if depth == 0 and node.role == 'external' %} folder-row-external{% endif %}" style="padding-left: {{ depth * 14 }}px" data-folder-path="{{ node.path }}"{% if depth == 0 %} data-root-id="{{ node.root_id }}" data-root-role="{{ node.role }}" data-root-abs="{{ node.abs_path }}"{% endif %}>
   <span
     class="folder-arrow{% if not has_kids %} folder-add-btn folder-arrow-add{% endif %}"
     {% if has_kids %}
@@ -22,6 +22,10 @@
   <span class="folder-reveal-btn" title="Open in Finder" data-path="{{ node.path }}">↗</span>
   {%- if depth == 0 %}
   <span class="folder-role-btn" title="{{ 'Move to My library' if node.role == 'external' else 'Mark as External (analysed, but not My library)' }}" data-root-id="{{ node.root_id }}" data-role="{{ node.role }}">{{ 'lib' if node.role == 'external' else 'ext' }}</span>
+  {%- if node.role == 'external' %}
+  <span class="folder-imprint-btn" title="Imprint the learned folder structure on this root…" data-root-id="{{ node.root_id }}" data-root-abs="{{ node.abs_path }}">⇥</span>
+  {%- endif %}
+  <span class="folder-remove-btn" title="Remove root from trackspace (files stay on disk)" data-root-id="{{ node.root_id }}" data-root-abs="{{ node.abs_path }}">✕</span>
   {%- endif %}
   {%- if node.path != '.' %}
   {# <span class="folder-rename-btn" title="Rename folder" data-path="{{ node.path }}" data-folder-name="{{ node.name | e }}">✎</span> #}

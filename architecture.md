@@ -71,7 +71,7 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Weak supervision | `backend/embeddings/supervised.py` | ~1075 | Folder-labelled projection head, match floors, excerpt dispersion |
 | Track structure | `backend/embeddings/structure.py` | ~275 | Intro/drop/break from a loudness envelope |
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
-| Feature cache | `backend/embeddings/feature_cache.py` | ~560 | One generic `_SOURCES` registry + fan-out journal |
+| Feature cache | `backend/embeddings/feature_cache.py` | ~560 | One generic `_SOURCES` registry + fan-out journal + origin memory |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
 | Frontend orchestration | `frontend/src/controller.ts` | ~780 | Wiring, data loading, tag-write queue, preview, keyboard |
 | Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~575 | Queue SSE + cluster panel + source weights |
@@ -220,10 +220,16 @@ recomputed on load (`services/roots_registry.py`). Each root carries a role:
 
 Persistence stores only the *paths* whose role is external (`external_roots` in
 `roots.json`); library is the default so old files stay valid. The folder-tree partial
-renders a muted "External" section, root rows carry `data-root-role`, and
-`POST /api/roots/role` flips a root between the two. Ephemeral imprint roots
-(`temp_roots`) are a separate, shorter-lived concept — they are removed when the
-imprint finishes.
+renders a muted "External" section, root rows carry `data-root-role` and `data-root-abs`,
+and `POST /api/roots/role` flips a root between the two. `POST /api/roots/remove` drops a
+root (the row's `.folder-remove-btn`, or dragging the row out of the sidebar); the files and
+their content-addressed embeddings stay, so re-adding restores it. Ephemeral imprint roots
+(`temp_roots`) are a separate, shorter-lived concept — they are marked external while alive
+and removed when the imprint finishes.
+
+A fan-out can also remember where a moved track used to live: the `origin_folders` table in
+the feature cache is keyed by fingerprint (content-addressed like every source), so a recursive
+fan-out's pre-move relative folder survives the move journal being pruned.
 
 ---
 

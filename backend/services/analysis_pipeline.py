@@ -1300,6 +1300,29 @@ def _unique_target(path: str) -> str:
     return f"{base} ({n}){ext}"
 
 
+def _sweep_empty_dirs(root_abs: str) -> int:
+    """Remove empty directories below *root_abs*, deepest first.
+
+    A recursive fan-out lifts every nested file into a learned folder, leaving the
+    old subdirectories empty. ``os.rmdir`` only succeeds on an empty directory, so
+    walking deepest-first also removes chains that held nothing but other empty
+    folders. Never removes *root_abs* itself; returns how many directories went away.
+    """
+    root_abs = os.path.abspath(root_abs)
+    dirs: list[str] = []
+    for dirpath, dirnames, _files in os.walk(root_abs):
+        for name in dirnames:
+            dirs.append(os.path.join(dirpath, name))
+    removed = 0
+    for path in sorted(dirs, key=lambda p: p.count(os.sep), reverse=True):
+        try:
+            os.rmdir(path)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
 def fanout_supervised(
     deps: AnalysisDeps,
     *,
@@ -1307,6 +1330,7 @@ def fanout_supervised(
     folder_vpath: str,
     recursive: bool = False,
     apply: bool = False,
+    generic_unmatched: bool = False,
 ) -> dict[str, Any]:
     """Sort the tracks in *folder_vpath* into the head's folder subpaths.
 
@@ -1318,10 +1342,16 @@ def fanout_supervised(
 
     A track only moves when it is *close enough* to a learned folder: its winning
     similarity must clear that class's training-distance floor (see
-    :func:`supervised_mod.compute_match_thresholds`). A track that resembles no
-    learned folder is reported as ``unmatched`` and left where it is. On *apply*,
-    every move is journalled before it happens so :func:`undo_fanout_supervised`
-    can restore the previous layout.
+    :func:`supervised_mod.compute_match_thresholds`). With *generic_unmatched*,
+    a track that resembles no learned folder is filed under its top Discogs label
+    as ``Generic/<Genre>/<Style>`` instead; without it (or when the label table is
+    unavailable) the track is reported as ``unmatched`` and left where it is.
+
+    With *recursive*, nested files are lifted into the learned folders directly
+    below the target root, their pre-move relative folder is remembered per
+    fingerprint, and the emptied old directories are swept afterwards. On *apply*,
+    every move is journalled before it happens so
+    :func:`undo_fanout_supervised` can restore the previous layout.
     """
     head = supervised_mod.load_head(deps.data_dir)
     if head is None:
@@ -1347,12 +1377,14 @@ def fanout_supervised(
             "folder": folder_vpath,
             "tracks": 0,
             "moved": 0,
+            "generic": 0,
             "unmatched": 0,
             "applied": bool(apply),
             "plan": [],
+            "swept_dirs": 0,
         }
 
-    paths, blocks, _logits = gather_source_blocks(
+    paths, blocks, logits = gather_source_blocks(
         deps, infos, clap_version=deps.clap_version
     )
     mat, used = supervised_mod.build_input_matrix(blocks, SUPERVISED_INPUT_WEIGHTS)
@@ -1370,79 +1402,121 @@ def fanout_supervised(
     idx, sim = supervised_mod.predict_folders(centroids, projected)
     matched = supervised_mod.matches_thresholds(idx, sim, thresholds)
     root_abs = deps.resolve_virtual_path(folder_vpath)
+    fp_by_path = {
+        str(t["path"]): str(t["fingerprint"])
+        for t in infos
+        if t.get("fingerprint")
+    }
 
     plan: list[dict[str, Any]] = []
     moved = 0
+    generic = 0
     unmatched = 0
     errors: list[str] = []
     batch_id = 0
-    for i, vpath in enumerate(paths):
-        c = int(idx[i])
-        if c < 0:
-            continue
-        sub = supervised_mod.folder_subpath(class_names[c])
-        if not sub:
-            continue
-        src = deps.resolve_virtual_path(vpath)
-        if not bool(matched[i]):
-            # Too far from every learned folder to belong to one: leave it in
-            # place and report why, rather than force it into the nearest.
-            unmatched += 1
-            plan.append(
-                {
-                    "path": vpath,
-                    "folder": class_names[c],
-                    "target": vpath,
-                    "similarity": float(sim[i]),
-                    "threshold": (
-                        float(thresholds[c])
-                        if thresholds is not None and c < thresholds.size
-                        else None
-                    ),
-                    "status": "unmatched",
-                }
-            )
-            continue
+
+    def _generic_bucket(i: int) -> tuple[str, str] | None:
+        """``(subpath, label)`` from a track's top Discogs style, or ``None``."""
+        if logits is None or i >= logits.shape[0]:
+            return None
+        styles = deps.maest_mod.top_styles(logits[i], k=1)
+        if not styles:
+            return None
+        label = str(styles[0][0])
+        sub = supervised_mod.generic_subpath(label)
+        return (sub, label) if sub else None
+
+    def _place(vpath: str, src: str, sub: str, entry: dict[str, Any]) -> None:
+        """Plan or apply one move into ``root_abs/sub``; updates the counters."""
+        nonlocal moved, batch_id
         target = os.path.normpath(os.path.join(root_abs, sub, os.path.basename(src)))
-        entry = {
-            "path": vpath,
-            "folder": class_names[c],
-            "target": deps.virtual_from_abs(target),
-            "similarity": float(sim[i]),
-        }
+        entry["target"] = deps.virtual_from_abs(target)
         if target == src:
             entry["status"] = "in-place"
+            return
+        if not apply:
+            entry["status"] = "planned"
+            return
+        row_id = 0
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            target = _unique_target(target)
+            if batch_id == 0:
+                batch_id = deps.feature_cache.journal_begin()
+            row_id = deps.feature_cache.journal_add(batch_id, src, target)
+            shutil.move(src, target)
+            fp = fp_by_path.get(vpath)
+            if recursive and fp:
+                rel = os.path.relpath(src, root_abs)
+                origin = os.path.dirname(rel)
+                if origin and origin != ".":
+                    deps.feature_cache.record_origin(fp, origin)
+            moved += 1
+            entry["target"] = deps.virtual_from_abs(target)
+            entry["status"] = "moved"
+        except OSError as e:
+            deps.feature_cache.journal_remove(row_id)
+            entry["status"] = "error"
+            errors.append(f"{vpath}: {e}")
+
+    for i, vpath in enumerate(paths):
+        c = int(idx[i])
+        src = deps.resolve_virtual_path(vpath)
+        folder_name = class_names[c] if 0 <= c < len(class_names) else ""
+        sub = supervised_mod.folder_subpath(folder_name) if c >= 0 else ""
+        if bool(matched[i]) and sub:
+            entry = {
+                "path": vpath,
+                "folder": folder_name,
+                "similarity": float(sim[i]),
+            }
+            _place(vpath, src, sub, entry)
             plan.append(entry)
             continue
-        if apply:
-            row_id = 0
-            try:
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                target = _unique_target(target)
-                if batch_id == 0:
-                    batch_id = deps.feature_cache.journal_begin()
-                row_id = deps.feature_cache.journal_add(batch_id, src, target)
-                shutil.move(src, target)
-                moved += 1
-                entry["target"] = deps.virtual_from_abs(target)
-                entry["status"] = "moved"
-            except OSError as e:
-                deps.feature_cache.journal_remove(row_id)
-                entry["status"] = "error"
-                errors.append(f"{vpath}: {e}")
-        else:
-            entry["status"] = "planned"
-        plan.append(entry)
+        bucket = _generic_bucket(i) if generic_unmatched else None
+        if bucket is not None:
+            generic += 1
+            generic_sub, label = bucket
+            entry = {
+                "path": vpath,
+                "folder": generic_sub,
+                "label": label,
+                "similarity": float(sim[i]),
+                "generic": True,
+            }
+            _place(vpath, src, generic_sub, entry)
+            plan.append(entry)
+            continue
+        # Too far from every learned folder to belong to one: leave it in place
+        # and report why, rather than force it into the nearest.
+        unmatched += 1
+        plan.append(
+            {
+                "path": vpath,
+                "folder": folder_name,
+                "target": vpath,
+                "similarity": float(sim[i]),
+                "threshold": (
+                    float(thresholds[c])
+                    if thresholds is not None and 0 <= c < thresholds.size
+                    else None
+                ),
+                "status": "unmatched",
+            }
+        )
 
+    swept = _sweep_empty_dirs(root_abs) if apply and recursive else 0
     return {
         "ok": True,
         "folder": folder_vpath,
         "tracks": len(paths),
         "moved": moved,
+        "generic": generic,
         "unmatched": unmatched,
         "applied": bool(apply),
         "errors": errors,
         "plan": plan,
+        "swept_dirs": swept,
     }
 
 

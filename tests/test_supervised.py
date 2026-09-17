@@ -262,8 +262,9 @@ class _FakeAnalysis:
 class _FakeMaest:
     MAEST_VERSION = 1
 
-    def __init__(self, n_excerpts: int = 3):
+    def __init__(self, n_excerpts: int = 3, style_labels: list[str] | None = None):
         self._n = n_excerpts
+        self._labels = list(style_labels or [])
 
     def is_model_ready(self) -> bool:
         return True
@@ -272,7 +273,16 @@ class _FakeMaest:
         return None
 
     def discogs_style_labels(self) -> list[str]:
-        return []
+        return list(self._labels)
+
+    def top_styles(self, logits, k: int = 5) -> list[tuple[str, float]]:
+        labels = self.discogs_style_labels()
+        v = np.asarray(logits, dtype=np.float32).reshape(-1)
+        if not labels or v.size == 0:
+            return []
+        n = min(len(labels), v.size)
+        idx = np.argsort(-v[:n])[: max(1, k)]
+        return [(labels[int(i)], float(v[int(i)])) for i in idx]
 
     def analyze_batch(self, paths, *, on_decode_warning=None, max_batch=12):
         return {p: _FakeAnalysis(n_excerpts=self._n) for p in paths}
@@ -744,7 +754,9 @@ def test_compare_heads_flags_incompatible_input_space():
     assert out["mean_cosine"] is None
 
 
-def _fanout_deps(tmp_path: Path, fc: FeatureCache, root: Path) -> AnalysisDeps:
+def _fanout_deps(
+    tmp_path: Path, fc: FeatureCache, root: Path, *, maest=None
+) -> AnalysisDeps:
     """Deps that map a real temp tree so fan-out can actually move files."""
     return AnalysisDeps(
         feature_cache=fc,
@@ -755,7 +767,7 @@ def _fanout_deps(tmp_path: Path, fc: FeatureCache, root: Path) -> AnalysisDeps:
         list_mp3s=lambda f, _r: sorted(
             str(p) for p in (root / f if f else root).glob("*.mp3")
         ),
-        maest_mod=_FakeMaest(),
+        maest_mod=maest or _FakeMaest(),
         rhythm_mod=None,
         audio_features_mod=None,
         maest_version=1,
@@ -822,7 +834,13 @@ def test_fanout_plans_then_moves_into_predicted_folders(tmp_path):
     assert not (loose / "t0.mp3").exists()
 
 
-def _fanout_scenario(tmp_path: Path, *, threshold_override: float | None = None):
+def _fanout_scenario(
+    tmp_path: Path,
+    *,
+    threshold_override: float | None = None,
+    maest=None,
+    subdir: str = "",
+):
     """Train a real head on two class blobs and lay out two loose tracks."""
     fc = FeatureCache(str(tmp_path / "features.db"))
     rng = np.random.default_rng(0)
@@ -852,14 +870,21 @@ def _fanout_scenario(tmp_path: Path, *, threshold_override: float | None = None)
 
     root = tmp_path / "lib"
     loose = root / "loose"
-    loose.mkdir(parents=True)
+    place = loose / subdir if subdir else loose
+    place.mkdir(parents=True)
     fanout_infos = []
     for c, center in enumerate(centers):
         fp = f"loose-{c}"
         fc.put_maest(fp, center, np.ones(519, np.float32), version=1)
-        (loose / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
-        fanout_infos.append({"path": f"loose/t{c}.mp3", "fingerprint": fp})
-    return fc, _fanout_deps(tmp_path, fc, root), loose, fanout_infos
+        (place / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
+        rel = f"loose/{subdir}/t{c}.mp3" if subdir else f"loose/t{c}.mp3"
+        fanout_infos.append({"path": rel, "fingerprint": fp})
+    return (
+        fc,
+        _fanout_deps(tmp_path, fc, root, maest=maest),
+        loose,
+        fanout_infos,
+    )
 
 
 def test_fanout_leaves_a_track_far_from_every_folder(tmp_path):
@@ -911,6 +936,99 @@ def test_fanout_journals_moves_and_undo_restores_them(tmp_path):
     # A batch is only undoable once.
     assert fc.latest_move_batch() is None
     assert undo_fanout_supervised(fdeps)["ok"] is False
+
+
+def test_generic_subpath_mirrors_the_discogs_taxonomy():
+    assert sup.generic_subpath("Electronic---Techno") == "Generic/Electronic/Techno"
+    assert sup.generic_subpath("Electronic") == "Generic/Electronic"
+    assert sup.generic_subpath("Folk, World, & Country---Folk") == (
+        "Generic/Folk, World, & Country/Folk"
+    )
+    # A separator inside a label part must not silently split the target folder.
+    assert sup.generic_subpath("A/B---C") == "Generic/A-B/C"
+    assert sup.generic_subpath("---") is None
+    assert sup.generic_subpath("") is None
+
+
+def test_fanout_files_unmatched_tracks_under_generic(tmp_path):
+    fc, fdeps, loose, fanout_infos = _fanout_scenario(
+        tmp_path,
+        threshold_override=2.0,
+        maest=_FakeMaest(style_labels=["Electronic---Techno", "Rock---Indie Rock"]),
+    )
+    result = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=True,
+        generic_unmatched=True,
+    )
+    assert result["ok"] is True
+    assert result["generic"] == 2 and result["unmatched"] == 0
+    assert result["moved"] == 2
+    assert (loose / "Generic" / "Electronic" / "Techno" / "t0.mp3").exists()
+    assert (loose / "Generic" / "Electronic" / "Techno" / "t1.mp3").exists()
+    assert all(e.get("generic") is True for e in result["plan"])
+    # Generic moves are journalled like any other, so undo restores them.
+    assert undo_fanout_supervised(fdeps)["restored"] == 2
+    assert (loose / "t0.mp3").exists() and (loose / "t1.mp3").exists()
+
+
+def test_fanout_generic_falls_back_when_labels_are_unavailable(tmp_path):
+    # No Discogs label table: there is no name for the bucket, so the track is
+    # left in place rather than moved into a folder called nothing.
+    fc, fdeps, loose, fanout_infos = _fanout_scenario(
+        tmp_path, threshold_override=2.0
+    )
+    result = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=True,
+        generic_unmatched=True,
+    )
+    assert result["generic"] == 0 and result["unmatched"] == 2
+    assert (loose / "t0.mp3").exists() and (loose / "t1.mp3").exists()
+
+
+def test_fanout_recursive_lifts_nested_files_and_sweeps(tmp_path):
+    fc, fdeps, loose, fanout_infos = _fanout_scenario(tmp_path, subdir="Old/Deep")
+    result = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        recursive=True,
+        apply=True,
+    )
+    assert result["moved"] == 2
+    assert (loose / "Folder0" / "t0.mp3").exists()
+    assert (loose / "Folder1" / "t1.mp3").exists()
+    # Both emptied levels of the old tree are swept, bounded to the fan-out root.
+    assert result["swept_dirs"] == 2
+    assert not (loose / "Old").exists()
+    # The pre-move relative folder is remembered per fingerprint.
+    assert fc.get_origins(["loose-0", "loose-1"]) == {
+        "loose-0": "Old/Deep",
+        "loose-1": "Old/Deep",
+    }
+    # Undo restores the files (recreating the swept directory it needs).
+    assert undo_fanout_supervised(fdeps)["restored"] == 2
+    assert (loose / "Old" / "Deep" / "t0.mp3").exists()
+    assert (loose / "Old" / "Deep" / "t1.mp3").exists()
+
+
+def test_fanout_non_recursive_does_not_sweep_or_record_origins(tmp_path):
+    fc, fdeps, loose, fanout_infos = _fanout_scenario(tmp_path, subdir="Old/Deep")
+    result = fanout_supervised(
+        fdeps,
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        apply=True,
+    )
+    assert result["swept_dirs"] == 0
+    # Without `recursive` the old tree is neither swept nor remembered.
+    assert (loose / "Old" / "Deep").is_dir()
+    assert fc.get_origins(["loose-0"]) == {}
 
 
 def test_import_refuses_a_stale_source_version(tmp_path):

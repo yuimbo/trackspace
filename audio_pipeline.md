@@ -636,12 +636,26 @@ The floor is calibrated to how tightly the head packs each folder, so a diffuse 
 gets a lower floor than a tight one, and an old head without floors (or a class with no
 training row) matches everything, preserving the previous behaviour.
 
+**Unmatched tracks can still be filed by genre.** With the imprint's *Sort unmatched
+into Generic/…* toggle on, a track that clears no learned folder's floor is filed under
+its top Discogs label as `Generic/<Genre>/<Style>` instead of being left loose. MAEST's
+519 `Genre---Style` logits — already gathered for the projection — are the label source;
+`generic_subpath` mirrors the taxonomy's depth and sanitises each component, and returns
+nothing when the label table is unavailable, in which case the track stays `unmatched`.
+
 **Fan-out is journalled and undoable.** Every applied move is written to the
 `fanout_journal` table (source, target, batch id) *before* the file is moved, so
 `POST /api/supervised/fanout/undo` can restore the previous layout. The journal
 records the *actual* target, so a ` (n)` collision suffix is undone back to the
 original name; a batch is undoable once (`GET` on the same path reports whether one is
 available).
+
+**Recursive fan-out, origin memory, and the empty-dir sweep.** With `recursive`, nested
+files are gathered and lifted into the learned folders directly below the target root. Each
+moved track's pre-move relative folder is remembered in the `origin_folders` table,
+keyed by fingerprint, so the original layout stays inspectable after the move journal is
+pruned. On `apply`, the emptied old subdirectories are swept deepest-first, bounded to
+the fan-out root (undo recreates the directories it needs, but does not re-sweep).
 
 **Imprinting an external folder.** A fan-out normally targets a folder inside the
 library. *Imprint* extends it to a folder elsewhere on disk: the target is registered as
@@ -652,7 +666,8 @@ fan-out against that root. `POST /api/supervised/imprint/analyze` registers the 
 queues analysis, `GET /api/supervised/imprint/status` reports readiness, and
 `POST /api/supervised/imprint/finish` removes the root again. The ephemeral root is
 persisted by path in `roots.json` (`temp_roots`) so a restart mid-imprint can still
-finish and clean it up, and a target that contains an existing library root is refused
+finish and clean it up, it is marked **external** (it is a projection target, not the
+user's library), and a target that contains an existing library root is refused
 rather than silently unregistering that root. `GET /api/supervised/imprint/temp_roots`
 lists the unfinished imprints a closed browser left behind and
 `POST /api/supervised/imprint/discard` drops them without touching the files.

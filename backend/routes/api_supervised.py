@@ -154,6 +154,7 @@ def create_api_supervised_blueprint(
             return jsonify({"ok": False, "error": "folder is required"}), 400
         recursive = opt_bool(data, "recursive", False)
         apply = opt_bool(data, "apply", False)
+        generic = opt_bool(data, "generic", False)
         try:
             result = pipeline.fanout_supervised(
                 analysis_deps,
@@ -161,6 +162,7 @@ def create_api_supervised_blueprint(
                 folder_vpath=folder,
                 recursive=recursive,
                 apply=apply,
+                generic_unmatched=generic,
             )
         except ApiValidationError as e:
             return jsonify({"ok": False, "error": str(e)}), 400

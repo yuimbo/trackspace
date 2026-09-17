@@ -253,6 +253,21 @@ export class HeadCoordinator {
 
   /* ── Imprint (fan-out an external folder) ─────────────────── */
 
+  /** Fill the imprint target from a folder-tree root row and open the panel. */
+  prefillImprint(absPath: string): void {
+    const $path = document.getElementById(
+      "head-imprint-path",
+    ) as HTMLInputElement | null;
+    const $details = document.getElementById(
+      "head-imprint-details",
+    ) as HTMLDetailsElement | null;
+    if ($path) {
+      $path.value = absPath;
+      $path.focus();
+    }
+    if ($details) $details.open = true;
+  }
+
   private _setImprintNote(text: string): void {
     const el = document.getElementById("imprint-note");
     if (el) el.textContent = text;
@@ -357,22 +372,35 @@ export class HeadCoordinator {
     ) {
       return;
     }
+    const generic =
+      (document.getElementById("imprint-generic-toggle") as HTMLInputElement | null)
+        ?.checked ?? true;
     try {
       const res = await postJSON<{
         ok: boolean;
         tracks?: number;
         moved?: number;
+        generic?: number;
         unmatched?: number;
         plan?: { target: string; folder: string }[];
         error?: string;
-      }>("/api/supervised/fanout", { folder: this._imprintFolder, apply });
+      }>("/api/supervised/fanout", {
+        folder: this._imprintFolder,
+        recursive: true,
+        apply,
+        generic,
+      });
       if (!res.ok) {
         this._setImprintNote(res.error || "Fan out failed");
         return;
       }
       const tracks = res.tracks ?? 0;
       const unmatched = res.unmatched ?? 0;
-      const suffix = unmatched ? ` (${unmatched} left unmatched)` : "";
+      const genericCount = res.generic ?? 0;
+      const parts: string[] = [];
+      if (genericCount) parts.push(`${genericCount} into Generic/`);
+      if (unmatched) parts.push(`${unmatched} left unmatched`);
+      const suffix = parts.length ? ` (${parts.join(", ")})` : "";
       if (apply) {
         this._setImprintNote(`Moved ${res.moved ?? 0} / ${tracks} tracks${suffix}.`);
         toast(`Moved ${res.moved ?? 0} tracks`, "ok");

@@ -32,6 +32,8 @@ export interface FolderTreeDeps {
   renderTagPanels(): void;
   /** Reload library + tree after a root was added or removed. */
   onRootsChanged(): Promise<void>;
+  /** Prefill the imprint target with a root's absolute path. */
+  onImprintRoot?(absPath: string): void;
 }
 
 export class FolderTreeCoordinator {
@@ -379,6 +381,33 @@ export class FolderTreeCoordinator {
       const rootId = btn.dataset.rootId ?? "";
       const role = btn.dataset.role === "external" ? "library" : "external";
       void this._setRootRole(rootId, role);
+      return;
+    }
+
+    if (t.closest(".folder-imprint-btn")) {
+      e.stopPropagation();
+      const btn = t.closest(".folder-imprint-btn") as HTMLElement;
+      const absPath = btn.dataset.rootAbs ?? "";
+      if (absPath) this.deps.onImprintRoot?.(absPath);
+      return;
+    }
+
+    if (t.closest(".folder-remove-btn")) {
+      e.stopPropagation();
+      const btn = t.closest(".folder-remove-btn") as HTMLElement;
+      const rootId = btn.dataset.rootId ?? "";
+      if (!rootId) return;
+      const label = btn.dataset.rootAbs || rootId;
+      if (
+        !window.confirm(
+          `Remove "${label}" from trackspace?\n\n` +
+            "Its files stay on disk and its cached analysis is kept, so " +
+            "re-adding the folder restores it instantly.",
+        )
+      ) {
+        return;
+      }
+      void this._removeRoot(rootId);
       return;
     }
 

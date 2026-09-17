@@ -13,7 +13,13 @@ from flask import Flask
 
 from backend.factory import _register_error_handlers
 from backend.routes.api_imprint import create_api_imprint_blueprint
-from backend.services.roots_registry import add_root, remove_root, save_roots_state
+from backend.services.roots_registry import (
+    ROLE_EXTERNAL,
+    add_root,
+    remove_root,
+    save_roots_state,
+    set_root_role,
+)
 from backend.services.virtual_paths import virtual_from_abs
 
 
@@ -31,9 +37,12 @@ class _StubDeps:
     clap_version = 0
 
 
-def _imprint_client(tmp_path, *, infos, roots=None, temp_roots=None):
+def _imprint_client(
+    tmp_path, *, infos, roots=None, temp_roots=None, root_roles=None
+):
     roots = roots if roots is not None else {}
     temp_roots = temp_roots if temp_roots is not None else set()
+    root_roles = root_roles if root_roles is not None else {}
     calls: list[tuple[int, tuple[str, ...]]] = []
 
     def enqueue(_queue, infos_arg, *, deps, kinds):
@@ -43,9 +52,11 @@ def _imprint_client(tmp_path, *, infos, roots=None, temp_roots=None):
     bp = create_api_imprint_blueprint(
         analysis_deps=_StubDeps(),
         roots=roots,
+        root_roles=root_roles,
         temp_roots=temp_roots,
         add_root=lambda p: add_root(p, roots),
         remove_root=lambda rid: remove_root(rid, roots),
+        set_root_role=lambda rid, role: set_root_role(rid, role, root_roles),
         schedule_root_watch=lambda _rid: None,
         unschedule_root_watch=lambda _rid: None,
         save_roots_state=lambda: save_roots_state(
@@ -61,14 +72,16 @@ def _imprint_client(tmp_path, *, infos, roots=None, temp_roots=None):
     _register_error_handlers(app)
     app.register_blueprint(bp)
     app.testing = True
-    return app.test_client(), roots, temp_roots, calls
+    return app.test_client(), roots, temp_roots, root_roles, calls
 
 
 def test_imprint_analyze_registers_an_ephemeral_root(tmp_path):
     external = tmp_path / "Downloads"
     external.mkdir()
     infos = [{"path": "d/t.mp3", "fingerprint": "fp"}]
-    client, roots, temp_roots, calls = _imprint_client(tmp_path, infos=infos)
+    client, roots, temp_roots, root_roles, calls = _imprint_client(
+        tmp_path, infos=infos
+    )
 
     body = client.post(
         "/api/supervised/imprint/analyze", json={"path": str(external)}
@@ -79,6 +92,8 @@ def test_imprint_analyze_registers_an_ephemeral_root(tmp_path):
     root_id = body["root_id"]
     assert temp_roots == {root_id}
     assert roots[root_id] == str(external)
+    # The target is a projection target, not the user's library.
+    assert root_roles == {root_id: ROLE_EXTERNAL}
     # Analysis is queued for exactly the sources the head consumes.
     assert calls == [(1, ("features", "maest", "clap"))]
 
@@ -87,6 +102,7 @@ def test_imprint_analyze_registers_an_ephemeral_root(tmp_path):
     ).get_json()
     assert finish == {"ok": True, "removed": True}
     assert root_id not in roots and root_id not in temp_roots
+    assert root_roles == {}
 
 
 def test_imprint_analyze_refuses_a_folder_containing_library_roots(tmp_path):
@@ -94,7 +110,7 @@ def test_imprint_analyze_refuses_a_folder_containing_library_roots(tmp_path):
     library.mkdir()
     roots: dict = {}
     add_root(str(library), roots)
-    client, roots, temp_roots, _ = _imprint_client(
+    client, roots, temp_roots, _, _ = _imprint_client(
         tmp_path, infos=[], roots=roots
     )
 
@@ -110,7 +126,7 @@ def test_imprint_finish_leaves_a_library_folder_alone(tmp_path):
     roots: dict = {}
     add_root(str(library), roots)
     rid = next(iter(roots))
-    client, roots, temp_roots, _ = _imprint_client(
+    client, roots, temp_roots, _, _ = _imprint_client(
         tmp_path, infos=[], roots=roots
     )
 
@@ -132,7 +148,7 @@ def test_imprint_temp_roots_lists_and_discards_stale_roots(tmp_path):
     external = tmp_path / "Downloads"
     external.mkdir()
     infos = [{"path": "d/t.mp3", "fingerprint": "fp"}]
-    client, roots, temp_roots, _ = _imprint_client(tmp_path, infos=infos)
+    client, roots, temp_roots, _, _ = _imprint_client(tmp_path, infos=infos)
     body = client.post(
         "/api/supervised/imprint/analyze", json={"path": str(external)}
     ).get_json()

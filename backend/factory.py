@@ -245,9 +245,11 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
         create_api_imprint_blueprint(
             analysis_deps=deps.analysis_deps,
             roots=deps.roots,
+            root_roles=deps.root_roles,
             temp_roots=deps.temp_roots,
             add_root=deps.add_root,
             remove_root=deps.remove_root,
+            set_root_role=deps.set_root_role,
             schedule_root_watch=deps.schedule_root_watch,
             unschedule_root_watch=deps.unschedule_root_watch,
             save_roots_state=deps.save_roots_state,

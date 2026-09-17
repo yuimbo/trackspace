@@ -889,6 +889,38 @@ def folder_subpath(class_name: str) -> str:
     return norm.split("/", 1)[1]
 
 
+#: Top-level folder a fan-out puts tracks that match no learned folder into.
+GENERIC_DIR = "Generic"
+
+#: Characters no single path component may contain on a common filesystem.
+#: Discogs genres carry punctuation (``Folk, World, & Country``) and could in
+#: principle contain a separator, which would silently split the target folder.
+_UNSAFE_COMPONENT = str.maketrans({c: "-" for c in '/\\:*?"<>|'})
+
+
+def sanitize_folder_component(name: str) -> str:
+    """One filesystem-safe path component derived from a Discogs label part."""
+    return str(name).translate(_UNSAFE_COMPONENT).strip().rstrip(". ")
+
+
+def generic_subpath(label: str, *, base: str = GENERIC_DIR) -> str | None:
+    """Folder an unmatched track's Discogs ``Genre---Style`` label maps to.
+
+    Mirrors the taxonomy's own depth, so ``Electronic---Techno`` becomes
+    ``Generic/Electronic/Techno``. Returns ``None`` when the label has no usable
+    part (empty or punctuation-only), leaving the caller to skip the track rather
+    than create a folder named after nothing.
+    """
+    parts = [
+        p
+        for p in (sanitize_folder_component(p) for p in str(label).split("---"))
+        if p
+    ]
+    if not parts:
+        return None
+    return "/".join([base, *parts])
+
+
 def head_bundle(data_dir: str) -> dict | None:
     """Self-describing, portable bundle for the installed head, or ``None``."""
     head = load_head(data_dir)

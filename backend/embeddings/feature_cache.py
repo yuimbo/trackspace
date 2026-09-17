@@ -180,6 +180,15 @@ class FeatureCache:
                 "CREATE INDEX IF NOT EXISTS fanout_journal_batch "
                 "ON fanout_journal (batch_id, undone)"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS origin_folders (
+                    fingerprint TEXT PRIMARY KEY,
+                    origin TEXT NOT NULL,
+                    recorded_at REAL NOT NULL
+                )
+                """
+            )
             for col, default in [
                 ("version", "INTEGER NOT NULL DEFAULT 0"),
                 ("clap_segments", "BLOB"),
@@ -322,6 +331,50 @@ class FeatureCache:
                 return int(cursor.rowcount or 0)
         except Exception:
             return 0
+
+    # ── Fan-out origin memory ───────────────────────────────────
+    # A recursive fan-out flattens a nested tree, so a track's old relative
+    # folder is lost once the move journal is pruned. This records it keyed by
+    # fingerprint (content-addressed like every other row), so the original
+    # layout stays inspectable after the fact.
+
+    def record_origin(self, fingerprint: str, origin: str) -> None:
+        """Remember one track's pre-fan-out relative folder (best-effort)."""
+        fp = str(fingerprint or "")
+        if not fp:
+            return
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO origin_folders (fingerprint, origin, recorded_at) "
+                    "VALUES (?, ?, ?) ON CONFLICT(fingerprint) DO UPDATE SET "
+                    "origin=excluded.origin, recorded_at=excluded.recorded_at",
+                    (fp, str(origin), time.time()),
+                )
+        except Exception:
+            return
+
+    def get_origins(self, fingerprints: list[str]) -> dict[str, str]:
+        """Origin folder per fingerprint; fingerprints with no record are omitted."""
+        fps = [str(f) for f in fingerprints if f]
+        if not fps:
+            return {}
+        out: dict[str, str] = {}
+        try:
+            with self._conn() as conn:
+                for start in range(0, len(fps), _IN_CHUNK):
+                    chunk = fps[start : start + _IN_CHUNK]
+                    placeholders = ",".join("?" * len(chunk))
+                    rows = conn.execute(
+                        "SELECT fingerprint, origin FROM origin_folders "
+                        f"WHERE fingerprint IN ({placeholders})",
+                        chunk,
+                    ).fetchall()
+                    for fp, origin in rows:
+                        out[str(fp)] = str(origin)
+        except Exception:
+            return {}
+        return out
 
     @staticmethod
     def _spec(source: str) -> _SourceSpec:

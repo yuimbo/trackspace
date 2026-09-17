@@ -238,6 +238,22 @@ body { display: flex; }
 .folder-role-btn:hover { color: var(--accent-hi); opacity: 1; }
 .folder-row-external .folder-role-btn { opacity: 0.5; }
 
+.folder-imprint-btn,
+.folder-remove-btn {
+  font-size: 10px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 0 2px;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.folder-row:hover .folder-imprint-btn,
+.folder-row:hover .folder-remove-btn { opacity: 0.7; }
+.folder-imprint-btn:hover,
+.folder-remove-btn:hover { color: var(--accent-hi); opacity: 1; }
+.folder-row-external .folder-imprint-btn { opacity: 0.5; }
+
 #folder-controls label {
   display: flex;
   align-items: center;

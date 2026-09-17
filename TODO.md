@@ -8,12 +8,11 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 
 - [ ] Whacko idea? Add a 3d view for the embedding space?
 
-- [ ] When projecting my library onto external tracks; those who don't fit into my paylists, can still end up in an Generic/${name}/ subdirectories; where "name" equals what that genre name that generic discogs model would give to them
-- [ ] If i want to project onto an external root which contains a bunch of subdirectories; allow me to just gather all of the nested files to reproject [[maybe stoer some metadata on the old relative folder structure?]]
-
 - [ ] **Undo leaves empty fan-out folders.** The move journal restores every
   file but does not remove the subfolders a fan-out created (they are often empty
-  afterwards). Sweep empty directories on undo, bounded to the fan-out root so it can
+  afterwards). The apply-side sweep now removes the *emptied source* directories
+  bounded to the fan-out root, but the learned folders a fan-out *created* are still
+  left behind on undo. Sweep them there too, bounded to the fan-out root so it can
   never touch an unrelated tree. Files:
   `backend/services/analysis_pipeline.py` (`undo_fanout_supervised`).
 - [ ] **The move journal is never pruned.** `fanout_journal` keeps every applied
@@ -72,12 +71,6 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Frontend
 
-- [ ] **External-root follow-ups.** External roots are marked in the folder tree,
-      dimmed on the canvas, and hidden until `#show-external-toggle` is on. Still
-      open: an "Imprint this external root" action on the root row; and marking the
-      *ephemeral* imprint roots external too (`api_imprint.py`) so an in-flight
-      fan-out target is not drawn as library. Files:
-      `backend/routes/api_imprint.py`, `frontend/src/coordinators/folder-tree-coordinator.ts`.
 - [ ] **Optional sibling hue wiggle.** Family tints currently differ only in
       lightness/saturation (`frontend/src/lib/colors.ts` / `backend/services/dir_colors.py`).
       If same-depth siblings still read too alike on the canvas, add a small hue deviation

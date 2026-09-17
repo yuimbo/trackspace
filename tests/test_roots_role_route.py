@@ -72,6 +72,16 @@ def test_folders_payload_tags_each_root_with_its_role():
     assert roles == {"lib": ROLE_LIBRARY, "ext": ROLE_EXTERNAL}
 
 
+def test_folders_payload_carries_each_root_absolute_path():
+    client, _ = _client(
+        roots={"lib": "/music/lib", "ext": "/music/ext"},
+        root_roles={"ext": ROLE_EXTERNAL},
+    )
+    roots = {r["root_id"]: r for r in client.get("/api/folders").get_json()["roots"]}
+    assert roots["lib"]["abs_path"] == "/music/lib"
+    assert roots["ext"]["abs_path"] == "/music/ext"
+
+
 def test_roots_role_rejects_unknown_role():
     client, _ = _client(roots={"lib": "/music/lib"}, root_roles={})
     res = client.post("/api/roots/role", json={"root_id": "lib", "role": "bogus"})
@@ -109,3 +119,8 @@ def test_partial_renders_external_section():
     assert 'data-root-role="external"' in html
     assert "folder-section-label" in html
     assert "folder-role-btn" in html
+    # The root row carries its absolute path for removal/imprint affordances.
+    assert 'data-root-abs="/music/ext"' in html
+    assert "folder-remove-btn" in html
+    # Only external roots get the imprint action.
+    assert "folder-imprint-btn" in html

@@ -16,6 +16,7 @@ import pytest
 from flask import Flask
 
 from backend.factory import _register_error_handlers
+from backend.embeddings import supervised as sup
 from backend.embeddings.feature_cache import FeatureCache
 from backend.routes.api_supervised import create_api_supervised_blueprint
 from backend.services.analysis_pipeline import AnalysisDeps, train_supervised
@@ -31,7 +32,16 @@ class _FakeMaest:
         return None
 
     def discogs_style_labels(self) -> list[str]:
-        return []
+        return ["Electronic---Techno"]
+
+    def top_styles(self, logits, k: int = 5) -> list[tuple[str, float]]:
+        labels = self.discogs_style_labels()
+        v = np.asarray(logits, dtype=np.float32).reshape(-1)
+        if not labels or v.size == 0:
+            return []
+        n = min(len(labels), v.size)
+        idx = np.argsort(-v[:n])[: max(1, k)]
+        return [(labels[int(i)], float(v[int(i)])) for i in idx]
 
 
 def _library(tmp_path: Path, *, n_classes: int = 3, per_class: int = 10):
@@ -213,6 +223,52 @@ def test_fanout_plans_then_applies_folder_moves(tmp_path):
     ).get_json()
     assert applied["moved"] == 2
     assert not (loose / "t0.mp3").exists()
+
+
+def test_fanout_generic_flag_files_unmatched_tracks(tmp_path):
+    fc, infos, centers = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    # Gate every track out of the learned folders: they must go generic.
+    head = sup.load_head(str(tmp_path))
+    assert head is not None
+    head["meta"]["class_match_thresholds"] = [2.0] * head["meta"]["n_classes"]
+    sup.save_head(
+        str(tmp_path),
+        head["payload"]["state_dict"],
+        head["meta"],
+        centroids=head["payload"].get("centroids"),
+    )
+
+    root = tmp_path / "lib"
+    loose = root / "loose"
+    loose.mkdir(parents=True)
+    fanout_infos = []
+    for c in (0, 1):
+        fp = f"loose-{c}"
+        fc.put_maest(fp, centers[c], np.ones(519, np.float32), version=1)
+        (loose / f"t{c}.mp3").write_bytes(b"ID3\x00fake")
+        fanout_infos.append({"path": f"loose/t{c}.mp3", "fingerprint": fp})
+
+    deps = _deps(tmp_path, fc, root=root)
+    client, _ = _app(tmp_path, fc, fanout_infos, deps=deps)
+
+    planned = client.post(
+        "/api/supervised/fanout",
+        json={"folder": "loose", "generic": True},
+    ).get_json()
+    assert planned["ok"] is True
+    assert planned["generic"] == 2 and planned["unmatched"] == 0
+    assert all(e.get("generic") is True for e in planned["plan"])
+
+    applied = client.post(
+        "/api/supervised/fanout",
+        json={"folder": "loose", "apply": True, "generic": True},
+    ).get_json()
+    assert applied["ok"] is True
+    assert applied["moved"] == 2
+    assert (loose / "Generic" / "Electronic" / "Techno" / "t0.mp3").exists()
 
 
 def test_fanout_undo_route_reverses_the_last_moves(tmp_path):

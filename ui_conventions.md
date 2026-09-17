@@ -79,8 +79,14 @@ means the track sits directly at the root.
 - Query params: `active` and `active_folders` = current `model.folder` (see `FolderTreeCoordinator.refresh()`);
   `pending_rename` = optional relative path for auto-opening rename after create.
 - Roots are grouped by role: My library first, then a muted **External** section
-  (`.folder-section-label`, `.folder-row-external`). Root rows carry `data-root-id` and
-  `data-root-role`; the `.folder-role-btn` flips a root via `POST /api/roots/role`.
+  (`.folder-section-label`, `.folder-row-external`). Root rows carry `data-root-id`,
+  `data-root-role` and `data-root-abs`; the `.folder-role-btn` flips a root via
+  `POST /api/roots/role`.
+- Root rows carry two more actions: `.folder-remove-btn` (✕, after a `confirm`) drops the
+  root via `POST /api/roots/remove` — files stay on disk and cached analysis is kept, so
+  re-adding restores it; dragging a root row out of the sidebar does the same without a
+  button. `.folder-imprint-btn` (external roots only) prefills the head panel's imprint
+  target with the root's absolute path through the controller's `onImprintRoot` dep.
 - `#show-external-toggle` (in `#folder-controls`, hidden while no external roots exist)
   is bound to `model.showExternal`; toggling it redraws the canvas without a rescan.
   When on, external dots are drawn at half alpha (`CanvasView._dot`) so they read as
@@ -118,13 +124,17 @@ The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):
   folders* clears the selection. External roots are labelled `(external)`. The checked
   folders are mirrored onto `model.trainFolders` and
   persisted in `localStorage`, so a selection survives a reload.
-- **Imprint on a folder…** takes an absolute path, calls
+- **Imprint on a folder…** takes an absolute path (or is prefilled from an external
+  root row's `.folder-imprint-btn`), calls
   `POST /api/supervised/imprint/analyze`, then polls
   `GET /api/supervised/imprint/status` until `pending == 0` before *Review plan* and
-  *Apply moves* run the ordinary `POST /api/supervised/fanout`. The ephemeral root is
+  *Apply moves* run the ordinary `POST /api/supervised/fanout`. The fan-out is always
+  `recursive`, so nested files under the target are gathered and lifted. The ephemeral root is
   dropped via `POST /api/supervised/imprint/finish` after the moves land. *Apply moves*
   is the only step that touches disk and always confirms first. The plan note reports how
-  many tracks were left `unmatched` (too far from every learned folder to be placed).
+  many tracks went `Generic/` and how many were left `unmatched` (too far from every learned
+  folder to be placed). The *Sort unmatched into Generic/&lt;genre&gt;/&lt;style&gt;* checkbox
+  (default on) sends `generic`, filing unmatched tracks under their top Discogs label.
 - **Undo moves** reverses the last applied fan-out batch through
   `POST /api/supervised/fanout/undo`; it is enabled only while a batch is available
   (`GET` on the same path) and disabled again after a successful undo.

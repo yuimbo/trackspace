@@ -59,7 +59,11 @@ def create_api_folders_blueprint(
     def _roots_payload() -> list[dict[str, Any]]:
         """One tree per root, each tagged with its role for the sidebar sections."""
         return [
-            {**folder_tree(root_abs, rid), "role": root_role(rid, root_roles)}
+            {
+                **folder_tree(root_abs, rid),
+                "role": root_role(rid, root_roles),
+                "abs_path": root_abs,
+            }
             for rid, root_abs in roots.items()
         ]
 

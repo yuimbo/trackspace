@@ -23,7 +23,10 @@ const PANEL_HTML = `
   <div id="head-train-folders"></div>
   <details id="head-train-folders-details"></details>
   <button id="btn-head-folders-all"></button>
-  <input id="head-imprint-path" />
+  <details id="head-imprint-details">
+    <input id="head-imprint-path" />
+    <input id="imprint-generic-toggle" type="checkbox" checked />
+  </details>
   <input id="head-import-file" type="file" hidden />
   <input id="head-compare-file" type="file" hidden />
   <button id="btn-export-head"></button>
@@ -244,7 +247,9 @@ describe("HeadCoordinator imprint", () => {
     );
     expect(postBody(fetchSpy, "/api/supervised/fanout")).toEqual({
       folder: "tmp/Downloads",
+      recursive: true,
       apply: true,
+      generic: true,
     });
     // The ephemeral imprint root is dropped once the moves are done.
     expect(
@@ -296,6 +301,96 @@ describe("HeadCoordinator imprint", () => {
     expect(document.getElementById("imprint-note")!.textContent).toContain(
       "1 left unmatched",
     );
+  });
+
+  it("sends generic: false when the generic toggle is off", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    const { coord, fetchSpy } = makeHarness((url) => {
+      if (url.startsWith("/api/supervised/imprint/analyze")) {
+        return {
+          ok: true,
+          root_id: "tmp",
+          folder: "tmp/Downloads",
+          tracks: 1,
+          analyzed: 1,
+          pending: 0,
+        };
+      }
+      if (url.startsWith("/api/supervised/fanout")) {
+        return { ok: true, tracks: 1, moved: 1, generic: 0, unmatched: 0, plan: [] };
+      }
+      return {};
+    });
+    coord.bindPanel();
+    (
+      document.getElementById("imprint-generic-toggle") as HTMLInputElement
+    ).checked = false;
+    (
+      document.getElementById("head-imprint-path") as HTMLInputElement
+    ).value = "/tmp/Downloads";
+    document.getElementById("btn-imprint-analyze")!.click();
+    await flush();
+    document.getElementById("btn-imprint-apply")!.click();
+    await flush();
+
+    expect(postBody(fetchSpy, "/api/supervised/fanout")).toMatchObject({
+      recursive: true,
+      generic: false,
+    });
+  });
+
+  it("reports generic buckets in the plan note", async () => {
+    const { coord } = makeHarness((url) => {
+      if (url.startsWith("/api/supervised/imprint/analyze")) {
+        return {
+          ok: true,
+          root_id: "tmp",
+          folder: "tmp/Downloads",
+          tracks: 3,
+          analyzed: 3,
+          pending: 0,
+        };
+      }
+      if (url.startsWith("/api/supervised/fanout")) {
+        return {
+          ok: true,
+          tracks: 3,
+          moved: 0,
+          generic: 2,
+          unmatched: 1,
+          plan: [
+            { target: "tmp/Downloads/Generic/Techno/a.mp3", folder: "Generic/Techno" },
+          ],
+        };
+      }
+      return {};
+    });
+    coord.bindPanel();
+    (
+      document.getElementById("head-imprint-path") as HTMLInputElement
+    ).value = "/tmp/Downloads";
+    document.getElementById("btn-imprint-analyze")!.click();
+    await flush();
+    document.getElementById("btn-imprint-plan")!.click();
+    await flush();
+    const note = document.getElementById("imprint-note")!.textContent ?? "";
+    expect(note).toContain("2 into Generic/");
+    expect(note).toContain("1 left unmatched");
+  });
+
+  it("prefills the imprint target from a root row", () => {
+    const { coord } = makeHarness();
+    coord.bindPanel();
+    coord.prefillImprint("/tmp/Downloads");
+
+    const $path = document.getElementById(
+      "head-imprint-path",
+    ) as HTMLInputElement;
+    const $details = document.getElementById(
+      "head-imprint-details",
+    ) as HTMLDetailsElement;
+    expect($path.value).toBe("/tmp/Downloads");
+    expect($details.open).toBe(true);
   });
 
   it("undoes the last fan-out from the Undo button", async () => {

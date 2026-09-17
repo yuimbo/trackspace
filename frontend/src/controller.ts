@@ -239,6 +239,8 @@ export class Controller {
       },
       renderTagPanels: () => this._renderTagPanels(),
       onRootsChanged: () => this._reloadLibraryAndTree(),
+      // "Imprint this root" on an external row prefills the head panel's target.
+      onImprintRoot: (absPath) => this.head.prefillImprint(absPath),
     });
 
     this.options = new OptionsPanelBinder({

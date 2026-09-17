@@ -27,6 +27,7 @@ from backend.services.request_validation import (
     parse_json_body,
     require_str,
 )
+from backend.services.roots_registry import ROLE_EXTERNAL
 
 log = logging.getLogger(__name__)
 
@@ -35,9 +36,11 @@ def create_api_imprint_blueprint(
     *,
     analysis_deps: Any,
     roots: MutableMapping[str, str],
+    root_roles: MutableMapping[str, str],
     temp_roots: MutableSet[str],
     add_root: Callable[[str], tuple[bool, str]],
     remove_root: Callable[[str], bool],
+    set_root_role: Callable[[str, str], None],
     schedule_root_watch: Callable[[str], None],
     unschedule_root_watch: Callable[[str], None],
     save_roots_state: Callable[[], None],
@@ -100,6 +103,9 @@ def create_api_imprint_blueprint(
         changed, root_id = add_root(abs_path)
         if changed:
             temp_roots.add(root_id)
+            # The target is analysed, not owned: mark it external so the canvas
+            # and the head's labels keep treating it as a projection target.
+            set_root_role(root_id, ROLE_EXTERNAL)
             schedule_root_watch(root_id)
             save_roots_state()
         try:
@@ -159,6 +165,7 @@ def create_api_imprint_blueprint(
             return jsonify({"ok": True, "removed": False})
         temp_roots.discard(root_id)
         remove_root(root_id)
+        root_roles.pop(root_id, None)
         unschedule_root_watch(root_id)
         save_roots_state()
         return jsonify({"ok": True, "removed": True})
@@ -190,6 +197,7 @@ def create_api_imprint_blueprint(
                 discarded += 1
             temp_roots.discard(rid)
             remove_root(rid)
+            root_roles.pop(rid, None)
             unschedule_root_watch(rid)
         if discarded:
             save_roots_state()
