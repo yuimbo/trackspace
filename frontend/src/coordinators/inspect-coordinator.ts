@@ -56,6 +56,8 @@ export class InspectCoordinator {
   /** Run one inspect-card action (`data-inspect-action` or a result focus). */
   async action(action: string, path: string): Promise<void> {
     if (action === "close") {
+      // The card owns the preview once pinned, so closing it ends the audition.
+      this.deps.stopPreview();
       this.deps.view.unpinInspect();
       return;
     }
@@ -65,11 +67,9 @@ export class InspectCoordinator {
     }
     if (action === "hover") {
       // Hovering a result row auditions it straight away, like a canvas hover.
+      // It deliberately does *not* stop on leave: the audition belongs to the
+      // open card, not to the pointer staying on the row.
       this.deps.preview(path);
-      return;
-    }
-    if (action === "unhover") {
-      this.deps.stopPreview();
       return;
     }
     if (action === "solo") {

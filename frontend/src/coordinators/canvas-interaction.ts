@@ -199,8 +199,10 @@ export class CanvasInteractionController {
     mouse.hitIdx = hit;
 
     // A plain click on empty background closes the pinned inspect card.
-    if (hit < 0 && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey)
+    if (hit < 0 && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
       cv.unpinInspect();
+      this.deps.stopPreview();
+    }
 
     // Shift on empty space (no dot, not inside selection box) → lasso.
     if (e.shiftKey && hit < 0 && !(txh?.type === "move")) {
@@ -1147,7 +1149,8 @@ export class CanvasInteractionController {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.key !== "Alt" || e.repeat) return;
       if (!this._explodeKeysAllowed(e.target)) return;
-      this.deps.canvas.toggleInspect();
+      // Unpinning ends the audition the card owned.
+      if (this.deps.canvas.toggleInspect()) this.deps.stopPreview();
     });
   }
 }

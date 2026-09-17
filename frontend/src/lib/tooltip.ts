@@ -264,11 +264,16 @@ const TARGET_HINT = "Highlight matches · S solo · H fit";
 /**
  * Mark an element as a navigation target: the canvas reads `data-hover-target` to
  * glow matching dots, and S/H act on it exactly as they do for a sidebar row.
+ * *title* overrides the generic hint (a result row has its own affordance text).
  */
-function markTarget(el: HTMLElement, target: HoverTarget): HTMLElement {
+function markTarget(
+  el: HTMLElement,
+  target: HoverTarget,
+  title: string = TARGET_HINT,
+): HTMLElement {
   el.classList.add("tt-target");
   el.dataset.hoverTarget = JSON.stringify(target);
-  el.title = TARGET_HINT;
+  el.title = title;
   return el;
 }
 
@@ -407,9 +412,14 @@ function inspectSection(
 function resultRow(result: ResultRow): HTMLElement {
   const row = el("div", "tt-result");
   row.dataset.inspectFocus = result.path;
-  // Hovering a row auditions it immediately, like hovering a canvas dot.
+  // Hovering a row glows it in the map and auditions it immediately, like
+  // hovering a canvas dot.
   row.dataset.preview = result.path;
-  row.title = "Select, fit the view, and audition";
+  markTarget(
+    row,
+    { kind: "track", path: result.path },
+    "Glow in the map · click to select, fit the view, and audition",
+  );
 
   const text = el("div", "tt-result-text");
   text.appendChild(el("div", "tt-result-title", result.title));

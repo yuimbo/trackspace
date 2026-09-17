@@ -379,6 +379,11 @@ describe("renderTooltip", () => {
     expect(row.dataset.inspectFocus).toBe("b.mp3");
     expect(row.textContent).toContain("A — B");
     expect(row.querySelector(".tt-result-score")?.textContent).toBe("-0.42");
+    // Hovering the row glows the track in the map.
+    expect(JSON.parse(row.dataset.hoverTarget!)).toEqual({
+      kind: "track",
+      path: "b.mp3",
+    });
   });
 
   it("shows a busy note while a ranking is in flight", () => {

@@ -199,7 +199,8 @@ export type HoverTarget =
   | { kind: "folder"; prefix: string }
   | { kind: "cluster"; id: number }
   | { kind: "key"; value: string }
-  | { kind: "bpm"; value: number };
+  | { kind: "bpm"; value: number }
+  | { kind: "track"; path: string };
 
 /** BPM window that counts as "the same tempo" for the BPM chip's hover target. */
 export const BPM_MATCH_TOLERANCE = 2;
@@ -590,6 +591,8 @@ export class Model extends EventBus {
           Number.isFinite(track.bpm) &&
           Math.abs(track.bpm - target.value) <= BPM_MATCH_TOLERANCE
         );
+      case "track":
+        return track.path === target.path;
     }
   }
 

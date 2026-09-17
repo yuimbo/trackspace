@@ -251,8 +251,11 @@ same seam as `SearchCoordinator`:
   neighbours) and fit the view to it, reusing `Model.focusPaths` and
   `fitViewToPaths`.
 - **Result row** — click focuses it: select alone, fit the view, audition it (only
-  when hover preview is on). **Hovering** a row auditions it immediately, like a
-  canvas hover, and leaving stops it.
+  when hover preview is on). **Hovering** a row glows that track in the map
+  (`{kind: "track", path}` hover target) and auditions it immediately, like a
+  canvas hover. Leaving the row does **not** stop the audition: the open card owns
+  it, so it keeps playing until the card closes (its `×`, Esc, a plain canvas
+  click, or another Alt press) or another row is hovered.
 
 Results are shown as title/artist/folder + similarity score, resolved against the
 loaded library (the endpoint returns only `path` + `score`). The card shows a

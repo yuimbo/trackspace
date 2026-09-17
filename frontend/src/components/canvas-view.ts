@@ -598,7 +598,8 @@ export class CanvasView {
   private _hoverGlowColor(track: Track): string {
     const t = this.hoverTarget;
     if (t?.kind === "cluster") return clusterColor(t.id);
-    if (t?.kind === "key" || t?.kind === "bpm") return TARGET_GLOW_COLOR;
+    if (t?.kind === "key" || t?.kind === "bpm" || t?.kind === "track")
+      return TARGET_GLOW_COLOR;
     return this.trackColor(track);
   }
 
@@ -1147,10 +1148,11 @@ export class CanvasView {
     return true;
   }
 
-  /** Alt toggles the hovered track's inspect card. */
-  toggleInspect(): void {
-    if (this.inspect) this.unpinInspect();
-    else this.pinInspect();
+  /** Alt toggles the hovered track's inspect card; true when it closed. */
+  toggleInspect(): boolean {
+    if (this.inspect) return this.unpinInspect();
+    this.pinInspect();
+    return false;
   }
 
   /** Merge a patch into the pinned inspect state (busy/results/…). */
@@ -1207,15 +1209,13 @@ export class CanvasView {
 
   private _onTipOut(e: MouseEvent): void {
     const t = e.target as HTMLElement;
+    // Leaving a result row does *not* stop its audition: the preview belongs to
+    // the open card, so it keeps playing until the card closes.
     const preview = t.closest<HTMLElement>("[data-preview]");
-    // Moving between the row's own children is not a leave.
     const previewTo = (e.relatedTarget as HTMLElement | null)?.closest?.(
       "[data-preview]",
     );
-    if (preview && previewTo !== preview && preview === this._previewRow) {
-      this._previewRow = null;
-      this.onInspectAction?.("unhover", preview.dataset.preview!);
-    }
+    if (preview && previewTo !== preview) this._previewRow = null;
     const el = t.closest<HTMLElement>("[data-hover-target]");
     if (!el) return;
     const to = (e.relatedTarget as HTMLElement | null)?.closest?.(

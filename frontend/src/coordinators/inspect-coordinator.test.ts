@@ -137,18 +137,20 @@ describe("InspectCoordinator", () => {
     expect(h.fitToPaths).not.toHaveBeenCalled();
   });
 
-  it("closes the card", async () => {
+  it("closes the card and ends the audition it owned", async () => {
     const h = makeHarness();
     await h.coord.action("close", "a.mp3");
+    expect(h.stopPreview).toHaveBeenCalled();
     expect(h.view.unpinInspect).toHaveBeenCalled();
   });
 
-  it("auditions a result row on hover and stops on leave", async () => {
+  it("auditions a result row on hover, and keeps playing on leave", async () => {
     const h = makeHarness();
     await h.coord.action("hover", "b.mp3");
     expect(h.preview).toHaveBeenCalledWith("b.mp3");
+    // Leaving the row must not stop it: the open card owns the audition.
     await h.coord.action("unhover", "b.mp3");
-    expect(h.stopPreview).toHaveBeenCalled();
+    expect(h.stopPreview).not.toHaveBeenCalled();
   });
 
   it("expands the anti-track to the most distant list", async () => {
