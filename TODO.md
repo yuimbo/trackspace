@@ -22,6 +22,43 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
   already reports `unmatched`), and re-measure the default on the real library.
   Files: `backend/embeddings/supervised.py`, `frontend/src/coordinators/head-coordinator.ts`.
 
+### UI/UX feedback round
+
+- [ ] **Right sidebar can overflow.** `#right-panel` is `overflow: hidden` and every
+  section is `flex-shrink: 0`, so once the cluster/head/imprint `<details>` are
+  expanded the lower sections are clipped with no way to reach them. Make the panel
+  scroll (`overflow-y: auto`) without breaking the inner `#properties-list` /
+  `#cluster-list` scroll areas or the `.rp-spacer` bottom-align behaviour.
+  Files: `frontend/src/trackspace.css`.
+- [ ] **Search: audition the best-matching section, not just the drop.** CLAP caches
+  only the mean of the `NUM_SEGMENTS` (=3) segment vectors, so a hit carries no
+  per-section score and the hover preview can only start at the structure `peak`.
+  Decide whether to cache per-segment vectors (a new versioned source, ~3× the CLAP
+  row) or re-encode the query against segments on demand, then return a
+  `section`/`start` per `/api/search` hit and have `SearchView`/preview honour it.
+  Files: `backend/embeddings/clap.py`, `backend/embeddings/feature_cache.py`,
+  `backend/routes/api_search.py`, `frontend/src/coordinators/search-coordinator.ts`,
+  `frontend/src/controller.ts` (preview start).
+- [ ] **Analysis coverage panel + per-stage retrigger.** There is no UI over
+  `/api/embeddings/status`: the user cannot see that `structure` (section
+  timestamps) is missing — e.g. after the `STRUCTURE_VERSION` 1→2 backfill or for
+  tracks the stage never reached — nor re-run one stage. Add a coverage overview
+  (per-source with/pending, incl. structure) and per-stage retrigger buttons backed
+  by `/api/embeddings/generate` (`force`), and include the structure count in
+  `coverage_payload` (currently deliberately omitted).
+  Files: `backend/embeddings/coverage.py`, `backend/routes/api_embeddings.py`,
+  `frontend/src/coordinators/analysis-coordinator.ts`, `frontend/index.html`.
+- [ ] **Some slow stages still lack a progress bar.** The projection `layout` base
+  phase is one opaque step (no iteration callback) and the `structure` stage reports no
+  `stage_progress`; audit every long-running stage for a phase/percent event and add
+  the missing ones. Files: `backend/embeddings/projection_backends.py`,
+  `backend/services/analysis_pipeline.py`, `frontend/src/lib/pipeline.ts`.
+- [ ] **Anti-track hides the ranking behind a button.** The pinned card shows one
+  anti-track and a "Show 10 most distant" button; show the 10 most distant directly
+  (drop `ANTI_MORE_K` / the `anti-more` action / `canExpandAnti`).
+  Files: `frontend/src/coordinators/inspect-coordinator.ts`,
+  `frontend/src/lib/tooltip.ts`.
+
 ### Source-weight comparability (normalising the source blocks)
 
 The rationale is in `audio_pipeline.md` → *Composite vector construction*.
