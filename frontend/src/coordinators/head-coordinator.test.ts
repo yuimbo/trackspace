@@ -393,6 +393,13 @@ describe("HeadCoordinator imprint", () => {
     expect($details.open).toBe(true);
   });
 
+  it("reveals the Organise tab when prefilling an imprint target", () => {
+    const showRightPanel = vi.fn();
+    const coord = new HeadCoordinator({ model: new Model(), showRightPanel });
+    coord.prefillImprint("/tmp/Downloads");
+    expect(showRightPanel).toHaveBeenCalledWith("organise");
+  });
+
   it("undoes the last fan-out from the Undo button", async () => {
     const { coord, fetchSpy, refreshProjection } = makeHarness((url) => {
       if (url === "/api/supervised/fanout/undo") {

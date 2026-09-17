@@ -56,21 +56,29 @@
     <div id="properties-list"></div>
   </section>
 
+  <!-- Tab strip: Search + Properties stay pinned above it; these four tabs own the
+       rest so the panel no longer scrolls to the brim. Sections are tagged with
+       `data-rp-panel` in place (their cross-tab DOM order is irrelevant). -->
+  <nav id="rp-tabs" role="tablist" aria-label="Right panel sections">
+    <button type="button" class="rp-tab" data-rp-tab="analysis" role="tab" aria-selected="false">Analysis</button>
+    <button type="button" class="rp-tab" data-rp-tab="organise" role="tab" aria-selected="false">Organise</button>
+    <button type="button" class="rp-tab" data-rp-tab="tracks" role="tab" aria-selected="false">Tracks</button>
+    <button type="button" class="rp-tab" data-rp-tab="view" role="tab" aria-selected="false">View</button>
+  </nav>
+
   <!-- component: analysis-panel (coverage + per-stage retrigger) -->
-  <section id="analysis-section" x-data>
+  <section id="analysis-section" data-rp-panel="analysis" x-data>
     <h2>Analysis</h2>
     <div id="analysis-coverage"></div>
     <div id="analysis-retrigger" class="analysis-retrigger"></div>
   </section>
 
-  <section id="batch-section" x-data>
+  <section id="batch-section" data-rp-panel="tracks" x-data>
     <h2>Batch Edit</h2>
     <div id="batch-list"></div>
   </section>
 
-  <div class="rp-spacer"></div>
-
-  <section id="options-section" x-data>
+  <section id="options-section" data-rp-panel="view" x-data>
     <h2>Options</h2>
     <div class="option-row hover-preview-row">
       <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
@@ -100,7 +108,7 @@
     </label>
   </section>
 
-  <section id="cluster-section" x-data>
+  <section id="cluster-section" data-rp-panel="analysis" x-data>
     <h2>Microgenres</h2>
     <label>
       <input type="checkbox" id="cluster-color-toggle" /> Colour by cluster
@@ -158,8 +166,13 @@
     >
       Train folder view
     </button>
+  </section>
+
+  <!-- component: head-panel (folder head: export/import/compare, training folders, imprint) -->
+  <section id="head-section" data-rp-panel="organise" x-data>
+    <h2>Folder head</h2>
     <details id="head-tools-details">
-      <summary>Folder head</summary>
+      <summary>Head tools</summary>
       <div class="head-actions">
         <button
           id="btn-export-head"
@@ -254,12 +267,12 @@
     </details>
   </section>
 
-  <section id="features-section" x-data>
+  <section id="features-section" data-rp-panel="tracks" x-data>
     <h2 class="features-heading">Features</h2>
     <ul id="feature-list"></ul>
   </section>
 
-  <section id="tag-section" x-data>
+  <section id="tag-section" data-rp-panel="tracks" x-data>
     <div id="tag-controls">
       <h2>Tags</h2>
       <button id="btn-add-tag" type="button" title="New tag">+ Tag</button>

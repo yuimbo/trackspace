@@ -9,7 +9,7 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model } from "../model";
+import { type Model, type RightPanelTab } from "../model";
 import { toast } from "../lib/toast";
 import { api, postJSON, postForm } from "../lib/api";
 
@@ -21,6 +21,8 @@ export interface HeadDeps {
   refreshClusters?(): void;
   /** Refresh the folder tree after an imprint root is added or removed. */
   onRootsChanged?(): Promise<void> | void;
+  /** Reveal a right-panel tab (the imprint controls live in Organise). */
+  showRightPanel?(tab: RightPanelTab): void;
 }
 
 /** One node of ``GET /api/folders`` — the training-folder selector's tree. */
@@ -255,6 +257,8 @@ export class HeadCoordinator {
 
   /** Fill the imprint target from a folder-tree root row and open the panel. */
   prefillImprint(absPath: string): void {
+    // The imprint controls live in the Organise tab, which may be hidden.
+    this.deps.showRightPanel?.("organise");
     const $path = document.getElementById(
       "head-imprint-path",
     ) as HTMLInputElement | null;

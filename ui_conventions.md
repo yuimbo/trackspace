@@ -112,6 +112,30 @@ server-side by `backend/services/dir_colors.py` for the Jinja folder-tree swatch
 
 ---
 
+## Right panel (tabs)
+
+The right column pins the two "what am I looking at?" sections — **Search** and
+**Properties** — above a tab strip (`#rp-tabs`, `RightPanelBinder`). Everything else
+lives in one of four tabs, so the panel no longer scrolls to the brim:
+
+| Tab | Sections | Concern |
+|-----|----------|---------|
+| **Analysis** | Analysis (coverage + per-stage retrigger), Microgenres | what the analysis says |
+| **Organise** | Folder head (train/export/import/compare, training folders, imprint) | the learned folder structure |
+| **Tracks** | Batch Edit, Features, Tags | the selection and its metadata |
+| **View** | Options (hover preview, view mode, explode) | how the map is drawn |
+
+- Sections are tagged **in place** with `data-rp-panel="<tab>"`; their cross-tab DOM order
+  is irrelevant because only one tab is shown at a time. `RightPanelBinder.sync` toggles each
+  tagged section's `hidden` and the tab's `active`/`aria-selected` from `model.rightPanelTab`.
+- The active tab is persisted in `localStorage` (like `showExternal`), so a reload returns to
+  the same tab; an unknown stored value falls back to **Analysis**.
+- `HeadCoordinator.prefillImprint` reveals the **Organise** tab through the controller's
+  `showRightPanel` dep before filling `#head-imprint-path`, so an imprint started from an
+  external root row is visible even when another tab was active.
+
+---
+
 ## Folder head panel
 
 The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):

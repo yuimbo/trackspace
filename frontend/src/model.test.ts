@@ -45,3 +45,30 @@ describe("Model external-root view", () => {
     expect(m2.showExternal).toBe(true);
   });
 });
+
+describe("Model right-panel tab", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("defaults to Analysis", () => {
+    expect(new Model().rightPanelTab).toBe("analysis");
+  });
+
+  it("persists the active tab", () => {
+    const m = new Model();
+    m.rightPanelTab = "tracks";
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.rightPanelTab).toBe("tracks");
+  });
+
+  it("falls back to Analysis for an unknown persisted tab", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ rightPanelTab: "bogus" }),
+    );
+    const m = new Model();
+    m.loadLS();
+    expect(m.rightPanelTab).toBe("analysis");
+  });
+});

@@ -30,6 +30,7 @@ import { EmbeddingCoordinator } from "./coordinators/embedding-coordinator";
 import { FolderTreeCoordinator } from "./coordinators/folder-tree-coordinator";
 import { CanvasInteractionController } from "./coordinators/canvas-interaction";
 import { OptionsPanelBinder } from "./coordinators/options-panel";
+import { RightPanelBinder } from "./coordinators/right-panel";
 import {
   SearchCoordinator,
   type SearchResponse,
@@ -100,6 +101,9 @@ export class Controller {
   /** Right-column Options panel controls. */
   private options: OptionsPanelBinder;
 
+  /** Right-panel tab strip (Analysis / Organise / Tracks / View). */
+  private rightPanel: RightPanelBinder;
+
   /** Semantic search: query fetch, result selection, result panel. */
   private search: SearchCoordinator;
 
@@ -148,7 +152,11 @@ export class Controller {
       // An imprint registers/removes a root, so the library and tree must
       // follow: the root set and the visible track set stay in step.
       onRootsChanged: () => this._reloadLibraryAndTree(),
+      // Prefilling an imprint target must reveal the Organise tab it lives in.
+      showRightPanel: (tab) => this.rightPanel.setTab(tab),
     });
+
+    this.rightPanel = new RightPanelBinder({ model });
 
     this.analysis = new AnalysisCoordinator({
       model,
@@ -258,6 +266,7 @@ export class Controller {
     this.folders.bind();
     this.interaction.bind();
     this.options.bind();
+    this.rightPanel.bind();
     this._bindTagControls();
     this.analysis.bindPanel();
     this.head.bindPanel();

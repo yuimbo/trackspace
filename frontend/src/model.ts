@@ -186,6 +186,14 @@ export function isAudioFeatureAxisId(tag: string): boolean {
 
 export type ViewMode = "tags" | "embeddings";
 
+/**
+ * Right-panel tab ids, in tab-strip order. Search and Properties stay pinned above
+ * the strip; these four tabs own the lower sections so the panel no longer scrolls to
+ * the brim. See `ui_conventions.md` → *Right panel*.
+ */
+export const RIGHT_PANEL_TABS = ["analysis", "organise", "tracks", "view"] as const;
+export type RightPanelTab = (typeof RIGHT_PANEL_TABS)[number];
+
 /** Hover-preview audition section; cycled with **D** and highlighted in the tooltip. */
 export type PreviewSection = "intro" | "drop" | "break";
 
@@ -370,6 +378,8 @@ export class Model extends EventBus {
   externalRootIds = new Set<string>();
   /** Include external-root tracks in the view (persisted, default off). */
   showExternal = false;
+  /** Active right-panel tab (persisted); search + properties stay pinned. */
+  rightPanelTab: RightPanelTab = "analysis";
 
   /* ── Computed ──────────────────────────────────────────────── */
 
@@ -970,6 +980,7 @@ export class Model extends EventBus {
         clusterWeights: this.clusterWeights,
         trainFolders: this.trainFolders,
         showExternal: this.showExternal,
+        rightPanelTab: this.rightPanelTab,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -1015,6 +1026,10 @@ export class Model extends EventBus {
         this.showExternal = Boolean(
           (d as { showExternal?: boolean }).showExternal,
         );
+        const rpTab = (d as { rightPanelTab?: unknown }).rightPanelTab;
+        this.rightPanelTab = RIGHT_PANEL_TABS.includes(rpTab as RightPanelTab)
+          ? (rpTab as RightPanelTab)
+          : "analysis";
       }
     } catch {
       /* start fresh */
