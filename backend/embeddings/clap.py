@@ -166,7 +166,7 @@ def analyze_batch(
                 )
                 device = next(_model.parameters()).device
                 inputs = {k: v.to(device) for k, v in inputs.items()}
-                with torch.no_grad():
+                with torch.inference_mode():
                     outputs = _model.get_audio_features(**inputs)
                 tensor = _extract_tensor(outputs)
                 emb = tensor.detach().cpu().numpy().astype(np.float32)
@@ -194,7 +194,7 @@ def generate_text_embeddings(texts: list[str]) -> np.ndarray | None:
             inputs = _processor(text=texts, return_tensors="pt", padding=True)
             device = next(_model.parameters()).device
             inputs = {k: v.to(device) for k, v in inputs.items()}
-            with torch.no_grad():
+            with torch.inference_mode():
                 outputs = _model.get_text_features(**inputs)
             tensor = _extract_tensor(outputs)
             return tensor.detach().cpu().numpy().astype(np.float32)

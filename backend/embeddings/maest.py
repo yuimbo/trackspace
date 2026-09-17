@@ -22,6 +22,7 @@ detect genre-spanning tracks without re-running inference.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -42,10 +43,19 @@ MAEST_NUM_SEGMENTS = 3
 MAEST_EMBED_DIM = 768
 MAEST_LOGIT_DIM = 519
 
+#: Excerpts per forward for the default job batch: ``make_maest_handler``'s
+#: ``batch_size`` (4) × :data:`MAEST_NUM_SEGMENTS`. Used only by :func:`warmup`
+#: to compile the job-shaped graph alongside the single-excerpt one.
+DEFAULT_BATCH_EXCERPTS = 4 * MAEST_NUM_SEGMENTS
+
 #: Bump when excerpt strategy, pooling, or the checkpoint changes.
 MAEST_VERSION = 1
 
 _model = None
+#: The uncompiled model, kept so a failed ``torch.compile`` can fall back to it.
+_eager_model = None
+#: True once ``_model`` is the compiled wrapper rather than ``_eager_model``.
+_compiled = False
 _mel = None
 _device = "cpu"
 _model_lock = threading.Lock()
@@ -77,7 +87,7 @@ def load_error() -> str | None:
 
 def load_model() -> None:
     """Load MAEST once; safe to call from several threads."""
-    global _model, _mel, _device, _loaded, _load_failed
+    global _model, _eager_model, _mel, _device, _loaded, _load_failed, _compiled
     if _loaded:
         return
     with _model_lock:
@@ -103,7 +113,21 @@ def load_model() -> None:
                 _device = "mps"
             else:
                 _device = "cpu"
-            _model = model.to(_device)
+            _eager_model = model.to(_device)
+            _model = _eager_model
+
+            # Opt-in only: inductor's MPS support and this model's graph-break
+            # behaviour are unmeasured, so the default stays eager until the
+            # profile harness shows a steady-state win. ``warmup`` falls back to
+            # the eager model if compilation turns out to be unusable.
+            if os.environ.get("TRACKSPACE_MAEST_COMPILE") == "1" and _device != "cpu":
+                try:
+                    _model = torch.compile(_eager_model)
+                    _compiled = True
+                    log.info("MAEST torch.compile enabled (device=%s).", _device)
+                except Exception as e:
+                    _model = _eager_model
+                    log.warning("MAEST torch.compile failed, using eager: %s", e)
 
             # The mel front end must run on CPU: torchaudio's STFT requires the
             # input and the window buffer on the same device, and `model.to()`
@@ -219,7 +243,7 @@ def analyze_batch(
             mel = _mel(wave)
             with inference_lock:
                 mel_dev = mel.to(_device)
-                with torch.no_grad():
+                with torch.inference_mode():
                     logits, emb = _model(mel_dev, melspectrogram_input=True)
                 logits_np = logits.detach().to("cpu").numpy().astype(np.float32)
                 emb_np = emb.detach().to("cpu").numpy().astype(np.float32)
@@ -283,20 +307,44 @@ def top_styles(logits: np.ndarray, k: int = 5) -> list[tuple[str, float]]:
     return [(str(labels[int(i)]), float(v[int(i)])) for i in idx]
 
 
+def _dummy_forward(batch: int) -> None:
+    import torch
+
+    silence = np.zeros(MAEST_SR * MAEST_SEGMENT_SECONDS, dtype=np.float32)
+    wave = torch.from_numpy(np.stack([silence] * batch, axis=0))
+    mel = _mel(wave)
+    with inference_lock:
+        with torch.inference_mode():
+            _model(mel.to(_device), melspectrogram_input=True)
+
+
 def warmup() -> None:
-    """Run one tiny forward pass so the first real batch is not paying init cost."""
+    """Run dummy forwards so the first real batch pays no init or compile cost.
+
+    With ``TRACKSPACE_MAEST_COMPILE`` on, the job-shaped batch is compiled too —
+    a chunk of ``DEFAULT_BATCH_EXCERPTS`` excerpts has a different shape from the
+    single-excerpt warmup, so without this the first claimed batch would trigger
+    the recompile. If the compiled model raises, it is dropped for the eager one.
+    """
+    global _model, _compiled
     if not _loaded:
         load_model()
     if not _loaded:
         return
     try:
-        import torch
+        _dummy_forward(1)
+        if _compiled:
+            _dummy_forward(DEFAULT_BATCH_EXCERPTS)
+        return
+    except Exception as e:
+        if not _compiled:
+            log.debug("MAEST warmup skipped: %s", e)
+            return
+        log.warning("MAEST torch.compile unusable, falling back to eager: %s", e)
 
-        silence = np.zeros(MAEST_SR * MAEST_SEGMENT_SECONDS, dtype=np.float32)
-        wave = torch.from_numpy(silence[None, :])
-        mel = _mel(wave)
-        with inference_lock:
-            with torch.no_grad():
-                _model(mel.to(_device), melspectrogram_input=True)
+    _model = _eager_model
+    _compiled = False
+    try:
+        _dummy_forward(1)
     except Exception as e:
         log.debug("MAEST warmup skipped: %s", e)

@@ -521,7 +521,7 @@ def train_head(
 
         train_loss = float(np.mean(batch_losses)) if batch_losses else float("nan")
         model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             z_val = torch.nn.functional.normalize(model(xt[val_idx]), dim=1)
             val_loss = float(
                 _supcon_loss(
@@ -671,7 +671,7 @@ def project_from_state(
     model = _build_model(int(in_dim), int(hidden_dim), int(out_dim))
     model.load_state_dict(state_dict)
     model.eval()
-    with torch.no_grad():
+    with torch.inference_mode():
         x = torch.from_numpy(np.asarray(mat, dtype=np.float32))
         z = torch.nn.functional.normalize(model(x), dim=1)
     return z.cpu().numpy().astype(np.float32)
