@@ -259,22 +259,24 @@ in-process, interleaved A/B of the same shapes gave 0.96× (batch 3) and 0.97×
 (batch 12), inside the noise floor — so it is kept for correctness of intent, not
 for speed.
 
-`torch.compile` on the MAEST transformer was measured and **rejected**. A
-steady-state, same-process forward comparison (medians of 4 interleaved rounds, mel
-precomputed, no decode, no shape churn) put the compiled model at **2.4× slower**
-on MPS:
+`torch.compile` on the MAEST transformer was measured twice and **rejected**.
+Interleaved, same-process comparisons (mel precomputed, no decode, no shape churn,
+alternating order, 6 rounds) reproduce the same slowdown:
 
-| batch | eager | compiled | ratio |
+| measurement | eager | compiled | slowdown |
 |---|---|---|---|
-| 3 excerpts | 647 ms | 1077 ms | 0.60× |
-| 12 excerpts | 1710 ms | 4092 ms | 0.42× |
+| forward, 3 excerpts | 388 ms | 890 ms | 2.29× |
+| forward, 12 excerpts | 1643 ms | 3875 ms | 2.36× |
+| `analyze_batch`, 8 real tracks | 4.3 s | 7.7 s | 1.78× |
 
-The queue harness agreed on the real 48-track sample: compiled ~1.4–1.6 s/track versus
-0.4–0.8 eager, and its run 1 additionally paid the ~15 s compile. An earlier
-"promising" smoke reading was an artefact — the fixture yields one excerpt per track, so
-the apparent batch-12 was really a batch of 4, and `warmup` had hidden the recompile.
-Inductor's MPS kernels are the wrong trade for this transformer; retry only on CUDA, and
-only with the paired measurement below.
+`dynamic=True` was no better (896 / 3927 ms), the queue harness agreed (compiled
+~1.4–1.6 s/track versus 0.4–0.8 eager on the 48-track sample, plus the ~15 s compile
+in run 1), and the compiled outputs match eager to ~3e-6 — a kernel-speed regression, not
+a numerical one. The compiled model's *best* forward (643 ms) is still slower than eager's
+*median* (388 ms), so the ordering is robust to the run-to-run spread. An earlier
+"promising" smoke reading was an artefact — the fixture yields one excerpt per track, so the
+apparent batch-12 was really a batch of 4, and `warmup` had hidden the recompile. Retry only
+on CUDA, and only with the paired measurement below.
 
 Decide any future accelerator change on an idle machine, comparing best-run numbers (the
 harness does **not** call `warmup`, so run 1 includes first-call/compile cost and run 2+

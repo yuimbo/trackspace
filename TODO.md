@@ -191,10 +191,10 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       forwards (MAEST, CLAP audio/text, the supervised head) now use
       `torch.inference_mode()`; measured neutral (0.96×/0.97× in an in-process,
       interleaved A/B), kept for correctness of intent. `torch.compile` on the MAEST
-      transformer was measured and removed: 2.4× slower on MPS (batch 12: 4092 ms vs
-      1710 ms per forward; batch 3: 1077 vs 647) and the queue harness agreed
-      (~1.4–1.6 s/track vs 0.4–0.8 eager). Only retry on CUDA, with the paired
-      measurement in `audio_pipeline.md` → *MAEST model management*.
+      transformer was measured twice, reproduced, and removed: ~2.3× slower per forward on
+      MPS and 1.78× end-to-end on real tracks, with `dynamic=True` no better (numbers
+      and method in `audio_pipeline.md` → *MAEST model management*). Only retry on CUDA,
+      with that same paired measurement.
 - [ ] **MAEST mel front end.** Already batched: `analyze_batch` stacks every
       excerpt of the claimed batch (up to `batch_size * MAEST_NUM_SEGMENTS`) into one
       `_mel(wave)` call, not three per track. The remaining CPU mel cost is the
