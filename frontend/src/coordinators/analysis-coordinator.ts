@@ -309,8 +309,12 @@ export class AnalysisCoordinator {
     ];
 
     // Per-stage failure counts (deduped: features and rhythm share one stage).
+    // Only a stage with a real gap (`pending > 0`) counts its failures: a drained
+    // stage whose cache is complete can still hold a stale failure row for a duplicate
+    // fingerprint, which must not read as "not fully covered".
     const failedByStage = new Map<string, number>();
-    for (const row of rows) failedByStage.set(row.stage, row.failed);
+    for (const row of rows)
+      failedByStage.set(row.stage, row.pending > 0 ? row.failed : 0);
     const failedTotal = [...failedByStage.values()].reduce((a, b) => a + b, 0);
 
     const summary = document.createElement("div");
@@ -341,9 +345,11 @@ export class AnalysisCoordinator {
       count.className = "analysis-coverage-count";
       count.textContent = `${row.done} / ${total}`;
       if (row.pending > 0) count.classList.add("has-pending");
-      // A drained queue with a short bar is almost always terminal failures, not
-      // pending work: flag the row and point at the retrigger button.
-      if (row.failed > 0) count.classList.add("has-failed");
+      // A drained stage with a short bar is almost always terminal failures, not
+      // pending work: flag the row and point at the retrigger button. A stale
+      // failure on an otherwise complete stage is ignored.
+      const failed = row.pending > 0 ? row.failed : 0;
+      if (failed > 0) count.classList.add("has-failed");
 
       const bar = document.createElement("span");
       bar.className = "analysis-coverage-bar";
@@ -355,7 +361,7 @@ export class AnalysisCoordinator {
       line.append(name, bar, count);
       line.title = `${row.done} of ${total} analysed${
         row.pending > 0 ? `, ${row.pending} pending` : ""
-      }${row.failed > 0 ? `, ${row.failed} failed (retrigger to retry)` : ""}`;
+      }${failed > 0 ? `, ${failed} failed (retrigger to retry)` : ""}`;
       host.appendChild(line);
     }
   }
