@@ -51,6 +51,8 @@ frontend/src/
   components/             one view per file (canvas, tags, properties, batch, status, search)
   lib/toast.ts            shared DOM helpers
   lib/api.ts              shared fetch / postJSON
+  lib/lenses.ts           lens registry + deterministic feature geometry
+  lib/scope-menu.ts       scope lens picker menu DOM
 tests/                    pytest suite (backend); vitest lives beside frontend sources
 data/                     SQLite caches (gitignored, created at runtime)
 ```
@@ -73,15 +75,15 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
 | Feature cache | `backend/embeddings/feature_cache.py` | ~560 | One generic `_SOURCES` registry + fan-out journal + origin memory |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
-| Frontend orchestration | `frontend/src/controller.ts` | ~780 | Wiring, data loading, tag-write queue, preview, keyboard |
+| Frontend orchestration | `frontend/src/controller.ts` | ~840 | Wiring, data loading, tag-write queue, preview, keyboard |
 | Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~575 | Queue SSE + cluster panel + source weights |
 | Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | ~610 | Train/export/import/compare, imprint, fan-out undo |
-| Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~680 | Layout cache + SSE + animations |
+| Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~1080 | Layout cache + SSE + animations + lenses + scopes |
 | Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | ~675 | HTMX tree + roots + highlights |
-| Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1040 | Pointer gestures + transforms |
-| Options panel | `frontend/src/coordinators/options-panel.ts` | ~90 | Right-column controls |
-| Canvas view | `frontend/src/components/canvas-view.ts` | ~1095 | |
-| State | `frontend/src/model.ts` | ~830 | Optional persistence / EventBus split |
+| Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1200 | Pointer gestures + transforms + scope gesture |
+| Options panel | `frontend/src/coordinators/options-panel.ts` | ~130 | Lens select + presets + hover preview |
+| Canvas view | `frontend/src/components/canvas-view.ts` | ~1350 | |
+| State | `frontend/src/model.ts` | ~1190 | Optional persistence / EventBus split |
 
 `canvas-interaction.ts` is the largest frontend file; the fit-view math is the
 natural next split if it needs to shrink (see `TODO.md`).
@@ -308,19 +310,20 @@ with vitest coverage:
   selection), export/import/compare, the imprint flow, and the fan-out move undo. The
   queue reaches it only through `syncTrainEnabled`, so the head panel is independent of
   the queue + cluster panel.
-- ✅ `EmbeddingCoordinator` — layout cache, embedding SSE, projection polling, and all
-  canvas position animations. Owns the shared `canvas.animPositions` overlay and the single
-  animation frame, so tag-axis and embedding animations cannot fight over the overlay.
+- ✅ `EmbeddingCoordinator` — layout cache, embedding SSE, projection polling, lens
+  switching, scope re-layout, and all canvas position animations. Owns the shared
+  `canvas.animPositions` overlay and the single animation frame, so tag-axis and
+  embedding animations cannot fight over the overlay.
 - ✅ `FolderTreeCoordinator` — HTMX refresh/bind, root import/removal, tree interaction,
   highlights, selected-folders overlay. Undoable renames and root-driven library reloads stay
   in the controller via deps callbacks (`renameFolder`, `onRootsChanged`).
 - ✅ `CanvasInteractionController` — pointer gestures (click/box/lasso select, tag drag,
-  transform handles, pan/zoom, folder-drop), explode-hold key, fit view. Owns the mouse state;
+  transform handles, pan/zoom, folder-drop), scope gesture, fit view. Owns the mouse state;
   exposes `isPointerBusy()` (consumed by the folder coordinator), `cancelActiveGesture()`,
   `fitView()`, `effectiveHoveredFolderPrefix()`. The debounced tag-write queue stays in the
   controller (shared with `BatchView.onApply`) behind `queueTagWrite` / `flushTagWrites` deps.
-- ✅ `OptionsPanelBinder` — right-column controls (view mode, hover preview + volume,
-  explode strength) with `bind()` / `sync()`.
+- ✅ `OptionsPanelBinder` — right-column controls (lens select + presets, hover preview +
+  volume) with `bind()` / `sync()`.
 
 ---
 

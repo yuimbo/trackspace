@@ -72,6 +72,32 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
   decreasing step sizes, expecting a quadratic residual); and operational checks
   (10k/20k, insertion batches, row permutations, old-coordinate byte-stability).
 
+## Lenses & scopes
+
+- [ ] **Local scope refit.** A projection scope lens reuses its *global* layout,
+  min-max normalised into the circle, so the subset's internal geometry is the one
+  it had in the full map. A t-SNE fit over just the in-scope tracks would show the
+  local structure better; it is a per-scope fit, so it needs a progress indicator and
+  a way to invalidate it when the scope moves. Files:
+  `frontend/src/coordinators/embedding-coordinator.ts` (`_scopeTargets`),
+  `backend/embeddings/layout.py`.
+- [ ] **Multiple scopes.** Only one scope is open at a time; a second X + drag
+  replaces it. Multiple non-overlapping scopes (and a per-scope close) would let a
+  user compare two clusters in two lenses at once. `Model.scope` / `scopePositions`
+  would become a list. Files: `frontend/src/model.ts`,
+  `frontend/src/components/canvas-view.ts`, `canvas-interaction.ts`.
+- [ ] **Energy/dance semantic 2-space (experiment).** The re-encoded `features`
+  block leaves energy and danceability linear. Test a more semantic encoding (e.g.
+  polar around an energy×dance axis) against the §8 fidelity harness — only keep it
+  if neighbourhood recall improves. Files:
+  `backend/embeddings/feature_encoding.py`, `tests/`.
+- [ ] **Preset export/import.** Lens presets live in `localStorage` only; a small
+  JSON export/import would let a tuned view move between machines. Files:
+  `frontend/src/model.ts` (`addLensPreset`), `frontend/src/coordinators/options-panel.ts`.
+- [ ] **Per-source lens readiness hint.** A lens whose source is disabled on the
+  server (e.g. `--no-clap`) shows an empty map rather than an explanatory note.
+  Files: `frontend/src/coordinators/embedding-coordinator.ts` (`ensureAndProject`).
+
 ## Deferred / optional
 
 ### Frontend

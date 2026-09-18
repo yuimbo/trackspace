@@ -245,16 +245,31 @@ dot, so it lives in `CanvasInteractionController._bindInspectKey`). See *Inspect
 
 ---
 
-## Embedding Space viewport mode
+## Lenses and scopes
 
 The UI half of the embedding-space view; the pipeline it drives is in `audio_pipeline.md`.
 
-- `model.viewMode` toggles between `"tags"` (default) and `"embeddings"`.
-- Hotkey **E** switches modes.
-- In embedding mode: canvas positions come from the selected projection method,
-  grid shows "Embedding Space (TSNE)" or "(UMAP)", transform handles and tag-drag
-  are disabled.  Tracks without embedding data are **hidden**
-  (not shown at tag-space positions).
+### Lenses
+
+- `model.lensId` selects the lens: the tag axes (`tags`), the combined map
+  (`combined`), one lens per source block (`maest`, `clap`, `rhythm`, `supervised`),
+  and the deterministic feature lenses (`camelot`, `tempo`). `model.viewMode` is a
+  derived getter — `"tags"` for the tag lens, `"embeddings"` for every other — so
+  the embedding-mode rules below need no per-lens branch.
+- Hotkey **E** cycles every built-in lens. The **View** tab has a lens select plus
+  *Save preset…* / *Delete preset*; a preset captures the lens and the display
+  options it was saved with (source weights, cluster colouring, granularity) and is
+  listed in the same select. Source weights only affect the combined lens, so their
+  panel is hidden for the others.
+- A projection lens requests a source subset (`sources=`) from the backend; the
+  combined lens projects every frozen source. The source set is part of
+  `layout_revision`, so each lens caches its own coordinates.
+- The deterministic lenses are a pure function of the cached audio features and are
+  computed client-side with no server round-trip. They draw their guide under the
+  dots: the Camelot rings + key labels, or the tempo spiral.
+- In embedding mode: canvas positions come from the selected lens, the grid caption
+  names it, transform handles and tag-drag are disabled.  Tracks without embedding
+  data are **hidden** (not shown at tag-space positions).
 - Mode transitions animate: positions lerp over 500 ms via `canvas.animPositions`.
   During animation, tracks have interpolated positions; after animation completes,
   `animPositions` is cleared and the canvas falls through to embedding positions.
@@ -289,6 +304,24 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 - **The pinned card follows its track.** While pinned, the card's anchor is the
   inspected track's *current* screen position, so a tweened move carries the card with
   it rather than leaving it at a stale screen position.
+
+### Scopes
+
+A scope is a circle on the canvas whose tracks are re-laid-out by another lens, so a
+cluster can be read in a different space without leaving the map.
+
+- Hold **X** and drag to draw a circle from the press point; releasing opens a lens
+  menu at the circle. **X** again or **Esc** closes the scope and animates its tracks
+  back out.
+- Membership is frozen from the tracks' *outer* positions when the scope opens, so the
+  re-layout cannot move a track across the boundary. Tracks the scope lens cannot
+  place keep their outer position rather than vanishing.
+- The in-scope positions are the scope lens's layout min-max normalised and mapped
+  into the circle's inscribed square; a deterministic scope lens is instant, a
+  projection scope lens reuses its cached global layout. The lens menu lists the
+  built-ins except the tag lens.
+- While a scope is open, in-scope dots behave like embedding-mode dots: tag
+  drag/transform is disabled. Switching the outer lens drops the scope.
 
 ---
 

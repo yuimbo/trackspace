@@ -102,6 +102,10 @@ content-addressed and versioned.
 
 The source set is fixed (`FROZEN_SOURCES`); the Options panel exposes one weight
 slider per source, and **Apply** sends the vector to both the map and the clusters.
+A projection request may select a **subset** of the sources (`sources=`), which is how
+the UI's per-source lenses project one block at a time; the combined lens omits the
+param. Each source set derives its own required sources (a single-source lens requires
+only itself) and is part of `layout_revision`.
 
 | Source | Module | Dimensions | Model |
 |--------|--------|-----------|-------|
@@ -109,7 +113,7 @@ slider per source, and **Apply** sends the vector to both the map and the cluste
 | MAEST embedding | `backend/embeddings/maest.py` | 768 | same model pass |
 | Rhythm | `backend/embeddings/rhythm_features.py` | 14 | `librosa` DSP |
 | CLAP | `backend/embeddings/clap.py` | 512 | `laion/larger_clap_music_and_speech` (HuggingFace) |
-| Audio features | `backend/embeddings/librosa_audio_features.py` | 6 | `librosa` (+ **madmom** RNN tempo when installed) |
+| Audio features | `backend/embeddings/feature_encoding.py` | 6 | perceptual re-encoding of `librosa_audio_features` (Camelot + tempo spiral) |
 | Supervised | `backend/embeddings/supervised.py` | 128 | folder-labelled projection head over the cached blocks (no encoder) |
 
 `structure` is cached alongside the vector sources but is **not one of them**: it is
@@ -330,6 +334,28 @@ Key is encoded on the **circle of fifths as a unit circle** in 2D:
 This preserves harmonic topology — keys a fifth apart are geometrically close,
 and the circular wrap is seamless.  Mode (major=1, minor=0) is a 3rd dimension.
 
+### Perceptual re-encoding (`embeddings/feature_encoding.py`)
+
+The *cached* vector above is not perceptually uniform, so the composite
+`features` block is re-encoded from it (a pure function, no re-analysis) before
+masking:
+
+- **Camelot wheel.** Major keys sit on an outer ring at their circle-of-fifths
+  angle; minor keys on an inner ring rotated three fifths (90°) so a relative
+  major/minor pair (C major / A minor — the same key signature) shares a radius.
+  This replaces the cos/sin + separate mode bit, which put a relative pair as far
+  apart as two unrelated keys.
+- **Tempo spiral.** One turn per octave: the angle is the fractional octave of the
+  BPM and the radius grows with log-BPM, so 60/120/240 BPM land on the same ray.
+  `tempo_norm` is linear in BPM, which put half/double-time siblings far apart.
+
+The block keeps six columns — `[camelot_x, camelot_y, spiral_x, spiral_y,
+energy, danceability]` — so the composite gather, PCA and t-SNE are unchanged.
+`FEATURE_ENCODING_VERSION` is part of the features row-cache key and the
+projection recipe is bumped; the raw cache row is untouched, so this needs **no
+re-analysis**. The default `features` weight is 0, so the combined map is unchanged
+until the *Audio* slider is raised.
+
 **Rhythm vector (14-D)** — `onset_density`, `onset_strength_mean/std`,
 `beat_confidence`, `pulse_clarity`, `syncopation`, `kick_periodicity`,
 `bass_ratio`, `spectral_centroid_norm`, `spectral_rolloff_norm`,
@@ -417,8 +443,10 @@ not the first block.
 ## Projection methods
 
 `compute_projection()` projects cached embeddings to 2D. The backends live in
-`embeddings/projection_backends.py`. (The frontend currently always requests
-`method=tsne`; `pca` is used internally for the live preview during generation.)
+`embeddings/projection_backends.py`. (The frontend requests `method=tsne`; `pca` is
+used internally for the live preview during generation.) The request carries the
+lens's `sources=` subset and optional `w=` weights; both are part of
+`layout_revision`, so each lens caches its own coordinates.
 
 | Method | Backend function | Notes |
 |--------|-----------------|-------|
