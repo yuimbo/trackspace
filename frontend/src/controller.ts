@@ -17,6 +17,7 @@ import type {
 import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
+import { showScopeLensMenu } from "./lib/scope-menu";
 import {
   CommandManager,
   RenameTagCommand,
@@ -207,6 +208,12 @@ export class Controller {
       stopPreview: () => this._stopPreview(),
       // Viewport moves (focus/homing) tween on the shared canvas frame.
       tweenViewport: (target) => this.embedding.tweenViewport(target),
+      // A scope's lens is a deliberate second step; the picker owns the menu DOM.
+      openScopePicker: (scope, screen) =>
+        showScopeLensMenu(screen, (lensId) => {
+          void this.embedding.openScope(scope, lensId);
+        }),
+      closeScope: () => this.embedding.closeScope(),
     });
 
     this.search = new SearchCoordinator({
@@ -261,7 +268,6 @@ export class Controller {
 
     this.options = new OptionsPanelBinder({
       model,
-      scheduleDraw: () => this.canvas.scheduleDraw(),
       selectLens: (id) => void this.embedding.switchToLens(id),
       saveLensPreset: () => {
         const name = window.prompt("Preset name");
@@ -298,6 +304,7 @@ export class Controller {
     this._bindResize();
     this._bindViewportChrome();
     this.options.sync();
+    this.embedding.syncLensChrome();
   }
 
   private _renderTagPanels(): void {
@@ -803,6 +810,10 @@ export class Controller {
     hk.on("deselect", () => {
       if (this.canvas.unpinInspect()) return;
       if (this.interaction.cancelActiveGesture()) return;
+      if (m.scope) {
+        this.embedding.closeScope();
+        return;
+      }
       m.clearSelection();
     });
   }

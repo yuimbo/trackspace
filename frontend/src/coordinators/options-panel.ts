@@ -1,9 +1,9 @@
 // ─── OptionsPanelBinder ────────────────────────────────────────
 //
 // Owns the right-column Options panel controls (hover preview + volume, lens
-// selector and presets, explode strength). Extracted from `Controller` — these are
-// pure input bindings that mirror model state and delegate the actions that need
-// other subsystems (lens switching, preset capture, preview playback).
+// selector and presets). Extracted from `Controller` — these are pure input
+// bindings that mirror model state and delegate the actions that need other
+// subsystems (lens switching, preset capture, preview playback).
 //
 // Deps are structural interfaces so the binder is unit-testable without the
 // DOM-heavy component classes.
@@ -15,7 +15,6 @@ const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
 export interface OptionsPanelDeps {
   model: Model;
-  scheduleDraw(): void;
   /** Switch to a lens id (built-in or preset). */
   selectLens(id: string): void;
   /** Capture the current lens + display options as a new named preset. */
@@ -67,27 +66,12 @@ export class OptionsPanelBinder {
     if ($save) $save.addEventListener("click", () => this.deps.saveLensPreset());
     const $del = document.getElementById("lens-preset-delete");
     if ($del) $del.addEventListener("click", () => this.deps.deleteLensPreset());
-
-    const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
-    if ($ex) {
-      $ex.value = String(m.explodeStrength);
-      $ex.addEventListener("input", () => {
-        m.explodeStrength = clamp(parseFloat($ex.value) || 0.1, 0.05, 0.2);
-        this.deps.scheduleDraw();
-      });
-      $ex.addEventListener("change", () => {
-        m.explodeStrength = clamp(parseFloat($ex.value) || 0.1, 0.05, 0.2);
-        m.saveLS();
-      });
-    }
   }
 
   /** Sync all options controls to match current model state. */
   sync(): void {
     const m = this.deps.model;
     this._renderLensOptions();
-    const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
-    if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
     const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
     if ($pv) $pv.value = String(m.previewVolume);
     this._renderPreviewVolume();

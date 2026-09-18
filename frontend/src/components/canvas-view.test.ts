@@ -115,3 +115,43 @@ describe("CanvasView cluster hover glow", () => {
     expect(cv.hoverTarget).toEqual({ kind: "key", value: "Am" });
   });
 });
+
+describe("CanvasView scope positions", () => {
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      makeFakeCtx().ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("resolves in-scope tracks to their scope position, others outside", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3", folder: "House" }),
+    ]);
+    const cv = new CanvasView(m);
+    m.scope = { cx: 0.5, cy: 0.5, r: 0.2, lensId: "camelot" };
+    m.scopePositions = new Map([["a.mp3", { x: 0.4, y: 0.6 }]]);
+
+    expect(cv.worldPosForTrack(m.trackByPath("a.mp3")!)).toEqual({
+      wx: 0.4,
+      wy: 0.6,
+    });
+    // Not in scopePositions → the tag axes (both null → 0.5, 0.5).
+    expect(cv.worldPosForTrack(m.trackByPath("b.mp3")!)).toEqual({
+      wx: 0.5,
+      wy: 0.5,
+    });
+  });
+});

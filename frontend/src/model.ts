@@ -248,6 +248,17 @@ export interface Viewport {
   zoom: number;
 }
 
+/** A circle on the canvas whose tracks are re-laid-out by another lens. */
+export interface Scope {
+  /** Centre in world coordinates. */
+  cx: number;
+  cy: number;
+  /** Radius in world units. */
+  r: number;
+  /** Lens the in-scope tracks are laid out by. */
+  lensId: string;
+}
+
 const LS_KEY = "trackspace";
 
 // ─── Minimal event bus ───────────────────────────────────────
@@ -408,14 +419,12 @@ export class Model extends EventBus {
   /** True while the required models are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
   /**
-   * Hold **X** on the canvas: nudge dots by tag axes (embedding mode) or toward
-   * embedding layout (tag mode). Strength 0.05–0.20 of a unit square chord.
+   * Active scope: a circle (world coordinates) whose tracks are re-laid-out by
+   * ``lensId``. ``scopePositions`` holds only the in-scope tracks' scope-lens
+   * positions, so membership is "has a scope position".
    */
-  explodeStrength = 0.1;
-  /** While true, user is holding X (not persisted). */
-  explodeHold = false;
-  /** Hide explode offset during tag drag / transform so coordinates stay consistent. */
-  suppressExplodeVisual = false;
+  scope: Scope | null = null;
+  scopePositions: Map<string, { x: number; y: number }> = new Map();
   libraryLoadProgress: {
     done: number;
     total: number;
@@ -1106,7 +1115,6 @@ export class Model extends EventBus {
         previewVolume: this.previewVolume,
         lensId: this._lensId,
         lensPresets: this.lensPresets,
-        explodeStrength: this.explodeStrength,
         clusterResolution: this.clusterResolution,
         colorByCluster: this.colorByCluster,
         clusterWeights: this.clusterWeights,
@@ -1147,10 +1155,6 @@ export class Model extends EventBus {
         this.lensPresets = _migrateLensPresets(
           (d as { lensPresets?: unknown }).lensPresets,
         );
-        const ex = Number((d as { explodeStrength?: number }).explodeStrength);
-        this.explodeStrength = Number.isFinite(ex)
-          ? Math.min(0.2, Math.max(0.05, ex))
-          : 0.1;
         const cr = Number((d as { clusterResolution?: number }).clusterResolution);
         this.clusterResolution = Number.isFinite(cr) && cr > 0 ? cr : 1.5;
         this.colorByCluster = Boolean(

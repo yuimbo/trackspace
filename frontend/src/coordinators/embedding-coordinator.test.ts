@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, DEFAULT_CLUSTER_WEIGHTS } from "../model";
+import { Model, DEFAULT_CLUSTER_WEIGHTS, type Track } from "../model";
 import { EmbeddingCoordinator } from "./embedding-coordinator";
 
 // ─── Fakes ───────────────────────────────────────────────────
@@ -107,7 +107,14 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const model = new Model();
   const update = vi.fn();
   const scheduleDraw = vi.fn();
-  const canvas = { animPositions: null, scheduleDraw };
+  const canvas = {
+    animPositions: null as Map<string, { x: number; y: number }> | null,
+    scheduleDraw,
+    // The real canvas resolves these from the embedding/tag lens; the tests only
+    // need a stable outer position for scope membership and anchors.
+    worldPosForTrack: (t: Track) => outerPos(model, t),
+    outerPosForTrack: (t: Track) => outerPos(model, t),
+  };
   const coord = new EmbeddingCoordinator({
     model,
     status: { update },
@@ -121,6 +128,12 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
+
+/** Outer position for scope membership/anchors: the embedding map, else 0.5. */
+function outerPos(m: Model, t: Track): { wx: number; wy: number } | null {
+  const ep = m.embeddingPositions.get(t.path);
+  return ep ? { wx: ep.x, wy: ep.y } : { wx: 0.5, wy: 0.5 };
+}
 
 function fetchCalls(fetchSpy: ReturnType<typeof vi.fn>, prefix: string): number {
   return fetchSpy.mock.calls.filter(([u]) => String(u).startsWith(prefix)).length;
@@ -379,6 +392,67 @@ describe("EmbeddingCoordinator lens switching", () => {
 });
 
 // ─── Position animations (shared overlay owner) ───────────────
+
+describe("EmbeddingCoordinator scopes", () => {
+  function feats(key: number, mode: number, tempo: number) {
+    return { key, mode, tempo, energy: 0.5, danceability: 0.5 };
+  }
+
+  function threeTracks(m: Model): void {
+    m.setAllTracks([
+      { path: "near.mp3", filename: "near.mp3", folder: "", tags: {}, artist: "", title: "", audio_features: feats(0.5, 1, 0.5) },
+      { path: "far.mp3", filename: "far.mp3", folder: "", tags: {}, artist: "", title: "", audio_features: feats(0.75, 0, 0.5) },
+      { path: "outside.mp3", filename: "outside.mp3", folder: "", tags: {}, artist: "", title: "", audio_features: feats(0.5, 1, 0.9) },
+    ]);
+    // Outer positions: near at the centre, far nearby, outside at the far corner.
+    m.embeddingPositions = new Map([
+      ["near.mp3", { x: 0.5, y: 0.5 }],
+      ["far.mp3", { x: 0.52, y: 0.5 }],
+      ["outside.mp3", { x: 1, y: 1 }],
+    ]);
+  }
+
+  it("lays out only the in-scope tracks with the scope lens", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    expect(model.scope?.lensId).toBe("camelot");
+    expect(model.scopePositions.has("near.mp3")).toBe(true);
+    expect(model.scopePositions.has("far.mp3")).toBe(true);
+    expect(model.scopePositions.has("outside.mp3")).toBe(false);
+    // Mapped into the circle's inscribed square, so inside the radius.
+    for (const p of model.scopePositions.values()) {
+      expect(Math.hypot(p.x - 0.5, p.y - 0.5)).toBeLessThanOrEqual(0.1);
+    }
+  });
+
+  it("closes the scope and clears its positions", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    coord.closeScope();
+    expect(model.scope).toBeNull();
+    expect(model.scopePositions.size).toBe(0);
+  });
+
+  it("warns and stays closed when the circle is empty", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ cx: 0.99, cy: 0.99, r: 0.01, lensId: "" }, "camelot");
+    expect(model.scope).toBeNull();
+  });
+
+  it("fetches a projection lens layout for a projection scope", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.setAllTracks([
+      { path: "a.mp3", filename: "a.mp3", folder: "", tags: {}, artist: "", title: "" },
+    ]);
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.2, lensId: "" }, "clap");
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(1);
+    expect(model.scopePositions.has("a.mp3")).toBe(true);
+  });
+});
 
 describe("EmbeddingCoordinator position animations", () => {
   it("animates an axis change and clears the overlay when finished", () => {

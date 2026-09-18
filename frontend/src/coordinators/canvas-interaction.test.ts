@@ -98,6 +98,8 @@ function makeHarness(): Harness {
     onHoverPreview: vi.fn(),
     stopPreview: vi.fn(),
     tweenViewport: vi.fn(),
+    openScopePicker: vi.fn(),
+    closeScope: vi.fn(),
   } as CanvasInteractionDeps;
   const coord = new CanvasInteractionController(deps);
   coord.bind();
@@ -249,7 +251,6 @@ describe("CanvasInteractionController tag drag", () => {
       expect.closeTo(0.53, 5),
     );
     expect(deps.flushTagWrites).toHaveBeenCalled();
-    expect(model.suppressExplodeVisual).toBe(false);
   });
 });
 
@@ -295,16 +296,6 @@ describe("CanvasInteractionController wheel", () => {
     expect(model.vp.zoom).toBeCloseTo(0.1, 5);
   });
 
-  it("adjusts explode strength while X is held", () => {
-    const { model, canvas } = makeHarness();
-    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
-    model.explodeHold = true;
-    const before = model.explodeStrength;
-    canvas.$canvas.dispatchEvent(
-      wheelEvent({ x: 10, y: 10, deltaY: -100 }),
-    );
-    expect(model.explodeStrength).toBeGreaterThan(before);
-  });
 });
 
 // ─── Folder drop ─────────────────────────────────────────
@@ -373,16 +364,45 @@ describe("CanvasInteractionController gesture state", () => {
     expect(canvas.scheduleDraw).toHaveBeenCalled();
   });
 
-  it("toggles the explode hold on the X key", () => {
-    const { model } = makeHarness();
+  it("opens the scope picker on an X + drag and passes the circle", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.hitTest.mockReturnValue(-1);
     document.dispatchEvent(
       new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
     );
-    expect(model.explodeHold).toBe(true);
+    down(canvas, 100, 100);
+    move(canvas, 140, 100);
+    up(canvas, 140, 100);
+    expect(deps.openScopePicker).toHaveBeenCalledTimes(1);
+    const scope = (deps.openScopePicker as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as { cx: number; cy: number; r: number };
+    expect(scope.cx).toBeCloseTo(0.1, 5);
+    expect(scope.cy).toBeCloseTo(0.1, 5);
+    expect(scope.r).toBeCloseTo(0.04, 5);
+  });
+
+  it("closes an open scope on a bare X press", () => {
+    const { model, deps } = makeHarness();
+    model.scope = { cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    expect(deps.closeScope).toHaveBeenCalledTimes(1);
+  });
+
+  it("disarms the scope gesture on X keyup", () => {
+    const { canvas } = makeHarness();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
     document.dispatchEvent(
       new KeyboardEvent("keyup", { code: "KeyX", bubbles: true }),
     );
-    expect(model.explodeHold).toBe(false);
+    canvas.hitTest.mockReturnValue(-1);
+    down(canvas, 10, 10);
+    // Disarmed → a plain empty drag is a box selection, not a scope.
+    expect(canvas.boxSel).not.toBeNull();
   });
 
   it("toggles the inspect card on the Alt key", () => {

@@ -8,12 +8,10 @@ const OPTIONS_HTML = `
   <select id="lens-select"></select>
   <button id="lens-preset-save" type="button"></button>
   <button id="lens-preset-delete" type="button"></button>
-  <input id="explode-strength-range" type="range" min="0.05" max="0.2" step="0.01" />
 `;
 
 interface Harness {
   model: Model;
-  scheduleDraw: ReturnType<typeof vi.fn>;
   selectLens: ReturnType<typeof vi.fn>;
   saveLensPreset: ReturnType<typeof vi.fn>;
   deleteLensPreset: ReturnType<typeof vi.fn>;
@@ -24,7 +22,6 @@ interface Harness {
 
 function makeHarness(): Harness {
   const model = new Model();
-  const scheduleDraw = vi.fn();
   const selectLens = vi.fn();
   const saveLensPreset = vi.fn();
   const deleteLensPreset = vi.fn();
@@ -32,7 +29,6 @@ function makeHarness(): Harness {
   const applyPreviewGain = vi.fn();
   const binder = new OptionsPanelBinder({
     model,
-    scheduleDraw,
     selectLens,
     saveLensPreset,
     deleteLensPreset,
@@ -42,7 +38,6 @@ function makeHarness(): Harness {
   binder.bind();
   return {
     model,
-    scheduleDraw,
     selectLens,
     saveLensPreset,
     deleteLensPreset,
@@ -178,32 +173,13 @@ describe("OptionsPanelBinder", () => {
     expect(del.disabled).toBe(false);
   });
 
-  it("updates explode strength and repaints", () => {
-    const { model, scheduleDraw } = makeHarness();
-    const $ex = el<HTMLInputElement>("explode-strength-range");
-    $ex.value = "0.15";
-    input("explode-strength-range");
-    expect(model.explodeStrength).toBeCloseTo(0.15, 5);
-    expect(scheduleDraw).toHaveBeenCalled();
-  });
-
-  it("clamps an out-of-range explode strength", () => {
-    const { model } = makeHarness();
-    const $ex = el<HTMLInputElement>("explode-strength-range");
-    $ex.value = "9";
-    input("explode-strength-range");
-    expect(model.explodeStrength).toBe(0.2);
-  });
-
   it("syncs control state from the model", () => {
     const { model, binder } = makeHarness();
     model.lensId = "clap";
-    model.explodeStrength = 0.12;
     model.previewVolume = 0.3;
     model.hoverPreview = false;
     binder.sync();
     expect(el<HTMLSelectElement>("lens-select").value).toBe("clap");
-    expect(el<HTMLInputElement>("explode-strength-range").value).toBe("0.12");
     expect(el<HTMLInputElement>("hover-preview-volume").value).toBe("0.3");
     expect(el<HTMLInputElement>("hover-preview-toggle").checked).toBe(false);
   });

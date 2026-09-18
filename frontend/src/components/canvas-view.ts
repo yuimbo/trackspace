@@ -5,6 +5,7 @@ import {
   CAMELOT_MAJOR_RADIUS,
   CAMELOT_MINOR_RADIUS,
   camelotGuide,
+  getLens,
   spiralGuide,
 } from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
@@ -96,6 +97,8 @@ export class CanvasView {
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
   intersectMode = false;
   dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null = null;
+  /** In-progress scope circle in screen coordinates (centre + radius px). */
+  scopeDrag: { cx: number; cy: number; r: number } | null = null;
   _rafId = 0;
 
   txHandles: TxHandle[] = [];
@@ -106,9 +109,6 @@ export class CanvasView {
 
   /** Transient per-track positions used during animated mode transitions. */
   animPositions: Map<string, { x: number; y: number }> | null = null;
-
-  /** 0→1 eases when explode (hold X) is toggled so offsets interpolate smoothly. */
-  private _explodeBlend = 0;
 
   // Offscreen canvas used as render texture for the glow screen-pass
   private _glowCanvas: HTMLCanvasElement | null = null;
@@ -232,7 +232,6 @@ export class CanvasView {
 
   draw(): void {
     this._clampVP();
-    this._updateExplodeBlend();
     const m = this.model;
     const tracks = m.tracks;
     const w = this.$canvas.clientWidth,
@@ -252,7 +251,6 @@ export class CanvasView {
       ctx.fillText("No tracks loaded", w / 2, h / 2);
       ctx.textAlign = "start";
       this._drawLasso();
-      if (this._explodeBlendAnimating()) this.scheduleDraw();
       return;
     }
 
@@ -265,10 +263,9 @@ export class CanvasView {
     this._drawClusters();
     this._drawBoxSel();
     this._drawLasso();
+    this._drawScope();
     this._drawModeBadge(w, h);
     this._updateTooltip(tracks);
-
-    if (this._explodeBlendAnimating()) this.scheduleDraw();
   }
 
   /** Lens background guide (Camelot rings + key labels, or the tempo spiral). */
@@ -314,27 +311,6 @@ export class CanvasView {
       ctx.stroke();
     }
     ctx.restore();
-  }
-
-  private _explodeBlendAnimating(): boolean {
-    const m = this.model;
-    const target =
-      m.explodeHold && !m.suppressExplodeVisual && m.explodeStrength > 1e-6
-        ? 1
-        : 0;
-    return Math.abs(this._explodeBlend - target) > 0.003;
-  }
-
-  private _updateExplodeBlend(): void {
-    const m = this.model;
-    const target =
-      m.explodeHold && !m.suppressExplodeVisual && m.explodeStrength > 1e-6
-        ? 1
-        : 0;
-    const k = 0.2;
-    this._explodeBlend += (target - this._explodeBlend) * k;
-    if (this._explodeBlend < 0.002) this._explodeBlend = 0;
-    else if (this._explodeBlend > 0.998) this._explodeBlend = 1;
   }
 
   /* ── Grid + tick labels (adaptive to zoom) ──────────────── */
@@ -543,76 +519,39 @@ export class CanvasView {
     return this._resolveTrackWPos(t);
   }
 
+  /** Outer (pre-scope) position, for scope membership and anchors. */
+  outerPosForTrack(t: Track): { wx: number; wy: number } | null {
+    return this._outerTrackWPos(t);
+  }
+
   private _resolveTrackWPos(t: Track): { wx: number; wy: number } | null {
     const m = this.model;
 
     // During animation, interpolated positions always take priority
     if (this.animPositions) {
       const ap = this.animPositions.get(t.path);
-      if (ap) return this._maybeExplode(t, ap.x, ap.y);
+      if (ap) return { wx: ap.x, wy: ap.y };
     }
 
+    // A scope re-lays out its tracks; scopePositions holds only in-scope paths.
+    if (m.scope) {
+      const sp = m.scopePositions.get(t.path);
+      if (sp) return { wx: sp.x, wy: sp.y };
+    }
+
+    return this._outerTrackWPos(t);
+  }
+
+  /** Position ignoring any scope: the embedding lens or the tag axes. */
+  private _outerTrackWPos(t: Track): { wx: number; wy: number } | null {
+    const m = this.model;
     if (m.viewMode === "embeddings") {
       const ep = m.embeddingPositions.get(t.path);
-      if (ep) return this._maybeExplode(t, ep.x, ep.y);
+      if (ep) return { wx: ep.x, wy: ep.y };
       // No embedding → hide the track (don't fall back to tag positions)
       return null;
     }
-
-    const tag = this._tagPos(t);
-    return this._maybeExplode(t, tag.wx, tag.wy);
-  }
-
-  /**
-   * Hold-X explode preview: direction from tag axes (embedding mode) or toward
-   * embedding (tag mode). Magnitude is in **screen pixels** (fraction of plot size
-   * from strength 5–20%), then mapped back to world so it scales correctly with zoom.
-   */
-  private _maybeExplode(t: Track, wx: number, wy: number): { wx: number; wy: number } {
-    const m = this.model;
-    if (m.suppressExplodeVisual) return { wx, wy };
-
-    const effective = m.explodeStrength * this._explodeBlend;
-    if (effective <= 1e-7) return { wx, wy };
-
-    let dwx = 0,
-      dwy = 0;
-    if (m.viewMode === "embeddings") {
-      const tag = this._tagPos(t);
-      dwx = (tag.wx - 0.5) * 2;
-      dwy = (tag.wy - 0.5) * 2;
-    } else {
-      const ep = m.embeddingPositions.get(t.path);
-      if (!ep) return { wx, wy };
-      dwx = ep.x - wx;
-      dwy = ep.y - wy;
-    }
-
-    const wlen = Math.hypot(dwx, dwy);
-    if (wlen < 1e-9) return { wx, wy };
-    dwx /= wlen;
-    dwy /= wlen;
-
-    const cw = this.$canvas.clientWidth,
-      ch = this.$canvas.clientHeight;
-    const iw = Math.max(1e-6, cw - 2 * PAD),
-      ih = Math.max(1e-6, ch - 2 * PAD);
-    const magPx = effective * Math.min(iw, ih);
-
-    const [sx0, sy0] = this.w2s(wx, wy);
-    const worldEps = 1e-4;
-    const [sx1, sy1] = this.w2s(wx + dwx * worldEps, wy + dwy * worldEps);
-    let px = sx1 - sx0,
-      py = sy1 - sy0;
-    const plen = Math.hypot(px, py);
-    if (plen < 1e-9) return { wx, wy };
-    px /= plen;
-    py /= plen;
-
-    const sx2 = sx0 + px * magPx;
-    const sy2 = sy0 + py * magPx;
-    const [wx2, wy2] = this.s2w(sx2, sy2);
-    return { wx: wx2, wy: wy2 };
+    return this._tagPos(t);
   }
 
   private _drawScatter(tracks: Track[]): void {
@@ -1166,6 +1105,45 @@ export class CanvasView {
       ctx.textBaseline = "bottom";
       ctx.fillText("∩ AND", pts[0][0] + 6, pts[0][1] - 4);
     }
+  }
+
+  /* ── Scope overlay ─────────────────────────────────────── */
+
+  /** The open scope's circle + lens chip, and the in-progress drag circle. */
+  private _drawScope(): void {
+    const ctx = this.ctx;
+    const scope = this.model.scope;
+    const drag = this.scopeDrag;
+    if (!scope && !drag) return;
+    ctx.save();
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = "rgba(120,220,255,0.85)";
+    ctx.fillStyle = "rgba(120,220,255,0.05)";
+    if (drag) {
+      ctx.beginPath();
+      ctx.arc(drag.cx, drag.cy, Math.max(1, drag.r), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+    }
+    if (scope) {
+      const [cx, cy] = this.w2s(scope.cx, scope.cy);
+      const [ex] = this.w2s(scope.cx + scope.r, scope.cy);
+      const rpx = Math.abs(ex - cx);
+      ctx.beginPath();
+      ctx.arc(cx, cy, rpx, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+      const label = getLens(scope.lensId).label;
+      ctx.setLineDash([]);
+      ctx.font = "bold 11px monospace";
+      ctx.fillStyle = "rgba(120,220,255,0.95)";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "bottom";
+      ctx.fillText(label, cx, cy - rpx - 4);
+    }
+    ctx.setLineDash([]);
+    ctx.restore();
   }
 
   /* ── Tooltip ────────────────────────────────────────────── */

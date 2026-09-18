@@ -15,8 +15,8 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight } from "../model";
-import { type Lens, lensWaitSources, lensWeights } from "../lib/lenses";
+import { type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight } from "../model";
+import { type Lens, getLens, lensWaitSources, lensWeights } from "../lib/lenses";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 import {
@@ -101,6 +101,10 @@ export interface EmbeddingDeps {
   canvas: {
     animPositions: Map<string, { x: number; y: number }> | null;
     scheduleDraw(): void;
+    /** Current resolved position (scope-aware), or null when hidden. */
+    worldPosForTrack(t: Track): { wx: number; wy: number } | null;
+    /** Position ignoring any scope, for membership and open/close anchors. */
+    outerPosForTrack(t: Track): { wx: number; wy: number } | null;
   };
 }
 
@@ -469,10 +473,13 @@ export class EmbeddingCoordinator {
     }
   }
 
-  private _projectionQueryString(methodOverride?: string): string {
+  private _projectionQueryString(
+    methodOverride?: string,
+    lensOverride?: Lens,
+  ): string {
     const method = methodOverride ?? "tsne";
     const m = this.deps.model;
-    const lens = m.lens();
+    const lens = lensOverride ?? m.lens();
     const base = `folder=&recursive=1&method=${method}`;
     // External roots are laid out only on request: the default map is the library.
     const ext = m.showExternal ? "&include_external=1" : "";
@@ -845,6 +852,12 @@ export class EmbeddingCoordinator {
   async switchToLens(target: string): Promise<void> {
     const m = this.deps.model;
     if (m.lensId === target) return;
+    // A scope re-lays out its tracks over the *outer* lens; switching that lens
+    // would leave the scope's positions describing a space that is no longer shown.
+    if (m.scope) {
+      m.scope = null;
+      m.scopePositions = new Map();
+    }
     // Persist the current viewport for the lens we're leaving.
     this._savedVpByLens.set(m.lensId, { ...m.vp });
 
@@ -882,7 +895,7 @@ export class EmbeddingCoordinator {
 
     m.saveLS();
     this.deps.status.update(m);
-    this._syncLensSelect();
+    this.syncLensChrome();
   }
 
   /** Switch to a specific view mode (tags ↔ the last map lens). */
@@ -891,9 +904,177 @@ export class EmbeddingCoordinator {
     await this.switchToLens(target === "tags" ? "tags" : "combined");
   }
 
-  /** Mirror the model's active lens into the View-tab `<select>`. */
-  private _syncLensSelect(): void {
+  /** Mirror the active lens into the View-tab select and the weight-panel visibility. */
+  syncLensChrome(): void {
     const sel = document.getElementById("lens-select") as HTMLSelectElement | null;
     if (sel) sel.value = this.deps.model.lensId;
+    // Source weights only re-weight the combined lens; a per-source lens fixes
+    // them, so hide the sliders where they would do nothing.
+    const lens = this.deps.model.lens();
+    const details = document.getElementById(
+      "cluster-weights-details",
+    ) as HTMLDetailsElement | null;
+    if (details) details.hidden = lens.kind !== "projection" || !!lens.sources;
+  }
+
+  /**
+   * Open a scope: re-lay out the tracks inside its circle by *lensId*.
+   *
+   * Membership is decided from the tracks' outer positions (where the user drew
+   * the circle), then frozen into ``scopePositions`` so the re-layout cannot move
+   * a track across the boundary. Tracks the scope lens cannot place keep their
+   * outer position rather than vanishing.
+   */
+  async openScope(scope: Scope, lensId: string): Promise<void> {
+    const m = this.deps.model;
+    const lens = getLens(lensId);
+    const active = { ...scope, lensId };
+    const inScope = m.allTracks.filter((t) => {
+      const p = this.deps.canvas.outerPosForTrack(t);
+      return p != null && Math.hypot(p.wx - active.cx, p.wy - active.cy) <= active.r;
+    });
+    if (inScope.length === 0) {
+      toast("No tracks inside the scope", "warn");
+      return;
+    }
+
+    const targets = await this._scopeTargets(lens, inScope, active);
+    if (targets.size === 0) {
+      toast("That lens has no positions for these tracks", "warn");
+      return;
+    }
+
+    const start = new Map<string, { x: number; y: number }>();
+    for (const path of targets.keys()) {
+      const t = m.trackByPath(path);
+      if (!t) continue;
+      const p = this.deps.canvas.outerPosForTrack(t);
+      if (p) start.set(path, { x: p.wx, y: p.wy });
+    }
+
+    m.scope = active;
+    m.scopePositions = targets;
+    this._animateOverlay(start, targets);
+  }
+
+  /** Close the active scope, animating its tracks back to their outer positions. */
+  closeScope(): void {
+    const m = this.deps.model;
+    if (!m.scope) return;
+    const start = new Map<string, { x: number; y: number }>();
+    for (const path of m.scopePositions.keys()) {
+      const p = m.scopePositions.get(path);
+      if (p) start.set(path, { ...p });
+    }
+    m.scope = null;
+    m.scopePositions = new Map();
+
+    const targets = new Map<string, { x: number; y: number }>();
+    for (const path of start.keys()) {
+      const t = m.trackByPath(path);
+      if (!t) continue;
+      const p = this.deps.canvas.outerPosForTrack(t);
+      if (p) targets.set(path, { x: p.wx, y: p.wy });
+    }
+    this._animateOverlay(start, targets);
+  }
+
+  /** Scope-lens positions for *inScope*, mapped into the scope's inscribed square. */
+  private async _scopeTargets(
+    lens: Lens,
+    inScope: Track[],
+    scope: Scope,
+  ): Promise<Map<string, { x: number; y: number }>> {
+    let raw: Map<string, { x: number; y: number }>;
+    if (lens.kind === "deterministic" && lens.compute) {
+      raw = new Map();
+      for (const t of inScope) {
+        const p = lens.compute(t);
+        if (p) raw.set(t.path, p);
+      }
+    } else {
+      raw = await this._fetchLensPositions(lens);
+    }
+
+    const subset = new Map<string, { x: number; y: number }>();
+    for (const t of inScope) {
+      const p = raw.get(t.path);
+      if (p) subset.set(t.path, p);
+    }
+    if (subset.size === 0) return subset;
+
+    let minX = Infinity,
+      maxX = -Infinity,
+      minY = Infinity,
+      maxY = -Infinity;
+    for (const p of subset.values()) {
+      minX = Math.min(minX, p.x);
+      maxX = Math.max(maxX, p.x);
+      minY = Math.min(minY, p.y);
+      maxY = Math.max(maxY, p.y);
+    }
+    const rx = maxX - minX || 1;
+    const ry = maxY - minY || 1;
+    // Inscribe the lens square in the circle so no dot can escape the outline.
+    const side = scope.r * Math.SQRT2;
+    const out = new Map<string, { x: number; y: number }>();
+    for (const [path, p] of subset) {
+      out.set(path, {
+        x: scope.cx + ((p.x - minX) / rx - 0.5) * side,
+        y: scope.cy + ((p.y - minY) / ry - 0.5) * side,
+      });
+    }
+    return out;
+  }
+
+  /** Fetch one lens's layout without touching the active lens or its positions. */
+  private async _fetchLensPositions(
+    lens: Lens,
+  ): Promise<Map<string, { x: number; y: number }>> {
+    const qs = this._projectionQueryString(undefined, lens);
+    const cached = this._layoutCache.get(qs);
+    if (cached) return new Map(cached.positions);
+    const raw = await api<unknown>(`/api/embeddings/projection?${qs}`);
+    const { positions, revision } = parseProjectionResponse(raw);
+    const out = new Map<string, { x: number; y: number }>();
+    for (const p of positions) out.set(p.path, { x: p.x, y: p.y });
+    if (revision) this._layoutCachePut(qs, { revision, positions: out });
+    return out;
+  }
+
+  /** Lerp a set of tracks between two position maps on the shared frame. */
+  private _animateOverlay(
+    start: Map<string, { x: number; y: number }>,
+    targets: Map<string, { x: number; y: number }>,
+  ): void {
+    const cv = this.deps.canvas;
+    if (start.size === 0 || targets.size === 0) {
+      cv.scheduleDraw();
+      return;
+    }
+    cv.animPositions = new Map(start);
+    const DURATION = 400;
+    const t0 = performance.now();
+    cancelAnimationFrame(this._animFrame);
+    const step = () => {
+      const t = Math.min(1, (performance.now() - t0) / DURATION);
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      for (const [path, from] of start) {
+        const to = targets.get(path);
+        if (!to) continue;
+        cv.animPositions!.set(path, {
+          x: from.x + (to.x - from.x) * e,
+          y: from.y + (to.y - from.y) * e,
+        });
+      }
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._animFrame = requestAnimationFrame(step);
+      } else {
+        cv.animPositions = null;
+        cv.scheduleDraw();
+      }
+    };
+    this._animFrame = requestAnimationFrame(step);
   }
 }

@@ -1,7 +1,7 @@
 // ─── CanvasInteractionController ──────────────────────────────
 //
 // Owns all canvas pointer gestures (click/box/lasso select, tag drag, transform
-// handles, pan/zoom, folder-drop drag) and the explode-hold key. Extracted from
+// handles, pan/zoom, folder-drop drag) and the scope gesture. Extracted from
 // `Controller` — gestures are a self-contained input layer whose outward effects are
 // model mutations, tag writes (via the controller's debounced queue), and view
 // repaints.
@@ -9,7 +9,13 @@
 // Deps are structural interfaces so the gesture state machine is unit-testable with
 // a fake canvas and without the DOM-heavy component classes.
 
-import { type HoverTarget, type Model, type Track, isAudioFeatureAxisId } from "../model";
+import {
+  type HoverTarget,
+  type Model,
+  type Scope,
+  type Track,
+  isAudioFeatureAxisId,
+} from "../model";
 import type { CanvasView, TxHandle } from "../components";
 
 const DRAG_THRESH = 4;
@@ -66,7 +72,8 @@ type MouseMode =
   | "boxsel"
   | "pending"
   | "drag"
-  | "txform";
+  | "txform"
+  | "scope";
 
 interface MouseState {
   mode: MouseMode;
@@ -108,12 +115,18 @@ export interface CanvasInteractionDeps {
   stopPreview(): void;
   /** Animate the viewport to *target* on the shared canvas animation frame. */
   tweenViewport?(target: { ox: number; oy: number; zoom: number }): void;
+  /** Show the scope lens picker at *screen*; picking a lens opens the scope. */
+  openScopePicker(scope: Scope, screen: { x: number; y: number }): void;
+  /** Close the active scope, animating its tracks back out. */
+  closeScope(): void;
 }
 
 export class CanvasInteractionController {
   private mouse: MouseState;
   /** True while the pointer is inside the viewport canvas (for hover resync). */
   private _pointerOverCanvas = false;
+  /** True while **X** is held with no scope open: a drag draws a new scope. */
+  private _scopeArmed = false;
 
   constructor(private deps: CanvasInteractionDeps) {
     this.mouse = {
@@ -135,16 +148,20 @@ export class CanvasInteractionController {
     };
   }
 
-  /** Wire canvas pointer events and the explode-hold key. */
+  /** Wire canvas pointer events and the scope key. */
   bind(): void {
     this._bindCanvas();
-    this._bindExplodeKeys();
+    this._bindScopeKeys();
     this._bindInspectKey();
   }
 
   /** True while a drag/transform gesture is in progress (hover clearing is suppressed). */
   isPointerBusy(): boolean {
-    return this.mouse.mode === "drag" || this.mouse.mode === "txform";
+    return (
+      this.mouse.mode === "drag" ||
+      this.mouse.mode === "txform" ||
+      this.mouse.mode === "scope"
+    );
   }
 
   /* ── Canvas mouse events ────────────────────────────────── */
@@ -184,9 +201,20 @@ export class CanvasInteractionController {
     }
     if (e.button !== 0) return;
 
+    // X + drag draws a scope circle; it takes priority over dot selection so a
+    // scope can be opened anywhere, including over a dense cluster.
+    if (this._scopeArmed) {
+      mouse.mode = "scope";
+      cv.scopeDrag = { cx: sx, cy: sy, r: 0 };
+      cv.scheduleDraw();
+      return;
+    }
+
     // Resize handles always take priority (disabled in embedding mode).
+    // A scope re-lays out its tracks, so their on-screen positions no longer
+    // match tag values; tag drag/transform is disabled while one is open.
     const txh =
-      m.selected.size > 0 && m.viewMode !== "embeddings"
+      m.selected.size > 0 && m.viewMode !== "embeddings" && !m.scope
         ? cv.hitTestTransform(sx, sy)
         : null;
     if (txh && txh.type !== "move") {
@@ -271,7 +299,6 @@ export class CanvasInteractionController {
     const m = this.deps.model;
     const cv = this.deps.canvas;
     const mouse = this.mouse;
-    m.suppressExplodeVisual = true;
     this._fillDragSnapFromSelection();
     mouse.mode = "drag";
     cv.$canvas.style.cursor = "move";
@@ -299,7 +326,6 @@ export class CanvasInteractionController {
     const m = this.deps.model;
     const cv = this.deps.canvas;
     const mouse = this.mouse;
-    m.suppressExplodeVisual = true;
     const [wx, wy] = cv.s2w(sx, sy);
 
     mouse.mode = "txform";
@@ -463,6 +489,13 @@ export class CanvasInteractionController {
       return;
     }
 
+    if (mouse.mode === "scope") {
+      const d = cv.scopeDrag;
+      if (d) d.r = Math.hypot(sx - d.cx, sy - d.cy);
+      cv.scheduleDraw();
+      return;
+    }
+
     if (mouse.mode === "txform") {
       const [wx, wy] = cv.s2w(sx, sy);
       this._applyTxform(wx, wy);
@@ -474,6 +507,7 @@ export class CanvasInteractionController {
       if (
         Math.hypot(sx - mouse.sx, sy - mouse.sy) > DRAG_THRESH &&
         m.selected.size > 0 &&
+        !m.scope &&
         (m.viewMode === "embeddings" ||
           axisWritable(m.axisX) ||
           axisWritable(m.axisY))
@@ -485,7 +519,8 @@ export class CanvasInteractionController {
 
     if (mouse.mode === "drag") {
       // In embedding mode the drag is only for folder-drop; skip tag mutations.
-      if (m.viewMode !== "embeddings") {
+      // A scope re-lays out its tracks, so skip them there too.
+      if (m.viewMode !== "embeddings" && !m.scope) {
         const [swx, swy] = cv.s2w(mouse.sx, mouse.sy);
         const [cwx, cwy] = cv.s2w(sx, sy);
         const dx = cwx - swx,
@@ -519,6 +554,24 @@ export class CanvasInteractionController {
     const cv = this.deps.canvas;
     const mouse = this.mouse;
     const tracks = m.tracks;
+
+    if (mouse.mode === "scope") {
+      const d = cv.scopeDrag;
+      cv.scopeDrag = null;
+      mouse.mode = "idle";
+      cv.scheduleDraw();
+      if (d && d.r >= 6) {
+        const [wx, wy] = cv.s2w(d.cx, d.cy);
+        const [wxr] = cv.s2w(d.cx + d.r, d.cy);
+        // The menu is fixed-positioned, so map canvas offsets to client coords.
+        const rect = cv.$canvas.getBoundingClientRect();
+        this.deps.openScopePicker(
+          { cx: wx, cy: wy, r: Math.abs(wxr - wx), lensId: "" },
+          { x: rect.left + d.cx, y: rect.top + d.cy },
+        );
+      }
+      return;
+    }
 
     if (mouse.mode === "boxsel") {
       const bs = cv.boxSel;
@@ -566,7 +619,6 @@ export class CanvasInteractionController {
       this.deps.flushTagWrites();
       mouse.mode = "idle";
       mouse.txSnap = null;
-      m.suppressExplodeVisual = false;
       cv.$canvas.style.cursor = "";
       cv.scheduleDraw();
       this.deps.status.update(m);
@@ -627,7 +679,6 @@ export class CanvasInteractionController {
     this.mouse.mode = "idle";
     this.mouse.snap = null;
     this.deps.canvas.$canvas.style.cursor = "";
-    this.deps.model.suppressExplodeVisual = false;
     this.deps.model.emit("change");
   }
 
@@ -670,23 +721,6 @@ export class CanvasInteractionController {
       e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? cv.$canvas.clientHeight : 1;
     const dx = e.deltaX * norm,
       dy = e.deltaY * norm;
-
-    if (m.explodeHold && this._pointerOverCanvas) {
-      const step =
-        e.deltaMode === 1
-          ? Math.sign(dy) * 0.01
-          : e.deltaMode === 2
-            ? Math.sign(dy) * 0.015
-            : -dy * 0.0002;
-      m.explodeStrength = clamp(m.explodeStrength + step, 0.05, 0.2);
-      const $ex = document.getElementById(
-        "explode-strength-range",
-      ) as HTMLInputElement | null;
-      if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
-      m.saveLS();
-      cv.scheduleDraw();
-      return;
-    }
 
     if (e.ctrlKey) {
       const factor = Math.exp(-dy * 0.005);
@@ -760,7 +794,6 @@ export class CanvasInteractionController {
       this._commitDrag();
     }
 
-    this.deps.model.suppressExplodeVisual = false;
 
     // Reset interaction state immediately so that any canvas mousemove events
     // fired during the async network call below are ignored.
@@ -1070,7 +1103,6 @@ export class CanvasInteractionController {
     if (mouse.mode === "drag") {
       this._revertDragSnapToBaseline();
       this._cleanupDocDrag();
-      m.suppressExplodeVisual = false;
       mouse.mode = "idle";
       mouse.snap = null;
       cv.dragGhosts = null;
@@ -1095,10 +1127,17 @@ export class CanvasInteractionController {
       cv.scheduleDraw();
       return true;
     }
+    if (mouse.mode === "scope") {
+      cv.scopeDrag = null;
+      mouse.mode = "idle";
+      cv.scheduleDraw();
+      return true;
+    }
     return false;
   }
 
-  private _explodeKeysAllowed(target: EventTarget | null): boolean {
+  /** False while typing in a text field, so X/Alt do not fire shortcuts there. */
+  private _scopeKeysAllowed(target: EventTarget | null): boolean {
     const el = target as HTMLElement | null;
     if (!el) return true;
     if (el.tagName === "TEXTAREA") return false;
@@ -1123,24 +1162,27 @@ export class CanvasInteractionController {
     return true;
   }
 
-  /** Hold **X** (outside text fields) for explode preview on the canvas. */
-  private _bindExplodeKeys(): void {
+  /**
+   * **X** + drag opens a scope around the cursor; a bare **X** press closes an
+   * open scope. The key arms the gesture on keydown and disarms on keyup.
+   */
+  private _bindScopeKeys(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.code !== "KeyX" || e.repeat) return;
-      if (!this._explodeKeysAllowed(e.target)) return;
+      if (!this._scopeKeysAllowed(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      this.deps.model.explodeHold = true;
-      this.deps.canvas.scheduleDraw();
+      if (this.deps.model.scope) {
+        this.deps.closeScope();
+        return;
+      }
+      this._scopeArmed = true;
     });
     document.addEventListener("keyup", (e: KeyboardEvent) => {
       if (e.code !== "KeyX") return;
-      this.deps.model.explodeHold = false;
-      this.deps.canvas.scheduleDraw();
+      this._scopeArmed = false;
     });
     window.addEventListener("blur", () => {
-      if (!this.deps.model.explodeHold) return;
-      this.deps.model.explodeHold = false;
-      this.deps.canvas.scheduleDraw();
+      this._scopeArmed = false;
     });
   }
 
@@ -1151,7 +1193,7 @@ export class CanvasInteractionController {
   private _bindInspectKey(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.key !== "Alt" || e.repeat) return;
-      if (!this._explodeKeysAllowed(e.target)) return;
+      if (!this._scopeKeysAllowed(e.target)) return;
       // Unpinning ends the audition the card owned.
       if (this.deps.canvas.toggleInspect()) this.deps.stopPreview();
     });
