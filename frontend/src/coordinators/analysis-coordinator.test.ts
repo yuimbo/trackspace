@@ -377,7 +377,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
     expect(model.clusterAssignments.size).toBe(0);
     expect(model.clusterNames.size).toBe(0);
     expect(document.getElementById("cluster-meta")!.textContent).toContain(
-      "Waiting for MAEST",
+      "Rebuild clusters",
     );
   });
 
@@ -480,11 +480,10 @@ describe("AnalysisCoordinator cluster fetch", () => {
 // ─── Panel bindings ─────────────────────────────────────────
 
 describe("AnalysisCoordinator panel bindings", () => {
-  it("toggles cluster colouring, syncs the checkbox, and fetches when needed", async () => {
-    const { model, coord, scheduleDraw } = makeHarness(() => ({ available: false }));
-    model.clustersAvailable = false;
+  it("enables cluster colouring when clusters are available", () => {
+    const { model, coord, scheduleDraw } = makeHarness();
+    model.clustersAvailable = true;
     coord.bindPanel();
-    const fetchSpy = vi.spyOn(coord, "fetchClusters").mockResolvedValue();
 
     coord.toggleColorByCluster();
 
@@ -492,8 +491,31 @@ describe("AnalysisCoordinator panel bindings", () => {
     expect(
       (document.getElementById("cluster-color-toggle") as HTMLInputElement).checked,
     ).toBe(true);
-    expect(fetchSpy).toHaveBeenCalled();
     expect(scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("refuses to colour by cluster when none are available, and says why", () => {
+    const { model, coord, scheduleDraw } = makeHarness();
+    model.clustersAvailable = false;
+    coord.bindPanel();
+    const fetchSpy = vi.spyOn(coord, "fetchClusters").mockResolvedValue();
+    vi.mocked(toast).mockClear();
+
+    coord.toggleColorByCluster();
+
+    expect(model.colorByCluster).toBe(false);
+    const $cc = document.getElementById(
+      "cluster-color-toggle",
+    ) as HTMLInputElement;
+    expect($cc.checked).toBe(false);
+    expect($cc.disabled).toBe(true);
+    expect(toast).toHaveBeenCalledWith(
+      expect.stringContaining("Rebuild clusters"),
+      "warn",
+    );
+    // No point fetching: we already know it is unavailable.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(scheduleDraw).not.toHaveBeenCalled();
   });
 
   it("does not refetch when toggling colouring off", () => {

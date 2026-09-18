@@ -865,6 +865,14 @@ def main():
 
     state.workers.start_all()
 
+    # The cluster store is in-memory, so a restart with an already-analysed library
+    # has no drain event to trigger a re-cluster and `/api/clusters` would report
+    # nothing until the user pressed "Rebuild clusters". Self-heal one run here; the
+    # queue's single "library" dedupe key collapses it with any drain or manual
+    # request, and a library with no MAEST rows is a cheap no-op.
+    enqueue_clustering(state.job_queue, reason="startup")
+    state.workers.wake(KIND_CLUSTER)
+
     def _bg_backfill_analysis():
         """Self-heal a source-version bump: re-queue what the purge just blanked."""
         try:

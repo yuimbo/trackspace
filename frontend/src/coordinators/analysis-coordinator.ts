@@ -225,6 +225,7 @@ export class AnalysisCoordinator {
 
     this._syncApplyEnabled();
     this._bindRetrigger();
+    this._syncClusterControls();
   }
 
   /* ── Analysis coverage + per-stage retrigger ─────────────── */
@@ -616,17 +617,51 @@ export class AnalysisCoordinator {
 
   private _applyColorByCluster(value: boolean, announce: boolean): void {
     const m = this.deps.model;
+    if (value && !m.clustersAvailable) {
+      // Never claim a colouring that cannot apply; say why and leave the toggle off.
+      if (announce) toast(this._clusterUnavailableReason(), "warn");
+      this._syncClusterControls();
+      return;
+    }
     m.colorByCluster = value;
-    const $cc = document.getElementById(
-      "cluster-color-toggle",
-    ) as HTMLInputElement | null;
-    if ($cc) $cc.checked = value;
     m.saveLS();
-    if (value && !m.clustersAvailable) void this.fetchClusters();
     if (announce) {
       toast(value ? "Colouring by cluster" : "Colouring by folder", "ok");
     }
     this.deps.scheduleDraw();
+    this._syncClusterControls();
+  }
+
+  /** Why cluster colouring cannot apply yet, for the disabled toggle's tooltip. */
+  private _clusterUnavailableReason(): string {
+    const m = this.deps.model;
+    if (m.queueStatus?.models?.maest_ready === false) {
+      return "Waiting for the MAEST model to load…";
+    }
+    const clusterKind = m.queueStatus?.kinds?.cluster;
+    if (clusterKind && clusterKind.outstanding > 0) return "Clustering…";
+    return "No clusters yet — press Rebuild clusters.";
+  }
+
+  /** Reflect cluster availability on the panel controls (disabled + explained). */
+  private _syncClusterControls(): void {
+    const m = this.deps.model;
+    const available = m.clustersAvailable;
+    const reason = this._clusterUnavailableReason();
+    const $cc = document.getElementById(
+      "cluster-color-toggle",
+    ) as HTMLInputElement | null;
+    if ($cc) {
+      $cc.disabled = !available;
+      $cc.checked = available && m.colorByCluster;
+      $cc.title = available
+        ? "Colour tracks by their microgenre cluster"
+        : reason;
+    }
+    const $cr = document.getElementById(
+      "cluster-resolution-range",
+    ) as HTMLInputElement | null;
+    if ($cr) $cr.disabled = !available;
   }
 
   /** Subscribe to queue progress.
@@ -760,6 +795,7 @@ export class AnalysisCoordinator {
       this.deps.status.update(m);
       this.deps.scheduleDraw();
       this._syncApplyEnabled();
+      this._syncClusterControls();
       // Clustering finished or changed → refresh assignments.
       const rev = st.clusters?.revision ?? null;
       if (rev && rev !== prevRevision) {
@@ -846,15 +882,15 @@ export class AnalysisCoordinator {
     }
 
     if (!m.clustersAvailable) {
-      $meta.textContent = m.queueStatus?.models?.maest_ready
-        ? "No clusters yet — run analysis."
-        : "Waiting for MAEST model…";
+      $meta.textContent = this._clusterUnavailableReason();
       $list.replaceChildren();
+      this._syncClusterControls();
       return;
     }
 
     const n = m.clusterNames.size || m.clusterSizes.size;
     $meta.textContent = `${n} clusters at resolution ${m.clusterResolution}`;
+    this._syncClusterControls();
 
     const entries = [...m.clusterSizes.entries()].sort((a, b) => b[1] - a[1]);
     $list.replaceChildren();

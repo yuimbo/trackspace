@@ -918,6 +918,14 @@ graph
 multi-resolution cluster hierarchy
 ```
 
+**When it runs.** A re-cluster is queued whenever a per-track stage drains
+(`_after_cluster_inputs_changed`), on `POST /api/clusters/rebuild`, and **once at
+startup** (`app.main`). The startup run exists because `ClusterStore` is in-memory:
+without it, restarting with an already-analysed library leaves nothing to drain, so
+`/api/clusters` would report nothing until the user pressed "Rebuild clusters". The
+queue's single `"library"` dedupe key collapses the startup run with any drain or
+manual request, and a library with no MAEST rows is a cheap no-op.
+
 ### Three decisions that are easy to get wrong
 
 **Cluster in feature space, never in t-SNE/UMAP space.** 2-D projections

@@ -161,8 +161,9 @@ none require re-running an encoder over the library.
   the candidate paths, as `/api/tracks/structure` now does.
 - [ ] **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
   6-genre validation it reached 96.6% purity.
-- [ ] **Persist cluster results.** `ClusterStore` is in-memory; a restart recomputes in
-  seconds at current library size. Persist only if that stops being true.
+- [ ] **Persist cluster results.** `ClusterStore` is in-memory; a restart now
+  self-heals one re-cluster at startup (`app.main`), which recomputes in seconds at
+  current library size. Persist only if that startup cost stops being negligible.
 
 ## Analysis performance
 
