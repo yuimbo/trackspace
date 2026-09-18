@@ -4,12 +4,14 @@ import {
   BPM_HI,
   BPM_LO,
   bpmSpiralXY,
+  camelotGuide,
   camelotPosition,
   camelotXY,
   getLens,
   lensWaitSources,
   lensWeights,
   nextLensId,
+  spiralGuide,
   tempoSpiralPosition,
 } from "./lenses";
 
@@ -139,6 +141,31 @@ describe("tempo spiral geometry", () => {
   it("clamps outside the tempo window", () => {
     expect(polar(bpmSpiralXY(-0.5)).r).toBeCloseTo(0.18, 6);
     expect(polar(bpmSpiralXY(1.5)).r).toBeCloseTo(0.86, 6);
+  });
+});
+
+describe("canvas guides", () => {
+  it("labels the twelve Camelot key positions on the outer ring", () => {
+    const guide = camelotGuide();
+    expect(guide.map((g) => g.label)).toContain("C");
+    expect(guide).toHaveLength(12);
+    for (const g of guide) {
+      expect(Math.hypot(g.x - 0.5, g.y - 0.5)).toBeCloseTo(
+        0.5 * 0.82,
+        6,
+      );
+    }
+  });
+
+  it("samples a spiral arm inside the unit square", () => {
+    const pts = spiralGuide();
+    expect(pts.length).toBeGreaterThan(1);
+    for (const p of pts) {
+      expect(p.x).toBeGreaterThanOrEqual(0);
+      expect(p.x).toBeLessThanOrEqual(1);
+      expect(p.y).toBeGreaterThanOrEqual(0);
+      expect(p.y).toBeLessThanOrEqual(1);
+    }
   });
 });
 

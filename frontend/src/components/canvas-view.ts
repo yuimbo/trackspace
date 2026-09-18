@@ -1,6 +1,12 @@
 import type { HoverTarget, Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/colors";
+import {
+  CAMELOT_MAJOR_RADIUS,
+  CAMELOT_MINOR_RADIUS,
+  camelotGuide,
+  spiralGuide,
+} from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
 import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
 
@@ -251,6 +257,7 @@ export class CanvasView {
     }
 
     this._drawGrid(w, h);
+    this._drawLensGuide();
     this._drawDragGhosts();
     this._drawScatter(tracks);
     this._drawFolderGlow(tracks);
@@ -262,6 +269,51 @@ export class CanvasView {
     this._updateTooltip(tracks);
 
     if (this._explodeBlendAnimating()) this.scheduleDraw();
+  }
+
+  /** Lens background guide (Camelot rings + key labels, or the tempo spiral). */
+  private _drawLensGuide(): void {
+    const m = this.model;
+    const lens = m.lens();
+    if (m.viewMode !== "embeddings" || !lens.guide) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = "rgba(255,255,255,0.16)";
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
+    ctx.lineWidth = 1;
+    ctx.font = "9px monospace";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+
+    if (lens.guide === "camelot") {
+      const [cx, cy] = this.w2s(0.5, 0.5);
+      const [ex] = this.w2s(0.5 + 0.5 * CAMELOT_MAJOR_RADIUS, 0.5);
+      const majorR = Math.abs(ex - cx);
+      const minorR = majorR * (CAMELOT_MINOR_RADIUS / CAMELOT_MAJOR_RADIUS);
+      for (const r of [majorR, minorR]) {
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+      for (const p of camelotGuide()) {
+        const [sx, sy] = this.w2s(p.x, p.y);
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(sx, sy);
+        ctx.stroke();
+        ctx.fillText(p.label, sx, sy);
+      }
+    } else {
+      const pts = spiralGuide();
+      ctx.beginPath();
+      pts.forEach((p, i) => {
+        const [sx, sy] = this.w2s(p.x, p.y);
+        if (i === 0) ctx.moveTo(sx, sy);
+        else ctx.lineTo(sx, sy);
+      });
+      ctx.stroke();
+    }
+    ctx.restore();
   }
 
   private _explodeBlendAnimating(): boolean {

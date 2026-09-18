@@ -21,8 +21,8 @@ export const BPM_LO = 60;
 export const BPM_HI = 200;
 
 // Mirrors ``backend/embeddings/feature_encoding.py``; keep in sync.
-const CAMELOT_MAJOR_RADIUS = 0.82;
-const CAMELOT_MINOR_RADIUS = 0.45;
+export const CAMELOT_MAJOR_RADIUS = 0.82;
+export const CAMELOT_MINOR_RADIUS = 0.45;
 const MINOR_FIFTHS_OFFSET = 3;
 const SPIRAL_R_MIN = 0.18;
 const SPIRAL_R_MAX = 0.86;
@@ -112,6 +112,30 @@ export function tempoSpiralPosition(t: Track): { x: number; y: number } | null {
   const p = bpmSpiralXY(tnorm);
   const j = _jitter(t, 0.04);
   return { x: p.x + j.x, y: p.y + j.y };
+}
+
+/** Camelot major key names by circle-of-fifths position (mirrors the backend). */
+export const CAMELOT_KEY_NAMES = [
+  "C", "G", "D", "A", "E", "B", "F#", "Db", "Ab", "Eb", "Bb", "F",
+] as const;
+
+/** Outer-ring key labels for the Camelot guide, in world coordinates. */
+export function camelotGuide(): { label: string; x: number; y: number }[] {
+  return CAMELOT_KEY_NAMES.map((label, p) => {
+    const a = (2 * Math.PI * p) / 12;
+    return {
+      label,
+      x: 0.5 + 0.5 * CAMELOT_MAJOR_RADIUS * Math.cos(a),
+      y: 0.5 + 0.5 * CAMELOT_MAJOR_RADIUS * Math.sin(a),
+    };
+  });
+}
+
+/** Sampled spiral arm points for the tempo guide, in world coordinates. */
+export function spiralGuide(steps = 180): { x: number; y: number }[] {
+  const out: { x: number; y: number }[] = [];
+  for (let i = 0; i <= steps; i++) out.push(bpmSpiralXY(i / steps));
+  return out;
 }
 
 /** Built-ins, in **E**-cycle order: tags → map lenses → feature lenses → tags. */

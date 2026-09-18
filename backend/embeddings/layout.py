@@ -23,6 +23,7 @@ from .clap import (
     load_model,
     _load_audio_segments,
 )
+from .feature_encoding import FEATURE_ENCODING_VERSION, encode_feature_vector
 from .projection_backends import (
     _project_pca,
     _project_tsne,
@@ -187,11 +188,17 @@ def _get_prepared_source_row(
             _source_version(source, feature_cache),
             feature_mask.tobytes(),
             round(b, 9),
+            FEATURE_ENCODING_VERSION,
         )
         hit = _source_row_cache_get(key)
         if hit is not None:
             return hit
-        v = raw * feature_mask
+        # Re-encode the cached raw row into the perceptual space before masking;
+        # a row that cannot be encoded contributes a zero block, like a missing one.
+        encoded = encode_feature_vector(raw)
+        if encoded is None:
+            encoded = np.zeros_like(raw)
+        v = encoded * feature_mask
         n = float(np.linalg.norm(v))
         if n < 1e-9:
             n = 1.0

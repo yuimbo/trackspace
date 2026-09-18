@@ -21,7 +21,7 @@ import numpy as np
 from .librosa_audio_features import AUDIO_FEATURE_DIM
 
 # Bump in layout_revision.compute_layout_revision payload when this recipe changes.
-PROJECTION_RECIPE_VERSION = 5
+PROJECTION_RECIPE_VERSION = 6
 
 FROZEN_SOURCES: tuple[str, ...] = (
     "maest_logits",
@@ -74,8 +74,9 @@ def required_sources_for(sources: tuple[str, ...]) -> tuple[str, ...]:
         )
     return required
 
-# Order: tempo_norm, key_cos, key_sin, mode, energy_norm, danceability — only tempo, energy, dance.
-FROZEN_FEATURE_MASK = np.array([1, 0, 0, 0, 1, 1], dtype=np.float32)
+# Encoded order: camelot_x, camelot_y, spiral_x, spiral_y, energy, dance — all
+# six are meaningful now, so the whole block is kept.
+FROZEN_FEATURE_MASK = np.array([1, 1, 1, 1, 1, 1], dtype=np.float32)
 assert int(FROZEN_FEATURE_MASK.size) == AUDIO_FEATURE_DIM
 
 # The audio-feature blend (``FROZEN_FEATURES_BLEND``) lives in ``backend.tuning``

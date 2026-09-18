@@ -130,3 +130,33 @@ def test_encode_feature_vector_shape_and_order():
 def test_encode_feature_vector_rejects_missing():
     assert encode_feature_vector(None) is None
     assert encode_feature_vector(np.zeros(3, dtype=np.float32)) is None
+
+
+def test_features_block_uses_the_perceptual_encoding():
+    """The composite ``features`` row must be the encoded block, not the raw one.
+
+    Relative keys (C major / A minor) share a Camelot ray and must end up more
+    similar than C major is to its tritone F# major — which the raw circle-of-fifths
+    cos/sin + separate mode bit did not guarantee.
+    """
+    from backend.embeddings import layout as layout_mod
+    from backend.embeddings.librosa_audio_features import AUDIO_FEATURE_DIM
+
+    layout_mod._source_row_cache.clear()
+    mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
+
+    def row(key_cos: float, key_sin: float, mode: float, fp: str) -> np.ndarray:
+        raw = np.array([0.5, key_cos, key_sin, mode, 0.5, 0.5], dtype=np.float32)
+        return layout_mod._get_prepared_source_row(
+            "features", fp, raw, mask, 1.0
+        )
+
+    a = math.pi / 2  # A minor's circle-of-fifths angle
+    c_major = row(1.0, 0.0, 1.0, "fp-cmaj")
+    a_minor = row(math.cos(a), math.sin(a), 0.0, "fp-amin")
+    fs_major = row(-1.0, 0.0, 1.0, "fp-fsmaj")
+
+    def cos(x: np.ndarray, y: np.ndarray) -> float:
+        return float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-9))
+
+    assert cos(c_major, a_minor) > cos(c_major, fs_major)
