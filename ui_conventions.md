@@ -256,8 +256,10 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   and the deterministic feature lenses (`camelot`, `tempo`). `model.viewMode` is a
   derived getter — `"tags"` for the tag lens, `"embeddings"` for every other — so
   the embedding-mode rules below need no per-lens branch.
-- Hotkey **E** cycles every built-in lens. The **View** tab has a lens select plus
-  *Save preset…* / *Delete preset*; a preset captures the lens and the display
+- Hotkey **E** cycles every built-in lens forward; **Shift+E** cycles backward. A
+  centre-screen tab bar flashes on every switch, with the active lens highlighted, so the
+  change is legible without checking the View tab. The **View** tab has a lens select
+  plus *Save preset…* / *Delete preset*; a preset captures the lens and the display
   options it was saved with (source weights, cluster colouring, granularity) and is
   listed in the same select. Source weights only affect the combined lens, so their
   panel is hidden for the others.
@@ -314,16 +316,21 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 A scope is a circle on the canvas whose tracks are re-laid-out by another lens, so a
 cluster can be read in a different space without leaving the map.
 
-- Hold **X** and drag to draw a circle from the press point; releasing opens a lens
-  menu at the circle. **X** again or **Esc** closes the scope and animates its tracks
-  back out.
+- Hold **X** and drag to draw a circle from the press point; **X + scroll** opens
+  a scope at the cursor or resizes the open one. The scope starts on the last-used
+  scope lens immediately. A bare **X** tap, **Esc**, or a click outside the circle closes
+  it and animates its tracks back out.
+- A tab bar of the available lenses is drawn just outside the circle; clicking a tab
+  switches the scope's lens (morphing between the two layouts) and remembers it as the
+  default for the next scope.
 - Membership is frozen from the tracks' *outer* positions when the scope opens, so the
-  re-layout cannot move a track across the boundary. Tracks the scope lens cannot
-  place keep their outer position rather than vanishing.
+  re-layout cannot move a track across the boundary. A track the scope lens cannot place
+  but whose outer position is inside the circle is **hidden**, so the region only shows the
+  re-layout.
 - The in-scope positions are the scope lens's layout min-max normalised and mapped
   into the circle's inscribed square; a deterministic scope lens is instant, a
-  projection scope lens reuses its cached global layout. The lens menu lists the
-  built-ins except the tag lens.
+  projection scope lens reuses its cached global layout. The tab bar lists the built-ins
+  except the tag lens.
 - While a scope is open, in-scope dots behave like embedding-mode dots: tag
   drag/transform is disabled. Switching the outer lens drops the scope.
 

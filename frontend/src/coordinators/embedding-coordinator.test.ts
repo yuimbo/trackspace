@@ -82,6 +82,9 @@ interface Harness {
   canvas: {
     animPositions: Map<string, { x: number; y: number }> | null;
     scheduleDraw: ReturnType<typeof vi.fn>;
+    worldPosForTrack(t: Track): { wx: number; wy: number } | null;
+    outerPosForTrack(t: Track): { wx: number; wy: number } | null;
+    flashLensHud: ReturnType<typeof vi.fn>;
   };
   coord: EmbeddingCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
@@ -114,6 +117,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     // need a stable outer position for scope membership and anchors.
     worldPosForTrack: (t: Track) => outerPos(model, t),
     outerPosForTrack: (t: Track) => outerPos(model, t),
+    flashLensHud: vi.fn(),
   };
   const coord = new EmbeddingCoordinator({
     model,
@@ -451,6 +455,46 @@ describe("EmbeddingCoordinator scopes", () => {
     await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.2, lensId: "" }, "clap");
     expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(1);
     expect(model.scopePositions.has("a.mp3")).toBe(true);
+  });
+
+  it("switches the open scope's lens and remembers it", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    const before = new Map(model.scopePositions);
+    await coord.setScopeLens("tempo");
+    expect(model.scope?.lensId).toBe("tempo");
+    expect(model.scopeLensId).toBe("tempo");
+    // Same membership (the circle did not move), a different layout.
+    expect([...model.scopePositions.keys()].sort()).toEqual(
+      [...before.keys()].sort(),
+    );
+  });
+
+  it("resizes the open scope without a tween", async () => {
+    const { model, coord, canvas } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    pump(600); // let the open tween finish
+    await coord.resizeScope(0.2);
+    expect(model.scope?.r).toBeCloseTo(0.2, 6);
+    // A scroll resize is immediate, not animated through the overlay.
+    expect(canvas.animPositions).toBeNull();
+  });
+
+  it("cycles backward with cycleLens(-1)", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    await coord.switchToLens("combined");
+    await coord.cycleLens(-1);
+    expect(model.lensId).toBe("tags");
+  });
+
+  it("flashes the lens HUD on a switch", async () => {
+    const { model, coord, canvas } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    await coord.switchToLens("combined");
+    expect(canvas.flashLensHud).toHaveBeenCalled();
   });
 });
 

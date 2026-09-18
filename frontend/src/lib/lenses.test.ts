@@ -11,6 +11,8 @@ import {
   lensWaitSources,
   lensWeights,
   nextLensId,
+  prevLensId,
+  scopeLenses,
   spiralGuide,
   tempoSpiralPosition,
 } from "./lenses";
@@ -58,8 +60,22 @@ describe("lens registry", () => {
     expect(nextLensId("tempo")).toBe("tags");
   });
 
+  it("Shift+E cycles backward and wraps", () => {
+    expect(prevLensId("tags")).toBe("tempo");
+    expect(prevLensId("combined")).toBe("tags");
+    expect(prevLensId("tempo")).toBe("camelot");
+  });
+
   it("cycles from a preset's base lens", () => {
     expect(nextLensId("preset:1", "clap")).toBe("rhythm");
+    expect(prevLensId("preset:1", "clap")).toBe("maest");
+  });
+
+  it("scope lenses exclude the tag lens", () => {
+    const ids = scopeLenses().map((l) => l.id);
+    expect(ids).not.toContain("tags");
+    expect(ids).toContain("camelot");
+    expect(ids).toContain("clap");
   });
 
   it("falls back to tags for an unknown id", () => {

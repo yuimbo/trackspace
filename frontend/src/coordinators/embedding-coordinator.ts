@@ -105,8 +105,13 @@ export interface EmbeddingDeps {
     worldPosForTrack(t: Track): { wx: number; wy: number } | null;
     /** Position ignoring any scope, for membership and open/close anchors. */
     outerPosForTrack(t: Track): { wx: number; wy: number } | null;
+    /** Flash the centre-screen lens tab bar (lens-switch feedback). */
+    flashLensHud(): void;
   };
 }
+
+/** Smallest scope radius, in world units. */
+const SCOPE_MIN_R = 0.02;
 
 export class EmbeddingCoordinator {
   /** Saved viewport state per view-mode so pan/zoom persists across toggles. */
@@ -127,6 +132,8 @@ export class EmbeddingCoordinator {
   private _animFrame = 0;
   /** Monotonic request id; a slow projection must not overwrite a newer one. */
   private _projectionReqSeq = 0;
+  /** Monotonic request id for scope recomputes (lens switch / resize). */
+  private _scopeReqSeq = 0;
 
   constructor(private deps: EmbeddingDeps) {}
 
@@ -557,7 +564,7 @@ export class EmbeddingCoordinator {
     }
 
     cv.animPositions = new Map(startPos);
-    const DURATION = 350;
+    const DURATION = 260;
     const t0 = performance.now();
 
     cancelAnimationFrame(this._animFrame);
@@ -695,7 +702,7 @@ export class EmbeddingCoordinator {
     }
 
     cv.animPositions = startPos;
-    const DURATION = 500;
+    const DURATION = 340;
     const t0 = performance.now();
 
     cancelAnimationFrame(this._animFrame);
@@ -740,7 +747,7 @@ export class EmbeddingCoordinator {
     }
 
     cv.animPositions = startPos;
-    const DURATION = 500;
+    const DURATION = 340;
     const t0 = performance.now();
 
     cancelAnimationFrame(this._animFrame);
@@ -804,7 +811,7 @@ export class EmbeddingCoordinator {
     // shows the old positions — the animation will take it from here.
     cv.animPositions = startPos;
 
-    const DURATION = 500;
+    const DURATION = 340;
     const t0 = performance.now();
 
     cancelAnimationFrame(this._animFrame);
@@ -835,10 +842,10 @@ export class EmbeddingCoordinator {
     this._animFrame = requestAnimationFrame(step);
   }
 
-  /** Advance to the next built-in lens (the **E** cycle). */
-  async cycleLens(): Promise<void> {
+  /** Advance the lens cycle; *dir* is +1 for **E**, -1 for **Shift+E**. */
+  async cycleLens(dir: 1 | -1 = 1): Promise<void> {
     const m = this.deps.model;
-    await this.switchToLens(m.nextLens());
+    await this.switchToLens(dir === 1 ? m.nextLens() : m.prevLens());
   }
 
   /**
@@ -881,6 +888,13 @@ export class EmbeddingCoordinator {
       m.vp.zoom = 1;
     }
 
+    // Feedback first: the tab bar and status must land before the (async) layout,
+    // so a slow fit never makes the switch feel unresponsive.
+    m.saveLS();
+    this.deps.status.update(m);
+    this.syncLensChrome();
+    this.deps.canvas.flashLensHud();
+
     if (lens.kind === "tags") {
       this._animateToTags();
     } else if (lens.kind === "deterministic") {
@@ -892,10 +906,6 @@ export class EmbeddingCoordinator {
       // Map → map: animate from the current positions to the new lens's layout.
       await this._fetchProjection();
     }
-
-    m.saveLS();
-    this.deps.status.update(m);
-    this.syncLensChrome();
   }
 
   /** Switch to a specific view mode (tags ↔ the last map lens). */
@@ -918,43 +928,74 @@ export class EmbeddingCoordinator {
   }
 
   /**
-   * Open a scope: re-lay out the tracks inside its circle by *lensId*.
+   * Open a scope: re-lay out the tracks inside its circle by ``lensId``.
    *
    * Membership is decided from the tracks' outer positions (where the user drew
    * the circle), then frozen into ``scopePositions`` so the re-layout cannot move
-   * a track across the boundary. Tracks the scope lens cannot place keep their
-   * outer position rather than vanishing.
+   * a track across the boundary. Tracks the scope lens cannot place are hidden
+   * (the canvas hides in-circle dots that have no scope position).
    */
   async openScope(scope: Scope, lensId: string): Promise<void> {
     const m = this.deps.model;
-    const lens = getLens(lensId);
     const active = { ...scope, lensId };
-    const inScope = m.allTracks.filter((t) => {
-      const p = this.deps.canvas.outerPosForTrack(t);
-      return p != null && Math.hypot(p.wx - active.cx, p.wy - active.cy) <= active.r;
-    });
+    const seq = ++this._scopeReqSeq;
+    const { raw, inScope } = await this._computeScopeRaw(active);
+    if (seq !== this._scopeReqSeq) return;
     if (inScope.length === 0) {
       toast("No tracks inside the scope", "warn");
       return;
     }
-
-    const targets = await this._scopeTargets(lens, inScope, active);
-    if (targets.size === 0) {
+    if (raw.size === 0) {
       toast("That lens has no positions for these tracks", "warn");
       return;
     }
-
-    const start = new Map<string, { x: number; y: number }>();
-    for (const path of targets.keys()) {
-      const t = m.trackByPath(path);
-      if (!t) continue;
-      const p = this.deps.canvas.outerPosForTrack(t);
-      if (p) start.set(path, { x: p.wx, y: p.wy });
-    }
-
+    const targets = this._mapIntoScope(raw, active);
+    const start = this._startFromOuter(targets.keys());
+    m.scopeLensId = lensId;
     m.scope = active;
     m.scopePositions = targets;
     this._animateOverlay(start, targets);
+  }
+
+  /**
+   * Re-lay the open scope with a different lens, morphing between them.
+   *
+   * Membership is unchanged (the circle did not move), so only the lens positions
+   * are recomputed; a lens the tracks have no data for leaves them at their outer
+   * positions.
+   */
+  async setScopeLens(lensId: string): Promise<void> {
+    const m = this.deps.model;
+    const scope = m.scope;
+    if (!scope || scope.lensId === lensId) return;
+    m.scopeLensId = lensId;
+    const next = { ...scope, lensId };
+    const seq = ++this._scopeReqSeq;
+    const { raw } = await this._computeScopeRaw(next);
+    if (seq !== this._scopeReqSeq) return;
+    const targets = this._mapIntoScope(raw, next);
+    const start = new Map(m.scopePositions);
+    m.scope = next;
+    m.scopePositions = targets;
+    this._animateOverlay(start, targets);
+  }
+
+  /**
+   * Resize the open scope (X + scroll). Membership can change with the radius, so
+   * the in-scope set and the mapped positions are recomputed; the change is
+   * applied immediately (no tween) so a scroll feels direct.
+   */
+  async resizeScope(r: number): Promise<void> {
+    const m = this.deps.model;
+    const scope = m.scope;
+    if (!scope) return;
+    const next = { ...scope, r: Math.max(SCOPE_MIN_R, r) };
+    const seq = ++this._scopeReqSeq;
+    const { raw } = await this._computeScopeRaw(next);
+    if (seq !== this._scopeReqSeq) return;
+    m.scope = next;
+    m.scopePositions = this._mapIntoScope(raw, next);
+    this.deps.canvas.scheduleDraw();
   }
 
   /** Close the active scope, animating its tracks back to their outer positions. */
@@ -979,35 +1020,57 @@ export class EmbeddingCoordinator {
     this._animateOverlay(start, targets);
   }
 
-  /** Scope-lens positions for *inScope*, mapped into the scope's inscribed square. */
-  private async _scopeTargets(
-    lens: Lens,
-    inScope: Track[],
+  /** In-scope tracks and their raw scope-lens positions, in the lens's own space. */
+  private async _computeScopeRaw(
     scope: Scope,
-  ): Promise<Map<string, { x: number; y: number }>> {
-    let raw: Map<string, { x: number; y: number }>;
-    if (lens.kind === "deterministic" && lens.compute) {
-      raw = new Map();
-      for (const t of inScope) {
-        const p = lens.compute(t);
-        if (p) raw.set(t.path, p);
-      }
-    } else {
-      raw = await this._fetchLensPositions(lens);
-    }
-
-    const subset = new Map<string, { x: number; y: number }>();
+  ): Promise<{
+    raw: Map<string, { x: number; y: number }>;
+    inScope: Track[];
+  }> {
+    const m = this.deps.model;
+    const lens = getLens(scope.lensId);
+    const inScope = m.allTracks.filter((t) => {
+      const p = this.deps.canvas.outerPosForTrack(t);
+      return p != null && Math.hypot(p.wx - scope.cx, p.wy - scope.cy) <= scope.r;
+    });
+    const all =
+      lens.kind === "deterministic" && lens.compute
+        ? null
+        : await this._fetchLensPositions(lens);
+    const raw = new Map<string, { x: number; y: number }>();
     for (const t of inScope) {
-      const p = raw.get(t.path);
-      if (p) subset.set(t.path, p);
+      const p = lens.compute ? lens.compute(t) : (all?.get(t.path) ?? null);
+      if (p) raw.set(t.path, p);
     }
-    if (subset.size === 0) return subset;
+    return { raw, inScope };
+  }
 
+  /** Outer positions for *paths*, as scope-open anchors. */
+  private _startFromOuter(
+    paths: Iterable<string>,
+  ): Map<string, { x: number; y: number }> {
+    const m = this.deps.model;
+    const out = new Map<string, { x: number; y: number }>();
+    for (const path of paths) {
+      const t = m.trackByPath(path);
+      if (!t) continue;
+      const p = this.deps.canvas.outerPosForTrack(t);
+      if (p) out.set(path, { x: p.wx, y: p.wy });
+    }
+    return out;
+  }
+
+  /** Normalise a scope lens's subset and map it into the circle's inscribed square. */
+  private _mapIntoScope(
+    raw: Map<string, { x: number; y: number }>,
+    scope: Scope,
+  ): Map<string, { x: number; y: number }> {
+    if (raw.size === 0) return new Map();
     let minX = Infinity,
       maxX = -Infinity,
       minY = Infinity,
       maxY = -Infinity;
-    for (const p of subset.values()) {
+    for (const p of raw.values()) {
       minX = Math.min(minX, p.x);
       maxX = Math.max(maxX, p.x);
       minY = Math.min(minY, p.y);
@@ -1018,7 +1081,7 @@ export class EmbeddingCoordinator {
     // Inscribe the lens square in the circle so no dot can escape the outline.
     const side = scope.r * Math.SQRT2;
     const out = new Map<string, { x: number; y: number }>();
-    for (const [path, p] of subset) {
+    for (const [path, p] of raw) {
       out.set(path, {
         x: scope.cx + ((p.x - minX) / rx - 0.5) * side,
         y: scope.cy + ((p.y - minY) / ry - 0.5) * side,
@@ -1053,7 +1116,7 @@ export class EmbeddingCoordinator {
       return;
     }
     cv.animPositions = new Map(start);
-    const DURATION = 400;
+    const DURATION = 280;
     const t0 = performance.now();
     cancelAnimationFrame(this._animFrame);
     const step = () => {

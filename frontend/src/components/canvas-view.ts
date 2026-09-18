@@ -2,11 +2,13 @@ import type { HoverTarget, Model, Track } from "../model";
 import { isAudioFeatureAxisId } from "../model";
 import { clusterColor, dirColor } from "../lib/colors";
 import {
+  BUILTIN_LENSES,
   CAMELOT_MAJOR_RADIUS,
   CAMELOT_MINOR_RADIUS,
   camelotGuide,
-  getLens,
+  scopeLenses,
   spiralGuide,
+  type Lens,
 } from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
 import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
@@ -17,6 +19,15 @@ export interface DotPosition {
   idx: number;
   sx: number;
   sy: number;
+}
+
+/** A clickable lens tab drawn on the canvas. */
+export interface LensTabHit {
+  lensId: string;
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
 }
 
 export interface TxHandle {
@@ -99,6 +110,11 @@ export class CanvasView {
   dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null = null;
   /** In-progress scope circle in screen coordinates (centre + radius px). */
   scopeDrag: { cx: number; cy: number; r: number } | null = null;
+  /** Clickable lens tabs drawn around the open scope (screen rects). */
+  scopeTabs: LensTabHit[] = [];
+  /** Centre-screen lens tab bar is drawn until this timestamp (ms). */
+  private _lensHudUntil = 0;
+  private _lensHudTimer = 0;
   _rafId = 0;
 
   txHandles: TxHandle[] = [];
@@ -240,6 +256,7 @@ export class CanvasView {
     ctx.clearRect(0, 0, w, h);
     this.positions = [];
     this.txHandles = [];
+    this.scopeTabs = [];
     this._txBox = null;
     this._txWorld = null;
     this._txAllowBoxDrag = false;
@@ -264,6 +281,7 @@ export class CanvasView {
     this._drawBoxSel();
     this._drawLasso();
     this._drawScope();
+    this._drawLensHud(w);
     this._drawModeBadge(w, h);
     this._updateTooltip(tracks);
   }
@@ -524,6 +542,25 @@ export class CanvasView {
     return this._outerTrackWPos(t);
   }
 
+  /** Show the centre-screen lens tab bar for *ms* (lens-switch feedback). */
+  flashLensHud(ms = 1400): void {
+    this._lensHudUntil = performance.now() + ms;
+    clearTimeout(this._lensHudTimer);
+    this._lensHudTimer = setTimeout(
+      () => this.scheduleDraw(),
+      ms + 30,
+    ) as unknown as number;
+    this.scheduleDraw();
+  }
+
+  /** Lens id under *sx,sy* when a scope tab is there, else null. */
+  scopeTabAt(sx: number, sy: number): string | null {
+    for (const t of this.scopeTabs) {
+      if (sx >= t.x0 && sx <= t.x1 && sy >= t.y0 && sy <= t.y1) return t.lensId;
+    }
+    return null;
+  }
+
   private _resolveTrackWPos(t: Track): { wx: number; wy: number } | null {
     const m = this.model;
 
@@ -533,13 +570,22 @@ export class CanvasView {
       if (ap) return { wx: ap.x, wy: ap.y };
     }
 
-    // A scope re-lays out its tracks; scopePositions holds only in-scope paths.
+    const outer = this._outerTrackWPos(t);
     if (m.scope) {
+      // A scope re-lays out its tracks; scopePositions holds only in-scope paths.
       const sp = m.scopePositions.get(t.path);
       if (sp) return { wx: sp.x, wy: sp.y };
+      // A track the scope lens could not place but whose outer position falls
+      // inside the circle would clutter the re-layout; hide it.
+      if (
+        outer &&
+        Math.hypot(outer.wx - m.scope.cx, outer.wy - m.scope.cy) <= m.scope.r
+      ) {
+        return null;
+      }
     }
 
-    return this._outerTrackWPos(t);
+    return outer;
   }
 
   /** Position ignoring any scope: the embedding lens or the tag axes. */
@@ -1109,7 +1155,7 @@ export class CanvasView {
 
   /* ── Scope overlay ─────────────────────────────────────── */
 
-  /** The open scope's circle + lens chip, and the in-progress drag circle. */
+  /** The open scope's circle, its lens tab switcher, and the in-progress drag. */
   private _drawScope(): void {
     const ctx = this.ctx;
     const scope = this.model.scope;
@@ -1134,16 +1180,84 @@ export class CanvasView {
       ctx.arc(cx, cy, rpx, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
-      const label = getLens(scope.lensId).label;
       ctx.setLineDash([]);
-      ctx.font = "bold 11px monospace";
-      ctx.fillStyle = "rgba(120,220,255,0.95)";
-      ctx.textAlign = "center";
-      ctx.textBaseline = "bottom";
-      ctx.fillText(label, cx, cy - rpx - 4);
+      // The lens tabs sit just outside the circle, above unless it is near the top.
+      const above = cy - rpx - 16 > 26;
+      const tabCy = above ? cy - rpx - 16 : cy + rpx + 16;
+      this.scopeTabs = this._drawLensTabs(
+        scopeLenses(),
+        scope.lensId,
+        cx,
+        tabCy,
+      );
     }
     ctx.setLineDash([]);
     ctx.restore();
+  }
+
+  /** Centre-screen lens tab bar; visible for a short window after a switch. */
+  private _drawLensHud(w: number): void {
+    if (performance.now() >= this._lensHudUntil) return;
+    this._drawLensTabs(BUILTIN_LENSES, this.model.lensId, w / 2, 30);
+  }
+
+  /**
+   * Draw a horizontal row of lens tabs centred at *(cx, cy)* and return their
+   * screen rects so a click can be routed back to the coordinator.
+   */
+  private _drawLensTabs(
+    lenses: readonly Lens[],
+    activeId: string,
+    cx: number,
+    cy: number,
+  ): LensTabHit[] {
+    const ctx = this.ctx;
+    const padX = 9;
+    const gap = 6;
+    const h = 20;
+    ctx.save();
+    ctx.font = "11px monospace";
+    const widths = lenses.map(
+      (l) => ctx.measureText(l.label).width + padX * 2,
+    );
+    const total =
+      widths.reduce((a, b) => a + b, 0) + gap * (lenses.length - 1);
+    let x = cx - total / 2;
+    const y = cy - h / 2;
+    const hits: LensTabHit[] = [];
+    lenses.forEach((lens, i) => {
+      const w = widths[i];
+      const active = lens.id === activeId;
+      this._roundRect(x, y, w, h, 5);
+      ctx.fillStyle = active ? "rgba(120,220,255,0.92)" : "rgba(18,20,24,0.86)";
+      ctx.fill();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = active
+        ? "rgba(120,220,255,1)"
+        : "rgba(120,220,255,0.3)";
+      ctx.stroke();
+      ctx.fillStyle = active ? "#0b1a22" : "rgba(210,220,230,0.9)";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(lens.label, x + w / 2, y + h / 2 + 0.5);
+      hits.push({ lensId: lens.id, x0: x, y0: y, x1: x + w, y1: y + h });
+      x += w + gap;
+    });
+    ctx.restore();
+    return hits;
+  }
+
+  /** Trace a rounded rectangle on the current path. */
+  private _roundRect(x: number, y: number, w: number, h: number, r: number): void {
+    const ctx = this.ctx;
+    const rr = Math.min(r, w / 2, h / 2);
+    ctx.beginPath();
+    ctx.moveTo(x + rr, y);
+    ctx.arcTo(x + w, y, x + w, y + h, rr);
+    ctx.arcTo(x + w, y + h, x, y + h, rr);
+    ctx.arcTo(x, y + h, x, y, rr);
+    ctx.arcTo(x, y, x + w, y, rr);
+    ctx.closePath();
   }
 
   /* ── Tooltip ────────────────────────────────────────────── */

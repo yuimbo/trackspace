@@ -24,7 +24,8 @@ export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "select-all",      key: "a",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}A`,         description: "Select all tracks" },
   { action: "undo",            key: "z",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}Z`,         description: "Undo last action" },
   { action: "deselect",        key: "Escape", mod: false, shift: false, alt: false, label: "Esc",                    description: "Deselect / cancel" },
-  { action: "toggle-view",     key: "e",      mod: false, shift: false, alt: false, label: "E",                      description: "Cycle lenses (tags → combined → per-source maps → feature wheels)" },
+  { action: "toggle-view",     key: "e",      mod: false, shift: false, alt: false, label: "E",                      description: "Cycle lenses forward (tags → combined → per-source maps → feature wheels)" },
+  { action: "toggle-view-prev", key: "e",      mod: false, shift: true,  alt: false, label: "Shift+E",              description: "Cycle lenses backward" },
   { action: "toggle-clusters", key: "c",      mod: false, shift: false, alt: false, label: "C",                      description: "Colour dots by microgenre cluster" },
 ];
 
@@ -38,8 +39,9 @@ export const MOUSE_HINTS: { label: string; description: string }[] = [
   { label: "Click folder",    description: "Select all tracks in this folder (and subfolders)" },
   { label: "⌘/Ctrl+click",    description: "Add this folder’s tracks to the selection" },
   { label: "Shift+click",     description: "Add tracks from each folder between anchor and this row (set anchor with a normal click)" },
-  { label: "X + drag", description: "Draw a scope around tracks, then pick a lens to re-lay them out" },
+  { label: "X + drag / scroll", description: "Scope: draw or resize a circle, then pick a lens from its tab bar" },
   { label: "X",          description: "Close the active scope" },
+  { label: "Click away", description: "Close the active scope" },
   { label: "Alt+click folder", description: "Exclude folder from the view" },
   { label: "Alt + hover dot",  description: "Pin the inspect card (anti-track, nearest, solo)" },
   { label: "Hover cluster + s / H", description: "Isolate to the cluster / fit the view to it" },

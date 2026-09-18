@@ -1,6 +1,7 @@
 import {
   getLens,
   nextLensId,
+  prevLensId,
   type Lens,
   type LensPreset,
 } from "./lib/lenses";
@@ -370,6 +371,12 @@ export class Model extends EventBus {
     return nextLensId(this._lensId, preset?.baseLens);
   }
 
+  /** Previous built-in lens id for the **Shift+E** cycle. */
+  prevLens(): string {
+    const preset = this.lensPresets.find((p) => p.id === this._lensId);
+    return prevLensId(this._lensId, preset?.baseLens);
+  }
+
   /** Apply a saved preset: base lens plus its captured display options. */
   applyLensPreset(p: LensPreset): void {
     this._lensId = p.id;
@@ -425,6 +432,8 @@ export class Model extends EventBus {
    */
   scope: Scope | null = null;
   scopePositions: Map<string, { x: number; y: number }> = new Map();
+  /** Lens a newly drawn scope starts on; persisted so the last choice sticks. */
+  scopeLensId = "camelot";
   libraryLoadProgress: {
     done: number;
     total: number;
@@ -1115,6 +1124,7 @@ export class Model extends EventBus {
         previewVolume: this.previewVolume,
         lensId: this._lensId,
         lensPresets: this.lensPresets,
+        scopeLensId: this.scopeLensId,
         clusterResolution: this.clusterResolution,
         colorByCluster: this.colorByCluster,
         clusterWeights: this.clusterWeights,
@@ -1155,6 +1165,9 @@ export class Model extends EventBus {
         this.lensPresets = _migrateLensPresets(
           (d as { lensPresets?: unknown }).lensPresets,
         );
+        if (typeof (d as { scopeLensId?: unknown }).scopeLensId === "string") {
+          this.scopeLensId = (d as { scopeLensId: string }).scopeLensId;
+        }
         const cr = Number((d as { clusterResolution?: number }).clusterResolution);
         this.clusterResolution = Number.isFinite(cr) && cr > 0 ? cr : 1.5;
         this.colorByCluster = Boolean(

@@ -134,24 +134,35 @@ describe("CanvasView scope positions", () => {
     vi.restoreAllMocks();
   });
 
-  it("resolves in-scope tracks to their scope position, others outside", () => {
+  it("resolves in-scope tracks, hides unplaced in-region ones, keeps the rest", () => {
     const m = new Model();
     m.setAllTracks([
       makeTrack({ path: "a.mp3" }),
       makeTrack({ path: "b.mp3", folder: "House" }),
+      makeTrack({ path: "c.mp3", folder: "Techno" }),
     ]);
     const cv = new CanvasView(m);
     m.scope = { cx: 0.5, cy: 0.5, r: 0.2, lensId: "camelot" };
     m.scopePositions = new Map([["a.mp3", { x: 0.4, y: 0.6 }]]);
+    // c.mp3's outer position is outside the circle.
+    m.embeddingPositions = new Map([
+      ["a.mp3", { x: 0.5, y: 0.5 }],
+      ["b.mp3", { x: 0.52, y: 0.5 }],
+      ["c.mp3", { x: 0.95, y: 0.95 }],
+    ]);
+    m.viewMode = "embeddings";
 
+    // In scope → its scope position.
     expect(cv.worldPosForTrack(m.trackByPath("a.mp3")!)).toEqual({
       wx: 0.4,
       wy: 0.6,
     });
-    // Not in scopePositions → the tag axes (both null → 0.5, 0.5).
-    expect(cv.worldPosForTrack(m.trackByPath("b.mp3")!)).toEqual({
-      wx: 0.5,
-      wy: 0.5,
+    // In the circle but unplaced by the scope lens → hidden, not left inside.
+    expect(cv.worldPosForTrack(m.trackByPath("b.mp3")!)).toBeNull();
+    // Outside the circle → its normal outer position.
+    expect(cv.worldPosForTrack(m.trackByPath("c.mp3")!)).toEqual({
+      wx: 0.95,
+      wy: 0.95,
     });
   });
 });

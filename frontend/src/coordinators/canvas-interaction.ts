@@ -20,6 +20,8 @@ import type { CanvasView, TxHandle } from "../components";
 
 const DRAG_THRESH = 4;
 const ZOOM_FACTOR = 1.12;
+/** Starting radius (world units) for a scope opened by X + scroll. */
+const DEFAULT_SCOPE_R = 0.12;
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
@@ -115,8 +117,12 @@ export interface CanvasInteractionDeps {
   stopPreview(): void;
   /** Animate the viewport to *target* on the shared canvas animation frame. */
   tweenViewport?(target: { ox: number; oy: number; zoom: number }): void;
-  /** Show the scope lens picker at *screen*; picking a lens opens the scope. */
-  openScopePicker(scope: Scope, screen: { x: number; y: number }): void;
+  /** Open a scope immediately with the given lens. */
+  openScope(scope: Scope, lensId: string): void;
+  /** Switch the open scope to a different lens. */
+  setScopeLens(lensId: string): void;
+  /** Resize the open scope (X + scroll). */
+  resizeScope(r: number): void;
   /** Close the active scope, animating its tracks back out. */
   closeScope(): void;
 }
@@ -125,8 +131,10 @@ export class CanvasInteractionController {
   private mouse: MouseState;
   /** True while the pointer is inside the viewport canvas (for hover resync). */
   private _pointerOverCanvas = false;
-  /** True while **X** is held with no scope open: a drag draws a new scope. */
+  /** True while **X** is held: a drag/scroll draws or resizes a scope. */
   private _scopeArmed = false;
+  /** Whether the current X hold produced a drag/scroll (vs a bare tap to close). */
+  private _scopeGestureUsed = false;
 
   constructor(private deps: CanvasInteractionDeps) {
     this.mouse = {
@@ -204,10 +212,26 @@ export class CanvasInteractionController {
     // X + drag draws a scope circle; it takes priority over dot selection so a
     // scope can be opened anywhere, including over a dense cluster.
     if (this._scopeArmed) {
+      this._scopeGestureUsed = true;
       mouse.mode = "scope";
       cv.scopeDrag = { cx: sx, cy: sy, r: 0 };
       cv.scheduleDraw();
       return;
+    }
+
+    // A scope owns its region: a tab switches lens, a click outside closes it, and
+    // a click inside falls through to normal selection.
+    if (m.scope) {
+      const tab = cv.scopeTabAt(sx, sy);
+      if (tab) {
+        if (tab !== m.scope.lensId) this.deps.setScopeLens(tab);
+        return;
+      }
+      const [wx, wy] = cv.s2w(sx, sy);
+      if (Math.hypot(wx - m.scope.cx, wy - m.scope.cy) > m.scope.r) {
+        this.deps.closeScope();
+        return;
+      }
     }
 
     // Resize handles always take priority (disabled in embedding mode).
@@ -563,11 +587,14 @@ export class CanvasInteractionController {
       if (d && d.r >= 6) {
         const [wx, wy] = cv.s2w(d.cx, d.cy);
         const [wxr] = cv.s2w(d.cx + d.r, d.cy);
-        // The menu is fixed-positioned, so map canvas offsets to client coords.
-        const rect = cv.$canvas.getBoundingClientRect();
-        this.deps.openScopePicker(
-          { cx: wx, cy: wy, r: Math.abs(wxr - wx), lensId: "" },
-          { x: rect.left + d.cx, y: rect.top + d.cy },
+        this.deps.openScope(
+          {
+            cx: wx,
+            cy: wy,
+            r: Math.abs(wxr - wx),
+            lensId: m.scopeLensId,
+          },
+          m.scopeLensId,
         );
       }
       return;
@@ -721,6 +748,22 @@ export class CanvasInteractionController {
       e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? cv.$canvas.clientHeight : 1;
     const dx = e.deltaX * norm,
       dy = e.deltaY * norm;
+
+    // X + scroll opens a scope at the cursor, or resizes the open one.
+    if (this._scopeArmed && this._pointerOverCanvas) {
+      this._scopeGestureUsed = true;
+      const factor = dy < 0 ? 1.15 : 1 / 1.15;
+      if (m.scope) {
+        this.deps.resizeScope(m.scope.r * factor);
+      } else {
+        const [wx, wy] = cv.s2w(sx, sy);
+        this.deps.openScope(
+          { cx: wx, cy: wy, r: DEFAULT_SCOPE_R, lensId: m.scopeLensId },
+          m.scopeLensId,
+        );
+      }
+      return;
+    }
 
     if (e.ctrlKey) {
       const factor = Math.exp(-dy * 0.005);
@@ -1163,26 +1206,28 @@ export class CanvasInteractionController {
   }
 
   /**
-   * **X** + drag opens a scope around the cursor; a bare **X** press closes an
-   * open scope. The key arms the gesture on keydown and disarms on keyup.
+   * **X** arms the scope gesture: **X + drag** draws a circle, **X + scroll**
+   * opens or resizes one at the cursor, and a bare **X** tap closes an open scope.
    */
   private _bindScopeKeys(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.code !== "KeyX" || e.repeat) return;
       if (!this._scopeKeysAllowed(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (this.deps.model.scope) {
-        this.deps.closeScope();
-        return;
-      }
       this._scopeArmed = true;
+      this._scopeGestureUsed = false;
     });
     document.addEventListener("keyup", (e: KeyboardEvent) => {
-      if (e.code !== "KeyX") return;
+      if (e.code !== "KeyX" || !this._scopeArmed) return;
       this._scopeArmed = false;
+      // A bare tap (no drag/scroll) toggles the open scope closed.
+      if (!this._scopeGestureUsed && this.deps.model.scope) {
+        this.deps.closeScope();
+      }
     });
     window.addEventListener("blur", () => {
       this._scopeArmed = false;
+      this._scopeGestureUsed = false;
     });
   }
 

@@ -40,6 +40,7 @@ interface FakeCanvas {
   minZoom: ReturnType<typeof vi.fn>;
   clearHover: ReturnType<typeof vi.fn>;
   worldPosForTrack: ReturnType<typeof vi.fn>;
+  scopeTabAt: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   unpinInspect: ReturnType<typeof vi.fn>;
   toggleInspect: ReturnType<typeof vi.fn>;
@@ -67,6 +68,7 @@ function makeCanvas(): FakeCanvas {
     minZoom: vi.fn(() => 0.1),
     clearHover: vi.fn(),
     worldPosForTrack: vi.fn(() => ({ wx: 0.5, wy: 0.5 })),
+    scopeTabAt: vi.fn(() => null),
     scheduleDraw: vi.fn(),
     unpinInspect: vi.fn(() => false),
     toggleInspect: vi.fn(),
@@ -98,7 +100,9 @@ function makeHarness(): Harness {
     onHoverPreview: vi.fn(),
     stopPreview: vi.fn(),
     tweenViewport: vi.fn(),
-    openScopePicker: vi.fn(),
+    openScope: vi.fn(),
+    setScopeLens: vi.fn(),
+    resizeScope: vi.fn(),
     closeScope: vi.fn(),
   } as CanvasInteractionDeps;
   const coord = new CanvasInteractionController(deps);
@@ -364,7 +368,7 @@ describe("CanvasInteractionController gesture state", () => {
     expect(canvas.scheduleDraw).toHaveBeenCalled();
   });
 
-  it("opens the scope picker on an X + drag and passes the circle", () => {
+  it("opens the scope immediately on an X + drag with the default lens", () => {
     const { model, canvas, deps } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
     canvas.hitTest.mockReturnValue(-1);
@@ -374,21 +378,59 @@ describe("CanvasInteractionController gesture state", () => {
     down(canvas, 100, 100);
     move(canvas, 140, 100);
     up(canvas, 140, 100);
-    expect(deps.openScopePicker).toHaveBeenCalledTimes(1);
-    const scope = (deps.openScopePicker as ReturnType<typeof vi.fn>).mock
-      .calls[0][0] as { cx: number; cy: number; r: number };
+    expect(deps.openScope).toHaveBeenCalledTimes(1);
+    const [scope, lensId] = (deps.openScope as ReturnType<typeof vi.fn>).mock
+      .calls[0] as [{ cx: number; cy: number; r: number }, string];
     expect(scope.cx).toBeCloseTo(0.1, 5);
     expect(scope.cy).toBeCloseTo(0.1, 5);
     expect(scope.r).toBeCloseTo(0.04, 5);
+    expect(lensId).toBe(model.scopeLensId);
   });
 
-  it("closes an open scope on a bare X press", () => {
+  it("closes an open scope on a bare X tap", () => {
     const { model, deps } = makeHarness();
     model.scope = { cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
     document.dispatchEvent(
       new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
     );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyX", bubbles: true }),
+    );
     expect(deps.closeScope).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens or resizes a scope on X + scroll", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
+    expect(deps.openScope).toHaveBeenCalledTimes(1);
+    model.scope = { cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
+    canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
+    expect(deps.resizeScope).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the scope when clicking outside it", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.scope = { cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    canvas.hitTest.mockReturnValue(-1);
+    canvas.scopeTabAt.mockReturnValue(null);
+    down(canvas, 500, 500);
+    expect(deps.closeScope).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches the scope lens from a tab click", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.scope = { cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    canvas.scopeTabAt.mockReturnValue("clap");
+    down(canvas, 500, 500);
+    expect(deps.setScopeLens).toHaveBeenCalledWith("clap");
+    expect(deps.closeScope).not.toHaveBeenCalled();
   });
 
   it("disarms the scope gesture on X keyup", () => {

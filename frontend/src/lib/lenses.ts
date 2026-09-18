@@ -154,11 +154,26 @@ export function getLens(id: string): Lens {
   return BUILTIN_LENSES.find((l) => l.id === id) ?? BUILTIN_LENSES[0];
 }
 
+/** Lenses a scope can use: the tag lens has no positions to lay out. */
+export function scopeLenses(): Lens[] {
+  return BUILTIN_LENSES.filter((l) => l.kind !== "tags");
+}
+
 /** Next built-in lens id for the **E** cycle; a preset cycles from its base lens. */
 export function nextLensId(id: string, baseLens?: string): string {
+  return stepLensId(id, 1, baseLens);
+}
+
+/** Previous built-in lens id for the **Shift+E** cycle. */
+export function prevLensId(id: string, baseLens?: string): string {
+  return stepLensId(id, -1, baseLens);
+}
+
+function stepLensId(id: string, dir: 1 | -1, baseLens?: string): string {
   const from = baseLens ?? id;
   const idx = BUILTIN_LENSES.findIndex((l) => l.id === from);
-  return BUILTIN_LENSES[(idx + 1) % BUILTIN_LENSES.length].id;
+  const n = BUILTIN_LENSES.length;
+  return BUILTIN_LENSES[(idx + dir + n) % n].id;
 }
 
 /** Lens source names for the "wait for analysis" gate; tags waits on nothing. */

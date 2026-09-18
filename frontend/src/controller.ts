@@ -17,7 +17,6 @@ import type {
 import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
-import { showScopeLensMenu } from "./lib/scope-menu";
 import {
   CommandManager,
   RenameTagCommand,
@@ -208,11 +207,10 @@ export class Controller {
       stopPreview: () => this._stopPreview(),
       // Viewport moves (focus/homing) tween on the shared canvas frame.
       tweenViewport: (target) => this.embedding.tweenViewport(target),
-      // A scope's lens is a deliberate second step; the picker owns the menu DOM.
-      openScopePicker: (scope, screen) =>
-        showScopeLensMenu(screen, (lensId) => {
-          void this.embedding.openScope(scope, lensId);
-        }),
+      // The scope's lens is switched from its on-canvas tab bar.
+      openScope: (scope, lensId) => void this.embedding.openScope(scope, lensId),
+      setScopeLens: (lensId) => void this.embedding.setScopeLens(lensId),
+      resizeScope: (r) => void this.embedding.resizeScope(r),
       closeScope: () => this.embedding.closeScope(),
     });
 
@@ -803,7 +801,9 @@ export class Controller {
 
     hk.on("undo", () => void this.cmdMgr.undo(m));
 
-    hk.on("toggle-view", () => void this.embedding.cycleLens());
+    hk.on("toggle-view", () => void this.embedding.cycleLens(1));
+
+    hk.on("toggle-view-prev", () => void this.embedding.cycleLens(-1));
 
     hk.on("toggle-clusters", () => this.analysis.toggleColorByCluster());
 
