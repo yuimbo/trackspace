@@ -370,8 +370,10 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         return sorted(results)
 
 
-    def _list_mp3s(folder_vpath: str, recursive: bool = False) -> list[str]:
-        return list_mp3s_service(folder_vpath, state.roots, recursive)
+    def _list_mp3s(
+        folder_vpath: str, recursive: bool = False, *, root_ids=None
+    ) -> list[str]:
+        return list_mp3s_service(folder_vpath, state.roots, recursive, root_ids=root_ids)
 
 
     def _folder_tree(root: str, root_id: str, rel_prefix: str = "") -> dict:
@@ -449,9 +451,17 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         return parse_projection_params(req, default_when_no_method=default_when_no_method)
 
 
-    def _build_track_infos(folder_vpath: str, recursive: bool) -> list[dict]:
-        """Build lightweight track info dicts with path + fingerprint for embedding ops."""
-        paths = _list_mp3s(folder_vpath, recursive)
+    def _build_track_infos(
+        folder_vpath: str, recursive: bool, *, include_external: bool = True
+    ) -> list[dict]:
+        """Build lightweight track info dicts with path + fingerprint for embedding ops.
+
+        *include_external* False scopes an all-roots walk to the library roots
+        only, so external tracks do not enter the default projection (they are
+        still analysed; the External toggle requests them explicitly).
+        """
+        root_ids = None if include_external else _library_root_ids()
+        paths = _list_mp3s(folder_vpath, recursive, root_ids=root_ids)
         infos = []
         for p, info in iter_parallel_reads(
             paths, read_fn=_cached_read_all, executor=state.thread_pool,
@@ -556,11 +566,15 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         priority_paths: list[str] | None = None,
         force: bool = False,
         kinds: tuple[str, ...] | None = None,
+        revive_failed: bool = False,
     ) -> dict[str, int]:
         """Queue per-track analysis and wake the workers.
 
         *kinds* restricts the request to specific stages (the coverage panel's
         per-stage retrigger); ``None`` means every per-track stage.
+        *revive_failed* also revives terminally-failed jobs — explicit user
+        retriggers and the version-purge backfill set it; the frontend's automatic
+        keep-warm generate does not.
         """
         queued = enqueue_library_work(
             state.job_queue,
@@ -569,6 +583,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             kinds=kinds or (KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP),
             priority_paths=priority_paths or [],
             force=force,
+            revive_failed=revive_failed,
         )
         state.workers.wake()
         return queued
@@ -587,7 +602,9 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         kinds = _kinds_for_purged_sources(purged)
         if not kinds:
             return {}
-        return _enqueue_analysis(infos=_build_track_infos("", True), kinds=kinds)
+        return _enqueue_analysis(
+            infos=_build_track_infos("", True), kinds=kinds, revive_failed=True
+        )
 
 
     def _register_workers() -> None:
@@ -702,6 +719,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             projection_query_fingerprint=_embedding_projection_query_fingerprint,
             parse_projection_params_fn=_parse_projection_params,
             build_track_infos_fn=_build_track_infos,
+            library_root_ids=_library_root_ids,
             broadcast_embed_event=_broadcast_embed_event,
             emit_decode_warning_once=_emit_decode_warning_once,
             broadcaster=state.embed_broadcaster,

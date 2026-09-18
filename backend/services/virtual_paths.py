@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 
 
@@ -61,11 +61,27 @@ def list_mp3s_under_abs(folder: str, recursive: bool = False) -> list[str]:
     return sorted(results)
 
 
-def list_mp3s(folder_vpath: str, roots: Mapping[str, str], recursive: bool = False) -> list[str]:
-    """Return absolute mp3 paths for one virtual folder, or all roots when empty."""
+def list_mp3s(
+    folder_vpath: str,
+    roots: Mapping[str, str],
+    recursive: bool = False,
+    *,
+    root_ids: Iterable[str] | None = None,
+) -> list[str]:
+    """Return absolute mp3 paths for one virtual folder, or all roots when empty.
+
+    *root_ids* limits the empty-folder (all-roots) case to those roots — the
+    projection passes the library roots so external roots are not walked at all.
+    A specific folder is always resolved as given.
+    """
     if folder_vpath in ("", "."):
+        selected = (
+            roots
+            if root_ids is None
+            else {rid: roots[rid] for rid in root_ids if rid in roots}
+        )
         results: list[str] = []
-        for root_abs in roots.values():
+        for root_abs in selected.values():
             results.extend(list_mp3s_under_abs(root_abs, recursive=True))
         return sorted(results)
     return list_mp3s_under_abs(resolve_virtual_path(folder_vpath, roots), recursive)

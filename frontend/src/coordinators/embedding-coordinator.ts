@@ -404,10 +404,14 @@ export class EmbeddingCoordinator {
   private _projectionQueryString(methodOverride?: string): string {
     const method = methodOverride ?? "tsne";
     const base = `folder=&recursive=1&method=${method}`;
+    // External roots are laid out only on request: the default map is the library.
+    const ext = this.deps.model.showExternal ? "&include_external=1" : "";
     // Only append weights when they differ from the defaults: the default query
     // key must stay stable so existing cached layouts remain valid.
     const w = this.deps.model.clusterWeights;
-    return _weightsAreDefault(w) ? base : `${base}&w=${_encodeWeights(w)}`;
+    return _weightsAreDefault(w)
+      ? `${base}${ext}`
+      : `${base}&w=${_encodeWeights(w)}${ext}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.

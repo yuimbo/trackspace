@@ -711,12 +711,16 @@ describe("AnalysisCoordinator coverage panel", () => {
   });
 
   it("flags terminal failures so a short bar is not mistaken for pending", async () => {
-    const { coord, model } = makeHarness((url) =>
-      url.startsWith("/api/embeddings/status") ? COVERAGE : {},
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status")
+        ? {
+            ...COVERAGE,
+            tracks_with_structure: 6,
+            tracks_pending_structure: 0,
+            tracks_failed_structure: 4,
+          }
+        : {},
     );
-    model.queueStatus = {
-      kinds: { structure: { failed: 4 } },
-    } as unknown as typeof model.queueStatus;
 
     await coord.fetchCoverage();
 

@@ -85,8 +85,40 @@ def tracks_with_fp_in_maps(
 def pending_tracks_for_source(
     fingerprinted_tracks: int,
     embedded_tracks: int,
+    failed_tracks: int = 0,
 ) -> int:
-    return fingerprinted_tracks - embedded_tracks
+    """Outstanding tracks for one source.
+
+    *failed_tracks* are tracks whose stage job is terminally failed (retries
+    exhausted). Nothing will run them again without an explicit retrigger, so counting
+    them as pending would leave the bar short forever — and, because the map's
+    "analysis ready" gate keys on these counts, would keep the frontend from ever
+    fetching the real t-SNE layout.
+    """
+    return max(0, fingerprinted_tracks - embedded_tracks - failed_tracks)
+
+
+def failed_track_count(
+    infos: list[dict],
+    maps: CachedSourceMaps,
+    source: str,
+    failed_fingerprints: set[str] | None,
+) -> int:
+    """Tracks whose *source* job terminally failed and have no cached row.
+
+    Counting in *track* space (not unique fingerprints) matches
+    :func:`pending_tracks_for_source`; a failure whose fingerprint is already
+    cached via another path is not a gap and is ignored.
+    """
+    if not failed_fingerprints:
+        return 0
+    have = maps.for_source(source)
+    return sum(
+        1
+        for t in infos
+        if t.get("fingerprint") in failed_fingerprints
+        and t["fingerprint"] not in have
+    )
 
 
 def eligible_paths_for_projection(
@@ -146,10 +178,17 @@ def coverage_payload(
     infos: list[dict],
     maps: CachedSourceMaps,
     versions: SourceVersions,
+    failed_by_source: Mapping[str, set[str]] | None = None,
 ) -> dict:
-    """Stats for ``/api/embeddings/status`` (explicit + legacy field names)."""
+    """Stats for ``/api/embeddings/status`` (explicit + legacy field names).
+
+    *failed_by_source* maps a source name to the fingerprints whose stage job
+    terminally failed (see :func:`failed_track_count`); those tracks are reported
+    as failed, not pending.
+    """
     total = len(infos)
     fingerprinted = sum(1 for t in infos if t.get("fingerprint"))
+    failed = failed_by_source or {}
 
     tracks_with_clap = tracks_with_fp_in_maps(infos, maps, "clap")
     tracks_with_features = tracks_with_fp_in_maps(infos, maps, "features")
@@ -158,28 +197,52 @@ def coverage_payload(
     tracks_with_supervised = tracks_with_fp_in_maps(infos, maps, "supervised")
     tracks_with_structure = tracks_with_fp_in_maps(infos, maps, "structure")
 
-    pending_clap = pending_tracks_for_source(fingerprinted, tracks_with_clap)
-    pending_features = pending_tracks_for_source(fingerprinted, tracks_with_features)
-    pending_maest = pending_tracks_for_source(fingerprinted, tracks_with_maest)
-    pending_rhythm = pending_tracks_for_source(fingerprinted, tracks_with_rhythm)
-    pending_supervised = pending_tracks_for_source(fingerprinted, tracks_with_supervised)
-    pending_structure = pending_tracks_for_source(fingerprinted, tracks_with_structure)
+    def pending(source: str, embedded: int) -> int:
+        return pending_tracks_for_source(
+            fingerprinted,
+            embedded,
+            failed_track_count(infos, maps, source, failed.get(source)),
+        )
+
+    pending_clap = pending("clap", tracks_with_clap)
+    pending_features = pending("features", tracks_with_features)
+    pending_maest = pending("maest", tracks_with_maest)
+    pending_rhythm = pending("rhythm", tracks_with_rhythm)
+    pending_supervised = pending("supervised", tracks_with_supervised)
+    pending_structure = pending("structure", tracks_with_structure)
+
+    failed_clap = failed_track_count(infos, maps, "clap", failed.get("clap"))
+    failed_features = failed_track_count(infos, maps, "features", failed.get("features"))
+    failed_maest = failed_track_count(infos, maps, "maest", failed.get("maest"))
+    failed_rhythm = failed_track_count(infos, maps, "rhythm", failed.get("rhythm"))
+    failed_supervised = failed_track_count(
+        infos, maps, "supervised", failed.get("supervised")
+    )
+    failed_structure = failed_track_count(
+        infos, maps, "structure", failed.get("structure")
+    )
 
     return {
         "tracks_total": total,
         "tracks_with_fingerprint": fingerprinted,
         "tracks_with_clap": tracks_with_clap,
         "tracks_pending_clap": pending_clap,
+        "tracks_failed_clap": failed_clap,
         "tracks_with_audio_features": tracks_with_features,
         "tracks_pending_audio_features": pending_features,
+        "tracks_failed_audio_features": failed_features,
         "tracks_with_maest": tracks_with_maest,
         "tracks_pending_maest": pending_maest,
+        "tracks_failed_maest": failed_maest,
         "tracks_with_rhythm": tracks_with_rhythm,
         "tracks_pending_rhythm": pending_rhythm,
+        "tracks_failed_rhythm": failed_rhythm,
         "tracks_with_supervised": tracks_with_supervised,
         "tracks_pending_supervised": pending_supervised,
+        "tracks_failed_supervised": failed_supervised,
         "tracks_with_structure": tracks_with_structure,
         "tracks_pending_structure": pending_structure,
+        "tracks_failed_structure": failed_structure,
         "cache_versions": {
             "clap": versions.clap,
             "audio_features": versions.features,

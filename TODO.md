@@ -117,6 +117,21 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Backend
 
+- [ ] **The map's "analysis ready" gate spans external roots.** `ensureAndProject`
+      (`frontend/src/coordinators/embedding-coordinator.ts`) keys on
+      `tracks_pending_maest/rhythm` across *all* roots, but the default layout is
+      library-only. A large external root being analysed still holds the map on the PCA
+      preview even though none of its tracks are in the default fit. Scope the gate to
+      library tracks, or fetch the layout once the library slice is complete.
+- [ ] **Clustering still includes external roots.** `/api/clusters` and `ClusterStore`
+      build over every root, while the default 2-D layout is library-only. Decide
+      whether cluster assignments and cluster colouring should follow the projection
+      scope or stay whole-library (the supervised head already learns from library
+      folders only).
+- [ ] **mlx-vis point cap.** Above `TRACKSPACE_MLX_TSNE_MAX_POINTS` (default 10000)
+      the map silently falls back to the PCA-reduced sklearn path; the library is now
+      ~15.4k. Re-benchmark mlx-vis vs sklearn at that size and either raise the cap
+      or accept the fallback.
 - [ ] **`services/analysis_pipeline.py` — split if it grows again.** Handlers are
       already one factory function per stage; the cluster store and the enqueue helpers
       are the natural next seams.
@@ -129,10 +144,6 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       and its raw fingerprint is discarded (only the hash is kept). If chromaprint can
       expose its 16-band frame image, the envelope could ride the scan pass and the
       structure stage would need no decode at all.
-- [ ] **Structure coverage in `/api/embeddings/status`.** Deliberately omitted (the
-      queue's per-kind stats already report structure progress, and `SourceVersions`
-      feeds the layout revision hash, where a metadata-only source must not appear).
-      Add a separate count if the status UI ever needs it.
 
 ## Product roadmap (analysis)
 

@@ -4,7 +4,7 @@ These build the real library and embeddings blueprints with real service
 implementations (virtual paths, track payload, coverage, layout revision) over two
 temporary library roots. Only the expensive/unrelated edges are stubbed: tag reads
 return fake fingerprints instead of running fpcalc, model handles report "not ready",
-and projection is a no-op.
+and projection echoes the infos it was scoped to.
 
 The invariant under test: any route that takes an empty ``folder`` must cover *every*
 registered root, not just the first/default one — and scoping to one root must never
@@ -46,13 +46,18 @@ class _FakeQueue:
     def stats_by_kind(self):
         return {}
 
+    def failed_keys_by_kind(self):
+        return {}
+
 
 class _FakeEmbeddings:
     def is_model_ready(self) -> bool:
         return False
 
-    def compute_projection(self, *_a, **_k) -> list:
-        return []
+    def compute_projection(self, infos, *_a, **_k) -> list:
+        # Echo the infos the route scoped for us, so a test can assert which
+        # roots made it into the layout.
+        return [{"path": t["path"], "x": 0.0, "y": 0.0} for t in infos]
 
 
 class _FakeMaest:
@@ -114,8 +119,13 @@ def client(roots, tmp_path):
     def virtual_from_abs_fn(path: str) -> str:
         return virtual_from_abs(path, roots_map)
 
-    def build_infos(folder: str, recursive: bool) -> list[dict]:
-        paths = list_mp3s_fn(folder, recursive)
+    def build_infos(
+        folder: str, recursive: bool, *, include_external: bool = True, **_kw
+    ) -> list[dict]:
+        # Root "b" stands in for an external root here, so the default layout
+        # walks root "a" only.
+        root_ids = None if include_external else ["a"]
+        paths = list_mp3s(folder, roots_map, recursive, root_ids=root_ids)
         infos = []
         for p, info in iter_parallel_reads(
             paths, read_fn=cached_read_all, executor=executor
@@ -176,6 +186,7 @@ def client(roots, tmp_path):
         projection_query_fingerprint=embedding_projection_query_fingerprint,
         parse_projection_params_fn=parse_projection_params,
         build_track_infos_fn=build_infos,
+        library_root_ids=lambda: ["a"],
         resolve_virtual_path=lambda rel: rel,
         virtual_from_abs_path=virtual_from_abs_fn,
         broadcast_embed_event=lambda _e: None,
@@ -266,12 +277,41 @@ def test_status_with_empty_folder_is_zero_not_error(client):
     assert body["tracks_pending_maest"] == 0
 
 
-def test_projection_empty_folder_covers_all_roots(client):
+def test_projection_empty_folder_covers_library_roots(client):
+    """The default layout fits "my library" roots only (root b is external)."""
     r = client.get("/api/embeddings/projection")
     assert r.status_code == 200
     body = r.get_json()
-    assert body["positions"] == []
+    assert {p["path"] for p in body["positions"]} == {
+        "a/one.mp3",
+        "a/sub/deep.mp3",
+        "a/shared/a_only.mp3",
+    }
     assert "revision" in body
+
+
+def test_projection_include_external_covers_all_roots(client):
+    r = client.get("/api/embeddings/projection?include_external=1")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert {p["path"] for p in body["positions"]} == {
+        "a/one.mp3",
+        "a/sub/deep.mp3",
+        "a/shared/a_only.mp3",
+        "b/two.mp3",
+        "b/shared/three.mp3",
+        "b/shared/b_only.mp3",
+    }
+
+
+def test_list_mp3s_root_ids_limits_all_roots_walk(roots):
+    assert len(list_mp3s("", roots, recursive=True)) == 6
+    scoped = list_mp3s("", roots, recursive=True, root_ids=["a"])
+    assert {os.path.basename(p) for p in scoped} == {
+        "one.mp3",
+        "deep.mp3",
+        "a_only.mp3",
+    }
 
 
 def test_projection_with_empty_folder_is_empty_not_error(client):

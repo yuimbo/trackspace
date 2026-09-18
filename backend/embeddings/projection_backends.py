@@ -176,6 +176,24 @@ def _mlx_tsne_max_points() -> int:
     return v
 
 
+def _sklearn_tsne_pca_dim(n_features: int) -> int | None:
+    """PCA width to pre-reduce to before the scikit-learn t-SNE fallback.
+
+    Raw composite vectors are ~2,000-D; Barnes-Hut t-SNE on that directly is
+    minutes-slow at library scale, long enough that the real layout never lands and
+    the map stays on the PCA preview. The openTSNE path already reduces to 50, so
+    mirror it here. Set ``TRACKSPACE_SKLEARN_TSNE_PCA_DIM=0`` to disable.
+    """
+    raw = os.environ.get("TRACKSPACE_SKLEARN_TSNE_PCA_DIM", "50").strip()
+    try:
+        dim = int(raw)
+    except ValueError:
+        dim = 50
+    if dim <= 0 or n_features < 2:
+        return None
+    return max(2, min(dim, n_features - 1))
+
+
 def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     if _use_cuml_projection():
@@ -223,7 +241,9 @@ def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
                 log.warning("mlx-vis t-SNE failed; using scikit-learn: %s", e)
                 _mlx_vis_projection_enabled = False
     from sklearn.manifold import TSNE  # lazy — heavy import
-    perplexity = min(30.0, max(5.0, (len(mat) - 1) / 3.0))
+    pca_dim = _sklearn_tsne_pca_dim(int(np.asarray(mat).shape[1]))
+    reduced = mat if pca_dim is None else _pca_reduce(mat, pca_dim)[0]
+    perplexity = min(30.0, max(5.0, (len(reduced) - 1) / 3.0))
     reducer = TSNE(
         n_components=2,
         perplexity=perplexity,
@@ -231,7 +251,7 @@ def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
         init="pca",
         random_state=42,
     )
-    return reducer.fit_transform(mat)
+    return reducer.fit_transform(reduced)
 
 
 # ─── openTSNE incremental t-SNE (prototype) ───────────────────

@@ -75,7 +75,8 @@ class TrackspaceBlueprintDeps:
     track_infos_cached: Callable[[str, bool, str], list[dict[str, Any]]]
     projection_query_fingerprint: Callable[[Any], str]
     parse_projection_params_fn: Callable[..., Any]
-    build_track_infos_fn: Callable[[str, bool], list[dict[str, Any]]]
+    build_track_infos_fn: Callable[..., list[dict[str, Any]]]
+    library_root_ids: Callable[[], list[str]]
     broadcast_embed_event: Callable[[dict[str, Any]], None]
     emit_decode_warning_once: Callable[[str, str, set[str]], None]
     broadcaster: Any
@@ -141,6 +142,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             projection_query_fingerprint=deps.projection_query_fingerprint,
             parse_projection_params_fn=deps.parse_projection_params_fn,
             build_track_infos_fn=deps.build_track_infos_fn,
+            library_root_ids=deps.library_root_ids,
             resolve_virtual_path=deps.resolve_virtual_path,
             virtual_from_abs_path=deps.virtual_from_abs,
             broadcast_embed_event=deps.broadcast_embed_event,

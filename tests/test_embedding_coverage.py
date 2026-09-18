@@ -46,6 +46,47 @@ def test_coverage_payload_reports_structure():
     assert p["cache_versions"]["structure"] == 3
 
 
+def test_coverage_pending_excludes_terminal_failures():
+    """A terminally-failed stage is failed, not pending.
+
+    Pending must reach zero once everything is either analysed or failed, or the
+    frontend's "analysis ready" gate never opens and the map stays on the PCA
+    preview instead of fetching the real t-SNE layout.
+    """
+    maps = CachedSourceMaps(clap={}, features={})
+    infos = [
+        {"path": "a.mp3", "fingerprint": "fp1"},
+        {"path": "b.mp3", "fingerprint": "fp2"},
+    ]
+    p = coverage_payload(
+        infos,
+        maps,
+        SourceVersions(2, 1, 1),
+        failed_by_source={"clap": {"fp1"}, "features": {"fp1"}},
+    )
+    assert p["tracks_pending_clap"] == 1
+    assert p["tracks_failed_clap"] == 1
+    assert p["tracks_pending_audio_features"] == 1
+    assert p["tracks_failed_audio_features"] == 1
+
+
+def test_coverage_failure_covered_by_duplicate_is_not_a_gap():
+    """A failed path whose fingerprint is cached via another path is not failed."""
+    maps = CachedSourceMaps(clap={"fp1": object()}, features={})
+    infos = [
+        {"path": "a.mp3", "fingerprint": "fp1"},
+        {"path": "b.mp3", "fingerprint": "fp1"},
+    ]
+    p = coverage_payload(
+        infos,
+        maps,
+        SourceVersions(2, 1, 1),
+        failed_by_source={"clap": {"fp1"}},
+    )
+    assert p["tracks_pending_clap"] == 0
+    assert p["tracks_failed_clap"] == 0
+
+
 def test_eligible_paths_requires_all_sources():
     maps = CachedSourceMaps(
         clap={"fp1": object()},

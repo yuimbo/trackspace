@@ -62,7 +62,8 @@ def create_api_embeddings_blueprint(
     track_infos_cached: Callable[[str, bool, str], list[dict[str, Any]]],
     projection_query_fingerprint: Callable[[Any], str],
     parse_projection_params_fn: Callable[..., Any],
-    build_track_infos_fn: Callable[[str, bool], list[dict[str, Any]]],
+    build_track_infos_fn: Callable[..., list[dict[str, Any]]],
+    library_root_ids: Callable[[], list[str]],
     resolve_virtual_path: Callable[[str], str],
     virtual_from_abs_path: Callable[[str], str],
     broadcast_embed_event: Callable[[dict[str, Any]], None],
@@ -155,6 +156,35 @@ def create_api_embeddings_blueprint(
         )
         return running, ({"done": done, "total": total} if total else None)
 
+    def _failed_fingerprints(infos: list[dict[str, Any]]) -> dict[str, set[str]]:
+        """Source name → fingerprints whose stage job terminally failed.
+
+        The queue keys on track path, so map back through *infos*. A failed track
+        that has a cache row anyway (a duplicate fingerprint analysed via another
+        path) is left in — coverage ignores failures already covered.
+        """
+        by_kind = job_queue.failed_keys_by_kind()
+        if not by_kind:
+            return {}
+        fp_by_path = {
+            t["path"]: t["fingerprint"] for t in infos if t.get("fingerprint")
+        }
+        sources_by_kind = {
+            KIND_FEATURES: ("features", "rhythm"),
+            KIND_MAEST: ("maest",),
+            KIND_CLAP: ("clap",),
+            KIND_STRUCTURE: ("structure",),
+        }
+        out: dict[str, set[str]] = {}
+        for kind, sources in sources_by_kind.items():
+            keys = by_kind.get(kind)
+            if not keys:
+                continue
+            fps = {fp_by_path[k] for k in keys if k in fp_by_path}
+            for source in sources:
+                out.setdefault(source, set()).update(fps)
+        return out
+
     @bp.route("/api/embeddings/status")
     def api_embeddings_status():
         if request.args.get("models_only") == "1":
@@ -177,14 +207,34 @@ def create_api_embeddings_blueprint(
 
         running, progress = _analysis_progress()
 
+        def _scope_infos(all_infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            """Infos in the default projection scope.
+
+            External roots are analysed (and covered) like library roots, but stay
+            out of the layout unless the client asks for them explicitly, so the
+            revision must match the projection's track set.
+            """
+            if request.args.get("include_external") == "1":
+                return all_infos
+            ids = set(library_root_ids())
+            return [t for t in all_infos if t["path"].split("/", 1)[0] in ids]
+
         def _compute() -> tuple[dict[str, Any], str | None]:
             fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
             maps = batch_fetch_maps(feature_cache, fps, versions)
             proj = parse_projection_params_fn(request, default_when_no_method=False)
             return (
-                coverage_payload(infos, maps, versions),
+                coverage_payload(
+                    infos,
+                    maps,
+                    versions,
+                    failed_by_source=_failed_fingerprints(infos),
+                ),
                 layout_revision_for_projection(
-                    infos, maps, proj, cache_versions=_version_tuple(versions)
+                    _scope_infos(infos),
+                    maps,
+                    proj,
+                    cache_versions=_version_tuple(versions),
                 ),
             )
 
@@ -248,6 +298,11 @@ def create_api_embeddings_blueprint(
             priority_paths=priority_paths,
             force=opt_bool(data, "force", False),
             kinds=tuple(stages) or None,
+            # An explicit stage / per-track / force retrigger is the user asking
+            # for failed jobs again; the frontend's automatic keep-warm generate
+            # (no stages, no paths, no force) must not revive them, or a broken
+            # file would be retried on every enqueue forever.
+            revive_failed=bool(stages or paths or opt_bool(data, "force", False)),
         )
         return jsonify({"ok": True, "queued": queued})
 
@@ -282,7 +337,12 @@ def create_api_embeddings_blueprint(
     def api_embeddings_projection():
         rel = request.args.get("folder", "")
         recursive = request.args.get("recursive", "1") == "1"
-        infos = build_track_infos_fn(rel, recursive)
+        # External roots stay out of the default layout; the External toggle
+        # requests them explicitly with include_external=1.
+        include_external = request.args.get("include_external") == "1"
+        infos = build_track_infos_fn(
+            rel, recursive, include_external=include_external
+        )
 
         proj = parse_projection_params_fn(request, default_when_no_method=True)
 

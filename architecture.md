@@ -220,10 +220,12 @@ recomputed on load (`services/roots_registry.py`). Each root carries a role:
 - **`library`** (default) — the user's own tracks; the canvas, tags, search and the
   supervised head's *labels* all use these.
 - **`external`** — downloads, reference material, or an imprint target. External roots
-  are scanned, analysed, embedded and laid out exactly like library roots (the
-  fingerprint-keyed `FeatureCache` never cares where a file lives), but the frontend
-  keeps their tracks out of the default view (`Model.trackInViewUnion`) until "External"
-  is toggled on, and the head does not learn from their folder labels by default.
+  are scanned, analysed and embedded exactly like library roots (the fingerprint-keyed
+  `FeatureCache` never cares where a file lives), but they stay out of the default
+  projection: `/api/embeddings/projection` walks the library roots only unless the
+  request carries `include_external=1`, which the frontend sends when the "External"
+  toggle is on. The toggle also gates their visibility (`Model.trackInViewUnion`), and
+  the head does not learn from their folder labels by default.
   Because analysis is content-addressed, marking a root external — or removing it —
   never discards its cached embeddings; re-adding restores it instantly.
 

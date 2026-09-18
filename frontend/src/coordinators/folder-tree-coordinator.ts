@@ -32,6 +32,8 @@ export interface FolderTreeDeps {
   renderTagPanels(): void;
   /** Reload library + tree after a root was added or removed. */
   onRootsChanged(): Promise<void>;
+  /** Refetch the map after the external-root layout scope changed. */
+  refreshProjection?(): Promise<void> | void;
   /** Prefill the imprint target with a root's absolute path. */
   onImprintRoot?(absPath: string): void;
 }
@@ -75,6 +77,9 @@ export class FolderTreeCoordinator {
     $toggle.addEventListener("change", () => {
       this.deps.model.setShowExternal($toggle.checked);
       this.deps.model.saveLS();
+      // The default layout fits library roots only; showing externals needs a
+      // layout that actually contains them.
+      void this.deps.refreshProjection?.();
     });
   }
 

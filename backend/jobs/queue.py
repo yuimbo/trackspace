@@ -207,13 +207,20 @@ class JobQueue:
         priority: int = 100,
         max_attempts: int | None = None,
         requeue_terminal: bool = False,
+        requeue_failed: bool = False,
     ) -> int:
         """Insert ``(dedupe_key, payload)`` pairs; return the number newly queued.
 
         Existing *pending* or *running* rows are left untouched — the work is
-        already scheduled. Rows in a terminal state are revived only when
+        already scheduled. Rows in a terminal state are revived when
         *requeue_terminal* is set (used by "force re-analyse"), which also
         resets ``attempts`` so a previously exhausted job gets a clean budget.
+
+        *requeue_failed* additionally revives ``failed`` rows. Leave it off for
+        automatic keep-warm enqueues: a genuinely broken file would otherwise be
+        retried on every enqueue, forever, and its permanent failure would keep
+        reading as outstanding work. Explicit user retriggers (a stage, a track, or
+        force) and the startup version-purge backfill set it.
         """
         now = time.time()
         attempts_cap = self._max_attempts if max_attempts is None else int(max_attempts)
@@ -240,7 +247,10 @@ class JobQueue:
 
             if requeue_terminal:
                 keys = [key for key, _ in items] if isinstance(items, list) else [r[1] for r in rows]
-                revived = self._reset_keys(conn, kind, keys, now, priority, attempts_cap)
+                states = ("done", "failed") if requeue_failed else ("done",)
+                revived = self._reset_keys(
+                    conn, kind, keys, now, priority, attempts_cap, states
+                )
                 inserted += revived
 
         if inserted:
@@ -255,8 +265,12 @@ class JobQueue:
         now: float,
         priority: int,
         attempts_cap: int,
+        states: Sequence[str],
     ) -> int:
         """Move terminal rows back to pending. Caller holds the transaction."""
+        if not states:
+            return 0
+        state_placeholders = ",".join("?" for _ in states)
         total = 0
         for chunk_start in range(0, len(keys), 500):
             chunk = keys[chunk_start : chunk_start + 500]
@@ -268,9 +282,9 @@ class JobQueue:
                        lease_owner=NULL, lease_expires=NULL,
                        priority=?, max_attempts=?, updated_at=?
                  WHERE kind=? AND dedupe_key IN ({placeholders})
-                   AND state IN ('done','failed')
+                   AND state IN ({state_placeholders})
                 """,
-                [priority, attempts_cap, now, kind, *chunk],
+                [priority, attempts_cap, now, kind, *chunk, *states],
             )
             total += cur.rowcount or 0
         return total
@@ -530,6 +544,25 @@ class JobQueue:
             }
             for r in rows
         ]
+
+    def failed_keys_by_kind(self) -> dict[str, set[str]]:
+        """Dedupe keys of permanently-failed jobs, grouped by kind.
+
+        Coverage uses this to keep terminal failures out of the *pending* counts: a
+        job that exhausted its retries will not run again without an explicit
+        retrigger, so it is not outstanding work.
+        """
+        try:
+            with self._conn() as conn:
+                rows = conn.execute(
+                    "SELECT kind, dedupe_key FROM jobs WHERE state='failed'"
+                ).fetchall()
+        except Exception:
+            return {}
+        out: dict[str, set[str]] = {}
+        for kind, key in rows:
+            out.setdefault(kind, set()).add(key)
+        return out
 
     def _note_progress(
         self, kind: str, *, path: str | None, ok: bool, detail: dict[str, Any]

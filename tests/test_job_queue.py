@@ -138,6 +138,48 @@ def test_force_requeue_revives_terminal_jobs(q: JobQueue) -> None:
     assert q.stats("maest").done == 0
 
 
+def test_automatic_requeue_does_not_revive_failed_jobs(q: JobQueue) -> None:
+    """A broken file must not be retried by the automatic keep-warm enqueue.
+
+    Only ``done`` rows are revived by default; a terminal failure is a real gap
+    the user must retrigger, or every page load would re-run it forever.
+    """
+    one_shot = JobQueue(q._db_path, max_attempts=1)
+    one_shot.enqueue_many("maest", [("broken", {})])
+    job = one_shot.claim("maest")[0]
+    assert one_shot.fail(job, "decode failed") is False
+    assert one_shot.stats("maest").failed == 1
+
+    one_shot.enqueue_many("maest", [("broken", {})], requeue_terminal=True)
+    assert one_shot.stats("maest").pending == 0
+    assert one_shot.stats("maest").failed == 1
+
+
+def test_explicit_requeue_revives_failed_jobs(q: JobQueue) -> None:
+    """An explicit retrigger (stage / track / force) does get a fresh budget."""
+    one_shot = JobQueue(q._db_path, max_attempts=1)
+    one_shot.enqueue_many("maest", [("broken", {})])
+    one_shot.fail(one_shot.claim("maest")[0], "decode failed")
+
+    one_shot.enqueue_many(
+        "maest", [("broken", {})], requeue_terminal=True, requeue_failed=True
+    )
+    assert one_shot.stats("maest").pending == 1
+    assert one_shot.stats("maest").failed == 0
+
+
+def test_failed_keys_by_kind_groups_permanently_failed(q: JobQueue) -> None:
+    one_shot = JobQueue(q._db_path, max_attempts=1)
+    _enqueue(one_shot, "maest", 2)
+    _enqueue(one_shot, "features", 1)
+    one_shot.fail(one_shot.claim("maest")[0], "boom")
+    one_shot.fail(one_shot.claim("features")[0], "boom")
+    by_kind = one_shot.failed_keys_by_kind()
+    assert by_kind["maest"] == {"k0"}
+    assert by_kind["features"] == {"k0"}
+    assert by_kind.get("structure") is None
+
+
 def test_stats_by_kind_separates_pipelines(q: JobQueue) -> None:
     _enqueue(q, "maest", 3)
     _enqueue(q, "features", 2)

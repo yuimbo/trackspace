@@ -1574,6 +1574,7 @@ def enqueue_library_work(
     kinds: Sequence[str] = (KIND_FEATURES, KIND_MAEST),
     priority_paths: Sequence[str] = (),
     force: bool = False,
+    revive_failed: bool = False,
 ) -> dict[str, int]:
     """Queue per-track analysis for tracks that still need it.
 
@@ -1581,12 +1582,16 @@ def enqueue_library_work(
     outstanding work rather than the whole library — which is what makes the
     progress numbers meaningful.
 
-    A track that is in that filtered list always gets a runnable job: a *terminal*
-    queue row for it (``done``/``failed``) is revived, because the cache — not the
-    queue — is the source of truth. Without this a source-version bump (which blanks
-    the stale rows on load) would never re-queue its backfill: the cache says the
-    work is missing while the queue still calls it done. *force* only widens the
-    cache filter to include already-cached tracks.
+    A track that is in that filtered list always gets a runnable job: a *done*
+    queue row for it is revived, because the cache — not the queue — is the source
+    of truth. Without this a source-version bump (which blanks the stale rows on
+    load) would never re-queue its backfill: the cache says the work is missing
+    while the queue still calls it done. *force* only widens the cache filter to
+    include already-cached tracks.
+
+    *revive_failed* additionally revives terminally-failed rows. Automatic
+    keep-warm enqueues leave it off so a genuinely broken file is not retried on
+    every call; explicit retriggers and the version-purge backfill set it.
     """
     fc = deps.feature_cache
     queued: dict[str, int] = {}
@@ -1650,7 +1655,11 @@ def enqueue_library_work(
             )
         ]
         queued[KIND_FEATURES] = queue.enqueue_many(
-            KIND_FEATURES, items, priority=100, requeue_terminal=True
+            KIND_FEATURES,
+            items,
+            priority=100,
+            requeue_terminal=True,
+            requeue_failed=revive_failed,
         )
 
     if KIND_MAEST in kinds:
@@ -1665,7 +1674,11 @@ def enqueue_library_work(
             )
         ]
         queued[KIND_MAEST] = queue.enqueue_many(
-            KIND_MAEST, items, priority=100, requeue_terminal=True
+            KIND_MAEST,
+            items,
+            priority=100,
+            requeue_terminal=True,
+            requeue_failed=revive_failed,
         )
 
     if KIND_STRUCTURE in kinds:
@@ -1676,7 +1689,11 @@ def enqueue_library_work(
             and (force or t["fingerprint"] not in have_structure)
         ]
         queued[KIND_STRUCTURE] = queue.enqueue_many(
-            KIND_STRUCTURE, items, priority=105, requeue_terminal=True
+            KIND_STRUCTURE,
+            items,
+            priority=105,
+            requeue_terminal=True,
+            requeue_failed=revive_failed,
         )
 
     # CLAP is skipped entirely when the server runs with --no-clap: the worker
@@ -1693,7 +1710,11 @@ def enqueue_library_work(
             )
         ]
         queued[KIND_CLAP] = queue.enqueue_many(
-            KIND_CLAP, items, priority=110, requeue_terminal=True
+            KIND_CLAP,
+            items,
+            priority=110,
+            requeue_terminal=True,
+            requeue_failed=revive_failed,
         )
 
     if priority_paths:

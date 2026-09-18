@@ -451,6 +451,14 @@ full refit). Flipping the default is a product decision.
 PCA is never shown in the UI toggle — it is only used internally for fast intermediate
 projections while embeddings are being generated.
 
+**scikit-learn fallback pre-reduction.** The final fallback (cuML absent, library above
+`TRACKSPACE_MLX_TSNE_MAX_POINTS`) runs scikit-learn t-SNE, which does not reduce
+dimensions itself. Raw composite vectors are ~2,000-D and Barnes-Hut on that directly is
+minutes-slow at library scale — long enough that the real layout never lands and the map
+stays on the PCA preview. The fallback therefore PCA-reduces to
+`TRACKSPACE_SKLEARN_TSNE_PCA_DIM` (default 50) first, mirroring the openTSNE path;
+set it to 0 to disable. cuML and mlx-vis reduce internally and are untouched.
+
 ### Projection caching
 
 Projection results are cached at two levels:
@@ -873,6 +881,20 @@ Two conclusions worth keeping in mind before optimising:
 7. **A `--no-*` flag must also skip its enqueue**, not just eager loading:
    a stage whose model never loads would otherwise leave jobs pending forever
    (the `clap_enabled` gate on `enqueue_library_work`).
+8. **Revive `done` rows on automatic enqueues, `failed` rows only on explicit
+   retries.** A version bump blanks stale cache rows while the durable queue still
+   calls that work `done`, so the backfill must revive those rows. A *failed* row is
+   a broken file: reviving it on every keep-warm enqueue retries it on every page
+   load, forever. Only explicit retriggers (a stage, a track, or `force`) and the
+   startup version-purge backfill set `requeue_failed`.
+
+**Terminal failures are not pending work.** Coverage reports
+`pending = fingerprinted − analysed − terminally-failed` (per source, deduped by
+fingerprint so a failure already covered via a duplicate path is not a gap). The map's
+"analysis ready" gate keys on `tracks_pending_maest/rhythm`: if a permanently broken
+track counted as pending, the gate would never open and the frontend would stay on the
+fast PCA preview instead of fetching the real t-SNE layout. The broken-files panel is
+the actionable list behind the `tracks_failed_*` counts.
 
 `--no-maest` / `--no-clap` skip eager model loading. Flask runs
 with `use_reloader=False`: the reloader would fork a second set of worker

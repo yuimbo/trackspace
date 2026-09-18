@@ -64,16 +64,22 @@ interface CoverageResponse {
   tracks_with_fingerprint?: number;
   tracks_with_clap?: number;
   tracks_pending_clap?: number;
+  tracks_failed_clap?: number;
   tracks_with_audio_features?: number;
   tracks_pending_audio_features?: number;
+  tracks_failed_audio_features?: number;
   tracks_with_rhythm?: number;
   tracks_pending_rhythm?: number;
+  tracks_failed_rhythm?: number;
   tracks_with_maest?: number;
   tracks_pending_maest?: number;
+  tracks_failed_maest?: number;
   tracks_with_supervised?: number;
   tracks_pending_supervised?: number;
+  tracks_failed_supervised?: number;
   tracks_with_structure?: number;
   tracks_pending_structure?: number;
+  tracks_failed_structure?: number;
   generating?: boolean;
 }
 
@@ -387,60 +393,61 @@ export class AnalysisCoordinator {
     if (!host) return;
     const total = d.tracks_total ?? 0;
     const fingerprinted = d.tracks_with_fingerprint ?? 0;
-    const failedFor = (stage: string): number =>
-      this.deps.model.queueStatus?.kinds?.[stage]?.failed ?? 0;
+    // Failures come from the backend, already deduped by fingerprint against the
+    // cache: a stale failure for a duplicate that is actually analysed is not a gap.
     const rows: CoverageRow[] = [
       {
         label: "Audio features",
         stage: "features",
         done: d.tracks_with_audio_features ?? 0,
         pending: d.tracks_pending_audio_features ?? 0,
-        failed: failedFor("features"),
+        failed: d.tracks_failed_audio_features ?? 0,
       },
       {
         label: "Rhythm",
         stage: "features",
         done: d.tracks_with_rhythm ?? 0,
         pending: d.tracks_pending_rhythm ?? 0,
-        failed: failedFor("features"),
+        failed: d.tracks_failed_rhythm ?? 0,
       },
       {
         label: "Structure",
         stage: "structure",
         done: d.tracks_with_structure ?? 0,
         pending: d.tracks_pending_structure ?? 0,
-        failed: failedFor("structure"),
+        failed: d.tracks_failed_structure ?? 0,
       },
       {
         label: "MAEST",
         stage: "maest",
         done: d.tracks_with_maest ?? 0,
         pending: d.tracks_pending_maest ?? 0,
-        failed: failedFor("maest"),
+        failed: d.tracks_failed_maest ?? 0,
       },
       {
         label: "CLAP",
         stage: "clap",
         done: d.tracks_with_clap ?? 0,
         pending: d.tracks_pending_clap ?? 0,
-        failed: failedFor("clap"),
+        failed: d.tracks_failed_clap ?? 0,
       },
       {
         label: "Supervised",
         stage: "supervise",
         done: d.tracks_with_supervised ?? 0,
         pending: d.tracks_pending_supervised ?? 0,
-        failed: failedFor("supervise"),
+        failed: d.tracks_failed_supervised ?? 0,
       },
     ];
 
-    // Per-stage failure counts (deduped: features and rhythm share one stage).
-    // Only a stage with a real gap (`pending > 0`) counts its failures: a drained
-    // stage whose cache is complete can still hold a stale failure row for a duplicate
-    // fingerprint, which must not read as "not fully covered".
+    // Per-stage failure counts (deduped: features and rhythm share one stage, so a
+    // track whose features job failed must count once, not twice).
     const failedByStage = new Map<string, number>();
     for (const row of rows)
-      failedByStage.set(row.stage, row.pending > 0 ? row.failed : 0);
+      failedByStage.set(
+        row.stage,
+        Math.max(failedByStage.get(row.stage) ?? 0, row.failed),
+      );
     const failedTotal = [...failedByStage.values()].reduce((a, b) => a + b, 0);
 
     const summary = document.createElement("div");
@@ -471,10 +478,9 @@ export class AnalysisCoordinator {
       count.className = "analysis-coverage-count";
       count.textContent = `${row.done} / ${total}`;
       if (row.pending > 0) count.classList.add("has-pending");
-      // A drained stage with a short bar is almost always terminal failures, not
-      // pending work: flag the row and point at the retrigger button. A stale
-      // failure on an otherwise complete stage is ignored.
-      const failed = row.pending > 0 ? row.failed : 0;
+      // A short bar with terminal failures is a real gap, not pending work: flag
+      // it and point at the retrigger button.
+      const failed = row.failed;
       if (failed > 0) count.classList.add("has-failed");
 
       const bar = document.createElement("span");

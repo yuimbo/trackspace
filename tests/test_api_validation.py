@@ -202,6 +202,9 @@ class _FakeQueue:
     def failures(self, kind, limit=50):
         return [{"kind": kind, "limit": limit}]
 
+    def failed_keys_by_kind(self):
+        return {}
+
     def retry_failed(self, kind):
         return 0
 
@@ -225,7 +228,7 @@ def jobs_client():
         job_queue=_FakeQueue(),
         workers=_FakeWorkers(),
         clusters=_FakeClusters(),
-        build_track_infos_fn=lambda folder, recursive: [],
+        build_track_infos_fn=lambda folder, recursive, **_k: [],
         enqueue_library_work=lambda *a, **k: {},
         enqueue_clustering=lambda *a, **k: 0,
         enqueue_supervised=lambda *a, **k: 0,
@@ -345,7 +348,8 @@ def embeddings_client():
         track_infos_cached=None,
         projection_query_fingerprint=None,
         parse_projection_params_fn=None,
-        build_track_infos_fn=lambda folder, recursive: [],
+        build_track_infos_fn=lambda folder, recursive, **_k: [],
+        library_root_ids=lambda: [],
         resolve_virtual_path=None,
         virtual_from_abs_path=None,
         broadcast_embed_event=None,
@@ -562,7 +566,7 @@ def rebuild_client():
         job_queue=_FakeQueue(),
         workers=_FakeWorkers(),
         clusters=clusters,
-        build_track_infos_fn=lambda folder, recursive: [],
+        build_track_infos_fn=lambda folder, recursive, **_k: [],
         enqueue_library_work=lambda *a, **k: {},
         enqueue_clustering=_enqueue_clustering,
         enqueue_supervised=lambda *a, **k: 0,
