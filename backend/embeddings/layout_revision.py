@@ -30,6 +30,7 @@ def compute_layout_revision(
     folder_semantic_basis_version: int = FOLDER_SEMANTIC_BASIS_VERSION,
     projection_recipe_version: int = PROJECTION_RECIPE_VERSION,
     weights: Mapping[str, float] | None = None,
+    sources: Sequence[str] | None = None,
 ) -> str:
     """Return a hex SHA-256 of the canonical payload (lexically sorted JSON keys)."""
     payload: dict[str, Any] = {
@@ -37,6 +38,11 @@ def compute_layout_revision(
         "eligible_paths": sorted(eligible_paths),
         "folder_semantic_basis_version": int(folder_semantic_basis_version),
         "projection_recipe_version": int(projection_recipe_version),
+        # Lenses project different source subsets from the same library slice, so
+        # two lenses with the same eligible paths and weights must not share a
+        # revision — the revision-keyed position cache would serve one lens's
+        # coordinates for the other.
+        "sources": sorted(sources or ()),
         # Formatted to 6 significant digits so float repr noise (0.1 vs 0.100000…)
         # cannot fork an otherwise identical configuration into two revisions.
         "source_weights": {

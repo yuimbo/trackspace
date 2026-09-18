@@ -50,8 +50,29 @@ SUPERVISED_INPUT_WEIGHTS: dict[str, float] = {
     k: v for k, v in FROZEN_SOURCE_WEIGHTS.items() if k != "supervised"
 }
 
-#: Sources a track must have before it can be placed on the map.
+#: Sources a track must have before it can be placed on the *combined* map.
 REQUIRED_SOURCES: tuple[str, ...] = ("maest_logits", "maest")
+
+
+def required_sources_for(sources: tuple[str, ...]) -> tuple[str, ...]:
+    """Sources a track must have to be placed in a lens.
+
+    A single-source lens requires exactly its own source: there is no fallback
+    block to zero-fill, so requiring the MAEST pair would hide every track the
+    lens is about.  A multi-source lens keeps the frozen MAEST requirement when
+    it is present, and a lens with no required source at all is rejected — it would
+    place every fingerprinted track and make the "analysis ready" gate meaningless.
+    """
+    srcs = tuple(s for s in sources if s in FROZEN_SOURCES)
+    if len(srcs) == 1:
+        return srcs
+    required = tuple(s for s in REQUIRED_SOURCES if s in srcs)
+    if not required:
+        raise ValueError(
+            "a multi-source projection must include a required source "
+            f"(one of: {', '.join(REQUIRED_SOURCES)})"
+        )
+    return required
 
 # Order: tempo_norm, key_cos, key_sin, mode, energy_norm, danceability — only tempo, energy, dance.
 FROZEN_FEATURE_MASK = np.array([1, 0, 0, 0, 1, 1], dtype=np.float32)

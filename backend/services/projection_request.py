@@ -11,6 +11,7 @@ from backend.embeddings.projection_config import (
     FROZEN_SCALE_FOLDERS,
     FROZEN_SOURCE_WEIGHTS,
     FROZEN_SOURCES,
+    required_sources_for,
 )
 from backend.services.request_validation import ApiValidationError, one_of, weight_map
 from backend.tuning import FROZEN_FEATURES_BLEND
@@ -20,6 +21,9 @@ _METHODS: tuple[str, ...] = ("tsne", "pca", "umap")
 
 #: Query param carrying client source weights: ``w=maest_logits:0.45,maest:0.25,…``.
 _WEIGHTS_PARAM = "w"
+
+#: Query param selecting the lens's source blocks: ``sources=clap``.
+_SOURCES_PARAM = "sources"
 
 
 @dataclass(frozen=True)
@@ -32,7 +36,11 @@ class ProjectionParams:
     features_blend: float
     folder_boost: float
     folder_depth_boost: float
+    #: Source blocks this lens projects. A strict subset is a per-source lens;
+    #: ``FROZEN_SOURCES`` is the combined lens.
     sources: tuple[str, ...]
+    #: Sources a track must have to appear in this lens, derived from ``sources``.
+    required_sources: tuple[str, ...]
     #: Client-supplied source weights (complete vector), or ``None`` for the frozen
     #: defaults. Part of ``layout_revision`` so a re-weighting refits the layout.
     source_weights: dict[str, float] | None = None
@@ -88,7 +96,7 @@ def parse_projection_params(
     *,
     default_when_no_method: bool = False,
 ) -> ProjectionParams:
-    """Parse method (``pca`` preview vs ``tsne``) and optional source weights.
+    """Parse method (``pca`` preview vs ``tsne``), sources, and optional weights.
 
     All other fields are frozen. An unknown ``method`` is rejected with a structured
     400 rather than silently falling back to t-SNE, so client bugs surface instead of
@@ -103,6 +111,9 @@ def parse_projection_params(
         one_of(raw_method, _METHODS, field="method")
         method = "tsne" if raw_method == "umap" else raw_method
 
+    raw_sources = (req.args.get(_SOURCES_PARAM) or "").strip()
+    sources = _parse_sources(raw_sources) if raw_sources else FROZEN_SOURCES
+
     raw_weights = (req.args.get(_WEIGHTS_PARAM) or "").strip()
     source_weights = (
         weight_map(
@@ -115,6 +126,11 @@ def parse_projection_params(
         else None
     )
 
+    try:
+        required_sources = required_sources_for(sources)
+    except ValueError as e:
+        raise ApiValidationError(str(e)) from None
+
     return ProjectionParams(
         method=method,
         tag_names=[],
@@ -124,6 +140,29 @@ def parse_projection_params(
         features_blend=FROZEN_FEATURES_BLEND,
         folder_boost=FROZEN_FOLDER_BOOST,
         folder_depth_boost=FROZEN_FOLDER_DEPTH_BOOST,
-        sources=FROZEN_SOURCES,
+        sources=sources,
+        required_sources=required_sources,
         source_weights=source_weights,
     )
+
+
+def _parse_sources(raw: str) -> tuple[str, ...]:
+    """Parse ``sources=clap,rhythm`` into canonical frozen-source order.
+
+    Unknown names and an empty list are client-safe 400s; a valid list is
+    deduplicated and reordered to the canonical ``FROZEN_SOURCES`` order so two
+    requests that name the same set share one layout revision.
+    """
+    names = [part.strip() for part in raw.split(",") if part.strip()]
+    if not names:
+        raise ApiValidationError(
+            f"field {_SOURCES_PARAM!r} must list at least one source"
+        )
+    for name in names:
+        if name not in FROZEN_SOURCES:
+            raise ApiValidationError(
+                f"field {_SOURCES_PARAM!r} has unknown source {name!r} "
+                f"(allowed: {', '.join(FROZEN_SOURCES)})"
+            )
+    named = set(names)
+    return tuple(s for s in FROZEN_SOURCES if s in named)

@@ -422,6 +422,49 @@ def test_projection_method_unknown_is_400():
         parse_projection_params(_Req({"method": "bogus"}))
 
 
+# ─── projection sources (lenses) ──────────────────────────
+
+
+def test_projection_defaults_to_all_frozen_sources():
+    from backend.embeddings.projection_config import (
+        FROZEN_SOURCES,
+        REQUIRED_SOURCES,
+    )
+
+    p = parse_projection_params(_Req({}))
+    assert p.sources == FROZEN_SOURCES
+    assert p.required_sources == REQUIRED_SOURCES
+
+
+def test_projection_single_source_lens_requires_only_itself():
+    p = parse_projection_params(_Req({"sources": "clap"}))
+    assert p.sources == ("clap",)
+    assert p.required_sources == ("clap",)
+
+
+def test_projection_sources_are_canonicalised():
+    """Two requests naming the same set in different orders share one revision."""
+    from backend.embeddings.projection_config import FROZEN_SOURCES
+
+    p = parse_projection_params(_Req({"sources": "rhythm,maest"}))
+    assert p.sources == tuple(s for s in FROZEN_SOURCES if s in ("maest", "rhythm"))
+    assert p.required_sources == ("maest",)
+
+
+def test_projection_sources_dedupe_and_reject_unknown():
+    assert parse_projection_params(_Req({"sources": "clap,clap"})).sources == ("clap",)
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"sources": "bogus"}))
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"sources": ",,"}))
+
+
+def test_projection_multi_source_without_required_is_400():
+    """A lens with no MAEST block would place every fingerprinted track."""
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"sources": "clap,rhythm"}))
+
+
 # ─── source weights ────────────────────────────────────────
 
 

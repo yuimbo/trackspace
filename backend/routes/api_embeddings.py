@@ -11,10 +11,7 @@ from flask import Blueprint, jsonify, request
 
 from backend.embeddings import landmark_projection as landmark_mod
 from backend.embeddings import supervised as supervised_mod
-from backend.embeddings.projection_config import (
-    FROZEN_SOURCE_WEIGHTS,
-    REQUIRED_SOURCES,
-)
+from backend.embeddings.projection_config import FROZEN_SOURCE_WEIGHTS
 from backend.jobs import (
     KIND_CLAP,
     KIND_FEATURES,
@@ -381,7 +378,7 @@ def create_api_embeddings_blueprint(
             features_blend=proj.features_blend,
             layout_revision=revision,
             source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
-            required_sources=REQUIRED_SOURCES,
+            required_sources=proj.required_sources,
             on_progress=_layout_progress,
         )
 
@@ -401,7 +398,7 @@ def create_api_embeddings_blueprint(
             sources=proj.sources,
             feature_mask=proj.feature_mask,
             features_blend=proj.features_blend,
-            required_sources=REQUIRED_SOURCES,
+            required_sources=proj.required_sources,
             weights0=weights0,
         )
         if model is None:
@@ -422,7 +419,7 @@ def create_api_embeddings_blueprint(
                 features_blend=proj.features_blend,
                 layout_revision=revision,
                 source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
-                required_sources=REQUIRED_SOURCES,
+                required_sources=proj.required_sources,
                 with_jacobian=True,
             )
         else:

@@ -17,14 +17,16 @@ def layout_revision_for_projection(
 ) -> str | None:
     """Compute layout revision for the projection slice.
 
-    *proj* carries the client's source weights (``None`` = frozen defaults), which
-    are part of the revision so a re-weighting invalidates position caches.
+    *proj* carries the lens's sources and the client's source weights (``None`` =
+    frozen defaults), both of which are part of the revision so a different lens or
+    a re-weighting invalidates position caches.
     """
-    eligible = eligible_paths_for_projection(
-        infos, maps, FROZEN_SOURCES, REQUIRED_SOURCES
-    )
+    sources = getattr(proj, "sources", None) or FROZEN_SOURCES
+    required = getattr(proj, "required_sources", None) or REQUIRED_SOURCES
+    eligible = eligible_paths_for_projection(infos, maps, sources, required)
     return compute_layout_revision(
         eligible_paths=eligible,
         cache_versions=tuple(cache_versions),
         weights=getattr(proj, "source_weights", None),
+        sources=sources,
     )

@@ -141,6 +141,15 @@ def test_layout_revision_changes_with_source_weights():
     assert r_default != r_custom
 
 
+def test_layout_revision_changes_with_sources():
+    """Different lenses share the same eligible paths and weights; without the
+    source set in the payload a CLAP lens could serve the combined lens's coords."""
+    kw = _base_revision_kwargs()
+    r_combined = compute_layout_revision(**{**kw, "sources": ("maest_logits", "maest")})
+    r_clap = compute_layout_revision(**{**kw, "sources": ("clap",)})
+    assert r_combined != r_clap
+
+
 def test_layout_revision_stable_for_equivalent_weights():
     kw = _base_revision_kwargs()
     r_a = compute_layout_revision(**{**kw, "weights": {"rhythm": 0.5, "maest": 0.25}})
