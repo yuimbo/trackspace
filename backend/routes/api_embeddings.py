@@ -19,6 +19,7 @@ from backend.jobs import (
     KIND_STRUCTURE,
 )
 from backend.services.embedding_status_cache import EmbeddingStatusCache
+from backend.services.lens_layout import compute_lens_projection, versions_tuple
 from backend.services.request_validation import (
     one_of,
     opt_bool,
@@ -122,16 +123,6 @@ def create_api_embeddings_blueprint(
             structure_version,
         )
 
-    def _version_tuple(versions: Any) -> tuple[int, ...]:
-        """Cache generations that feed the layout revision hash."""
-        return (
-            versions.clap,
-            versions.features,
-            versions.maest,
-            versions.rhythm,
-            versions.supervised,
-        )
-
     def _analysis_progress() -> tuple[bool, dict[str, int] | None]:
         """Generation state derived from the queue, not an in-process flag.
 
@@ -231,7 +222,7 @@ def create_api_embeddings_blueprint(
                     _scope_infos(infos),
                     maps,
                     proj,
-                    cache_versions=_version_tuple(versions),
+                    cache_versions=versions_tuple(versions),
                 ),
             )
 
@@ -343,13 +334,6 @@ def create_api_embeddings_blueprint(
 
         proj = parse_projection_params_fn(request, default_when_no_method=True)
 
-        fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
-        pversions = _versions()
-        maps = batch_fetch_maps(feature_cache, fps, pversions)
-        revision = layout_revision_for_projection(
-            infos, maps, proj, cache_versions=_version_tuple(pversions)
-        )
-
         with_jacobian = request.args.get("jacobian", "") == "1"
 
         def _layout_progress(phase: str, done: int = 0, total: int = 0) -> None:
@@ -362,23 +346,17 @@ def create_api_embeddings_blueprint(
                 "total": int(total),
             })
 
+        pversions = _versions()
         weights0 = dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS)
-        positions = embeddings_mod.compute_projection(
+        positions, revision = compute_lens_projection(
             infos,
             feature_cache,
-            version=embedding_version,
-            method=proj.method,
-            context_tags=proj.tag_names,
-            context_folders=proj.explicit_folders if proj.explicit_folders else None,
-            scale_folders=proj.scale_folders,
-            folder_boost=proj.folder_boost,
-            folder_depth_boost=proj.folder_depth_boost,
-            sources=proj.sources,
-            feature_mask=proj.feature_mask,
-            features_blend=proj.features_blend,
-            layout_revision=revision,
-            source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
-            required_sources=proj.required_sources,
+            proj,
+            embeddings_mod=embeddings_mod,
+            batch_fetch_maps=batch_fetch_maps,
+            layout_revision_for_projection=layout_revision_for_projection,
+            source_versions=pversions,
+            embedding_version=embedding_version,
             on_progress=_layout_progress,
         )
 

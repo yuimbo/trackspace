@@ -9,6 +9,7 @@ the PCA / t-SNE backends in `projection_backends`. Re-exported from
 
 import hashlib
 import logging
+import threading
 from collections import OrderedDict
 from collections.abc import Callable
 import numpy as np
@@ -53,33 +54,42 @@ _revision_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
 _SOURCE_ROW_CACHE_MAX = 24_000
 _source_row_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
 
+#: Guards the module-level tier caches. They are mutated from Flask request
+#: threads *and* the layout-prefetch worker, so an unguarded OrderedDict could
+#: be corrupted by a concurrent `move_to_end`/eviction.
+_cache_lock = threading.RLock()
+
 
 def _source_row_cache_get(key: tuple) -> np.ndarray | None:
-    if key not in _source_row_cache:
-        return None
-    _source_row_cache.move_to_end(key)
-    return _source_row_cache[key]
+    with _cache_lock:
+        if key not in _source_row_cache:
+            return None
+        _source_row_cache.move_to_end(key)
+        return _source_row_cache[key]
 
 
 def _source_row_cache_put(key: tuple, value: np.ndarray) -> None:
-    _source_row_cache[key] = value
-    _source_row_cache.move_to_end(key)
-    while len(_source_row_cache) > _SOURCE_ROW_CACHE_MAX:
-        _source_row_cache.popitem(last=False)
+    with _cache_lock:
+        _source_row_cache[key] = value
+        _source_row_cache.move_to_end(key)
+        while len(_source_row_cache) > _SOURCE_ROW_CACHE_MAX:
+            _source_row_cache.popitem(last=False)
 
 
 def _tier_cache_get(cache: OrderedDict, key: str):
-    if key not in cache:
-        return None
-    cache.move_to_end(key)
-    return cache[key]
+    with _cache_lock:
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
 
 
 def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
-    cache[key] = value
-    cache.move_to_end(key)
-    while len(cache) > max_size:
-        cache.popitem(last=False)
+    with _cache_lock:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
 
 
 def _supervised_cache_version(feature_cache) -> int:

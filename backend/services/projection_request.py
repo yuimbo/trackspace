@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from backend.embeddings.projection_config import (
@@ -91,6 +91,36 @@ def _parse_weight_spec(raw: str) -> dict[str, float]:
     return parsed
 
 
+def projection_params_for_lens(
+    sources: tuple[str, ...],
+    source_weights: dict[str, float] | None,
+) -> ProjectionParams:
+    """Build the frozen-default projection params for a lens.
+
+    Shared by the HTTP route (after query parsing) and the layout-prefetch job, so a
+    warmed layout is computed with exactly the parameters a later request would use.
+    ``source_weights=None`` means the frozen defaults (the combined lens).
+    """
+    try:
+        required_sources = required_sources_for(sources)
+    except ValueError as e:
+        raise ApiValidationError(str(e)) from None
+
+    return ProjectionParams(
+        method="tsne",
+        tag_names=[],
+        explicit_folders=[],
+        scale_folders=FROZEN_SCALE_FOLDERS,
+        feature_mask=FROZEN_FEATURE_MASK.copy(),
+        features_blend=FROZEN_FEATURES_BLEND,
+        folder_boost=FROZEN_FOLDER_BOOST,
+        folder_depth_boost=FROZEN_FOLDER_DEPTH_BOOST,
+        sources=sources,
+        required_sources=required_sources,
+        source_weights=source_weights,
+    )
+
+
 def parse_projection_params(
     req: Any,
     *,
@@ -126,24 +156,8 @@ def parse_projection_params(
         else None
     )
 
-    try:
-        required_sources = required_sources_for(sources)
-    except ValueError as e:
-        raise ApiValidationError(str(e)) from None
-
-    return ProjectionParams(
-        method=method,
-        tag_names=[],
-        explicit_folders=[],
-        scale_folders=FROZEN_SCALE_FOLDERS,
-        feature_mask=FROZEN_FEATURE_MASK.copy(),
-        features_blend=FROZEN_FEATURES_BLEND,
-        folder_boost=FROZEN_FOLDER_BOOST,
-        folder_depth_boost=FROZEN_FOLDER_DEPTH_BOOST,
-        sources=sources,
-        required_sources=required_sources,
-        source_weights=source_weights,
-    )
+    params = projection_params_for_lens(sources, source_weights)
+    return params if method == params.method else replace(params, method=method)
 
 
 def _parse_sources(raw: str) -> tuple[str, ...]:

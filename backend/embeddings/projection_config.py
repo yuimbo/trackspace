@@ -16,6 +16,8 @@ the only source with a *text* encoder — the semantic folder/tag weighting in
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from .librosa_audio_features import AUDIO_FEATURE_DIM
@@ -49,6 +51,45 @@ FROZEN_SOURCE_WEIGHTS: dict[str, float] = {
 SUPERVISED_INPUT_WEIGHTS: dict[str, float] = {
     k: v for k, v in FROZEN_SOURCE_WEIGHTS.items() if k != "supervised"
 }
+
+
+def _single_lens_weights(sources: tuple[str, ...]) -> dict[str, float]:
+    """Exact weight vector the frontend sends for a per-source lens.
+
+    Every source is listed explicitly (0 except the lens's own), matching the
+    frontend's ``lensWeights`` so a warmed layout and the request that later reads
+    it share one ``layout_revision``.
+    """
+    return {k: (1.0 if k in sources else 0.0) for k in FROZEN_SOURCE_WEIGHTS}
+
+
+@dataclass(frozen=True)
+class ProjectionLens:
+    """One UI lens the backend can project.
+
+    ``weights`` is ``None`` for the combined lens (the frozen defaults, which the
+    client omits from the query string) and the complete explicit vector for a
+    per-source lens.
+    """
+
+    id: str
+    sources: tuple[str, ...]
+    weights: dict[str, float] | None
+
+
+#: Projection lenses the layout-prefetch job warms, in E-cycle order.
+#: Must stay in step with ``frontend/src/lib/lenses.ts`` — the id, sources and
+#: weights are what decide whether a prefetched layout is the one the client asks for.
+PROJECTION_LENSES: tuple[ProjectionLens, ...] = (
+    ProjectionLens("combined", FROZEN_SOURCES, None),
+    ProjectionLens("maest", ("maest_logits", "maest"), _single_lens_weights(("maest_logits", "maest"))),
+    ProjectionLens("clap", ("clap",), _single_lens_weights(("clap",))),
+    ProjectionLens("rhythm", ("rhythm",), _single_lens_weights(("rhythm",))),
+    ProjectionLens("supervised", ("supervised",), _single_lens_weights(("supervised",))),
+)
+
+#: Lens ids the prefetch job warms, for enqueue/status convenience.
+PROJECTION_LENS_IDS: tuple[str, ...] = tuple(l.id for l in PROJECTION_LENSES)
 
 #: Sources a track must have before it can be placed on the *combined* map.
 REQUIRED_SOURCES: tuple[str, ...] = ("maest_logits", "maest")

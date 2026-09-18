@@ -118,6 +118,31 @@ describe("pipelineProgress", () => {
     ).toBe("hard negatives");
   });
 
+  it("drives the bar from the layout prefetch and names each lens", () => {
+    const prog = pipelineProgress(
+      queue({
+        active: true,
+        outstanding: 5,
+        total: 9501,
+        finished: 9499,
+        order: ["layout"],
+        kinds: {
+          layout: kind({
+            label: "View layouts",
+            running: 1,
+            outstanding: 5,
+            total: 5,
+            stage: { phase: "layout clap", done: 3, total: 5, at: 1 },
+          }),
+        },
+      }),
+    );
+    expect(prog!.label).toBe("Preparing views");
+    expect(prog!.detail).toBe("laying out clap 3 / 5");
+    expect(prog!.tail).toBe(true);
+    expect(prog!.fraction).toBeCloseTo(3 / 5);
+  });
+
   it("falls back to finished/total for per-track stages", () => {
     expect(stageDetail("maest", kind({ finished: 7, total: 12 }))).toBe("7 / 12");
   });

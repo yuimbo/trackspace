@@ -42,6 +42,7 @@ from backend.jobs import (
     KIND_CLAP,
     KIND_CLUSTER,
     KIND_FEATURES,
+    KIND_LAYOUT,
     KIND_MAEST,
     KIND_SCAN,
     KIND_STRUCTURE,
@@ -736,6 +737,38 @@ def make_cluster_handler(
         )
         for job in jobs:
             out[job.id] = JobResult.success(**detail)
+        return out
+
+    return handle
+
+
+def make_layout_handler(
+    prefetch: Callable[[str], int],
+    *,
+    emit: ProgressFn | None = None,
+) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
+    """Warm one projection lens's 2-D layout per job.
+
+    Library-wide but idempotent: a lens whose revision is already cached is a hit
+    inside ``compute_projection``, so re-running the prefetch after every cluster
+    pass costs a revision check, not a refit. *prefetch* returns the number of
+    tracks placed and is wired to the projection stack in ``app.py``.
+    """
+
+    def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
+        out: dict[int, JobResult] = {}
+        total = len(jobs)
+        for i, job in enumerate(jobs):
+            lens_id = str(job.payload.get("lens") or job.dedupe_key)
+            try:
+                n = int(prefetch(lens_id))
+            except Exception as e:
+                log.exception("Layout prefetch failed for lens %s", lens_id)
+                out[job.id] = JobResult.failure(f"{type(e).__name__}: {e}")
+                continue
+            out[job.id] = JobResult.success(lens=lens_id, n_tracks=n)
+            if emit is not None:
+                emit(f"layout {lens_id}", i + 1, total)
         return out
 
     return handle
@@ -1736,6 +1769,26 @@ def enqueue_clustering(queue: JobQueue, *, reason: str = "library-change") -> in
         KIND_CLUSTER,
         [("library", {"reason": reason})],
         priority=200,
+        requeue_terminal=True,
+    )
+
+
+def enqueue_layouts(
+    queue: JobQueue,
+    lens_ids: Sequence[str],
+    *,
+    reason: str = "cluster-drained",
+) -> int:
+    """Request one layout-prefetch job per lens.
+
+    ``(kind, dedupe_key)`` uniqueness collapses repeats, so a burst of drains
+    cannot queue a burst of fits; ``requeue_terminal`` revives the completed rows
+    so the next drain re-checks the revision.
+    """
+    return queue.enqueue_many(
+        KIND_LAYOUT,
+        [(lens_id, {"lens": lens_id, "reason": reason}) for lens_id in lens_ids],
+        priority=300,
         requeue_terminal=True,
     )
 

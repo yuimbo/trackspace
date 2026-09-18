@@ -35,6 +35,7 @@ const STAGE_LABELS: Record<string, string> = {
   clap: "CLAP embeddings",
   supervise: "Folder supervision",
   cluster: "Clustering",
+  layout: "Preparing views",
 };
 
 /** Friendly names for the phase strings the singleton handlers emit. */
@@ -58,9 +59,11 @@ const PHASE_LABELS: Record<string, string> = {
 const GENERATING_KINDS = new Set(["features", "maest", "clap"]);
 
 /** Library-wide singleton kinds, each one job among thousands of per-track rows. */
-const TAIL_KINDS = new Set(["supervise", "cluster"]);
+const TAIL_KINDS = new Set(["supervise", "cluster", "layout"]);
 
 export function phaseLabel(phase: string): string {
+  // The layout prefetch names each lens: "layout clap".
+  if (phase.startsWith("layout ")) return `laying out ${phase.slice(7)}`;
   return PHASE_LABELS[phase] ?? phase;
 }
 

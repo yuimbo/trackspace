@@ -43,19 +43,26 @@ from backend.jobs import (
     KIND_CLAP,
     KIND_CLUSTER,
     KIND_FEATURES,
+    KIND_LAYOUT,
     KIND_MAEST,
     KIND_SCAN,
     KIND_STRUCTURE,
     KIND_SUPERVISED,
 )
+from backend.embeddings.projection_config import (
+    PROJECTION_LENS_IDS,
+    PROJECTION_LENSES,
+)
 from backend.services.analysis_pipeline import (
     AnalysisDeps,
     enqueue_clustering,
+    enqueue_layouts,
     enqueue_library_work,
     enqueue_supervised,
     make_clap_handler,
     make_cluster_handler,
     make_features_handler,
+    make_layout_handler,
     make_maest_handler,
     make_scan_handler,
     make_structure_handler,
@@ -63,6 +70,7 @@ from backend.services.analysis_pipeline import (
 )
 from backend.services.dir_colors import dir_color
 from backend.services.layout_revision_for_status import layout_revision_for_projection
+from backend.services.lens_layout import compute_lens_projection
 from backend.services.library_scan import emit_scan_progress_events
 from backend.services.roots_registry import (
     add_root as roots_add,
@@ -77,6 +85,7 @@ from backend.services.projection_request import (
     ProjectionParams,
     embedding_projection_query_fingerprint,
     parse_projection_params,
+    projection_params_for_lens,
 )
 from backend.services.track_payload import (
     build_track_list as build_track_list_service,
@@ -476,6 +485,57 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
 
     # ---------------------------------------------------------------------------
+    # Layout prefetch — warm every lens's projection in the durable queue
+    # ---------------------------------------------------------------------------
+
+    #: One-entry cache so the five lens jobs of a prefetch batch share one walk.
+    _prefetch_infos_cache: dict[str, list[dict]] = {}
+
+
+    def _prefetch_infos() -> list[dict]:
+        sig = _library_mtime_signature("", True)
+        cached = _prefetch_infos_cache.get(sig)
+        if cached is not None:
+            return cached
+        infos = _build_track_infos("", True, include_external=False)
+        _prefetch_infos_cache.clear()
+        _prefetch_infos_cache[sig] = infos
+        return infos
+
+
+    def _prefetch_lens(lens_id: str) -> int:
+        """Warm one lens's projection so a later switch is a cache hit.
+
+        Runs through the durable ``layout`` queue after the cluster pass. The
+        revision is computed exactly as the HTTP route does, so the warmed entry is
+        the one the client will request; an already-current lens is a cache hit
+        inside ``compute_projection`` and costs no fit.
+        """
+        lens = next((l for l in PROJECTION_LENSES if l.id == lens_id), None)
+        if lens is None:
+            raise ValueError(f"unknown lens {lens_id!r}")
+        proj = projection_params_for_lens(lens.sources, lens.weights)
+        positions, _revision = compute_lens_projection(
+            _prefetch_infos(),
+            state.feature_cache,
+            proj,
+            embeddings_mod=embeddings,
+            batch_fetch_maps=batch_fetch_maps,
+            layout_revision_for_projection=layout_revision_for_projection,
+            source_versions=SourceVersions(
+                clap=EMBEDDING_VERSION,
+                features=FEATURES_VERSION,
+                maest=MAEST_VERSION,
+                rhythm=RHYTHM_VERSION,
+                supervised=supervised_mod.cache_version(state.feature_cache),
+                structure=STRUCTURE_VERSION,
+            ),
+            embedding_version=EMBEDDING_VERSION,
+        )
+        return len(positions)
+
+
+    # ---------------------------------------------------------------------------
     # Analysis pipeline — durable queue + background workers
     # ---------------------------------------------------------------------------
 
@@ -517,10 +577,20 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         The first full MAEST pass also auto-queues one supervised training run, but
         only while no head exists: after that a retrain is an explicit user action
         (folder reorganisation is not visible to the watcher).
+
+        Once the cluster pass lands, the per-lens layouts are warmed so switching a
+        lens is instant. This returns instead of re-enqueuing clustering: a cluster
+        drain must not feed another cluster pass.
         """
         if event.get("type") != "drained":
             return
         kind = event.get("kind")
+        if kind == KIND_CLUSTER:
+            enqueue_layouts(
+                state.job_queue, PROJECTION_LENS_IDS, reason="cluster-drained"
+            )
+            state.workers.wake(KIND_LAYOUT)
+            return
         if (
             kind == KIND_MAEST
             and supervised_mod.current_run_id(state.data_dir) == 0
@@ -693,6 +763,21 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                     emit=_stage_emit(KIND_CLUSTER),
                 ),
                 batch_size=1,
+                # Drain hook: a completed cluster pass is the last consumer of
+                # the cached vectors, so it warms the per-lens layouts.
+                on_event=_job_event_sink,
+            )
+        )
+        state.workers.add(
+            JobWorker(
+                state.job_queue,
+                KIND_LAYOUT,
+                make_layout_handler(
+                    _prefetch_lens,
+                    emit=_stage_emit(KIND_LAYOUT),
+                ),
+                batch_size=1,
+                # No drain hook: a layout drain must not re-enqueue clustering.
                 on_event=_on_job_event,
             )
         )

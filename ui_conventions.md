@@ -264,6 +264,10 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 - A projection lens requests a source subset (`sources=`) from the backend; the
   combined lens projects every frozen source. The source set is part of
   `layout_revision`, so each lens caches its own coordinates.
+- Layouts are **pre-warmed in the background**: after the cluster pass drains, the
+  durable queue runs one low-priority `layout` job per built-in projection lens, so the
+  first switch to a lens is a cache hit instead of a ~12–20 s fit. The status bar
+  shows it as **Preparing views**; a lens whose revision is unchanged is a no-op.
 - The deterministic lenses are a pure function of the cached audio features and are
   computed client-side with no server round-trip. They draw their guide under the
   dots: the Camelot rings + key labels, or the tempo spiral.

@@ -12,6 +12,7 @@ Pipeline order (each stage's output feeds the next):
     clap      → CLAP audio embedding (GPU, batched; text encoder shared with layout)
     supervise → folder-supervised projection head over cached vectors (CPU, singleton)
     cluster   → kNN graph + multi-resolution Leiden (whole-library, singleton)
+    layout    → warm the per-lens 2-D projections (CPU/GPU, singleton per lens)
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ KIND_MAEST = "maest"
 KIND_CLAP = "clap"
 KIND_SUPERVISED = "supervise"
 KIND_CLUSTER = "cluster"
+KIND_LAYOUT = "layout"
 
 #: Ordered by pipeline position — status UIs render them in this order.
 JOB_KINDS: tuple[str, ...] = (
@@ -33,6 +35,7 @@ JOB_KINDS: tuple[str, ...] = (
     KIND_CLAP,
     KIND_SUPERVISED,
     KIND_CLUSTER,
+    KIND_LAYOUT,
 )
 
 _LABELS: dict[str, str] = {
@@ -43,6 +46,7 @@ _LABELS: dict[str, str] = {
     KIND_CLAP: "CLAP analysis",
     KIND_SUPERVISED: "Folder supervision",
     KIND_CLUSTER: "Clustering",
+    KIND_LAYOUT: "View layouts",
 }
 
 

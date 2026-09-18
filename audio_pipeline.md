@@ -20,6 +20,7 @@ maest     → MAEST embedding + 519 style logits + per-excerpt vectors
 clap      → CLAP audio embedding (the column span text directions project onto)
 supervise → folder-supervised 128-D projection head over the cached vectors
 cluster   → weighted blocks → PCA → cosine kNN → multi-resolution Leiden
+layout    → warm the per-lens 2-D projections (background, after cluster)
 ```
 
 ---
@@ -817,6 +818,7 @@ maest     → MAEST embedding + 519 style logits   (GPU, batch 4, gated on model
 clap      → CLAP audio embedding                 (GPU, batch 4, gated on model)
 supervise → folder-supervised projection head    (CPU, singleton, whole-library)
 cluster   → kNN graph + multi-resolution Leiden  (whole-library singleton)
+layout    → warm each lens's 2-D projection      (CPU/GPU, one job per lens)
 ```
 
 Names live in `backend/jobs/kinds.py` so enqueuers, workers, and routes cannot
@@ -827,11 +829,24 @@ renders while the CLAP backfill continues; its drain triggers a re-cluster like 
 other per-track stage. (CLAP is not the long pole: measured ~0.14 s/track, one of the
 fastest stages — see *Per-stage throughput*.)
 
+**Layouts are pre-warmed behind the scenes.** A t-SNE fit is ~12–20 s at library
+scale, and the UI's lenses (combined + one per source) each have their own
+`layout_revision`, so the first switch to a lens would otherwise wait for a fit. Once
+the `cluster` pass drains — the last consumer of the cached vectors — the queue
+enqueues one low-priority `layout` job per lens (`PROJECTION_LENSES` in
+`projection_config.py`, kept in step with `frontend/src/lib/lenses.ts`). Each job
+calls the same `compute_lens_projection` service the HTTP route uses, so it computes
+the *same* `layout_revision` and populates the revision-keyed position cache the
+client will later read. A lens whose revision is already cached is a no-op, so the
+sweep after every cluster pass costs a revision check, not a refit. The status bar
+shows it as **Preparing views** (one job per lens, driven by the stage step count).
+
 **Progress is reported per job and per phase.** Each completed per-track job emits a
-`progress` event on `/api/jobs/stream`; the two library-wide singletons instead
+`progress` event on `/api/jobs/stream`; the library-wide singletons instead
 report named phases as `stage_progress` events — `supervise` emits `gather`,
-`mining`, `training (epoch i/N)`, `projecting`, and `cluster` emits `vectors`,
-`pca`, `graph`, `leiden (i/N)`. The latest phase is echoed in `/api/jobs/status`
+`mining`, `training (epoch i/N)`, `projecting`, `cluster` emits `vectors`,
+`pca`, `graph`, `leiden (i/N)`, and `layout` emits `layout <lens>`. The latest phase
+is echoed in `/api/jobs/status`
 (`kind.stage`) so a reload mid-run still renders it. The frontend reduces the
 whole snapshot to one summary — overall `finished/total` plus the running stage —
 in `frontend/src/lib/pipeline.ts`, shown both in the status bar and as the

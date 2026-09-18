@@ -97,6 +97,13 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 - [ ] **Per-source lens readiness hint.** A lens whose source is disabled on the
   server (e.g. `--no-clap`) shows an empty map rather than an explanatory note.
   Files: `frontend/src/coordinators/embedding-coordinator.ts` (`ensureAndProject`).
+- [ ] **Prefetch scope.** The `layout` job warms only the library-only,
+  default-weights lens set. External-inclusive layouts and user weight presets are
+  still computed on demand, and every new analysis drain re-warms all five lenses
+  (cheap when the revision is unchanged, a full refit when it moved). Consider
+  warming the external variant too, or gating the sweep behind a size threshold.
+  Files: `backend/app.py` (`_prefetch_lens`),
+  `backend/embeddings/projection_config.py` (`PROJECTION_LENSES`).
 
 ## Deferred / optional
 
