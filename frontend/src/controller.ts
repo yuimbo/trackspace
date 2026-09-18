@@ -208,7 +208,8 @@ export class Controller {
       // Viewport moves (focus/homing) tween on the shared canvas frame.
       tweenViewport: (target) => this.embedding.tweenViewport(target),
       // The scope's lens is switched from its on-canvas tab bar.
-      openScope: (scope, lensId) => void this.embedding.openScope(scope, lensId),
+      openScope: (scope, lensId, allowEmpty) =>
+        void this.embedding.openScope(scope, lensId, allowEmpty),
       setScopeLens: (lensId) => void this.embedding.setScopeLens(lensId),
       resizeScope: (r) => void this.embedding.resizeScope(r),
       closeScope: () => this.embedding.closeScope(),

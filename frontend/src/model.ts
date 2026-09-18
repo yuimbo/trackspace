@@ -418,6 +418,14 @@ export class Model extends EventBus {
   } | null = null;
   projectionPending = false;
   /**
+   * Query string of the layout request currently in flight. ``layout_progress``
+   * events echo their request's query, so a phase from an older overlapping
+   * request is ignored instead of overwriting the newer one's progress.
+   */
+  pendingProjectionQuery: string | null = null;
+  /** When the in-flight layout request started (ms), for an elapsed readout. */
+  projectionStartedAt: number | null = null;
+  /**
    * In-flight phase of a layout request, streamed on `/api/embeddings/stream`.
    * The layout is a plain request rather than a queued job, so it carries its own
    * phase here instead of riding `queueStatus`.

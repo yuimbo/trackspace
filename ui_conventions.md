@@ -268,15 +268,23 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   `layout_revision`, so each lens caches its own coordinates.
 - Layouts are **pre-warmed in the background**: after the cluster pass drains, the
   durable queue runs one low-priority `layout` job per built-in projection lens, so the
-  first switch to a lens is a cache hit instead of a ~12–20 s fit. The status bar
-  shows it as **Preparing views**; a lens whose revision is unchanged is a no-op.
+  first switch to a lens is a cache hit instead of a ~12–20 s fit. A **user request
+  preempts the prefetch** (`services/projection_priority.py`), so a switch never queues
+  behind several prefetched fits. The status bar shows it as **Preparing views**; a lens
+  whose revision is unchanged is a no-op.
+- While a lens is loading, the centre pill names the **target** lens and an elapsed
+  readout (`Loading CLAP timbre · laying out · 12s`) — the map keeps showing the previous
+  lens until the new layout lands. A `layout_progress` phase carries its request's query, so
+  an older overlapping request's phase is ignored. The background `layout` prefetch is
+  **not** shown on the canvas (only in the status bar), so background work never looks like
+  the shown view is computing.
 - The deterministic lenses are a pure function of the cached audio features and are
   computed client-side with no server round-trip. They draw their guide under the
   dots: the Camelot rings + key labels, or the tempo spiral.
 - In embedding mode: canvas positions come from the selected lens, the grid caption
   names it, transform handles and tag-drag are disabled.  Tracks without embedding
   data are **hidden** (not shown at tag-space positions).
-- Mode transitions animate: positions lerp over 500 ms via `canvas.animPositions`.
+- Mode transitions animate: positions lerp over ~340 ms via `canvas.animPositions`.
   During animation, tracks have interpolated positions; after animation completes,
   `animPositions` is cleared and the canvas falls through to embedding positions.
 - The controller auto-triggers embedding generation when switching to embedding mode
@@ -317,7 +325,9 @@ A scope is a circle on the canvas whose tracks are re-laid-out by another lens, 
 cluster can be read in a different space without leaving the map.
 
 - Hold **X** and drag to draw a circle from the press point; **X + scroll** opens
-  a scope at the cursor or resizes the open one. The scope starts on the last-used
+  a scope at the cursor or resizes the open one (it starts small in *screen* space and
+  grows outwards, so it reads the same at any zoom; growth is exponential in the wheel
+  delta so a trackpad's burst of events accumulates). The scope starts on the last-used
   scope lens immediately. A bare **X** tap, **Esc**, or a click outside the circle closes
   it and animates its tracks back out.
 - A tab bar of the available lenses is drawn just outside the circle; clicking a tab

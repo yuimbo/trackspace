@@ -109,7 +109,7 @@ describe("StatusView analysis progress", () => {
     model.projectionPending = true;
     model.layoutProgress = { phase: "jacobian", done: 2, total: 5 };
     view.update(model);
-    expect(statusText()).toContain("Layout: Jacobian 2 / 5");
+    expect(statusText()).toContain("Layout (Tags): Jacobian 2 / 5");
   });
 
   it("shows no analysis segment when the queue is idle", () => {

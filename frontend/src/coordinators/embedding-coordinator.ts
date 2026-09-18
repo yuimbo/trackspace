@@ -112,6 +112,8 @@ export interface EmbeddingDeps {
 
 /** Smallest scope radius, in world units. */
 const SCOPE_MIN_R = 0.02;
+/** Largest scope radius, in world units (roughly the whole unit square). */
+const SCOPE_MAX_R = 0.75;
 
 export class EmbeddingCoordinator {
   /** Saved viewport state per view-mode so pan/zoom persists across toggles. */
@@ -509,11 +511,15 @@ export class EmbeddingCoordinator {
   private async _fetchProjectionIncremental(): Promise<void> {
     this._projectionFetchPending = true;
     const m = this.deps.model;
+    const qs = this._projectionQueryString("pca");
     m.projectionPending = true;
+    m.pendingProjectionQuery = qs;
+    m.projectionStartedAt = Date.now();
+    m.layoutProgress = null;
     this.deps.canvas.scheduleDraw();
     try {
       const raw = await api<unknown>(
-        `/api/embeddings/projection?${this._projectionQueryString("pca")}`,
+        `/api/embeddings/projection?${qs}`,
       );
       const { positions } = parseProjectionResponse(raw);
       if (!positions.length) return;
@@ -536,6 +542,8 @@ export class EmbeddingCoordinator {
     } finally {
       this._projectionFetchPending = false;
       m.projectionPending = false;
+      m.pendingProjectionQuery = null;
+      m.projectionStartedAt = null;
       m.layoutProgress = null;
       this.deps.canvas.scheduleDraw();
     }
@@ -636,6 +644,9 @@ export class EmbeddingCoordinator {
 
     // --- Full projection fetch ---
     m.projectionPending = true;
+    m.pendingProjectionQuery = qs;
+    m.projectionStartedAt = Date.now();
+    m.layoutProgress = null;
     this.deps.canvas.scheduleDraw();
     try {
       const raw = await api<unknown>(
@@ -659,6 +670,8 @@ export class EmbeddingCoordinator {
     } finally {
       if (reqSeq === this._projectionReqSeq) {
         m.projectionPending = false;
+        m.pendingProjectionQuery = null;
+        m.projectionStartedAt = null;
         m.layoutProgress = null;
         this.deps.canvas.scheduleDraw();
       }
@@ -935,26 +948,38 @@ export class EmbeddingCoordinator {
    * a track across the boundary. Tracks the scope lens cannot place are hidden
    * (the canvas hides in-circle dots that have no scope position).
    */
-  async openScope(scope: Scope, lensId: string): Promise<void> {
+  async openScope(
+    scope: Scope,
+    lensId: string,
+    allowEmpty = false,
+  ): Promise<void> {
     const m = this.deps.model;
     const active = { ...scope, lensId };
     const seq = ++this._scopeReqSeq;
+    // Show the circle immediately so X + scroll can resize it while the layout
+    // loads; the no-tracks case reverts below.
+    m.scopeLensId = lensId;
+    m.scope = active;
+    m.scopePositions = new Map();
+    this.deps.canvas.scheduleDraw();
+
     const { raw, inScope } = await this._computeScopeRaw(active);
     if (seq !== this._scopeReqSeq) return;
-    if (inScope.length === 0) {
+    if (inScope.length === 0 && !allowEmpty) {
+      m.scope = null;
       toast("No tracks inside the scope", "warn");
       return;
     }
-    if (raw.size === 0) {
+    if (raw.size === 0 && !allowEmpty) {
+      m.scope = null;
       toast("That lens has no positions for these tracks", "warn");
       return;
     }
     const targets = this._mapIntoScope(raw, active);
     const start = this._startFromOuter(targets.keys());
-    m.scopeLensId = lensId;
-    m.scope = active;
     m.scopePositions = targets;
-    this._animateOverlay(start, targets);
+    if (start.size > 0) this._animateOverlay(start, targets);
+    else this.deps.canvas.scheduleDraw();
   }
 
   /**
@@ -982,20 +1007,22 @@ export class EmbeddingCoordinator {
 
   /**
    * Resize the open scope (X + scroll). Membership can change with the radius, so
-   * the in-scope set and the mapped positions are recomputed; the change is
-   * applied immediately (no tween) so a scroll feels direct.
+   * the in-scope set and the mapped positions are recomputed; the radius updates
+   * synchronously (so a rapid scroll accumulates and the circle moves at once),
+   * while the positions follow in the same tick.
    */
-  async resizeScope(r: number): Promise<void> {
+  resizeScope(r: number): Promise<void> {
     const m = this.deps.model;
     const scope = m.scope;
-    if (!scope) return;
-    const next = { ...scope, r: Math.max(SCOPE_MIN_R, r) };
-    const seq = ++this._scopeReqSeq;
-    const { raw } = await this._computeScopeRaw(next);
-    if (seq !== this._scopeReqSeq) return;
+    if (!scope) return Promise.resolve();
+    const next = { ...scope, r: Math.min(Math.max(r, SCOPE_MIN_R), SCOPE_MAX_R) };
     m.scope = next;
-    m.scopePositions = this._mapIntoScope(raw, next);
-    this.deps.canvas.scheduleDraw();
+    const seq = ++this._scopeReqSeq;
+    return this._computeScopeRaw(next).then(({ raw }) => {
+      if (seq !== this._scopeReqSeq) return;
+      m.scopePositions = this._mapIntoScope(raw, next);
+      this.deps.canvas.scheduleDraw();
+    });
   }
 
   /** Close the active scope, animating its tracks back to their outer positions. */

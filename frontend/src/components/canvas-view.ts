@@ -115,6 +115,7 @@ export class CanvasView {
   /** Centre-screen lens tab bar is drawn until this timestamp (ms). */
   private _lensHudUntil = 0;
   private _lensHudTimer = 0;
+  private _waitTimer = 0;
   _rafId = 0;
 
   txHandles: TxHandle[] = [];
@@ -919,17 +920,21 @@ export class CanvasView {
     // The analysis pipeline owns its own progress pill (see _drawPipelinePill), so
     // these fallbacks only cover states the queue cannot describe.
     if (m.projectionPending) {
+      // Name the lens being loaded: the map still shows the previous lens while the
+      // new one fits, so "Computing layout…" alone reads as if the shown view is.
+      const lens = m.lens().label;
       const p = m.layoutProgress;
-      if (!p) return { label: "Computing layout…", fraction: null };
-      const phase = phaseLabel(p.phase);
+      const phase = p ? ` · ${phaseLabel(p.phase)}` : "";
+      const counts = p && p.total > 1 ? ` ${p.done} / ${p.total}` : "";
+      const elapsed =
+        m.projectionStartedAt != null
+          ? ` · ${Math.max(0, Math.round((Date.now() - m.projectionStartedAt) / 1000))}s`
+          : "";
       return {
-        label:
-          p.total > 1
-            ? `Computing layout… ${phase} ${p.done} / ${p.total}`
-            : `Computing layout… ${phase}`,
-        // The layout phases report no steps (no iteration callback), so the bar is
-        // indeterminate while it runs.
-        fraction: p.total > 1 ? p.done / p.total : null,
+        label: `Loading ${lens}${phase}${counts}${elapsed}`,
+        // The base layout phases report no steps (no iteration callback), so the bar
+        // is indeterminate; the elapsed readout is what shows it is still moving.
+        fraction: p && p.total > 1 ? p.done / p.total : null,
       };
     }
     if (m.embeddingPositions.size > 0) return null;
@@ -937,6 +942,15 @@ export class CanvasView {
     if (m.embeddingModelsLoading) return { label: "loading models…", fraction: null };
     if (m.embeddingsGenerating) return { label: "generating embeddings…", fraction: null };
     return { label: "loading…", fraction: null };
+  }
+
+  /** Redraw once while a projection is in flight so its elapsed readout ticks. */
+  private _scheduleWaitRedraw(): void {
+    clearTimeout(this._waitTimer);
+    this._waitTimer = setTimeout(
+      () => this.scheduleDraw(),
+      500,
+    ) as unknown as number;
   }
 
   /** Progress pill for the whole analysis pipeline, with a determinate bar.
@@ -1084,12 +1098,15 @@ export class CanvasView {
 
     const wait = this._embeddingWait(m);
     const prog = pipelineProgress(m.queueStatus);
-    if (prog) {
+    // The speculative per-lens prefetch is background work: the status bar reports
+    // it, but the canvas must not make it look like the shown view is computing.
+    if (prog && !prog.background) {
       // Docked once the map is drawn, so the indicator never covers the points.
       this._drawPipelinePill(w, h, prog, m.embeddingPositions.size > 0);
     } else if (wait) {
       this._drawCenterStatusPill(w, h, wait.label, wait.fraction);
     }
+    if (m.projectionPending) this._scheduleWaitRedraw();
 
     ctx.restore();
   }

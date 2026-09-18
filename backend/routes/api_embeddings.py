@@ -335,6 +335,10 @@ def create_api_embeddings_blueprint(
         proj = parse_projection_params_fn(request, default_when_no_method=True)
 
         with_jacobian = request.args.get("jacobian", "") == "1"
+        # The client keys its pending layout by its query string, so echo it here:
+        # with two requests overlapping, a stale phase must not overwrite the newer
+        # request's progress.
+        query = request.query_string.decode("utf-8", "replace")
 
         def _layout_progress(phase: str, done: int = 0, total: int = 0) -> None:
             # The layout is a plain request, not a queued job, so its phases ride
@@ -344,6 +348,7 @@ def create_api_embeddings_blueprint(
                 "phase": phase,
                 "done": int(done),
                 "total": int(total),
+                "query": query,
             })
 
         pversions = _versions()

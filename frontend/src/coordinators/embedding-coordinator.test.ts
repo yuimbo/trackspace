@@ -476,10 +476,26 @@ describe("EmbeddingCoordinator scopes", () => {
     threeTracks(model);
     await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
     pump(600); // let the open tween finish
-    await coord.resizeScope(0.2);
+    const pending = coord.resizeScope(0.2);
+    // The radius updates synchronously so a rapid scroll accumulates.
     expect(model.scope?.r).toBeCloseTo(0.2, 6);
+    await pending;
     // A scroll resize is immediate, not animated through the overlay.
     expect(canvas.animPositions).toBeNull();
+  });
+
+  it("opens an empty scope when allowEmpty is set", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    // A tiny circle in a corner: no tracks, but X + scroll must still open it so it
+    // can grow in.
+    await coord.openScope(
+      { cx: 0.99, cy: 0.99, r: 0.005, lensId: "" },
+      "camelot",
+      true,
+    );
+    expect(model.scope).not.toBeNull();
+    expect(model.scopePositions.size).toBe(0);
   });
 
   it("cycles backward with cycleLens(-1)", async () => {

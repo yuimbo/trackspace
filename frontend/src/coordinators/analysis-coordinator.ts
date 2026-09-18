@@ -716,13 +716,16 @@ export class AnalysisCoordinator {
     es.addEventListener("layout_progress", ((e: MessageEvent) => {
       // A layout request is not a queued job, so its phase rides its own event
       // instead of `stage_progress`. The canvas pill and status bar render it
-      // while the projection is pending.
+      // while the projection is pending. The event echoes its request's query, so a
+      // phase from an older overlapping request is ignored.
       const d = JSON.parse(e.data) as {
         phase: string;
         done?: number;
         total?: number;
+        query?: string;
       };
       const m = this.deps.model;
+      if (d.query && d.query !== m.pendingProjectionQuery) return;
       m.layoutProgress = {
         phase: d.phase,
         done: d.done ?? 0,

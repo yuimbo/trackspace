@@ -531,6 +531,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 structure=STRUCTURE_VERSION,
             ),
             embedding_version=EMBEDDING_VERSION,
+            user=False,
         )
         return len(positions)
 

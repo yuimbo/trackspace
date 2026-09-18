@@ -264,6 +264,27 @@ describe("AnalysisCoordinator queue stream", () => {
     expect(scheduleDraw).toHaveBeenCalled();
   });
 
+  it("ignores a layout phase from a different in-flight request", async () => {
+    const { model, coord } = makeHarness();
+    const es = await startSettled(coord);
+    model.pendingProjectionQuery = "sources=clap";
+    // A stale request's phase must not overwrite the current one's progress.
+    es.emit("layout_progress", {
+      phase: "jacobian",
+      done: 2,
+      total: 5,
+      query: "sources=rhythm",
+    });
+    expect(model.layoutProgress).toBeNull();
+    es.emit("layout_progress", {
+      phase: "jacobian",
+      done: 2,
+      total: 5,
+      query: "sources=clap",
+    });
+    expect(model.layoutProgress).toMatchObject({ phase: "jacobian" });
+  });
+
   it("toasts analysis complete only once the whole queue drains", async () => {
     const { model, coord } = makeHarness((url) =>
       url.startsWith("/api/jobs/status")

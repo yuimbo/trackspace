@@ -92,6 +92,17 @@ def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
             cache.popitem(last=False)
 
 
+def revision_layout_cached(revision: str | None) -> list[dict] | None:
+    """The cached t-SNE layout for *revision*, or ``None``.
+
+    Lets a caller short-circuit before taking the projection slot: an already-warmed
+    lens must not wait behind a background fit for another lens.
+    """
+    if not revision:
+        return None
+    return _tier_cache_get(_revision_layout_cache, revision)
+
+
 def _supervised_cache_version(feature_cache) -> int:
     """Effective cache version for the ``supervised`` source.
 

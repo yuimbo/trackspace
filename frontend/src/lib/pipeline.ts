@@ -24,6 +24,11 @@ export interface PipelineProgress {
   tail: boolean;
   /** The running tail stage reported no step count, so the bar cannot be determinate. */
   indeterminate: boolean;
+  /**
+   * The only outstanding work is the speculative per-lens layout prefetch, which the
+   * user did not ask for. The canvas hides it; the status bar still reports it.
+   */
+  background: boolean;
 }
 
 /** Friendly names for job kinds — action-oriented, unlike the server's nouns. */
@@ -60,6 +65,9 @@ const GENERATING_KINDS = new Set(["features", "maest", "clap"]);
 
 /** Library-wide singleton kinds, each one job among thousands of per-track rows. */
 const TAIL_KINDS = new Set(["supervise", "cluster", "layout"]);
+
+/** Speculative kinds the user did not request; the canvas hides their progress. */
+const BACKGROUND_KINDS = new Set(["layout"]);
 
 export function phaseLabel(phase: string): string {
   // The layout prefetch names each lens: "layout clap".
@@ -125,5 +133,6 @@ export function pipelineProgress(q: QueueStatus | null): PipelineProgress | null
     generating,
     tail: !generating,
     indeterminate,
+    background: BACKGROUND_KINDS.has(firstKind) && !generating,
   };
 }

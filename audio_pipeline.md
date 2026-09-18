@@ -841,6 +841,22 @@ client will later read. A lens whose revision is already cached is a no-op, so t
 sweep after every cluster pass costs a revision check, not a refit. The status bar
 shows it as **Preparing views** (one job per lens, driven by the stage step count).
 
+**A user projection preempts the prefetch.** A fit is seconds long and holds the shared
+accelerator lock, so without a gate a lens switch could wait behind several prefetched fits
+(the "never-ending computing layout" case). `services/projection_priority.py` serialises
+projection fits and lets a waiting user request run before any further prefetch starts: the
+prefetch yields the slot whenever a user request is active or waiting, and a user request
+waits at most the one fit already in flight. The route calls
+`compute_lens_projection` with `user=True`; the prefetch passes `user=False`.
+
+**The layout phase is correlated with its request.** `layout_progress` echoes the request's
+query string, and the client ignores a phase whose query is not the request it is currently
+awaiting — with two overlapping requests, a stale phase must not overwrite the newer one's
+progress. The canvas pill is labelled with the *target* lens (`Loading CLAP timbre …`) plus an
+elapsed readout, because the map keeps showing the previous lens while the new one fits. The
+speculative `layout` prefetch is background work: the status bar reports it, but the canvas
+hides it.
+
 **Progress is reported per job and per phase.** Each completed per-track job emits a
 `progress` event on `/api/jobs/stream`; the library-wide singletons instead
 report named phases as `stage_progress` events — `supervise` emits `gather`,

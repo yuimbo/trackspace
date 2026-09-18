@@ -408,9 +408,19 @@ describe("CanvasInteractionController gesture state", () => {
     );
     canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
     expect(deps.openScope).toHaveBeenCalledTimes(1);
+    const [scope, lensId, allowEmpty] = (
+      deps.openScope as ReturnType<typeof vi.fn>
+    ).mock.calls[0] as [{ r: number }, string, boolean];
+    // Starts small in *screen* space (14 px / the 0.001 world-per-px fake) and may
+    // be empty so the scroll can grow it in.
+    expect(scope.r).toBeCloseTo(0.014, 5);
+    expect(lensId).toBe(model.scopeLensId);
+    expect(allowEmpty).toBe(true);
+
     model.scope = { cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
     canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
     expect(deps.resizeScope).toHaveBeenCalledTimes(1);
+    expect((deps.resizeScope as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBeGreaterThan(0.1);
   });
 
   it("closes the scope when clicking outside it", () => {

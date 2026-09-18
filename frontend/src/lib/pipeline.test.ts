@@ -141,6 +141,22 @@ describe("pipelineProgress", () => {
     expect(prog!.detail).toBe("laying out clap 3 / 5");
     expect(prog!.tail).toBe(true);
     expect(prog!.fraction).toBeCloseTo(3 / 5);
+    // Background work the user did not ask for: the canvas hides it.
+    expect(prog!.background).toBe(true);
+  });
+
+  it("marks per-track generation as foreground", () => {
+    const prog = pipelineProgress(
+      queue({
+        active: true,
+        outstanding: 1,
+        total: 10,
+        finished: 9,
+        order: ["maest"],
+        kinds: { maest: kind({ outstanding: 1, total: 10, finished: 9 }) },
+      }),
+    );
+    expect(prog!.background).toBe(false);
   });
 
   it("falls back to finished/total for per-track stages", () => {

@@ -20,8 +20,8 @@ import type { CanvasView, TxHandle } from "../components";
 
 const DRAG_THRESH = 4;
 const ZOOM_FACTOR = 1.12;
-/** Starting radius (world units) for a scope opened by X + scroll. */
-const DEFAULT_SCOPE_R = 0.12;
+/** Starting radius (screen px) for a scope opened by X + scroll. */
+const SCOPE_SCROLL_START_PX = 14;
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
@@ -117,8 +117,9 @@ export interface CanvasInteractionDeps {
   stopPreview(): void;
   /** Animate the viewport to *target* on the shared canvas animation frame. */
   tweenViewport?(target: { ox: number; oy: number; zoom: number }): void;
-  /** Open a scope immediately with the given lens. */
-  openScope(scope: Scope, lensId: string): void;
+  /** Open a scope immediately with the given lens; *allowEmpty* opens even if it
+   *  currently contains no tracks (X + scroll grows it in). */
+  openScope(scope: Scope, lensId: string, allowEmpty?: boolean): void;
   /** Switch the open scope to a different lens. */
   setScopeLens(lensId: string): void;
   /** Resize the open scope (X + scroll). */
@@ -749,17 +750,23 @@ export class CanvasInteractionController {
     const dx = e.deltaX * norm,
       dy = e.deltaY * norm;
 
-    // X + scroll opens a scope at the cursor, or resizes the open one.
+    // X + scroll opens a scope at the cursor, or resizes the open one. The
+    // growth is exponential in the wheel delta so a trackpad's burst of small events
+    // accumulates smoothly instead of jumping.
     if (this._scopeArmed && this._pointerOverCanvas) {
       this._scopeGestureUsed = true;
-      const factor = dy < 0 ? 1.15 : 1 / 1.15;
+      const factor = Math.exp(clamp(-dy / 600, -0.4, 0.4));
       if (m.scope) {
         this.deps.resizeScope(m.scope.r * factor);
       } else {
         const [wx, wy] = cv.s2w(sx, sy);
+        // Start small *on screen* and grow outwards, so the opening circle looks
+        // the same at any zoom instead of appearing already huge.
+        const [wxr] = cv.s2w(sx + SCOPE_SCROLL_START_PX, sy);
         this.deps.openScope(
-          { cx: wx, cy: wy, r: DEFAULT_SCOPE_R, lensId: m.scopeLensId },
+          { cx: wx, cy: wy, r: Math.abs(wxr - wx), lensId: m.scopeLensId },
           m.scopeLensId,
+          true,
         );
       }
       return;

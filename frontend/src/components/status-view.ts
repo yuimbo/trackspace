@@ -282,8 +282,12 @@ ${maestError}
       const p = model.layoutProgress;
       const phase = p ? phaseLabel(p.phase) : "computing";
       const counts = p && p.total > 1 ? ` ${p.done} / ${p.total}` : "";
+      const elapsed =
+        model.projectionStartedAt != null
+          ? ` · ${Math.max(0, Math.round((Date.now() - model.projectionStartedAt) / 1000))}s`
+          : "";
       const span = document.createElement("span");
-      span.textContent = `Layout: ${phase}${counts}`;
+      span.textContent = `Layout (${model.lens().label}): ${phase}${counts}${elapsed}`;
       this.$el.appendChild(span);
     }
 
