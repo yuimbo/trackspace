@@ -540,6 +540,14 @@ leaf name.
 Weighting is transparent — when no context is provided, raw embeddings are
 projected unmodified.
 
+**Rank-deficient blocks and `gesdd`.** A folder whose tracks are nearly collinear in the
+composite space gives a within-folder PCA block that is finite but numerically
+rank-deficient. `np.linalg.svd` drives LAPACK's `gesdd`, which can raise *"SVD did not
+converge"* on such a block and 500 the whole projection request. All SVDs in the layout /
+clustering path go through `embeddings/linalg_utils.svd_singular`, which retries with scipy's
+`gesvd` driver — it converges on the same input — and the folder PC helper also skips a
+non-finite block outright.
+
 ---
 
 ## Weak supervision (folder-supervised projection head)

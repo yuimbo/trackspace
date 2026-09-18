@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .clap import inference_lock as _inference_lock
+from .linalg_utils import svd_singular
 
 log = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ def _pca_ref_store(paths: list[str], coords: np.ndarray) -> None:
 
 def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
     centred = mat - mat.mean(axis=0)
-    _, _, Vt = np.linalg.svd(centred, full_matrices=False)
+    _, _, Vt = svd_singular(centred)
     coords = centred @ Vt[:2].T
 
     if paths is not None:
@@ -89,7 +90,7 @@ def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
                     A = coords[idx_new]
                     B = ref[idx_ref]
                     A_mu, B_mu = A.mean(axis=0), B.mean(axis=0)
-                    U, _, Vt2 = np.linalg.svd((A - A_mu).T @ (B - B_mu))
+                    U, _, Vt2 = svd_singular((A - A_mu).T @ (B - B_mu))
                     R = U @ Vt2
                     coords = (coords - A_mu) @ R + B_mu
         _pca_ref_store(paths, coords)

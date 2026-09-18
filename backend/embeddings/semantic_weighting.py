@@ -16,6 +16,7 @@ import numpy as np
 
 from .clap import generate_text_embeddings
 from .layout_revision import FOLDER_SEMANTIC_BASIS_VERSION
+from .linalg_utils import svd_singular
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +73,11 @@ def _folder_orthogonal_pc_directions(
     proj = x_dev @ d_unit
     x_orth = x_dev - np.outer(proj, d_unit.astype(np.float64))
 
-    _, s, vt = np.linalg.svd(x_orth.astype(np.float64), full_matrices=False)
+    if not np.isfinite(x_orth).all():
+        log.debug("folder PC directions: non-finite block %s; skipping", mat_block.shape)
+        return []
+
+    _, s, vt = svd_singular(x_orth.astype(np.float64))
     if s.size == 0 or float(s[0]) < 1e-12:
         return []
 

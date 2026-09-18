@@ -32,6 +32,8 @@ from typing import Any
 
 import numpy as np
 
+from .linalg_utils import svd_singular
+
 log = logging.getLogger(__name__)
 
 #: ``(phase, done, total)`` — progress hook for a library-wide singleton run.
@@ -211,7 +213,7 @@ def reduce_dimensions(mat: np.ndarray, n_components: int = DEFAULT_PCA_DIM) -> n
         return mat.astype(np.float32)
     centred = mat - mat.mean(axis=0, keepdims=True)
     try:
-        _, _, vt = np.linalg.svd(centred, full_matrices=False)
+        _, _, vt = svd_singular(centred)
     except np.linalg.LinAlgError:
         log.warning("PCA SVD did not converge; clustering on raw weighted matrix")
         return mat.astype(np.float32)
