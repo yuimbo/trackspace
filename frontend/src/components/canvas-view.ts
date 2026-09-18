@@ -8,7 +8,6 @@ import {
   camelotGuide,
   scopeLenses,
   spiralGuide,
-  type Lens,
 } from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
 import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
@@ -28,6 +27,12 @@ export interface LensTabHit {
   y0: number;
   x1: number;
   y1: number;
+}
+
+/** One tab in a transient canvas HUD (id + label; the active one is highlighted). */
+export interface HudTab {
+  id: string;
+  label: string;
 }
 
 export interface TxHandle {
@@ -112,9 +117,13 @@ export class CanvasView {
   scopeDrag: { cx: number; cy: number; r: number } | null = null;
   /** Clickable lens tabs drawn around the open scope (screen rects). */
   scopeTabs: LensTabHit[] = [];
-  /** Centre-screen lens tab bar is drawn until this timestamp (ms). */
-  private _lensHudUntil = 0;
-  private _lensHudTimer = 0;
+  /**
+   * Transient centre-screen HUD: a tab row with the active tab highlighted. A new
+   * flash **replaces** the previous one, so repeated hotkeys never stack a history.
+   */
+  private _hud: { tabs: readonly HudTab[]; activeId: string; until: number } | null =
+    null;
+  private _hudTimer = 0;
   private _waitTimer = 0;
   _rafId = 0;
 
@@ -282,7 +291,7 @@ export class CanvasView {
     this._drawBoxSel();
     this._drawLasso();
     this._drawScope();
-    this._drawLensHud(w);
+    this._drawHud(w);
     this._drawModeBadge(w, h);
     this._updateTooltip(tracks);
   }
@@ -543,15 +552,20 @@ export class CanvasView {
     return this._outerTrackWPos(t);
   }
 
-  /** Show the centre-screen lens tab bar for *ms* (lens-switch feedback). */
-  flashLensHud(ms = 1400): void {
-    this._lensHudUntil = performance.now() + ms;
-    clearTimeout(this._lensHudTimer);
-    this._lensHudTimer = setTimeout(
+  /** Flash a transient tab row at the centre of the canvas. */
+  flashHud(tabs: readonly HudTab[], activeId: string, ms = 1400): void {
+    this._hud = { tabs, activeId, until: performance.now() + ms };
+    clearTimeout(this._hudTimer);
+    this._hudTimer = setTimeout(
       () => this.scheduleDraw(),
       ms + 30,
     ) as unknown as number;
     this.scheduleDraw();
+  }
+
+  /** Lens-switch feedback: the built-in lenses with the active one highlighted. */
+  flashLensHud(ms = 1400): void {
+    this.flashHud(BUILTIN_LENSES, this.model.lensId, ms);
   }
 
   /** Lens id under *sx,sy* when a scope tab is there, else null. */
@@ -1201,7 +1215,7 @@ export class CanvasView {
       // The lens tabs sit just outside the circle, above unless it is near the top.
       const above = cy - rpx - 16 > 26;
       const tabCy = above ? cy - rpx - 16 : cy + rpx + 16;
-      this.scopeTabs = this._drawLensTabs(
+      this.scopeTabs = this._drawHudTabs(
         scopeLenses(),
         scope.lensId,
         cx,
@@ -1212,18 +1226,19 @@ export class CanvasView {
     ctx.restore();
   }
 
-  /** Centre-screen lens tab bar; visible for a short window after a switch. */
-  private _drawLensHud(w: number): void {
-    if (performance.now() >= this._lensHudUntil) return;
-    this._drawLensTabs(BUILTIN_LENSES, this.model.lensId, w / 2, 30);
+  /** The transient centre-screen HUD, while its flash window is open. */
+  private _drawHud(w: number): void {
+    const hud = this._hud;
+    if (!hud || performance.now() >= hud.until) return;
+    this._drawHudTabs(hud.tabs, hud.activeId, w / 2, 30);
   }
 
   /**
-   * Draw a horizontal row of lens tabs centred at *(cx, cy)* and return their
-   * screen rects so a click can be routed back to the coordinator.
+   * Draw a horizontal row of tabs centred at *(cx, cy)* and return their screen rects
+   * so a click can be routed back to the coordinator.
    */
-  private _drawLensTabs(
-    lenses: readonly Lens[],
+  private _drawHudTabs(
+    tabs: readonly HudTab[],
     activeId: string,
     cx: number,
     cy: number,
@@ -1234,17 +1249,17 @@ export class CanvasView {
     const h = 20;
     ctx.save();
     ctx.font = "11px monospace";
-    const widths = lenses.map(
-      (l) => ctx.measureText(l.label).width + padX * 2,
+    const widths = tabs.map(
+      (t) => ctx.measureText(t.label).width + padX * 2,
     );
     const total =
-      widths.reduce((a, b) => a + b, 0) + gap * (lenses.length - 1);
+      widths.reduce((a, b) => a + b, 0) + gap * (tabs.length - 1);
     let x = cx - total / 2;
     const y = cy - h / 2;
     const hits: LensTabHit[] = [];
-    lenses.forEach((lens, i) => {
+    tabs.forEach((tab, i) => {
       const w = widths[i];
-      const active = lens.id === activeId;
+      const active = tab.id === activeId;
       this._roundRect(x, y, w, h, 5);
       ctx.fillStyle = active ? "rgba(120,220,255,0.92)" : "rgba(18,20,24,0.86)";
       ctx.fill();
@@ -1256,8 +1271,8 @@ export class CanvasView {
       ctx.fillStyle = active ? "#0b1a22" : "rgba(210,220,230,0.9)";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(lens.label, x + w / 2, y + h / 2 + 0.5);
-      hits.push({ lensId: lens.id, x0: x, y0: y, x1: x + w, y1: y + h });
+      ctx.fillText(tab.label, x + w / 2, y + h / 2 + 0.5);
+      hits.push({ lensId: tab.id, x0: x, y0: y, x1: x + w, y1: y + h });
       x += w + gap;
     });
     ctx.restore();

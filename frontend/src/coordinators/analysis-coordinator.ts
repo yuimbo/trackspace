@@ -30,7 +30,11 @@ export interface AnalysisDeps {
   /** Repaint the canvas after cluster assignments change. */
   scheduleDraw(): void;
   /** Canvas hover state — hovering a cluster row glows its member points. */
-  canvas: { hoverTarget: HoverTarget | null };
+  canvas: {
+    hoverTarget: HoverTarget | null;
+    /** Flash the transient centre HUD (colour-mode feedback). */
+    flashHud(tabs: readonly { id: string; label: string }[], activeId: string): void;
+  };
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): Promise<void> | void;
   /** Approximate the layout for a live slider drag (optional in tests). */
@@ -626,7 +630,15 @@ export class AnalysisCoordinator {
     m.colorByCluster = value;
     m.saveLS();
     if (announce) {
-      toast(value ? "Colouring by cluster" : "Colouring by folder", "ok");
+      // A transient HUD replaces the previous one, so repeated presses do not stack a
+      // history of "Colouring by …" toasts.
+      this.deps.canvas.flashHud(
+        [
+          { id: "folder", label: "Folder colour" },
+          { id: "cluster", label: "Cluster colour" },
+        ],
+        value ? "cluster" : "folder",
+      );
     }
     this.deps.scheduleDraw();
     this._syncClusterControls();

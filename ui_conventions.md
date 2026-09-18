@@ -235,6 +235,11 @@ folder); `Model.trackMatchesHoverTarget` is the only place a target is interpret
 the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active chip is
 highlighted in the tooltip (`model.previewSection`).
 
+**Colour by folder/cluster** (action `"toggle-clusters"`, **C**) flips `model.colorByCluster` and flashes a
+**transient HUD** (`CanvasView.flashHud`) with the two modes and the active one highlighted. A HUD flash
+*replaces* the previous one, so repeated presses show the current mode rather than stacking "Colouring by …"
+toasts. See `design-patterns.md` → *Transient canvas HUD*.
+
 **Inspect card** is pinned by **Alt** (not a `HOTKEY_MAP` action — it is a bare modifier over a hovered
 dot, so it lives in `CanvasInteractionController._bindInspectKey`). See *Inspect card* below.
 

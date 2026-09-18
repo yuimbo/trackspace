@@ -108,7 +108,10 @@ interface Harness {
   scheduleDraw: ReturnType<typeof vi.fn>;
   refreshProjection: ReturnType<typeof vi.fn>;
   applyApproximateWeights: ReturnType<typeof vi.fn>;
-  canvas: { hoverTarget: HoverTarget | null };
+  canvas: {
+    hoverTarget: HoverTarget | null;
+    flashHud: ReturnType<typeof vi.fn>;
+  };
   coord: AnalysisCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
 }
@@ -120,7 +123,10 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const scheduleDraw = vi.fn();
   const refreshProjection = vi.fn();
   const applyApproximateWeights = vi.fn(() => true);
-  const canvas = { hoverTarget: null as HoverTarget | null };
+  const canvas = {
+    hoverTarget: null as HoverTarget | null,
+    flashHud: vi.fn(),
+  };
   const coord = new AnalysisCoordinator({
     model,
     status: { update },
@@ -413,7 +419,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
       model,
       status: { update: vi.fn() },
       scheduleDraw: vi.fn(),
-      canvas: { hoverTarget: null },
+      canvas: { hoverTarget: null, flashHud: vi.fn() },
     });
     const p1 = coord.fetchClusters();
     const p2 = coord.fetchClusters();
@@ -502,7 +508,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
 
 describe("AnalysisCoordinator panel bindings", () => {
   it("enables cluster colouring when clusters are available", () => {
-    const { model, coord, scheduleDraw } = makeHarness();
+    const { model, coord, scheduleDraw, canvas } = makeHarness();
     model.clustersAvailable = true;
     coord.bindPanel();
 
@@ -513,6 +519,17 @@ describe("AnalysisCoordinator panel bindings", () => {
       (document.getElementById("cluster-color-toggle") as HTMLInputElement).checked,
     ).toBe(true);
     expect(scheduleDraw).toHaveBeenCalled();
+    // A transient HUD replaces the old "Colouring by …" toast, so repeated presses
+    // never stack a history.
+    expect(canvas.flashHud).toHaveBeenLastCalledWith(
+      expect.arrayContaining([{ id: "cluster", label: "Cluster colour" }]),
+      "cluster",
+    );
+    coord.toggleColorByCluster();
+    expect(canvas.flashHud).toHaveBeenLastCalledWith(
+      expect.anything(),
+      "folder",
+    );
   });
 
   it("refuses to colour by cluster when none are available, and says why", () => {

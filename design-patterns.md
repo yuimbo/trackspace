@@ -117,6 +117,25 @@ target kind, update its description — the modal follows automatically.
 
 ---
 
+## Pattern: transient canvas HUD
+
+A hotkey whose effect is a **mode** (which lens is active, how dots are coloured) needs
+feedback, but a toast is the wrong shape: pressing the key repeatedly stacks a history of
+"now X" / "now Y" messages on top of each other, and the newest is not obviously the
+truth. Instead flash a **single transient tab row** at the centre of the canvas:
+
+- `CanvasView.flashHud(tabs, activeId, ms?)` draws the tabs with the active one
+  highlighted, exactly like the lens switcher and the scope tab bar (`_drawHudTabs`).
+- A new flash **replaces** the previous one (one `_hud` slot + one timer), so repeated
+  presses cannot stack; the last state is the only one shown.
+- It is view state: no model event, no persistence — just `scheduleDraw()`.
+- Reserve it for *mode* feedback (lens, colour-by). A one-off outcome ("Analysis
+  complete") is still a toast; an error/unavailable reason is still a warn toast.
+- The canvas owns the drawing; a coordinator calls it through a deps callback
+  (`EmbeddingDeps.canvas.flashLensHud`, `AnalysisDeps.canvas.flashHud`).
+
+---
+
 ## Checklist for a new interaction surface
 
 1. Is it a *set of tracks* under the pointer? Make it a `HoverTarget` (above) — do
