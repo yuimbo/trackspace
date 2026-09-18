@@ -20,6 +20,12 @@ export interface DotPosition {
   sy: number;
 }
 
+/** One landmark sample point for the search field (path + query cosine). */
+export interface SearchFieldPoint {
+  path: string;
+  score: number;
+}
+
 /** A clickable lens tab drawn on the canvas. */
 export interface LensTabHit {
   lensId: string;
@@ -74,6 +80,9 @@ const TX_KNOB_HIT = 9;
 
 /** Halo colour for a key/BPM hover target (folders/clusters use their own colours). */
 const TARGET_GLOW_COLOR = "#8e9bff";
+/** Search-field glow: accent RGB (matches `TARGET_GLOW_COLOR`) and splat radius in px. */
+const FIELD_GLOW_RGB = "142,155,255";
+const FIELD_GLOW_R = 64;
 
 export class CanvasView {
   model: Model;
@@ -83,6 +92,21 @@ export class CanvasView {
 
   positions: DotPosition[] = [];
   hoveredIdx = -1;
+  /**
+   * A track hovered via a non-canvas row (search hit / Properties row). It gets
+   * the same glow, audition and info card as a canvas hover; the row's leave
+   * clears it. Purely visual, so it lives here rather than on the model.
+   */
+  hoveredPath: string | null = null;
+  /**
+   * True while the search box is focused. The search-field glow shows only then,
+   * so a dormant query never tints the map. Purely visual, so it lives here
+   * rather than on the model (see `ui_conventions.md` → *Adding new interaction
+   * surfaces*).
+   */
+  searchActive = false;
+  /** Landmark query scores the backend returns for the CLAP-lens field. */
+  searchField: SearchFieldPoint[] | null = null;
   /**
    * Hovered navigation element — a folder row, cluster row, or card chip (key/BPM).
    * Owned by whichever list renders it (sidebar tree, cluster panel, inspect card);
@@ -283,6 +307,7 @@ export class CanvasView {
 
     this._drawGrid(w, h);
     this._drawLensGuide();
+    this._drawSearchField();
     this._drawDragGhosts();
     this._drawScatter(tracks);
     this._drawFolderGlow(tracks);
@@ -337,6 +362,61 @@ export class CanvasView {
         else ctx.lineTo(sx, sy);
       });
       ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  /* ── Search field (where the active query matches) ───────── */
+
+  /**
+   * The "where does my query match" glow, drawn under the dots while the search
+   * box is focused and the CLAP lens is shown.
+   *
+   * Built from the backend's landmark sample: each landmark is splatted at its
+   * *current* map position (scope/animation included), sized and weighted by its
+   * query cosine, additively blended so the samples read as one smooth field.
+   * t-SNE only preserves local neighbourhoods, so this shows where matching
+   * tracks live — not a calibrated similarity contour.
+   */
+  private _drawSearchField(): void {
+    const m = this.model;
+    // The lens actually on screen: the scope's when one is open, else the map's.
+    const lensId = m.scope ? m.scope.lensId : m.lensId;
+    if (!this.searchActive || m.viewMode !== "embeddings" || lensId !== "clap") {
+      return;
+    }
+    const field = this.searchField;
+    if (!field || !field.length) return;
+
+    let lo = Infinity,
+      hi = -Infinity;
+    const pts: { sx: number; sy: number; s: number }[] = [];
+    for (const p of field) {
+      const t = m.trackByPath(p.path);
+      if (!t) continue;
+      const pos = this._resolveTrackWPos(t);
+      if (!pos) continue;
+      const [sx, sy] = this.w2s(pos.wx, pos.wy);
+      pts.push({ sx, sy, s: p.score });
+      if (p.score < lo) lo = p.score;
+      if (p.score > hi) hi = p.score;
+    }
+    if (!pts.length) return;
+    const span = Math.max(hi - lo, 1e-6);
+
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    for (const p of pts) {
+      const w = (p.s - lo) / span;
+      const r = FIELD_GLOW_R * (0.55 + 0.45 * w);
+      const grad = ctx.createRadialGradient(p.sx, p.sy, 0, p.sx, p.sy, r);
+      grad.addColorStop(0, `rgba(${FIELD_GLOW_RGB},${(0.05 + 0.35 * w * w).toFixed(3)})`);
+      grad.addColorStop(1, `rgba(${FIELD_GLOW_RGB},0)`);
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(p.sx, p.sy, r, 0, Math.PI * 2);
+      ctx.fill();
     }
     ctx.restore();
   }
@@ -969,15 +1049,18 @@ export class CanvasView {
 
   /** Progress pill for the whole analysis pipeline, with a determinate bar.
    *
-   * Big and centred while the map has nothing to plot; once positions exist it
-   * docks to the top-centre so progress stays visible without covering the map.
+   * Big and centred while the map has nothing to plot and it is the only
+   * indicator; otherwise docked at *top* so progress stays visible without
+   * covering the map and leaves room for the layout pill below it. Returns the
+   * pill's bottom edge, so a second indicator can stack under it.
    */
   private _drawPipelinePill(
     w: number,
     h: number,
     prog: PipelineProgress,
+    top: number,
     docked: boolean,
-  ): void {
+  ): number {
     const ctx = this.ctx;
     const label = `${prog.label} · ${prog.detail}`;
     const fontSize = docked ? 12 : 16;
@@ -990,7 +1073,7 @@ export class CanvasView {
     const pw = Math.max(barW, ctx.measureText(label).width) + 28;
     const ph = fontSize + 34;
     const cx = w / 2;
-    const cy = docked ? 34 + ph / 2 : h / 2;
+    const cy = docked ? top + ph / 2 : h / 2;
     const x = cx - pw / 2;
     const y = cy - ph / 2;
 
@@ -1030,40 +1113,52 @@ export class CanvasView {
 
     ctx.textAlign = "start";
     ctx.textBaseline = "alphabetic";
+    return y + ph;
   }
 
+  /** Docked status pill for a layout that is still computing.
+   *
+   * The map keeps rendering the previous lens while the new one fits, so a
+   * **throbber** is what makes the wait legible instead of the map looking
+   * idle. Drawn at *top* so it stacks under the analysis pill, and returns its
+   * bottom edge for the next indicator.
+   */
   private _drawCenterStatusPill(
     w: number,
-    h: number,
     label: string,
-    fraction: number | null = null,
-  ): void {
+    fraction: number | null,
+    top: number,
+  ): number {
     const ctx = this.ctx;
-    const cx = w / 2;
-    const cy = h / 2;
-    ctx.font = "bold 22px monospace";
-    ctx.textAlign = "center";
+    const pad = 14;
+    const spinnerR = 7;
+    const gap = 10;
+    ctx.font = "bold 13px monospace";
+    ctx.textAlign = "left";
     ctx.textBaseline = "middle";
-    const metrics = ctx.measureText(label);
-    const pw = metrics.width + 28;
-    const ph = 44;
-    const rx = 8;
+    const pw = pad + spinnerR * 2 + gap + ctx.measureText(label).width + pad;
+    const ph = 40;
+    const cx = w / 2;
+    const x = cx - pw / 2;
+    const rowY = top + 16;
     ctx.beginPath();
-    ctx.roundRect(cx - pw / 2, cy - ph / 2, pw, ph, rx);
-    ctx.fillStyle = "rgba(10,14,30,0.72)";
+    ctx.roundRect(x, top, pw, ph, 8);
+    ctx.fillStyle = "rgba(10,14,30,0.82)";
     ctx.fill();
     ctx.strokeStyle = "rgba(180,220,255,0.35)";
     ctx.lineWidth = 1;
     ctx.stroke();
-    ctx.fillStyle = "rgba(180,220,255,0.9)";
-    ctx.fillText(label, cx, cy - 4);
+
+    this._drawSpinner(x + pad + spinnerR, rowY, spinnerR);
+    ctx.fillStyle = "rgba(180,220,255,0.95)";
+    ctx.fillText(label, x + pad + spinnerR * 2 + gap, rowY);
 
     // A bar under the label: determinate when the phase reports steps, an
     // animated indeterminate track otherwise (the layout base phase is opaque).
-    const barW = Math.max(120, pw - 40);
+    const barW = Math.max(120, pw - 2 * pad);
     const barH = 4;
     const bx = cx - barW / 2;
-    const by = cy + ph / 2 - 12;
+    const by = top + ph - 10;
     ctx.fillStyle = "rgba(255,255,255,0.14)";
     ctx.beginPath();
     ctx.roundRect(bx, by, barW, barH, barH / 2);
@@ -1095,6 +1190,25 @@ export class CanvasView {
 
     ctx.textAlign = "start";
     ctx.textBaseline = "alphabetic";
+    return top + ph;
+  }
+
+  /** A rotating arc, so an indeterminate wait reads as "working". */
+  private _drawSpinner(cx: number, cy: number, r: number): void {
+    const ctx = this.ctx;
+    const a0 = ((performance.now() / 900) % 1) * Math.PI * 2;
+    ctx.save();
+    ctx.lineWidth = 2;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = "rgba(180,220,255,0.25)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = "rgba(120,200,255,0.95)";
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, a0, a0 + Math.PI * 0.55);
+    ctx.stroke();
+    ctx.restore();
   }
 
   private _drawModeBadge(w: number, h: number): void {
@@ -1114,11 +1228,21 @@ export class CanvasView {
     const prog = pipelineProgress(m.queueStatus);
     // The speculative per-lens prefetch is background work: the status bar reports
     // it, but the canvas must not make it look like the shown view is computing.
-    if (prog && !prog.background) {
-      // Docked once the map is drawn, so the indicator never covers the points.
-      this._drawPipelinePill(w, h, prog, m.embeddingPositions.size > 0);
-    } else if (wait) {
-      this._drawCenterStatusPill(w, h, wait.label, wait.fraction);
+    const showProg = !!prog && !prog.background;
+    // A lens still fitting keeps the previous lens on screen, so the layout wait
+    // *stacks below* the analysis pill rather than being hidden by it — otherwise
+    // a lens switch looks like the shown map is idle and interactive.
+    const layoutWait = wait !== null && m.projectionPending;
+    // Docked once the map is drawn, or whenever a second indicator shares the
+    // top strip, so neither indicator covers the points.
+    const docked = m.embeddingPositions.size > 0 || layoutWait;
+
+    let top = 34;
+    if (showProg && prog) {
+      top = this._drawPipelinePill(w, h, prog, top, docked) + 8;
+    }
+    if (wait && (layoutWait || !showProg)) {
+      this._drawCenterStatusPill(w, wait.label, wait.fraction, top);
     }
     if (m.projectionPending) this._scheduleWaitRedraw();
 
@@ -1316,6 +1440,16 @@ export class CanvasView {
       } else {
         anchor = this._pinPos;
       }
+    } else if (this.hoveredPath) {
+      // A search hit / Properties row hovered: show the same card a canvas hover
+      // would, anchored at the track's dot. No delay — the row is the hover.
+      track = this.model.trackByPath(this.hoveredPath);
+      const idx = track ? tracks.indexOf(track) : -1;
+      const pos = idx >= 0 ? this.positions.find((p) => p.idx === idx) : undefined;
+      if (track && pos) {
+        const r = this.$canvas.getBoundingClientRect();
+        anchor = { left: r.left + pos.sx, top: r.top + pos.sy };
+      }
     } else if (this.hoveredIdx >= 0 && this.tipReady) {
       track = tracks[this.hoveredIdx];
       const pos = this.positions.find((p) => p.idx === this.hoveredIdx);
@@ -1488,6 +1622,7 @@ export class CanvasView {
     clearTimeout(this.tipTimer);
     this.tipReady = false;
     this.hoveredIdx = -1;
+    this.hoveredPath = null;
     this.hoveredSiblingFolder = null;
     // The pinned inspect card outlives the pointer leaving the canvas.
     if (!this.inspect) this.$tip.classList.add("hidden");

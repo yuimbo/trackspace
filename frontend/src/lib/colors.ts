@@ -49,6 +49,17 @@ export function dirColor(folderPath: string): string {
   return `hsl(${hue},${sat}%,${light}%)`;
 }
 
+/**
+ * Colour stops for a folder *tag*: a single colour for a root or top-level
+ * folder, or a parent→own gradient for a nested folder, so the tag reads as a
+ * deeper tint of its family (mirrors how `dirColor` shades deeper paths).
+ */
+export function dirTagColors(folderPath: string): string[] {
+  const segments = folderPath.split("/");
+  if (segments.length - 1 < 2) return [dirColor(folderPath)];
+  return [dirColor(segments.slice(0, -1).join("/")), dirColor(folderPath)];
+}
+
 // ─── Cluster coloring ────────────────────────────────────────
 /** Golden-angle hue for cluster *id*.
  *

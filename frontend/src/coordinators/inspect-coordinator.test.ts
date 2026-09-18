@@ -159,6 +159,44 @@ describe("InspectCoordinator", () => {
     });
   });
 
+  it("coalesces a slider drag into a leading and a trailing step", async () => {
+    const h = makeHarness({ ok: true, ranking: ["b.mp3", "c.mp3", "d.mp3"] });
+    h.model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+      makeTrack({ path: "d.mp3" }),
+    ]);
+
+    // A burst of input events: the first step applies at once, the rest
+    // coalesce into a single trailing step with the final value.
+    void h.coord.action("proximity", "a.mp3", 100);
+    void h.coord.action("proximity", "a.mp3", 50);
+    await h.coord.action("proximity", "a.mp3", 10);
+
+    expect(h.fitToPaths).toHaveBeenCalledTimes(2);
+    expect(h.fitToPaths).toHaveBeenLastCalledWith(
+      new Set(["a.mp3", "b.mp3"]),
+    );
+  });
+
+  it("drops a pending slider step when another action supersedes it", async () => {
+    const h = makeHarness({ ok: true, ranking: ["b.mp3", "c.mp3"] });
+    h.model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+
+    void h.coord.action("proximity", "a.mp3", 100); // leading, applies now
+    void h.coord.action("proximity", "a.mp3", 30); // pending trailing step
+    await h.coord.action("close", "a.mp3"); // supersedes the pending step
+
+    expect(h.view.unpinInspect).toHaveBeenCalled();
+    // Only the leading step fit; the trailing one was cancelled.
+    expect(h.fitToPaths).toHaveBeenCalledTimes(1);
+  });
+
   it("focuses a result: select it alone, fit the view, audition it", async () => {
     const h = makeHarness();
     h.model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);

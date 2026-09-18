@@ -19,7 +19,7 @@ from backend.tuning import BPM_HI, BPM_LO
 
 log = logging.getLogger(__name__)
 
-FEATURES_VERSION = 6
+FEATURES_VERSION = 7
 AUDIO_FEATURE_DIM = 6
 
 _KEY_TO_FIFTHS: dict[str, int] = {

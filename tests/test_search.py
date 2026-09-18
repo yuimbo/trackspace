@@ -212,6 +212,39 @@ def test_search_limit_is_applied():
     assert body["results"][0]["path"] == "a.mp3"
 
 
+# ─── field ────────────────────────────────────────────────
+
+
+def test_search_omits_field_without_the_flag():
+    c = _client()
+    body = c.get("/api/search?q=x").get_json()
+    assert "field" not in body
+
+
+def test_search_field_returns_a_landmark_sample():
+    """Fewer tracks than landmarks: the whole library is the sample."""
+    c = _client()
+    body = c.get("/api/search?q=x&field=1").get_json()
+    assert [p["path"] for p in body["field"]] == ["a.mp3", "b.mp3", "c.mp3"]
+    scores = {p["path"]: p["score"] for p in body["field"]}
+    assert abs(scores["a.mp3"] - 1.0) < 1e-6
+
+
+def test_search_field_uses_best_segment_score():
+    segments = {"fp-a": np.array([[0.0, 1.0], [1.0, 0.0]], dtype=np.float32)}
+    positions = {"fp-a": np.array([0.2, 0.8], dtype=np.float32)}
+    c = _client(segments=segments, positions=positions)
+    body = c.get("/api/search?q=x&field=1").get_json()
+    scores = {p["path"]: p["score"] for p in body["field"]}
+    assert scores["a.mp3"] == 1.0
+
+
+def test_search_field_is_empty_without_cached_embeddings():
+    c = _client(rows={})
+    body = c.get("/api/search?q=x&field=1").get_json()
+    assert body["field"] == []
+
+
 def test_search_missing_query_is_400():
     c = _client()
     r = c.get("/api/search")

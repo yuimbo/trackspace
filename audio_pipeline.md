@@ -246,6 +246,17 @@ request. The frontend turns the hits into the canvas selection and lists them (w
 bars) in the Search panel; clicking a result selects it alone and fits the viewport to
 it.
 
+`field=1` additionally returns a ~128-point **landmark** sample
+(`field: [{path, score}]`) for the canvas search field. The landmarks are the
+representative tracks the layout's own weight chart already selects
+(`landmark_projection._select_landmarks` over the L2-normalised pooled CLAP
+matrix), so the sample is a property of the cache, not of the query; the selection
+is cached by a CLAP-content token because the k-means is ~0.3 s at 10k tracks.
+The client has every track's 2-D map position, so it splats the sample into the
+"where does my query match" glow without any further backend work. The field is a
+local-density view, not a calibrated similarity contour (t-SNE preserves only local
+neighbourhoods).
+
 Retrieval quality depends on the CLAP checkpoint above — with the working
 `larger_clap_music_and_speech` conversion the query ranking is meaningful; with the
 old `larger_clap_music` conversion it was query-insensitive.
@@ -320,6 +331,9 @@ is steady state):
 
 - Tempo: **madmom** (`RNNBeatProcessor` + comb `TempoEstimationProcessor`) when importable,
   else `librosa.feature.tempo()` (same audio clip; `FEATURES_VERSION` 6+).
+  Normalised to `[0, 1]` over **60–250 BPM** (`BPM_LO`/`BPM_HI` in `backend/tuning.py`);
+  the upper end matches madmom's `MAX_BPM`, so the estimator's whole range survives
+  normalisation instead of saturating at a lower ceiling.
   Classical-feature excerpts stay at **22.05 kHz** for librosa; madmom receives a
   **44.1 kHz** resample of that buffer only. Optional env
   **`TRACKSPACE_MADMOM_FAST=1`** uses one BLSTM instead of the default

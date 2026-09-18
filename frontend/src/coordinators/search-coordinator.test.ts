@@ -33,9 +33,16 @@ function makeHarness(fetchImpl: (q: string, limit: number) => Promise<SearchResp
     renderResults: vi.fn(),
   };
   const fitToPaths = vi.fn();
+  const setField = vi.fn();
   const fetchResults = vi.fn(fetchImpl);
-  const coord = new SearchCoordinator({ model, view, fetchResults, fitToPaths });
-  return { model, view, fetchResults, fitToPaths, coord };
+  const coord = new SearchCoordinator({
+    model,
+    view,
+    fetchResults,
+    fitToPaths,
+    setField,
+  });
+  return { model, view, fetchResults, fitToPaths, setField, coord };
 }
 
 const HITS: SearchResponse = {
@@ -56,6 +63,27 @@ describe("SearchCoordinator", () => {
     await coord.search("   ");
     expect(fetchResults).not.toHaveBeenCalled();
     expect(view.clear).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the canvas field for a blank query", async () => {
+    const { coord, setField } = makeHarness(async () => HITS);
+    await coord.search("   ");
+    expect(setField).toHaveBeenCalledWith(null);
+  });
+
+  it("publishes the landmark field from the response", async () => {
+    const field = [{ path: "a.mp3", score: 0.7 }];
+    const { coord, setField } = makeHarness(async () => ({ ...HITS, field }));
+    await coord.search("x");
+    expect(setField).toHaveBeenCalledWith(field);
+  });
+
+  it("clears the canvas field when the fetch fails", async () => {
+    const { coord, setField } = makeHarness(async () => {
+      throw new Error("boom");
+    });
+    await coord.search("x");
+    expect(setField).toHaveBeenCalledWith(null);
   });
 
   it("trims the query and passes it with the result limit", async () => {
@@ -144,9 +172,10 @@ describe("SearchCoordinator", () => {
     expect(fitToPaths).toHaveBeenCalledWith(["b.mp3"]);
   });
 
-  it("clears the panel", () => {
-    const { coord, view } = makeHarness(async () => HITS);
+  it("clears the panel and the canvas field", () => {
+    const { coord, view, setField } = makeHarness(async () => HITS);
     coord.clear();
     expect(view.clear).toHaveBeenCalledTimes(1);
+    expect(setField).toHaveBeenCalledWith(null);
   });
 });

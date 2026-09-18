@@ -18,7 +18,7 @@ import type { Track } from "../model";
 
 // Mirrors ``backend/tuning.py`` BPM_LO / BPM_HI; keep in sync.
 export const BPM_LO = 60;
-export const BPM_HI = 200;
+export const BPM_HI = 250;
 
 // Mirrors ``backend/embeddings/feature_encoding.py``; keep in sync.
 export const CAMELOT_MAJOR_RADIUS = 0.82;

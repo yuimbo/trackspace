@@ -220,11 +220,16 @@ export class Controller {
       view: searchView,
       fetchResults: (query, limit) =>
         api<SearchResponse>(
-          `/api/search?q=${encodeURIComponent(query)}&limit=${limit}`,
+          `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&field=1`,
           undefined,
           true,
         ),
       fitToPaths: (paths) => this.interaction.fitViewToPaths(paths),
+      // The landmark field is purely visual: it lives on the canvas, not the model.
+      setField: (field) => {
+        this.canvas.searchField = field;
+        this.canvas.scheduleDraw();
+      },
     });
 
     this.inspect = new InspectCoordinator({
@@ -373,13 +378,24 @@ export class Controller {
         if (!keepPaths.has(p)) m.selected.delete(p);
       m.emit("change");
     };
-    // Hovering a selected track (Properties) or a search hit previews it.
+    // Hovering a selected track (Properties) or a search hit behaves like a
+    // canvas hover: glow the dot, show the info card, and audition it.
     const onHoverTrack = (path: string) => {
+      this.canvas.hoveredPath = path;
+      this.canvas.hoverTarget = { kind: "track", path };
+      this.canvas.scheduleDraw();
       if (!m.hoverPreview) return;
       const t = m.trackByPath(path);
       if (t) this._startPreview(t);
     };
-    const onHoverEnd = () => this._stopPreview();
+    const onHoverEnd = () => {
+      this.canvas.hoveredPath = null;
+      if (this.canvas.hoverTarget?.kind === "track") {
+        this.canvas.hoverTarget = null;
+      }
+      this.canvas.scheduleDraw();
+      this._stopPreview();
+    };
     this.props.onHoverTrack = onHoverTrack;
     this.props.onHoverEnd = onHoverEnd;
     this.searchView.onHoverTrack = onHoverTrack;
@@ -389,6 +405,11 @@ export class Controller {
       void this.search.search(query);
     };
     this.searchView.onFocusResult = (path) => this.search.focusResult(path);
+    // The canvas shows the search field only while the search box is focused.
+    this.searchView.onActiveChange = (active) => {
+      this.canvas.searchActive = active;
+      this.canvas.scheduleDraw();
+    };
 
     this.batch.onApply = (tag, updates) => {
       for (const [path, value] of updates) {

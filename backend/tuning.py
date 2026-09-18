@@ -16,9 +16,11 @@ from typing import Final
 # --- Audio feature extraction (backend/embeddings/librosa_audio_features.py) ---
 
 #: Tempo range used to normalise BPM to [0, 1] and to invert that back for
-#: display. Tracks outside the range clip to the ends.
+#: display. Tracks outside the range clip to the ends. The upper end matches
+#: madmom's ``TempoEstimationProcessor`` ceiling (``MAX_BPM = 250``) so the whole
+#: range the estimator can report survives normalisation.
 BPM_LO: Final[float] = 60.0
-BPM_HI: Final[float] = 200.0
+BPM_HI: Final[float] = 250.0
 
 # --- Projection recipe (backend/embeddings/projection_config.py) ---
 

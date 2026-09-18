@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import vectors from "./dir-color-vectors.json";
-import { dirColor } from "./colors";
+import { dirColor, dirTagColors } from "./colors";
 
 /** The pre-family algorithm, kept to prove depth <= 1 is byte-identical. */
 function legacyDirColor(folderPath: string): string {
@@ -68,5 +68,21 @@ describe("dirColor", () => {
     expect(dirColor("abc12345/GENRES/Rock/70s")).toBe(
       dirColor("abc12345/GENRES/Rock/70s"),
     );
+  });
+});
+
+describe("dirTagColors", () => {
+  it("is solid for roots and top-level folders", () => {
+    expect(dirTagColors("abc12345")).toEqual([dirColor("abc12345")]);
+    expect(dirTagColors("abc12345/GENRES")).toEqual([
+      dirColor("abc12345/GENRES"),
+    ]);
+  });
+
+  it("runs parent→own for nested folders", () => {
+    expect(dirTagColors("abc12345/GENRES/Rock")).toEqual([
+      dirColor("abc12345/GENRES"),
+      dirColor("abc12345/GENRES/Rock"),
+    ]);
   });
 });

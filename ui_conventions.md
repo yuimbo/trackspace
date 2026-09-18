@@ -277,12 +277,14 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   preempts the prefetch** (`services/projection_priority.py`), so a switch never queues
   behind several prefetched fits. The status bar shows it as **Preparing views**; a lens
   whose revision is unchanged is a no-op.
-- While a lens is loading, the centre pill names the **target** lens and an elapsed
+- While a lens is loading, a **throbber pill** names the **target** lens and an elapsed
   readout (`Loading CLAP timbre · laying out · 12s`) — the map keeps showing the previous
-  lens until the new layout lands. A `layout_progress` phase carries its request's query, so
-  an older overlapping request's phase is ignored. The background `layout` prefetch is
-  **not** shown on the canvas (only in the status bar), so background work never looks like
-  the shown view is computing.
+  lens until the new layout lands, so the spinner is what makes the wait legible. It is
+  drawn **stacked below** the analysis pipeline pill rather than replacing it, so track
+  analysis progress can never hide a lens switch. A `layout_progress` phase carries its
+  request's query, so an older overlapping request's phase is ignored. The background
+  `layout` prefetch is **not** shown on the canvas (only in the status bar), so
+  background work never looks like the shown view is computing.
 - The deterministic lenses are a pure function of the cached audio features and are
   computed client-side with no server round-trip. They draw their guide under the
   dots: the Camelot rings + key labels, or the tempo spiral.
@@ -349,6 +351,26 @@ cluster can be read in a different space without leaving the map.
 - While a scope is open, in-scope dots behave like embedding-mode dots: tag
   drag/transform is disabled. Switching the outer lens drops the scope.
 
+### Search field
+
+While the search box is **focused** and the **CLAP lens** is the one on screen (the
+scope's lens when a scope is open, else `model.lensId`), the canvas draws a
+**search field** under the dots: a glowing "where does my query match" layer.
+
+- `/` or **⌘/Ctrl+F** focuses the box; **Esc** clears it and leaves the field,
+  which is the only thing that hides the glow.
+- The box searches **as you type** (debounced ~300 ms; Enter searches at once, an
+  emptied box clears at once). The input stays editable during a fetch, and a
+  response superseded by a newer query is dropped.
+- The field is built from the backend's `field=1` landmark sample — the same
+  representative tracks the layout's weight chart selects — splatted additively at
+  their *current* map positions (scope/animation included) and weighted by their
+  query cosine. `CanvasView.searchActive` / `searchField` own it; the search
+  response carries the sample and the controller publishes it.
+- It shows *where matching tracks live*, not a calibrated similarity contour:
+  t-SNE preserves only local neighbourhoods, so two tracks with equal CLAP cosine
+  can sit far apart on screen.
+
 ---
 
 ## Hover preview and tooltip
@@ -364,20 +386,40 @@ cluster can be read in a different space without leaving the map.
   start after lead-in silence), falling back to `0`.
   `model.previewTrackPath` / `model.previewSection` are in-memory preview state,
   not persisted.
+- **A search hit behaves like a track.** Hovering a result row glows its dot
+  (`canvas.hoverTarget` = `{kind: "track", path}`), auditions it, and shows the
+  same info **card** a canvas hover would, anchored at its dot — so a result reads
+  as "this track, here", not a detached list row. The controller implements it in
+  `onHoverTrack` / `onHoverEnd`; `CanvasView.hoveredPath` owns the card anchor.
+  The Properties panel's rows share the same seam.
 - Structure is **fetched lazily on first hover** (`/api/tracks/structure?paths=…`,
   silent, deduped per path) and cached on `model.trackStructure`. A missing row is
   the normal "not analysed yet" case; the preview keeps its fallback position and
   re-seeks to the drop if the fetch lands while the track is still auditioning
   (unless the user has already cycled to another section).
 - The hover **tooltip** is a card (`lib/tooltip.ts`: pure `buildTooltip` +
-  `renderTooltip`), not a block of text. It shows the folder kicker and title, a
-  BPM/key meta row, **structure chips** (`intro 0:12–0:32`, `drop 1:04`,
-  `break 3:12`; the auditioned one is highlighted), the **genre group** (cluster
-  swatch + name + a `genre-spanning` badge whose hover text explains that the
-  intro and drop excerpts disagree) and two stat-bar areas — user **Personal
-  tags** and audio **Features**. Feature axis ids never render as tags. `buildTooltip`
-  returns a `key`; the canvas re-renders the DOM only when that key changes, so
-  pan/zoom frames do not rebuild the card.
+  `renderTooltip`), not a block of text. It shows a **title/artist header** (the
+  title is bold; the artist line is dropped when there is no artist metadata, and the
+  whole header collapses to just the **filename** when there is neither), a
+  **location stack** with the folder and cluster tags on separate lines,
+  **structure chips** (`intro 0:12–0:32`, `drop 1:04`, `break 3:12`; the
+  auditioned one is highlighted) and two stat areas — user **Personal tags** and
+  audio **Features**. The location tags are told apart by their icon: the folder uses a
+  **folder** glyph and the cluster a **tag** glyph, and each tag is **filled** with
+  its colour (`tt-loc-filled`; a nested folder gets a parent→own **gradient**,
+  `dirTagColors`) with the icon/name in the dark canvas colour for contrast. The
+  cluster tag also carries a `genre-spanning` badge whose hover text explains that the
+  intro and drop excerpts disagree. Feature axis ids never render as tags, and BPM/key
+  are **not** duplicated near the title: both render as **chips** in Features
+  (`TooltipBar.chip`) because a key or a BPM has no magnitude to bar. **Mode** is
+  folded into the Key chip — `musical_key` already carries the major/minor suffix
+  ("Am" = minor, "A" = major) — so it stays a canvas axis/filter but has no tooltip
+  row of its own.
+  Personal tags are **sorted by label** so the card does not jump as you move between
+  dots. The card has a **fixed width** (300 px) so rows wrap the same way for every
+  track, and the structure chips are compact enough that the usual trio stays on one
+  row. `buildTooltip` returns a `key`; the canvas re-renders the DOM only when that
+  key changes, so pan/zoom frames do not rebuild the card.
 
 ## Analysis panel (coverage + retrigger)
 
@@ -418,7 +460,7 @@ open when the pointer leaves the canvas (that is how you reach it), and closes o
 owns the pin/anchor state and delegates clicks (`data-inspect-action`,
 `data-inspect-focus`, `data-inspect-close`) to `onInspectAction`.
 
-In the pinned card the folder kicker, cluster name and the key/BPM feature rows are
+In the pinned card the folder tag, cluster tag and the key/BPM feature rows are
 **navigation targets** (`data-hover-target`, `.tt-target`): hovering one glows the matching
 dots and makes **S**/**H**/**F**/**Shift+S** act on that set, exactly like a sidebar row.
 `CanvasView` delegates the card's `mouseover`/`mouseout` onto `canvas.hoverTarget`; see
@@ -439,6 +481,11 @@ same seam as `SearchCoordinator`:
   scores) and cached, so a drag never hits the network; widening reveals exactly what
   the previous step hid (`Model.setProximityKeep`). The slider is excluded from the
   card's re-render key, so dragging does not rebuild the input under the pointer.
+  Drag steps are **throttled** (`PROXIMITY_THROTTLE_MS`): a burst applies the first
+  step at once and the last on the trailing edge, so the neighbourhood still tracks
+  the drag without the re-hide/re-home/"change" cascade running on every pointer
+  move. A superseded step's async ranking result is dropped (`_proximitySeq`), and any
+  other card action cancels the pending step.
 - **Result row** — click focuses it: select alone, fit the view, audition it (only
   when hover preview is on). **Hovering** a row glows that track in the map
   (`{kind: "track", path}` hover target) and auditions it immediately, like a

@@ -104,6 +104,17 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
   warming the external variant too, or gating the sweep behind a size threshold.
   Files: `backend/app.py` (`_prefetch_lens`),
   `backend/embeddings/projection_config.py` (`PROJECTION_LENSES`).
+- [ ] **Search field resolution.** The field splats the backend's fixed 128-point
+  landmark sample, so zooming into a sparse region shows a few large blobs rather than
+  detail. Consider a larger sample (or a screen-space grid) when zoomed in; the
+  selection is cached by CLAP content, so a bigger sample is a one-time k-means cost.
+  Files: `backend/routes/api_search.py` (`_landmark_paths`),
+  `frontend/src/components/canvas-view.ts` (`_drawSearchField`).
+- [ ] **Search field is layout-independent.** The landmark sample is selected over
+  the whole CLAP matrix, so hidden tracks and external roots leave gaps in the field
+  even though the displayed layout may differ. Tie the sample to the displayed lens
+  revision if the gaps read as noise. Files: `backend/routes/api_search.py`
+  (`_landmark_paths`), `frontend/src/components/canvas-view.ts`.
 
 ## Deferred / optional
 
@@ -114,6 +125,18 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       If same-depth siblings still read too alike on the canvas, add a small hue deviation
       that also decays with depth; bump the shared golden vectors in
       `frontend/src/lib/dir-color-vectors.json` (asserted by both suites).
+- [ ] **The map stays interactive while a lens fits.** A lens switch keeps the
+      previous lens on screen (with the throbber pill stacked under any analysis
+      progress), and pointer gestures still act on the *old* lens's positions. Gate
+      selection/drag while `model.projectionPending`, or dim the canvas, so a click
+      during the wait cannot act on a stale layout. Files:
+      `frontend/src/coordinators/canvas-interaction.ts`,
+      `frontend/src/components/canvas-view.ts`.
+- [ ] **Hovered search row can go stale on live search.** `SearchView.renderResults`
+      rebuilds every row on each debounced query, so a hovered row's `mouseleave`
+      may not fire and its glow/card can linger. Clear `canvas.hoveredPath` when the
+      list rebuilds. Files: `frontend/src/components/search-view.ts`,
+      `frontend/src/controller.ts`.
 - [ ] **Inspect card follow-ups.** The pinned card (Alt over a dot) has anti-track,
       nearest, solo-neighbourhood and result focus, and its folder/cluster/key/BPM elements
       are navigation targets (glow + S/H/F/Shift+S) — see `design-patterns.md`. Still open:
@@ -147,6 +170,12 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 - [ ] **Structure preview follow-up.** `_fetchStructure` (`controller.ts`) fetches one
       path per hover — a batched request for the visible tracks would cut the
       round-trips.
+- [ ] **Frontend duplicates backend tuning constants.** `frontend/src/lib/lenses.ts`
+      mirrors `BPM_LO`/`BPM_HI` (`backend/tuning.py`) and the Camelot/spiral radii
+      (`backend/embeddings/feature_encoding.py`) by hand, so a retune needs an edit in
+      both languages (the tempo-window change did). Expose them to the frontend — an
+      `/api/tuning` payload or a build-time generated module — so the deterministic
+      lenses cannot silently drift from the backend.
 
 ### Backend
 
@@ -186,9 +215,10 @@ none require re-running an encoder over the library.
 - [ ] **Playlist labels.** Playlists do not exist in the product yet; when they do,
   they are another noisy label source for the same head (the training recipe already takes
   a label vector, so this is a data-plumbing change, not a new model).
-- [ ] **Search follow-ups.** Folder-scoped search (`folder` param), search-as-you-type
-  debounce, and a minimum-score threshold / "select all" affordance. Fit-on-focus is done
-  (`CanvasInteractionController.fitViewToPaths`). Perf: `/api/search` calls the *uncached*
+- [ ] **Search follow-ups.** Folder-scoped search (`folder` param) and a minimum-score
+  threshold / "select all" affordance. Fit-on-focus is done
+  (`CanvasInteractionController.fitViewToPaths`); live search is done
+  (`SearchView` debounce, `SEARCH_DEBOUNCE_MS`). Perf: `/api/search` calls the *uncached*
   `build_track_infos_fn` (`backend/routes/api_search.py`), so every query re-reads the
   whole library — use `track_infos_cached` (with `library_mtime_signature`) or resolve only
   the candidate paths, as `/api/tracks/structure` now does.

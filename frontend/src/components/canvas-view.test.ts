@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, type Track } from "../model";
+import {
+  Model,
+  type QueueKindStatus,
+  type QueueStatus,
+  type Track,
+} from "../model";
 import { clusterColor } from "../lib/colors";
 import { CanvasView } from "./canvas-view";
 
@@ -116,6 +121,88 @@ describe("CanvasView cluster hover glow", () => {
   });
 });
 
+describe("CanvasView search field", () => {
+  let gradients: number;
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+    gradients = 0;
+    const target: Record<string, unknown> = {
+      measureText: () => ({ width: 10 }),
+      createRadialGradient: () => {
+        gradients += 1;
+        return { addColorStop: () => undefined };
+      },
+    };
+    const ctx = new Proxy(target, {
+      get(t, prop: string) {
+        if (prop in t) return t[prop];
+        return () => undefined;
+      },
+      set(t, prop: string, value) {
+        t[prop] = value;
+        return true;
+      },
+    });
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function makeCanvas(): CanvasView {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    m.lensId = "clap";
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    return new CanvasView(m);
+  }
+
+  it("splats a landmark per sample point while the box is active", () => {
+    const cv = makeCanvas();
+    cv.searchField = [{ path: "a.mp3", score: 0.5 }];
+    cv.searchActive = true;
+    cv.draw();
+    expect(gradients).toBe(1);
+  });
+
+  it("hides the field while the search box is not active", () => {
+    const cv = makeCanvas();
+    cv.searchField = [{ path: "a.mp3", score: 0.5 }];
+    cv.searchActive = false;
+    cv.draw();
+    expect(gradients).toBe(0);
+  });
+
+  it("hides the field off the CLAP lens", () => {
+    const cv = makeCanvas();
+    cv.searchField = [{ path: "a.mp3", score: 0.5 }];
+    cv.searchActive = true;
+    cv.model.lensId = "rhythm";
+    cv.draw();
+    expect(gradients).toBe(0);
+  });
+
+  it("shows the field under a CLAP scope", () => {
+    const cv = makeCanvas();
+    cv.searchField = [{ path: "a.mp3", score: 0.5 }];
+    cv.searchActive = true;
+    cv.model.lensId = "combined";
+    cv.model.scope = { cx: 0.5, cy: 0.5, r: 0.2, lensId: "clap" };
+    cv.model.scopePositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    cv.draw();
+    expect(gradients).toBe(1);
+  });
+});
+
 describe("CanvasView scope positions", () => {
   let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
 
@@ -164,5 +251,150 @@ describe("CanvasView scope positions", () => {
       wx: 0.95,
       wy: 0.95,
     });
+  });
+});
+
+// ─── Loading indicators (stacked) ─────────────────────────────
+
+describe("CanvasView loading indicators", () => {
+  let texts: string[];
+  let arcs: { a0: number; a1: number }[];
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+    texts = [];
+    arcs = [];
+    const target: Record<string, unknown> = {
+      measureText: () => ({ width: 10 }),
+      fillText: (t: string) => {
+        texts.push(t);
+      },
+      arc: (_x: number, _y: number, _r: number, a0: number, a1: number) => {
+        arcs.push({ a0, a1 });
+      },
+      roundRect: () => undefined,
+    };
+    const ctx = new Proxy(target, {
+      get(t, prop: string) {
+        if (prop in t) return t[prop];
+        return () => undefined;
+      },
+      set(t, prop: string, value) {
+        t[prop] = value;
+        return true;
+      },
+    });
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function kind(over: Partial<QueueKindStatus> = {}): QueueKindStatus {
+    return {
+      label: "MAEST embeddings",
+      pending: 0,
+      running: 1,
+      done: 0,
+      failed: 0,
+      total: 10,
+      finished: 1,
+      outstanding: 1,
+      ...over,
+    };
+  }
+
+  function makeCanvas(): CanvasView {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    m.lensId = "clap";
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    return new CanvasView(m);
+  }
+
+  it("stacks the layout wait under the analysis progress", () => {
+    const cv = makeCanvas();
+    const m = cv.model;
+    m.queueStatus = {
+      kinds: { maest: kind() },
+      order: ["maest"],
+      outstanding: 1,
+      total: 10,
+      finished: 1,
+      active: true,
+      epoch: 1,
+    } satisfies QueueStatus;
+    m.projectionPending = true;
+    m.layoutProgress = { phase: "layout", done: 0, total: 0 };
+    cv.draw();
+    expect(texts.some((t) => t.includes("MAEST embeddings"))).toBe(true);
+    expect(texts.some((t) => t.includes("Loading CLAP timbre"))).toBe(true);
+  });
+
+  it("draws a rotating throbber while the layout is in flight", () => {
+    const cv = makeCanvas();
+    cv.model.projectionPending = true;
+    cv.model.layoutProgress = { phase: "layout", done: 0, total: 0 };
+    cv.draw();
+    // A full ring plus a partial highlight arc.
+    expect(arcs.some((a) => a.a1 - a.a0 < Math.PI * 2 - 1e-6)).toBe(true);
+  });
+
+  it("hides the layout wait once positions are ready", () => {
+    const cv = makeCanvas();
+    cv.model.embeddingsReady = true;
+    cv.draw();
+    expect(texts.some((t) => t.includes("Loading"))).toBe(false);
+  });
+});
+
+// ─── Hovered-row info card ───────────────────────────────────
+
+describe("CanvasView hovered-row info card", () => {
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      makeFakeCtx().ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function makeCanvas(): CanvasView {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3", title: "Song", artist: "A" })]);
+    m.lensId = "clap";
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    return new CanvasView(m);
+  }
+
+  it("shows the info card for a hovered search-result track", () => {
+    const cv = makeCanvas();
+    cv.hoveredPath = "a.mp3";
+    cv.draw();
+    expect(cv.$tip.classList.contains("hidden")).toBe(false);
+    expect(cv.$tip.textContent).toContain("Song");
+  });
+
+  it("hides the card when no row or dot is hovered", () => {
+    const cv = makeCanvas();
+    cv.draw();
+    expect(cv.$tip.classList.contains("hidden")).toBe(true);
   });
 });

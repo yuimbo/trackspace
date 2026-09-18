@@ -1,10 +1,12 @@
 // ─── Hover tooltip ("hockey card") ────────────────────────────
 //
-// The tooltip is a small card rather than a block of text: a header (folder +
-// title), a BPM/key meta row, structure chips (the audition sections), the genre
-// group (cluster + genre-spanning badge), and two stat-bar areas — user tags and
-// audio features. `buildTooltip` is pure (unit-testable) and `renderTooltip` is the
-// only DOM code, so the canvas view stays free of layout.
+// The tooltip is a small card rather than a block of text: a title/artist header
+// (collapsing to the filename when metadata is missing), a location stack of the
+// folder and cluster as icon-distinguished coloured tags, structure chips (the
+// audition sections), and two stat areas — user tags and audio features. BPM and key
+// appear only in Features: tempo as a bar and key as a chip, so they are not
+// duplicated near the title. `buildTooltip` is pure (unit-testable) and
+// `renderTooltip` is the only DOM code, so the canvas view stays free of layout.
 
 import {
   type HoverTarget,
@@ -15,15 +17,17 @@ import {
   LIBROSA_FEATURE_AXIS_IDS,
   isAudioFeatureAxisId,
 } from "../model";
-import { clusterColor } from "./colors";
+import { clusterColor, dirTagColors } from "./colors";
 import { displayFolderPath } from "./path-presenter";
 import { structureChips, type StructureChip } from "./structure";
 
-/** One stat row: a 0–1 bar plus its human readout. */
+/** One stat row: a 0–1 bar (or a chip for categorical stats) plus its readout. */
 export interface TooltipBar {
   label: string;
   value: number;
   readout: string;
+  /** Categorical stat (key): render a chip, not a magnitude bar. */
+  chip?: boolean;
   /** Navigation target when the row is a key/BPM stat (hover glows + S/H act on it). */
   target?: HoverTarget;
 }
@@ -67,10 +71,14 @@ export interface TooltipCard {
   key: string;
   path: string;
   folder: string;
-  /** Hover target for the folder kicker (the track's folder). */
+  /** Icon colour stops: one solid colour, or a parent→own gradient when nested. */
+  folderColors: string[];
+  /** Hover target for the folder tag (the track's folder). */
   folderTarget: HoverTarget;
+  /** Bold primary line: the title, falling back to the filename. */
   title: string;
-  meta: string[];
+  /** Secondary artist line, or ``null`` when the track has no artist metadata. */
+  artist: string | null;
   chips: StructureChip[];
   genre: TooltipGenre | null;
   tags: TooltipBar[];
@@ -101,38 +109,57 @@ const HOLD_ALT_HINT = "Hold ⌥ (Alt) to interact";
 
 const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
 
-/** Feature readout: the real unit where one exists, the normalised value otherwise. */
-function featureReadout(k: string, v: number, track: Track): string {
-  if (k === "tempo" && track.bpm != null && Number.isFinite(track.bpm))
-    return `${Math.round(track.bpm)} BPM`;
-  if (k === "key" && track.musical_key) return track.musical_key;
-  return v.toFixed(2);
-}
-
 function audioFeatureRows(track: Track, m: Model): TooltipBar[] {
   const row = track.audio_features;
   const rows: TooltipBar[] = [];
   for (const k of LIBROSA_FEATURE_AXIS_IDS) {
+    // Mode is folded into the Key chip: ``musical_key`` already carries the
+    // major/minor suffix ("Am" = minor, "A" = major), so a 0/1 bar would only
+    // repeat it. It stays a canvas axis / filter, just not a tooltip row.
+    if (k === "mode") continue;
+    // Key and BPM are labels, not 0–1 magnitudes, so they render as chips.
+    // The chip's ``value`` is unused.
+    if (k === "key") {
+      if (!track.musical_key) continue;
+      rows.push({
+        label: m.axisDisplayName(k),
+        value: 0,
+        readout: track.musical_key,
+        chip: true,
+        target: { kind: "key", value: track.musical_key },
+      });
+      continue;
+    }
+    // Tempo is a BPM chip or nothing: the normalised 0–1 value is not a useful
+    // standalone bar, so there is no bar fallback when BPM is unknown.
+    if (k === "tempo") {
+      if (track.bpm == null || !Number.isFinite(track.bpm)) continue;
+      rows.push({
+        label: m.axisDisplayName(k),
+        value: 0,
+        readout: `${Math.round(track.bpm)} BPM`,
+        chip: true,
+        target: { kind: "bpm", value: track.bpm },
+      });
+      continue;
+    }
     const fromAudio = row ? row[k as keyof TrackAudioFeatures] : undefined;
     const v = typeof fromAudio === "number" ? fromAudio : track.tags[k];
     if (typeof v !== "number" || !Number.isFinite(v)) continue;
-    const bar: TooltipBar = {
+    rows.push({
       label: m.axisDisplayName(k),
       value: clamp01(v),
-      readout: featureReadout(k, v, track),
-    };
-    // Key and tempo are navigation targets: hovering the row glows every track
-    // with the same key / a near tempo, and S/H act on them.
-    if (k === "tempo" && track.bpm != null && Number.isFinite(track.bpm))
-      bar.target = { kind: "bpm", value: track.bpm };
-    else if (k === "key" && track.musical_key)
-      bar.target = { kind: "key", value: track.musical_key };
-    rows.push(bar);
+      readout: v.toFixed(2),
+    });
   }
   return rows;
 }
 
-/** User tags (ID3), one bar each — feature axis ids are rendered separately. */
+/** User tags (ID3), one bar each — feature axis ids are rendered separately.
+ *
+ * Sorted by label: the object's key order is not stable across tracks, and an
+ * arbitrary order makes the card jump around as you move between dots.
+ */
 function tagRows(track: Track): TooltipBar[] {
   const rows: TooltipBar[] = [];
   for (const [k, v] of Object.entries(track.tags)) {
@@ -140,7 +167,7 @@ function tagRows(track: Track): TooltipBar[] {
     if (typeof v !== "number" || !Number.isFinite(v)) continue;
     rows.push({ label: k, value: clamp01(v), readout: v.toFixed(2) });
   }
-  return rows;
+  return rows.sort((a, b) => a.label.localeCompare(b.label));
 }
 
 /**
@@ -153,15 +180,12 @@ export function buildTooltip(
   m: Model,
   inspect: InspectState | null = null,
 ): TooltipCard {
-  const folder = displayFolderPath(track.folder || "");
-  const ar = (track.artist || "").trim();
-  const ti = (track.title || "").trim();
-  const title = ar && ti ? `${ar} — ${ti}` : ti || ar || track.filename;
-
-  const meta: string[] = [];
-  if (track.bpm != null && Number.isFinite(track.bpm))
-    meta.push(`${Math.round(track.bpm)} BPM`);
-  if (track.musical_key) meta.push(track.musical_key);
+  const folderPath = track.folder || "";
+  const folder = displayFolderPath(folderPath);
+  // Metadata is optional: with no artist and no title the card collapses to a
+  // single filename line instead of an empty header.
+  const artist = (track.artist || "").trim() || null;
+  const title = (track.title || "").trim() || track.filename;
 
   const structure = m.trackStructure.get(track.path);
   const chips = structureChips(structure);
@@ -194,8 +218,6 @@ export function buildTooltip(
     track.filename,
     track.artist,
     track.title,
-    track.bpm ?? "",
-    track.musical_key ?? "",
     track.folder ?? "",
     structure ? JSON.stringify(structure) : "",
     chips.map((c) => c.text).join("|"),
@@ -211,9 +233,10 @@ export function buildTooltip(
     key,
     path: track.path,
     folder,
+    folderColors: dirTagColors(folderPath),
     folderTarget: { kind: "folder", prefix: track.folder ?? "" },
     title,
-    meta,
+    artist,
     chips,
     genre,
     tags,
@@ -282,6 +305,105 @@ function markTarget(
   return el;
 }
 
+const SVG_NS = "http://www.w3.org/2000/svg";
+/** Feather-style folder / tag glyphs, stroked in the tag's contrast colour. */
+const FOLDER_GLYPH = "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z";
+const TAG_GLYPH = "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z";
+
+/** Folder or tag glyph, stroked in `currentColor` so the tag sets the contrast. */
+function locationIcon(kind: "folder" | "tag"): SVGSVGElement {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("class", "tt-loc-icon");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", kind === "folder" ? FOLDER_GLYPH : TAG_GLYPH);
+  svg.appendChild(path);
+  if (kind === "tag") {
+    const dot = document.createElementNS(SVG_NS, "circle");
+    dot.setAttribute("cx", "7");
+    dot.setAttribute("cy", "7");
+    dot.setAttribute("r", "1");
+    dot.setAttribute("fill", "currentColor");
+    svg.appendChild(dot);
+  }
+  return svg;
+}
+
+/** Tag fill: a solid colour, or a parent→own gradient for a nested folder. */
+function tagFill(colors: string[]): string | null {
+  if (colors.length === 0) return null;
+  if (colors.length === 1) return colors[0];
+  return `linear-gradient(135deg, ${colors.join(", ")})`;
+}
+
+/** Relative luminance of an `hsl(h,s%,l%)` colour, for contrast decisions. */
+function hslLuminance(h: number, s: number, l: number): number {
+  const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
+  const channel = (n: number): number => {
+    const k = (n + h / 30) % 12;
+    const v = (l / 100) - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(4);
+}
+
+/** Icon/name colour with enough contrast for the tag's fill(s). */
+function tagTextColor(colors: string[]): string {
+  const luminances = colors.map((c) => {
+    const m = /hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*\)/.exec(c);
+    return m ? hslLuminance(+m[1], +m[2], +m[3]) : 0.5;
+  });
+  // 0.179 is where dark and light text have equal contrast against the fill.
+  const avg = luminances.reduce((a, b) => a + b, 0) / luminances.length;
+  return avg > 0.179 ? "#0d1219" : "#f4f7fb";
+}
+
+/** One filled location chip: a coloured type icon plus its name. */
+function locationTag(
+  kind: "folder" | "tag",
+  label: string,
+  colors: string[],
+  target: HoverTarget,
+): HTMLElement {
+  const tag = el("span", `tt-loc-tag tt-${kind}`);
+  const fill = tagFill(colors);
+  if (fill) {
+    tag.classList.add("tt-loc-filled");
+    tag.style.background = fill;
+    tag.style.color = tagTextColor(colors);
+  }
+  tag.appendChild(locationIcon(kind));
+  tag.appendChild(el("span", "tt-loc-name", label));
+  return markTarget(tag, target);
+}
+
+/** Cluster chip: filled tag colour + tag icon + name + spanning badge. */
+function clusterTag(genre: TooltipGenre): HTMLElement {
+  const tag = el("span", "tt-loc-tag tt-cluster");
+  const colors = genre.color ? [genre.color] : [];
+  const fill = tagFill(colors);
+  if (fill) {
+    tag.classList.add("tt-loc-filled");
+    tag.style.background = fill;
+    tag.style.color = tagTextColor(colors);
+  }
+  tag.appendChild(locationIcon("tag"));
+  if (genre.name) tag.appendChild(el("span", "tt-loc-name", genre.name));
+  if (genre.spanning) {
+    const badge = el("span", "tt-badge", "genre-spanning");
+    badge.title = SPANNING_HINT;
+    tag.appendChild(badge);
+  }
+  if (genre.target) markTarget(tag, genre.target);
+  return tag;
+}
+
 function statSection(
   title: string,
   rows: TooltipBar[],
@@ -290,6 +412,16 @@ function statSection(
   const section = el("div", `tt-section${extra ? " " + extra : ""}`);
   section.appendChild(el("div", "tt-section-title", title));
   for (const r of rows) {
+    if (r.chip) {
+      // Categorical stat (key): the value has no magnitude to bar, so show a
+      // chip in the same row style as the other stats.
+      const chip = el("span", "tt-stat-chip");
+      chip.appendChild(el("span", "tt-stat-chip-label", r.label));
+      chip.appendChild(el("span", "tt-stat-chip-value", r.readout));
+      if (r.target) markTarget(chip, r.target);
+      section.appendChild(chip);
+      continue;
+    }
     const row = el("div", "tt-stat");
     row.appendChild(el("span", "tt-stat-label", r.label));
     const bar = el("span", "tt-stat-bar");
@@ -307,15 +439,17 @@ function statSection(
 /** Render a built card into *host*, replacing any previous content. */
 export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   const root = el("div", "tt-card");
-  root.appendChild(markTarget(el("div", "tt-folder", card.folder), card.folderTarget));
-  root.appendChild(el("div", "tt-title", card.title));
+  const head = el("div", "tt-head");
+  head.appendChild(el("div", "tt-title", card.title));
+  if (card.artist) head.appendChild(el("div", "tt-artist", card.artist));
+  root.appendChild(head);
 
-  if (card.meta.length) {
-    const meta = el("div", "tt-meta");
-    for (const part of card.meta)
-      meta.appendChild(el("span", "tt-meta-chip", part));
-    root.appendChild(meta);
-  }
+  const location = el("div", "tt-loc");
+  location.appendChild(
+    locationTag("folder", card.folder, card.folderColors, card.folderTarget),
+  );
+  if (card.genre) location.appendChild(clusterTag(card.genre));
+  root.appendChild(location);
 
   if (card.chips.length) {
     const chips = el("div", "tt-chips");
@@ -326,24 +460,6 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
       chips.appendChild(chip);
     }
     root.appendChild(chips);
-  }
-
-  if (card.genre) {
-    const genre = el("div", "tt-genre");
-    if (card.genre.color) {
-      const swatch = el("span", "tt-genre-swatch");
-      swatch.style.background = card.genre.color;
-      genre.appendChild(swatch);
-    }
-    if (card.genre.name)
-      genre.appendChild(el("span", "tt-genre-name", card.genre.name));
-    if (card.genre.spanning) {
-      const badge = el("span", "tt-badge", "genre-spanning");
-      badge.title = SPANNING_HINT;
-      genre.appendChild(badge);
-    }
-    if (card.genre.target) markTarget(genre, card.genre.target);
-    root.appendChild(genre);
   }
 
   if (card.tags.length) root.appendChild(statSection("Personal tags", card.tags));

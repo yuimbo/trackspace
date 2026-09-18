@@ -14,6 +14,7 @@ const MOD_SYMBOL = IS_MAC ? "⌘" : "Ctrl+";
 
 export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "focus-search",   key: "/",      mod: false, shift: false, alt: false, label: "/",                      description: "Focus semantic search" },
+  { action: "focus-search",   key: "f",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}F`,         description: "Focus semantic search" },
   { action: "toggle-preview",  key: "m",      mod: false, shift: false, alt: false, label: "M",                      description: "Toggle hover preview" },
   { action: "fit-view",        key: "h",      mod: false, shift: false, alt: false, label: "H",                      description: "Fit view to the hovered element (cluster/folder/key/BPM) or track's folder (80% radius), else full view" },
   { action: "focus-folder",    key: "f",      mod: false, shift: false, alt: false, label: "F",                      description: "Select all tracks of the hovered element or the track's folder (and subfolders)" },

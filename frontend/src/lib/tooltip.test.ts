@@ -31,19 +31,32 @@ afterEach(() => {
 });
 
 describe("buildTooltip", () => {
-  it("renders the folder kicker, title, and BPM/key meta", () => {
+  it("splits the title and artist", () => {
     const card = buildTooltip(
-      makeTrack({ folder: "House", artist: "A", title: "B", bpm: 128.4, musical_key: "Am" }),
+      makeTrack({ folder: "House", artist: "A", title: "B" }),
       new Model(),
     );
     expect(card.folder).toBe("House");
-    expect(card.title).toBe("A — B");
-    expect(card.meta).toEqual(["128 BPM", "Am"]);
+    expect(card.title).toBe("B");
+    expect(card.artist).toBe("A");
   });
 
-  it("falls back to the filename when artist and title are empty", () => {
+  it("collapses to just the filename when artist and title are missing", () => {
     const card = buildTooltip(makeTrack({ filename: "x.mp3" }), new Model());
     expect(card.title).toBe("x.mp3");
+    expect(card.artist).toBeNull();
+  });
+
+  it("gives a nested folder a parent→own gradient tag", () => {
+    const root = buildTooltip(
+      makeTrack({ folder: "abc12345/GENRES/Rock" }),
+      new Model(),
+    );
+    expect(root.folderColors).toHaveLength(2);
+    expect(root.folderColors[0]).not.toBe(root.folderColors[1]);
+
+    const top = buildTooltip(makeTrack({ folder: "abc12345/GENRES" }), new Model());
+    expect(top.folderColors).toHaveLength(1);
   });
 
   it("builds structure chips and highlights the previewed section", () => {
@@ -102,7 +115,7 @@ describe("buildTooltip", () => {
     ]);
   });
 
-  it("renders audio features as bars with real-unit readouts", () => {
+  it("chips key and BPM and bars the remaining features", () => {
     const card = buildTooltip(
       makeTrack({
         bpm: 128.4,
@@ -117,26 +130,28 @@ describe("buildTooltip", () => {
       }),
       new Model(),
     );
+    // Mode is folded into the key label, so it is not its own row.
     expect(card.features.map((f) => f.label)).toEqual([
       "Tempo",
       "Key",
-      "Mode",
       "Energy",
       "Dance",
     ]);
     expect(card.features[0]).toEqual({
       label: "Tempo",
-      value: 0.5,
+      value: 0,
       readout: "128 BPM",
+      chip: true,
       target: { kind: "bpm", value: 128.4 },
     });
     expect(card.features[1]).toEqual({
       label: "Key",
-      value: 0.3,
+      value: 0,
       readout: "Am",
+      chip: true,
       target: { kind: "key", value: "Am" },
     });
-    expect(card.features[3]).toEqual({ label: "Energy", value: 0.75, readout: "0.75" });
+    expect(card.features[2]).toEqual({ label: "Energy", value: 0.75, readout: "0.75" });
   });
 
   it("changes the cache key when the previewed section changes", () => {
@@ -212,10 +227,10 @@ describe("buildTooltip", () => {
     );
     expect(card.folderTarget).toEqual({ kind: "folder", prefix: "House" });
     expect(card.genre?.target).toEqual({ kind: "cluster", id: 3 });
-    const bar = (label: string) => card.features.find((f) => f.label === label);
-    expect(bar("Tempo")?.target).toEqual({ kind: "bpm", value: 128.4 });
-    expect(bar("Key")?.target).toEqual({ kind: "key", value: "Am" });
-    expect(bar("Energy")?.target).toBeUndefined();
+    const row = (label: string) => card.features.find((f) => f.label === label);
+    expect(row("Tempo")?.target).toEqual({ kind: "bpm", value: 128.4 });
+    expect(row("Key")?.target).toEqual({ kind: "key", value: "Am" });
+    expect(row("Energy")?.target).toBeUndefined();
   });
 
   it("marks user tag bars without a target", () => {
@@ -244,6 +259,32 @@ describe("renderTooltip", () => {
     expect(host.querySelector(".tt-badge")?.getAttribute("title")).toContain("dispersion");
     expect(host.querySelectorAll(".tt-stat-bar i").length).toBe(1);
     expect(host.querySelector(".tt-stat-value")?.textContent).toBe("0.50");
+  });
+
+  it("chips BPM and key, with no meta chips and no bars", () => {
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(
+        makeTrack({ bpm: 128.4, musical_key: "Am", tags: { tempo: 0.5 } }),
+        new Model(),
+      ),
+    );
+    expect(host.querySelector(".tt-meta")).toBeNull();
+    // BPM and key are labels: chips in Features, not magnitude bars.
+    expect(host.querySelectorAll(".tt-stat-chip")).toHaveLength(2);
+    const values = [...host.querySelectorAll(".tt-stat-chip-value")].map(
+      (v) => v.textContent,
+    );
+    expect(values).toEqual(["128 BPM", "Am"]);
+    const targets = [...host.querySelectorAll<HTMLElement>(".tt-stat-chip")].map(
+      (c) => c.dataset.hoverTarget,
+    );
+    expect(targets).toEqual([
+      JSON.stringify({ kind: "bpm", value: 128.4 }),
+      JSON.stringify({ kind: "key", value: "Am" }),
+    ]);
+    expect(host.querySelectorAll(".tt-stat-bar i").length).toBe(0);
   });
 
   it("uses textContent for tag names (no HTML injection)", () => {
@@ -330,18 +371,43 @@ describe("renderTooltip", () => {
     expect(folder?.classList.contains("tt-target")).toBe(true);
     expect(folder?.title).toContain("S solo");
 
-    const genre = host.querySelector<HTMLElement>(".tt-genre");
-    expect(genre?.dataset.hoverTarget).toBe(
+    const cluster = host.querySelector<HTMLElement>(".tt-cluster");
+    expect(cluster?.dataset.hoverTarget).toBe(
       JSON.stringify({ kind: "cluster", id: 3 }),
     );
 
-    const rows = [...host.querySelectorAll<HTMLElement>(".tt-stat")];
-    const tempo = rows.find((r) => r.textContent?.startsWith("Tempo"));
+    const chips = [...host.querySelectorAll<HTMLElement>(".tt-stat-chip")];
+    const tempo = chips.find((c) => c.textContent?.startsWith("Tempo"));
     expect(tempo?.dataset.hoverTarget).toBe(
       JSON.stringify({ kind: "bpm", value: 128.4 }),
     );
+    const rows = [...host.querySelectorAll<HTMLElement>(".tt-stat")];
     const energy = rows.find((r) => r.textContent?.startsWith("Energy"));
     expect(energy?.dataset.hoverTarget).toBeUndefined();
+  });
+
+  it("pairs the folder and cluster tags with distinct icons", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Techno"]]);
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(makeTrack({ folder: "abc12345/GENRES/Rock", title: "B", artist: "A" }), m),
+    );
+
+    const loc = host.querySelector(".tt-loc");
+    const folder = loc?.querySelector<HTMLElement>(".tt-folder");
+    const cluster = loc?.querySelector<HTMLElement>(".tt-cluster");
+    expect(folder).not.toBeNull();
+    expect(cluster).not.toBeNull();
+    // A nested folder fills its tag with a parent→own gradient.
+    expect(folder?.classList.contains("tt-loc-filled")).toBe(true);
+    expect(folder?.style.background).toContain("linear-gradient");
+    // The cluster fills its tag with its solid colour.
+    expect(cluster?.classList.contains("tt-loc-filled")).toBe(true);
+    expect(cluster?.style.background).not.toContain("linear-gradient");
+    expect(host.querySelector(".tt-artist")?.textContent).toBe("A");
   });
 
   it("renders the navigate buttons and ranked rows when pinned", () => {

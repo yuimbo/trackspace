@@ -10,6 +10,7 @@
 
 import { type Model } from "../model";
 import type { SearchResult, SearchMeta } from "../components/search-view";
+import type { SearchFieldPoint } from "../components/canvas-view";
 
 /** Ranked result list size requested from the backend (1–200). */
 export const SEARCH_LIMIT = 50;
@@ -21,6 +22,8 @@ export interface SearchResponse {
   results?: SearchResult[];
   searched?: number;
   total_tracks?: number;
+  /** Landmark sample for the CLAP-lens field (``field=1`` only). */
+  field?: SearchFieldPoint[];
   error?: string;
 }
 
@@ -39,6 +42,8 @@ export interface SearchCoordinatorDeps {
   fetchResults(query: string, limit: number): Promise<SearchResponse>;
   /** Fit the canvas viewport to the given paths (result-row focus). */
   fitToPaths(paths: string[]): void;
+  /** Publish the landmark field to the canvas (``null`` clears it). */
+  setField(field: SearchFieldPoint[] | null): void;
 }
 
 export class SearchCoordinator {
@@ -50,6 +55,7 @@ export class SearchCoordinator {
   clear(): void {
     this._lastQuery = "";
     this.deps.model.searchSections = new Map();
+    this.deps.setField(null);
     this.deps.view.clear();
   }
 
@@ -63,6 +69,7 @@ export class SearchCoordinator {
     const query = rawQuery.trim();
     this._lastQuery = query;
     if (!query) {
+      this.deps.setField(null);
       this.deps.view.clear();
       return;
     }
@@ -74,11 +81,13 @@ export class SearchCoordinator {
     } catch (err) {
       if (this._lastQuery !== query) return;
       this.deps.view.setBusy(false);
+      this.deps.setField(null);
       this.deps.view.showError(err instanceof Error ? err.message : String(err));
       return;
     }
     if (this._lastQuery !== query) return;
     this.deps.view.setBusy(false);
+    this.deps.setField(body.field ?? null);
 
     const m = this.deps.model;
     // Drop hits for files added since the last library load: the model cannot

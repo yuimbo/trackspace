@@ -15,6 +15,14 @@ export const NEAR_K = 5;
 export const ANTI_K = 10;
 /** ``k`` sentinel for "the whole near ranking" (the server's ``all=1`` mode). */
 export const PROXIMITY_ALL = 0;
+/**
+ * Proximity-slider throttle window. A drag fires an input event per pointer
+ * move, and every one of them re-hides the library, re-homes the camera and runs
+ * the model "change" cascade (status, panels, tree). Applying at most one step per
+ * window — the first immediately, the last on the trailing edge — keeps the
+ * neighbourhood live without the drag fighting the main thread.
+ */
+export const PROXIMITY_THROTTLE_MS = 100;
 
 /** Shape of ``GET /api/tracks/similar``. */
 export interface SimilarResponse {
@@ -57,11 +65,21 @@ export class InspectCoordinator {
   /** In-flight ranking fetch, so a drag burst shares one request. */
   private _rankingPending: Promise<string[] | null> | null = null;
   private _rankingPendingPath: string | null = null;
+  /** Proximity throttle: the latest requested step and its callers. */
+  private _proximityPending: { path: string; percent: number } | null = null;
+  private _proximityWaiters: Array<() => void> = [];
+  private _proximityTimer: ReturnType<typeof setTimeout> | null = null;
+  private _proximityLastRun = 0;
+  /** Monotonic step id: a stale async apply must not overwrite a newer one. */
+  private _proximitySeq = 0;
 
   constructor(private deps: InspectCoordinatorDeps) {}
 
   /** Run one inspect-card action (`data-inspect-action` or a result focus). */
   async action(action: string, path: string, value?: number): Promise<void> {
+    // Any other action supersedes a pending slider step, so a trailing apply
+    // cannot re-hide the library after e.g. a focus or close.
+    if (action !== "proximity") this._cancelProximity();
     if (action === "close") {
       // The card owns the preview once pinned, so closing it ends the audition.
       this.deps.stopPreview(path);
@@ -85,7 +103,7 @@ export class InspectCoordinator {
       return;
     }
     if (action === "proximity") {
-      await this.setProximity(path, value ?? 100);
+      await this._scheduleProximity(path, value ?? 100);
       return;
     }
     if (action === "anti" || action === "near") {
@@ -122,12 +140,72 @@ export class InspectCoordinator {
   }
 
   /**
+   * Coalesce a slider drag into at most one step per `PROXIMITY_THROTTLE_MS`
+   * window: the first step runs immediately (so the map tracks the drag), the last
+   * runs on the trailing edge (so the final value always lands). The returned
+   * promise resolves once the applied step has finished, which keeps the tests
+   * deterministic without exposing the timer.
+   */
+  private _scheduleProximity(path: string, percent: number): Promise<void> {
+    this._proximityPending = { path, percent };
+    const wait = new Promise<void>((resolve) =>
+      this._proximityWaiters.push(resolve),
+    );
+    if (this._proximityTimer !== null) return wait;
+    const elapsed = Date.now() - this._proximityLastRun;
+    if (elapsed >= PROXIMITY_THROTTLE_MS) this._runProximity();
+    else
+      this._proximityTimer = setTimeout(
+        () => this._runProximity(),
+        PROXIMITY_THROTTLE_MS - elapsed,
+      );
+    return wait;
+  }
+
+  /** Apply the pending slider step and release everyone waiting on it. */
+  private _runProximity(): void {
+    if (this._proximityTimer !== null) {
+      clearTimeout(this._proximityTimer);
+      this._proximityTimer = null;
+    }
+    const pending = this._proximityPending;
+    this._proximityPending = null;
+    if (!pending) return;
+    this._proximityLastRun = Date.now();
+    const waiters = this._proximityWaiters;
+    this._proximityWaiters = [];
+    const seq = ++this._proximitySeq;
+    void this.setProximity(pending.path, pending.percent, seq)
+      .catch(() => {})
+      .finally(() => {
+        for (const resolve of waiters) resolve();
+      });
+  }
+
+  /** Drop a pending slider step and release its waiters (superseded action). */
+  private _cancelProximity(): void {
+    if (this._proximityTimer !== null) {
+      clearTimeout(this._proximityTimer);
+      this._proximityTimer = null;
+    }
+    this._proximityPending = null;
+    const waiters = this._proximityWaiters;
+    this._proximityWaiters = [];
+    for (const resolve of waiters) resolve();
+  }
+
+  /**
    * Neighbourhood slider: keep the closest *percent* of the ranked library and
    * hide the rest, re-homing the view as it narrows. 100 % reveals everything
    * (no isolation); because the visible set shrinks gradually the camera move is
-   * far less sudden than the old discrete top-N "solo" it replaces.
+   * far less sudden than the old discrete top-N "solo" it replaces. *seq* guards
+   * the async ranking fetch: a superseded step must not apply its stale result.
    */
-  private async setProximity(path: string, percent: number): Promise<void> {
+  private async setProximity(
+    path: string,
+    percent: number,
+    seq: number,
+  ): Promise<void> {
     const m = this.deps.model;
     const p = Math.max(0, Math.min(100, percent));
     if (p >= 100) {
@@ -137,7 +215,7 @@ export class InspectCoordinator {
       return;
     }
     const ranked = await this.rankedFor(path);
-    if (ranked === null) return;
+    if (ranked === null || seq !== this._proximitySeq) return;
     const keepCount = Math.ceil((p / 100) * ranked.length);
     const keep = new Set<string>([path, ...ranked.slice(0, keepCount)]);
     this._proximityHidden = m.setProximityKeep(keep, this._proximityHidden);
