@@ -16,6 +16,7 @@
 // coordinator is unit-testable without the DOM-heavy component classes.
 
 import { type Model, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight } from "../model";
+import { type Lens, lensWaitSources, lensWeights } from "../lib/lenses";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 import {
@@ -30,6 +31,30 @@ type EmbeddingLayoutStatusHint = {
 };
 
 const LAYOUT_CACHE_MAX = 8;
+
+/** Status coverage fields the "wait for analysis" gate reads, per lens source. */
+const PENDING_FIELD: Record<string, string> = {
+  maest_logits: "tracks_pending_maest",
+  maest: "tracks_pending_maest",
+  clap: "tracks_pending_clap",
+  rhythm: "tracks_pending_rhythm",
+  features: "tracks_pending_audio_features",
+  supervised: "tracks_pending_supervised",
+};
+
+/** Human label for each pending field in the "Analysing N tracks" toast. */
+const PENDING_LABEL: Record<string, string> = {
+  tracks_pending_maest: "MAEST",
+  tracks_pending_clap: "CLAP",
+  tracks_pending_rhythm: "rhythm",
+  tracks_pending_audio_features: "features",
+  tracks_pending_supervised: "folder head",
+};
+
+function _numField(status: object, field: string): number {
+  const v = (status as Record<string, unknown>)[field];
+  return typeof v === "number" ? v : 0;
+}
 
 /** True when *w* equals the frozen defaults, so the default query key is unchanged. */
 function _weightsAreDefault(w: Record<string, number>): boolean {
@@ -81,7 +106,7 @@ export interface EmbeddingDeps {
 
 export class EmbeddingCoordinator {
   /** Saved viewport state per view-mode so pan/zoom persists across toggles. */
-  private _savedVpByMode = new Map<string, { ox: number; oy: number; zoom: number }>();
+  private _savedVpByLens = new Map<string, { ox: number; oy: number; zoom: number }>();
 
   private _embedPollTimer = 0;
   private _embedEventSource: EventSource | null = null;
@@ -162,7 +187,9 @@ export class EmbeddingCoordinator {
    *  has, the new positions are stored so switching to the map animates to them.
    */
   refreshProjection(): Promise<void> {
-    if (!this.deps.model.embeddingsReady) return Promise.resolve();
+    const m = this.deps.model;
+    if (!m.embeddingsReady || m.lens().kind !== "projection")
+      return Promise.resolve();
     return this._fetchProjection();
   }
 
@@ -177,7 +204,7 @@ export class EmbeddingCoordinator {
    */
   async fetchWeightJacobian(): Promise<void> {
     const m = this.deps.model;
-    if (!m.embeddingsReady) return;
+    if (!m.embeddingsReady || m.lens().kind !== "projection") return;
     const qs = this._projectionQueryString();
     if (this._weightJacobian && this._jacobianKey === qs) return;
     try {
@@ -221,6 +248,12 @@ export class EmbeddingCoordinator {
   /** Entry point: check status, then generate embeddings or fetch a layout. */
   async ensureAndProject(): Promise<void> {
     const m = this.deps.model;
+    const lens = m.lens();
+    if (lens.kind === "tags") return;
+    if (lens.kind === "deterministic") {
+      this._applyDeterministic(lens);
+      return;
+    }
     try {
       const status = await api<{
         total: number;
@@ -233,6 +266,10 @@ export class EmbeddingCoordinator {
         tracks_with_maest?: number;
         tracks_pending_maest?: number;
         tracks_pending_rhythm?: number;
+        tracks_pending_clap?: number;
+        tracks_pending_audio_features?: number;
+        tracks_pending_supervised?: number;
+        tracks_with_supervised?: number;
         features_extracted: number;
         features_pending: number;
         generating: boolean;
@@ -240,11 +277,14 @@ export class EmbeddingCoordinator {
         layout_revision?: string;
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
-      // Only MAEST gates the map: it is the required source (see the backend's
-      // REQUIRED_SOURCES). CLAP is an optional low-weight block, so a server
-      // started with --no-clap must still render — blocking on it left the
-      // canvas stuck on "loading models…" forever.
-      const modelsBlocked = status.maest_model_ready === false;
+      // Only a lens that needs MAEST waits on the MAEST model: a CLAP/rhythm
+      // lens must still render on a server where MAEST is loading or disabled —
+      // blocking on it left the canvas stuck on "loading models…" forever.
+      const waitSources = lensWaitSources(lens);
+      const needsMaest = waitSources.some(
+        (s) => s === "maest" || s === "maest_logits",
+      );
+      const modelsBlocked = needsMaest && status.maest_model_ready === false;
       m.embeddingModelsLoading = modelsBlocked;
       if (modelsBlocked) {
         toast(status.maest_error || "MAEST model loading…", "ok");
@@ -255,15 +295,31 @@ export class EmbeddingCoordinator {
 
       m.embeddingModelsLoading = false;
 
-      const maestPending = status.tracks_pending_maest ?? 0;
-      const rhythmPending = status.tracks_pending_rhythm ?? 0;
-      const needsWork = maestPending > 0 || rhythmPending > 0;
+      if (
+        lens.sources?.includes("supervised") &&
+        (status.tracks_with_supervised ?? 0) === 0
+      ) {
+        toast("Train the folder head to use this lens", "warn");
+      }
+
+      // One pending count per status field, deduped across sources that share a
+      // field (maest_logits and maest are the same stage).
+      const pending = new Map<string, number>();
+      for (const s of waitSources) {
+        const field = PENDING_FIELD[s];
+        if (!field) continue;
+        pending.set(
+          field,
+          (pending.get(field) ?? 0) + _numField(status, field),
+        );
+      }
+      const needsWork = [...pending.values()].some((n) => n > 0);
 
       if (needsWork && !status.generating) {
-        const total = Math.max(maestPending, rhythmPending);
-        const workParts: string[] = [];
-        if (maestPending > 0) workParts.push(`${maestPending} MAEST`);
-        if (rhythmPending > 0) workParts.push(`${rhythmPending} rhythm`);
+        const total = Math.max(...pending.values());
+        const workParts = [...pending]
+          .filter(([, n]) => n > 0)
+          .map(([field, n]) => `${n} ${PENDING_LABEL[field] ?? field}`);
         const detail =
           workParts.length > 1 ? ` (${workParts.join(", ")})` : "";
         toast(`Analysing ${total} tracks${detail}…`, "ok");
@@ -285,15 +341,13 @@ export class EmbeddingCoordinator {
         this._listenEmbeddingStream();
         // Keep showing the last stable layout while embeddings regenerate; only
         // fetch a layout when we have no positions yet (first-time progressive PCA).
-        if (m.viewMode === "embeddings" && m.embeddingPositions.size === 0) {
+        if (m.embeddingPositions.size === 0) {
           void this._fetchProjection();
         }
         return;
       }
 
-      if (m.viewMode === "embeddings") {
-        await this._fetchProjection({ status });
-      }
+      await this._fetchProjection({ status });
     } catch {
       /* api() already toasted */
     } finally {
@@ -301,6 +355,20 @@ export class EmbeddingCoordinator {
         this.deps.model.embeddingModelsLoading = false;
       }
     }
+  }
+
+  /** Deterministic lens: positions are a pure function of cached features. */
+  private _applyDeterministic(lens: Lens): void {
+    const m = this.deps.model;
+    const positions = new Map<string, { x: number; y: number }>();
+    if (lens.compute) {
+      for (const t of m.allTracks) {
+        const p = lens.compute(t);
+        if (p) positions.set(t.path, p);
+      }
+    }
+    m.embeddingsReady = true;
+    this._applyPositions(positions);
   }
 
   private _pollModelReady(): void {
@@ -403,15 +471,19 @@ export class EmbeddingCoordinator {
 
   private _projectionQueryString(methodOverride?: string): string {
     const method = methodOverride ?? "tsne";
+    const m = this.deps.model;
+    const lens = m.lens();
     const base = `folder=&recursive=1&method=${method}`;
     // External roots are laid out only on request: the default map is the library.
-    const ext = this.deps.model.showExternal ? "&include_external=1" : "";
+    const ext = m.showExternal ? "&include_external=1" : "";
+    // A per-source lens projects only its own blocks; the combined lens omits the
+    // param so its default query key stays stable.
+    const src = lens.sources ? `&sources=${lens.sources.join(",")}` : "";
     // Only append weights when they differ from the defaults: the default query
     // key must stay stable so existing cached layouts remain valid.
-    const w = this.deps.model.clusterWeights;
-    return _weightsAreDefault(w)
-      ? `${base}${ext}`
-      : `${base}&w=${_encodeWeights(w)}${ext}`;
+    const w = lensWeights(lens, m.clusterWeights);
+    const wq = _weightsAreDefault(w) ? "" : `&w=${_encodeWeights(w)}`;
+    return `${base}${src}${wq}${ext}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.
@@ -756,53 +828,72 @@ export class EmbeddingCoordinator {
     this._animFrame = requestAnimationFrame(step);
   }
 
-  async toggleViewMode(): Promise<void> {
+  /** Advance to the next built-in lens (the **E** cycle). */
+  async cycleLens(): Promise<void> {
     const m = this.deps.model;
-    // Persist the current viewport for the mode we're leaving.
-    this._savedVpByMode.set(m.viewMode, { ...m.vp });
-
-    if (m.viewMode === "tags") {
-      m.setViewMode("embeddings");
-      m.embeddingModelsLoading = false;
-      // Restore a previously saved embedding viewport, or default to full [0,1] view.
-      const saved = this._savedVpByMode.get("embeddings");
-      if (saved) {
-        m.vp.ox = saved.ox;
-        m.vp.oy = saved.oy;
-        m.vp.zoom = saved.zoom;
-      } else {
-        m.vp.ox = 0;
-        m.vp.oy = 0;
-        m.vp.zoom = 1;
-      }
-      if (m.embeddingsReady) {
-        this._animateToEmbeddings();
-      } else {
-        await this.ensureAndProject();
-      }
-    } else {
-      m.setViewMode("tags");
-      m.embeddingModelsLoading = false;
-      // Restore a previously saved tag viewport, or leave as-is (first time back).
-      const saved = this._savedVpByMode.get("tags");
-      if (saved) {
-        m.vp.ox = saved.ox;
-        m.vp.oy = saved.oy;
-        m.vp.zoom = saved.zoom;
-      }
-      this._animateToTags();
-    }
-    m.saveLS();
-    this.deps.status.update(m);
-    const $vm = document.getElementById(
-      "view-mode-toggle",
-    ) as HTMLInputElement | null;
-    if ($vm) $vm.checked = m.viewMode === "embeddings";
+    await this.switchToLens(m.nextLens());
   }
 
-  /** Switch to a specific view mode (no-op if already there). */
+  /**
+   * Switch to a lens (built-in id or preset id), animating the transition.
+   *
+   * Each lens remembers its own viewport, so returning to one restores where the
+   * user left it. Tag-space ↔ map transitions animate through the shared
+   * `animPositions` overlay; map → map and feature → feature animate between
+   * their stored positions.
+   */
+  async switchToLens(target: string): Promise<void> {
+    const m = this.deps.model;
+    if (m.lensId === target) return;
+    // Persist the current viewport for the lens we're leaving.
+    this._savedVpByLens.set(m.lensId, { ...m.vp });
+
+    m.lensId = target;
+    // A preset carries the display options it was saved with; applying them here
+    // keeps the select and the weights panel consistent with the canvas.
+    const preset = m.lensPresets.find((p) => p.id === target);
+    if (preset) m.applyLensPreset(preset);
+    const lens = m.lens();
+    m.embeddingModelsLoading = false;
+
+    // Restore a previously saved viewport, or default to the full [0,1] view.
+    const saved = this._savedVpByLens.get(target);
+    if (saved) {
+      m.vp.ox = saved.ox;
+      m.vp.oy = saved.oy;
+      m.vp.zoom = saved.zoom;
+    } else {
+      m.vp.ox = 0;
+      m.vp.oy = 0;
+      m.vp.zoom = 1;
+    }
+
+    if (lens.kind === "tags") {
+      this._animateToTags();
+    } else if (lens.kind === "deterministic") {
+      this._applyDeterministic(lens);
+    } else if (m.embeddingPositions.size === 0) {
+      // First entry into map space: fetch the layout (may trigger analysis).
+      await this.ensureAndProject();
+    } else {
+      // Map → map: animate from the current positions to the new lens's layout.
+      await this._fetchProjection();
+    }
+
+    m.saveLS();
+    this.deps.status.update(m);
+    this._syncLensSelect();
+  }
+
+  /** Switch to a specific view mode (tags ↔ the last map lens). */
   async switchToMode(target: "tags" | "embeddings"): Promise<void> {
     if (this.deps.model.viewMode === target) return;
-    await this.toggleViewMode();
+    await this.switchToLens(target === "tags" ? "tags" : "combined");
+  }
+
+  /** Mirror the model's active lens into the View-tab `<select>`. */
+  private _syncLensSelect(): void {
+    const sel = document.getElementById("lens-select") as HTMLSelectElement | null;
+    if (sel) sel.value = this.deps.model.lensId;
   }
 }

@@ -417,7 +417,7 @@ export class CanvasView {
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
     if (m.viewMode === "embeddings") {
-      ctx.fillText("Embedding Space", w / 2, h - 2);
+      ctx.fillText(m.lens().label, w / 2, h - 2);
     }
 
     ctx.restore();

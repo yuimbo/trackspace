@@ -1,3 +1,10 @@
+import {
+  getLens,
+  nextLensId,
+  type Lens,
+  type LensPreset,
+} from "./lib/lenses";
+
 /** Cached librosa descriptors ([0,1]) when the fingerprint has a features row. */
 export interface TrackAudioFeatures {
   tempo: number;
@@ -184,6 +191,28 @@ export function isAudioFeatureAxisId(tag: string): boolean {
   return _LIBROSA_FEATURE_SET.has(tag);
 }
 
+function _migrateLensPresets(raw: unknown): LensPreset[] {
+  if (!Array.isArray(raw)) return [];
+  const out: LensPreset[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const p = item as Record<string, unknown>;
+    if (typeof p.id !== "string" || typeof p.name !== "string") continue;
+    out.push({
+      id: p.id,
+      name: p.name,
+      baseLens: typeof p.baseLens === "string" ? p.baseLens : "combined",
+      weights: _migrateClusterWeights(p.weights),
+      colorByCluster: Boolean(p.colorByCluster),
+      clusterResolution:
+        typeof p.clusterResolution === "number" && p.clusterResolution > 0
+          ? p.clusterResolution
+          : 1.5,
+    });
+  }
+  return out;
+}
+
 export type ViewMode = "tags" | "embeddings";
 
 /**
@@ -283,7 +312,82 @@ export class Model extends EventBus {
   vp: Viewport = { ox: 0, oy: 0, zoom: 1 };
   _knownTags: string[] = [];
 
-  viewMode: ViewMode = "tags";
+  /**
+   * Active lens id (built-in or preset). "tags" is the tag-axis lens; every other
+   * built-in is an embedding-space lens. See `lib/lenses.ts`.
+   */
+  private _lensId = "tags";
+  /** User presets: a base lens plus saved display options. Persisted. */
+  lensPresets: LensPreset[] = [];
+
+  get lensId(): string {
+    return this._lensId;
+  }
+
+  set lensId(id: string) {
+    this._lensId = id;
+  }
+
+  /**
+   * Derived compatibility view of the lens: "tags" for the tag-axis lens,
+   * "embeddings" for every map/feature lens. Keeping this as the *read* surface
+   * means all the existing embedding-mode gating (transform handles, tag drag,
+   * hiding unanalysed tracks) needs no per-lens branch.
+   */
+  get viewMode(): ViewMode {
+    return getLens(this._lensId).kind === "tags" ? "tags" : "embeddings";
+  }
+
+  set viewMode(mode: ViewMode) {
+    this._lensId =
+      mode === "embeddings"
+        ? getLens(this._lensId).kind === "tags"
+          ? "combined"
+          : this._lensId
+        : "tags";
+  }
+
+  /** The active lens, resolving a preset id to its base lens. */
+  lens(): Lens {
+    const preset = this.lensPresets.find((p) => p.id === this._lensId);
+    return getLens(preset ? preset.baseLens : this._lensId);
+  }
+
+  /** Next built-in lens id for the **E** cycle. */
+  nextLens(): string {
+    const preset = this.lensPresets.find((p) => p.id === this._lensId);
+    return nextLensId(this._lensId, preset?.baseLens);
+  }
+
+  /** Apply a saved preset: base lens plus its captured display options. */
+  applyLensPreset(p: LensPreset): void {
+    this._lensId = p.id;
+    this.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, ...p.weights };
+    this.colorByCluster = p.colorByCluster;
+    this.clusterResolution = p.clusterResolution;
+    this.emit("change");
+  }
+
+  /** Capture the current lens + display options as a new preset. */
+  addLensPreset(name: string): LensPreset {
+    const preset: LensPreset = {
+      id: `preset:${Date.now().toString(36)}`,
+      name,
+      baseLens: this.lens().id,
+      weights: { ...this.clusterWeights },
+      colorByCluster: this.colorByCluster,
+      clusterResolution: this.clusterResolution,
+    };
+    this.lensPresets = [...this.lensPresets, preset];
+    this._lensId = preset.id;
+    return preset;
+  }
+
+  deleteLensPreset(id: string): void {
+    this.lensPresets = this.lensPresets.filter((p) => p.id !== id);
+    if (this._lensId === id) this._lensId = "tags";
+  }
+
   embeddingPositions: Map<string, { x: number; y: number }> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
@@ -1000,7 +1104,8 @@ export class Model extends EventBus {
         filterRanges: this.filterRanges,
         hoverPreview: this.hoverPreview,
         previewVolume: this.previewVolume,
-        viewMode: this.viewMode,
+        lensId: this._lensId,
+        lensPresets: this.lensPresets,
         explodeStrength: this.explodeStrength,
         clusterResolution: this.clusterResolution,
         colorByCluster: this.colorByCluster,
@@ -1033,7 +1138,15 @@ export class Model extends EventBus {
           typeof rawPv === "number" && Number.isFinite(rawPv) && rawPv > 0
             ? Math.min(1, rawPv)
             : DEFAULT_PREVIEW_VOLUME;
-        this.viewMode = d.viewMode ?? "tags";
+        this._lensId =
+          typeof d.lensId === "string"
+            ? d.lensId
+            : d.viewMode === "embeddings"
+              ? "combined"
+              : "tags";
+        this.lensPresets = _migrateLensPresets(
+          (d as { lensPresets?: unknown }).lensPresets,
+        );
         const ex = Number((d as { explodeStrength?: number }).explodeStrength);
         this.explodeStrength = Number.isFinite(ex)
           ? Math.min(0.2, Math.max(0.05, ex))

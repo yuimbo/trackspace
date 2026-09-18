@@ -1,22 +1,27 @@
 // ─── OptionsPanelBinder ────────────────────────────────────────
 //
-// Owns the right-column Options panel controls (hover preview + volume, embedding
-// view mode, explode strength). Extracted from `Controller` — these are pure
-// input bindings that mirror model state and delegate the two actions that need
-// other subsystems (view-mode toggle, preview playback).
+// Owns the right-column Options panel controls (hover preview + volume, lens
+// selector and presets, explode strength). Extracted from `Controller` — these are
+// pure input bindings that mirror model state and delegate the actions that need
+// other subsystems (lens switching, preset capture, preview playback).
 //
 // Deps are structural interfaces so the binder is unit-testable without the
 // DOM-heavy component classes.
 
 import { DEFAULT_PREVIEW_VOLUME, previewGain, type Model } from "../model";
+import { BUILTIN_LENSES } from "../lib/lenses";
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
 export interface OptionsPanelDeps {
   model: Model;
   scheduleDraw(): void;
-  /** Flip between tags and embedding-space view. */
-  toggleViewMode(): void;
+  /** Switch to a lens id (built-in or preset). */
+  selectLens(id: string): void;
+  /** Capture the current lens + display options as a new named preset. */
+  saveLensPreset(): void;
+  /** Delete the active preset; no-op when a built-in lens is active. */
+  deleteLensPreset(): void;
   /** Stop hover-preview playback (when the toggle is turned off). */
   stopPreview(): void;
   /** Apply a new preview gain (already tapered) to the audio element. */
@@ -28,11 +33,9 @@ export class OptionsPanelBinder {
 
   bind(): void {
     const m = this.deps.model;
+    this._renderLensOptions();
     const $hov = document.getElementById(
       "hover-preview-toggle",
-    ) as HTMLInputElement;
-    const $vm = document.getElementById(
-      "view-mode-toggle",
     ) as HTMLInputElement;
 
     $hov.checked = m.hoverPreview;
@@ -58,8 +61,12 @@ export class OptionsPanelBinder {
       });
     }
 
-    $vm.checked = m.viewMode === "embeddings";
-    $vm.addEventListener("change", () => this.deps.toggleViewMode());
+    const $lens = document.getElementById("lens-select") as HTMLSelectElement | null;
+    if ($lens) $lens.addEventListener("change", () => this.deps.selectLens($lens.value));
+    const $save = document.getElementById("lens-preset-save");
+    if ($save) $save.addEventListener("click", () => this.deps.saveLensPreset());
+    const $del = document.getElementById("lens-preset-delete");
+    if ($del) $del.addEventListener("click", () => this.deps.deleteLensPreset());
 
     const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
     if ($ex) {
@@ -78,9 +85,7 @@ export class OptionsPanelBinder {
   /** Sync all options controls to match current model state. */
   sync(): void {
     const m = this.deps.model;
-    const isEmbed = m.viewMode === "embeddings";
-    const $vm = document.getElementById("view-mode-toggle") as HTMLInputElement | null;
-    if ($vm) $vm.checked = isEmbed;
+    this._renderLensOptions();
     const $ex = document.getElementById("explode-strength-range") as HTMLInputElement | null;
     if ($ex) $ex.value = String(Math.round(m.explodeStrength * 100) / 100);
     const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
@@ -88,6 +93,46 @@ export class OptionsPanelBinder {
     this._renderPreviewVolume();
     const $hov = document.getElementById("hover-preview-toggle") as HTMLInputElement | null;
     if ($hov) $hov.checked = m.hoverPreview;
+  }
+
+  /** Rebuild the lens `<select>` from the built-ins plus the saved presets. */
+  private _renderLensOptions(): void {
+    const m = this.deps.model;
+    const sel = document.getElementById("lens-select") as HTMLSelectElement | null;
+    if (sel) {
+      // Built with DOM APIs, not innerHTML: a preset name is user input.
+      sel.replaceChildren();
+      const groups: [string, { id: string; label: string }[]][] = [
+        ["Lenses", BUILTIN_LENSES.map((l) => ({ id: l.id, label: l.label }))],
+      ];
+      if (m.lensPresets.length) {
+        groups.push([
+          "Presets",
+          m.lensPresets.map((p) => ({ id: p.id, label: p.name })),
+        ]);
+      }
+      for (const [label, items] of groups) {
+        const og = document.createElement("optgroup");
+        og.label = label;
+        for (const item of items) {
+          const opt = document.createElement("option");
+          opt.value = item.id;
+          opt.textContent = item.label;
+          og.appendChild(opt);
+        }
+        sel.appendChild(og);
+      }
+      sel.value = m.lensId;
+    }
+    const del = document.getElementById(
+      "lens-preset-delete",
+    ) as HTMLButtonElement | null;
+    if (del) del.disabled = !m.lensPresets.some((p) => p.id === m.lensId);
+    const save = document.getElementById(
+      "lens-preset-save",
+    ) as HTMLButtonElement | null;
+    // The tag lens has no map display options to capture.
+    if (save) save.disabled = m.lens().kind === "tags";
   }
 
   /** Show the slider position as a percentage. */

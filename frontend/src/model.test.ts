@@ -102,3 +102,66 @@ describe("Model right-panel tab", () => {
     expect(m.rightPanelTab).toBe("analysis");
   });
 });
+
+describe("Model lens", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("defaults to the tags lens", () => {
+    const m = new Model();
+    expect(m.lensId).toBe("tags");
+    expect(m.viewMode).toBe("tags");
+  });
+
+  it("derives viewMode from the lens kind", () => {
+    const m = new Model();
+    m.lensId = "camelot";
+    expect(m.viewMode).toBe("embeddings");
+    m.viewMode = "tags";
+    expect(m.lensId).toBe("tags");
+  });
+
+  it("migrates a legacy viewMode", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ viewMode: "embeddings" }),
+    );
+    const m = new Model();
+    m.loadLS();
+    expect(m.lensId).toBe("combined");
+  });
+
+  it("persists the active lens and presets", () => {
+    const m = new Model();
+    m.lensId = "clap";
+    const p = m.addLensPreset("My view");
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.lensId).toBe(p.id);
+    expect(m2.lensPresets.map((x) => x.name)).toEqual(["My view"]);
+    expect(m2.lensPresets[0].baseLens).toBe("clap");
+  });
+
+  it("applying a preset restores its display options", () => {
+    const m = new Model();
+    m.clusterWeights = { ...m.clusterWeights, rhythm: 0.5 };
+    m.colorByCluster = true;
+    m.clusterResolution = 3;
+    const p = m.addLensPreset("loud");
+    m.clusterWeights = { ...m.clusterWeights, rhythm: 0.1 };
+    m.colorByCluster = false;
+    m.applyLensPreset(p);
+    expect(m.lensId).toBe(p.id);
+    expect(m.clusterWeights.rhythm).toBeCloseTo(0.5, 6);
+    expect(m.colorByCluster).toBe(true);
+    expect(m.clusterResolution).toBe(3);
+  });
+
+  it("deleting the active preset falls back to tags", () => {
+    const m = new Model();
+    const p = m.addLensPreset("x");
+    m.deleteLensPreset(p.id);
+    expect(m.lensId).toBe("tags");
+    expect(m.lensPresets).toEqual([]);
+  });
+});

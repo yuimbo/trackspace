@@ -95,7 +95,27 @@
       />
       <span id="hover-preview-volume-value" class="option-value"></span>
     </div>
-    <label><input type="checkbox" id="view-mode-toggle" /> Embedding space <kbd>E</kbd></label>
+    <label class="folder-tune">
+      <span>Lens <kbd>E</kbd></span>
+      <select id="lens-select" title="What the canvas shows: tag axes, an embedding map, or a feature wheel"></select>
+    </label>
+    <div class="cluster-weight-actions">
+      <button
+        id="lens-preset-save"
+        type="button"
+        title="Save the current lens and display options as a preset"
+      >
+        Save preset…
+      </button>
+      <button
+        id="lens-preset-delete"
+        type="button"
+        title="Delete the active preset"
+        disabled
+      >
+        Delete preset
+      </button>
+    </div>
     <label class="folder-tune">
       <span>Explode <kbd>X</kbd> + scroll</span>
       <input

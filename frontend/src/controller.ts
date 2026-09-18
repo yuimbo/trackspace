@@ -262,7 +262,23 @@ export class Controller {
     this.options = new OptionsPanelBinder({
       model,
       scheduleDraw: () => this.canvas.scheduleDraw(),
-      toggleViewMode: () => void this.embedding.toggleViewMode(),
+      selectLens: (id) => void this.embedding.switchToLens(id),
+      saveLensPreset: () => {
+        const name = window.prompt("Preset name");
+        if (!name || !name.trim()) return;
+        model.addLensPreset(name.trim());
+        model.saveLS();
+        this.options.sync();
+      },
+      deleteLensPreset: () => {
+        const preset = model.lensPresets.find((p) => p.id === model.lensId);
+        if (!preset) return;
+        if (!window.confirm(`Delete preset “${preset.name}”?`)) return;
+        model.deleteLensPreset(preset.id);
+        model.saveLS();
+        this.embedding.ensureAndProject();
+        this.options.sync();
+      },
       stopPreview: () => this._stopPreview(),
       applyPreviewGain: (gain) => {
         this.$audio.volume = gain;
@@ -780,7 +796,7 @@ export class Controller {
 
     hk.on("undo", () => void this.cmdMgr.undo(m));
 
-    hk.on("toggle-view", () => void this.embedding.toggleViewMode());
+    hk.on("toggle-view", () => void this.embedding.cycleLens());
 
     hk.on("toggle-clusters", () => this.analysis.toggleColorByCluster());
 

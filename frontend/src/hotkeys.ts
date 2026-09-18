@@ -24,7 +24,7 @@ export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "select-all",      key: "a",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}A`,         description: "Select all tracks" },
   { action: "undo",            key: "z",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}Z`,         description: "Undo last action" },
   { action: "deselect",        key: "Escape", mod: false, shift: false, alt: false, label: "Esc",                    description: "Deselect / cancel" },
-  { action: "toggle-view",     key: "e",      mod: false, shift: false, alt: false, label: "E",                      description: "Toggle Embedding Space" },
+  { action: "toggle-view",     key: "e",      mod: false, shift: false, alt: false, label: "E",                      description: "Cycle lenses (tags → combined → per-source maps → feature wheels)" },
   { action: "toggle-clusters", key: "c",      mod: false, shift: false, alt: false, label: "C",                      description: "Colour dots by microgenre cluster" },
 ];
 

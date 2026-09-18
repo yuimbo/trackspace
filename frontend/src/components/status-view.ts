@@ -257,7 +257,7 @@ ${maestError}
     if (model.viewMode === "embeddings") {
       addSep();
       const mode = document.createElement("span");
-      mode.textContent = "Embedding Space (t-SNE) — MAEST+rhythm";
+      mode.textContent = `Lens: ${model.lens().label}`;
       this.$el.appendChild(mode);
     }
 

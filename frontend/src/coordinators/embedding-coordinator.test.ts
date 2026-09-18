@@ -72,7 +72,7 @@ function pump(ms = 600): void {
 
 const HTML = `
   <div id="toast-container"></div>
-  <input id="view-mode-toggle" type="checkbox" />
+  <select id="lens-select"></select>
 `;
 
 interface Harness {
@@ -301,31 +301,80 @@ describe("EmbeddingCoordinator generation stream", () => {
   });
 });
 
-// ─── View mode ─────────────────────────────────────────────
+// ─── Lenses ────────────────────────────────────────────────
 
-describe("EmbeddingCoordinator view mode", () => {
-  it("saves and restores the viewport across a mode toggle", async () => {
+describe("EmbeddingCoordinator lens switching", () => {
+  it("saves and restores the viewport across a lens switch", async () => {
     const { model, coord } = makeHarness(projectionRoute);
     vi.spyOn(model, "saveLS").mockImplementation(() => {});
     model.viewMode = "tags";
     model.embeddingsReady = true;
     model.vp = { ox: 0.1, oy: 0.2, zoom: 2 };
 
-    await coord.toggleViewMode();
+    await coord.switchToLens("combined");
     expect(model.viewMode).toBe("embeddings");
     expect(model.vp).toEqual({ ox: 0, oy: 0, zoom: 1 });
 
-    await coord.toggleViewMode();
+    await coord.switchToLens("tags");
     expect(model.viewMode).toBe("tags");
     expect(model.vp).toEqual({ ox: 0.1, oy: 0.2, zoom: 2 });
   });
 
-  it("is a no-op when switchToMode targets the current mode", async () => {
+  it("E cycles every built-in lens and wraps back to tags", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    const seen = [model.lensId];
+    for (let i = 0; i < 8; i++) {
+      await coord.cycleLens();
+      seen.push(model.lensId);
+    }
+    expect(seen).toEqual([
+      "tags",
+      "combined",
+      "maest",
+      "clap",
+      "rhythm",
+      "supervised",
+      "camelot",
+      "tempo",
+      "tags",
+    ]);
+  });
+
+  it("adds the source param for a per-source lens", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    await coord.switchToLens("clap");
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    expect(String(call![0])).toContain("sources=clap");
+  });
+
+  it("places deterministic lenses with no server fetch", async () => {
+    const { model, coord, fetchSpy } = makeHarness();
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.setAllTracks([
+      {
+        path: "c.mp3",
+        filename: "c.mp3",
+        folder: "",
+        tags: {},
+        artist: "",
+        title: "",
+        audio_features: { tempo: 0.5, key: 0.5, mode: 1, energy: 0.5, danceability: 0.5 },
+      },
+    ]);
+    await coord.switchToLens("camelot");
+    expect(model.embeddingPositions.has("c.mp3")).toBe(true);
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(0);
+  });
+
+  it("is a no-op when switchToLens targets the current lens", async () => {
     const { model, coord } = makeHarness();
-    model.viewMode = "tags";
-    const toggle = vi.spyOn(coord, "toggleViewMode");
+    const swap = vi.spyOn(coord, "switchToLens");
     await coord.switchToMode("tags");
-    expect(toggle).not.toHaveBeenCalled();
+    expect(swap).not.toHaveBeenCalled();
   });
 });
 
