@@ -10,28 +10,34 @@ describe("packPointVertices", () => {
     alpha: 0.5,
   };
 
-  it("emits nine floats per vertex across six vertices", () => {
-    expect(packPointVertices([point]).length).toBe(54);
+  it("emits ten floats per vertex across six vertices", () => {
+    expect(packPointVertices([point]).length).toBe(60);
   });
 
-  it("carries the centre, radius, colour and alpha on every vertex", () => {
-    const data = packPointVertices([point]);
+  it("carries the centre, radius, colour, alpha and weight on every vertex", () => {
+    const data = packPointVertices([{ ...point, weight: 0.15 }]);
     for (let v = 0; v < 6; v++) {
-      const o = v * 9;
+      const o = v * 10;
       expect([data[o], data[o + 1]]).toEqual([10, 20]);
       expect(data[o + 4]).toBe(6.5);
       expect(data[o + 5]).toBeCloseTo(0.1);
       expect(data[o + 6]).toBeCloseTo(0.2);
       expect(data[o + 7]).toBeCloseTo(0.3);
       expect(data[o + 8]).toBe(0.5);
+      expect(data[o + 9]).toBeCloseTo(0.15);
     }
+  });
+
+  it("defaults the colour priority to full", () => {
+    const data = packPointVertices([point]);
+    expect(data[9]).toBe(1);
   });
 
   it("expands the quad corners across both triangles", () => {
     const data = packPointVertices([point]);
     const corners = Array.from({ length: 6 }, (_, v) => [
-      data[v * 9 + 2],
-      data[v * 9 + 3],
+      data[v * 10 + 2],
+      data[v * 10 + 3],
     ]);
     expect(corners).toEqual([
       [-1, -1],

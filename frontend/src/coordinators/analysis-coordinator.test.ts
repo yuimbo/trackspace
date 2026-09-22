@@ -80,17 +80,11 @@ const PANEL_HTML = `
   <div id="toast-container"></div>
   <div id="cluster-meta"></div>
   <ul id="cluster-list"></ul>
-  <select id="color-mode-select">
-    <option value="folder">Folder</option>
-    <option value="head">Predicted folder</option>
-    <option value="cluster">Cluster</option>
-    <option value="tempo">Tempo</option>
-    <option value="key">Key</option>
-  </select>
-  <select id="head-color-confident">
-    <option value="1">Confident only</option>
-    <option value="0">All nearest</option>
-  </select>
+  <div id="view-options" class="view-options hidden">
+    <div id="head-confident-fold" class="view-option hidden">
+      <input type="checkbox" id="head-color-confident" />
+    </div>
+  </div>
   <input id="cluster-resolution-range" type="range" />
   <div id="cluster-weights"></div>
   <p id="cluster-weights-note"></p>
@@ -126,7 +120,10 @@ interface Harness {
 }
 
 /** Route a URL to its response body (default: `{}`). */
-function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
+function makeHarness(
+  routes: (url: string) => unknown = () => ({}),
+  head?: { syncTrainEnabled(disabled: boolean): void; refreshHeadInfo?(): void },
+): Harness {
   const model = new Model();
   const update = vi.fn();
   const scheduleDraw = vi.fn();
@@ -142,6 +139,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     canvas,
     refreshProjection,
     applyApproximateWeights,
+    head,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
     Promise.resolve(jsonResponse(routes(String(input)))),
@@ -374,22 +372,28 @@ describe("AnalysisCoordinator status polling", () => {
 
   it("invalidates predicted folders when a supervise run finishes", async () => {
     let outstanding = 1;
-    const { coord } = makeHarness((url) => {
-      if (url.startsWith("/api/jobs/status")) {
-        return makeQueueStatus({
-          kinds: { supervise: makeKind({ outstanding }) },
-        });
-      }
-      return {};
-    });
+    const refreshHeadInfo = vi.fn();
+    const { coord } = makeHarness(
+      (url) => {
+        if (url.startsWith("/api/jobs/status")) {
+          return makeQueueStatus({
+            kinds: { supervise: makeKind({ outstanding }) },
+          });
+        }
+        return {};
+      },
+      { syncTrainEnabled: vi.fn(), refreshHeadInfo },
+    );
     const invalidate = vi.spyOn(coord, "refreshFolderPredictions");
     // First poll records the outstanding run…
     await coord.refreshQueueStatus();
     expect(invalidate).not.toHaveBeenCalled();
+    expect(refreshHeadInfo).not.toHaveBeenCalled();
     // …the next poll sees it drain, so the cached head answer is stale.
     outstanding = 0;
     await coord.refreshQueueStatus();
     expect(invalidate).toHaveBeenCalled();
+    expect(refreshHeadInfo).toHaveBeenCalled();
   });
 });
 
@@ -436,7 +440,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
     );
   });
 
-  it("ignores concurrent fetches while one is in flight", async () => {
+  it("coalesces concurrent fetches into one trailing fetch", async () => {
     let resolveFetch!: (r: Response) => void;
     const fetchSpy = vi.fn(
       () => new Promise<Response>((r) => (resolveFetch = r)),
@@ -451,9 +455,12 @@ describe("AnalysisCoordinator cluster fetch", () => {
     });
     const p1 = coord.fetchClusters();
     const p2 = coord.fetchClusters();
+    // The second call is coalesced, not issued.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
     resolveFetch(jsonResponse({ available: false }));
     await Promise.all([p1, p2]);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    // Settling the first issues exactly one trailing fetch for the latest state.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it("sorts the panel by size and selects a cluster's tracks on click", async () => {
@@ -535,7 +542,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
 // ─── Panel bindings ─────────────────────────────────────────
 
 describe("AnalysisCoordinator panel bindings", () => {
-  it("cycles colour modes and mirrors the active one in the panel select", () => {
+  it("cycles colour modes and folds the gate out only in head mode", () => {
     const { model, coord, scheduleDraw } = makeHarness();
     model.clustersAvailable = true;
     coord.bindPanel();
@@ -544,8 +551,11 @@ describe("AnalysisCoordinator panel bindings", () => {
     coord.cycleColorMode();
     expect(model.colorMode).toBe("head");
     expect(
-      (document.getElementById("color-mode-select") as HTMLSelectElement).value,
-    ).toBe("head");
+      document.getElementById("head-confident-fold")!.classList.contains("hidden"),
+    ).toBe(false);
+    expect(
+      document.getElementById("view-options")!.classList.contains("hidden"),
+    ).toBe(false);
     expect(scheduleDraw).toHaveBeenCalled();
 
     coord.cycleColorMode();
@@ -559,6 +569,12 @@ describe("AnalysisCoordinator panel bindings", () => {
 
     coord.cycleColorMode();
     expect(model.colorMode).toBe("folder");
+    expect(
+      document.getElementById("head-confident-fold")!.classList.contains("hidden"),
+    ).toBe(true);
+    expect(
+      document.getElementById("view-options")!.classList.contains("hidden"),
+    ).toBe(true);
   });
 
   it("cycles colour modes backward with shift", () => {
@@ -588,11 +604,6 @@ describe("AnalysisCoordinator panel bindings", () => {
     coord.cycleColorMode();
 
     expect(model.colorMode).toBe("head");
-    expect(
-      document
-        .getElementById("color-mode-select")!
-        .querySelector<HTMLOptionElement>('option[value="cluster"]')!.disabled,
-    ).toBe(true);
     expect(toast).toHaveBeenCalledWith(
       expect.stringContaining("Rebuild clusters"),
       "warn",
@@ -602,16 +613,51 @@ describe("AnalysisCoordinator panel bindings", () => {
     expect(scheduleDraw).not.toHaveBeenCalled();
   });
 
-  it("applies a colour mode picked from the panel select", () => {
+  it("applies a colour mode picked from the top tabber", () => {
     const { model, coord } = makeHarness();
     model.clustersAvailable = true;
     coord.bindPanel();
 
-    const $cm = document.getElementById("color-mode-select") as HTMLSelectElement;
-    $cm.value = "key";
-    $cm.dispatchEvent(new Event("change"));
+    coord.applyColorMode("key", false);
 
     expect(model.colorMode).toBe("key");
+  });
+
+  it("moves the selection-bloom cursor independently of the colour mode", () => {
+    const { model, coord, scheduleDraw } = makeHarness();
+    coord.bindPanel();
+    model.colorMode = "folder";
+    model.selectionBloom = "folder";
+
+    coord.moveSelectionBloom(1);
+
+    expect(model.selectionBloom).toBe("head");
+    // The dot colour is untouched: the cursor is a separate selection.
+    expect(model.colorMode).toBe("folder");
+    expect(scheduleDraw).toHaveBeenCalled();
+
+    coord.moveSelectionBloom(-1);
+    expect(model.selectionBloom).toBe("folder");
+  });
+
+  it("fetches predicted folders when the bloom cursor reaches head", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/supervised/predictions")
+        ? {
+            available: true,
+            assignments: { "a.mp3": "Root/Techno" },
+            matched: ["a.mp3"],
+          }
+        : {},
+    );
+    coord.bindPanel();
+    expect(model.folderPredictionsLoaded).toBe(false);
+
+    coord.applySelectionBloom("head");
+    await flush();
+
+    expect(model.selectionBloom).toBe("head");
+    expect(model.folderPredictionsLoaded).toBe(true);
   });
 
   it("fetches predicted folders on first selection of that mode", async () => {
@@ -658,25 +704,29 @@ describe("AnalysisCoordinator panel bindings", () => {
     );
   });
 
-  it("persists the confidence gate and disables it outside head mode", () => {
+  it("persists the confidence gate and folds it out only in head mode", () => {
     const { model, coord } = makeHarness();
     model.colorMode = "head";
     coord.bindPanel();
 
     const $hc = document.getElementById(
       "head-color-confident",
-    ) as HTMLSelectElement;
-    expect($hc.disabled).toBe(false);
-    expect($hc.value).toBe("1");
+    ) as HTMLInputElement;
+    expect($hc.checked).toBe(true);
 
-    $hc.value = "0";
+    $hc.checked = false;
     $hc.dispatchEvent(new Event("change"));
     expect(model.headColorConfident).toBe(false);
 
-    // Switching away disables the gate, which only affects predicted folders.
+    // Switching away folds the gate back, which only affects predicted folders.
     model.colorMode = "folder";
     coord.applyColorMode("folder", false);
-    expect($hc.disabled).toBe(true);
+    expect(
+      document.getElementById("head-confident-fold")!.classList.contains("hidden"),
+    ).toBe(true);
+    expect(
+      document.getElementById("view-options")!.classList.contains("hidden"),
+    ).toBe(true);
   });
 
   it("invalidates and refetches predictions when the head changes", async () => {
@@ -708,6 +758,7 @@ describe("AnalysisCoordinator panel bindings", () => {
     const { model, coord } = makeHarness();
     model.clusterResolutions = [0.4, 1.5, 3.0];
     model.clusterResolution = 1.5;
+    model.clustersAvailable = true;
     coord.bindPanel();
     const fetchSpy = vi.spyOn(coord, "fetchClusters").mockResolvedValue();
 
@@ -716,10 +767,41 @@ describe("AnalysisCoordinator panel bindings", () => {
     ) as HTMLInputElement;
     expect($cr.value).toBe("1");
     $cr.value = "2";
-    $cr.dispatchEvent(new Event("change"));
+    $cr.dispatchEvent(new Event("input"));
 
     expect(model.clusterResolution).toBe(3.0);
     expect(fetchSpy).toHaveBeenCalled();
+    // Adjusting granularity switches to cluster colouring so the change is visible.
+    expect(model.colorMode).toBe("cluster");
+  });
+
+  it("coalesces a mid-fetch resolution change into one trailing fetch", async () => {
+    const { model, coord } = makeHarness();
+    const calls: string[] = [];
+    const resolvers: Array<() => void> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Promise<Response>((resolve) => {
+          resolvers.push(() => resolve(jsonResponse({ available: false })));
+        });
+      }),
+    );
+
+    model.clusterResolution = 1.5;
+    const first = coord.fetchClusters();
+    // The slider moves again before the first fetch settles.
+    model.clusterResolution = 0.4;
+    const second = coord.fetchClusters();
+    expect(calls).toHaveLength(1);
+
+    resolvers[0]();
+    await first;
+    await second;
+    // The trailing fetch picks up the resolution the drag ended on.
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toContain("resolution=0.4");
   });
 
   it("queues a cluster rebuild from the panel button", async () => {
@@ -934,23 +1016,29 @@ describe("AnalysisCoordinator coverage panel", () => {
     ).toContain("4 failed");
   });
 
-  it("wires one retrigger button per stage plus a forced re-run", async () => {
-    const { coord, fetchSpy } = makeHarness();
+  it("re-runs a stage from its coverage row's hover icon, after confirming", async () => {
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirm);
+    const { coord, fetchSpy } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status") ? COVERAGE : {},
+    );
     coord.bindPanel();
+    await coord.fetchCoverage();
 
     const buttons = [
       ...document.querySelectorAll<HTMLButtonElement>("#analysis-retrigger button"),
     ];
-    expect(buttons.map((b) => b.textContent)).toEqual([
-      "Audio features",
-      "Structure",
-      "MAEST",
-      "CLAP",
-      "Re-run all",
-    ]);
+    expect(buttons.map((b) => b.textContent)).toEqual(["Re-run all"]);
 
-    buttons[1].click();
+    const rows = [...document.querySelectorAll(".analysis-coverage-row")];
+    const rerun = rows[2].querySelector<HTMLButtonElement>(
+      ".analysis-coverage-rerun",
+    );
+    expect(rerun?.title).toContain("Structure");
+    rerun!.click();
     await flush();
+
+    expect(confirm).toHaveBeenCalled();
     const structurePost = fetchSpy.mock.calls.find(
       ([url, init]) =>
         String(url) === "/api/embeddings/generate" &&
@@ -961,6 +1049,69 @@ describe("AnalysisCoordinator coverage panel", () => {
       recursive: true,
       stages: ["structure"],
       force: false,
+    });
+  });
+
+  it("leaves rows sharing a stage or without one icon-free", async () => {
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status") ? COVERAGE : {},
+    );
+    await coord.fetchCoverage();
+
+    const rows = [...document.querySelectorAll(".analysis-coverage-row")];
+    const hasIcon = (r: Element) =>
+      Boolean(r.querySelector(".analysis-coverage-rerun"));
+    // Audio features / Structure / MAEST / CLAP own a stage; Rhythm shares
+    // features, Supervised is library-wide.
+    expect(rows.map(hasIcon)).toEqual([true, false, true, true, true, false]);
+  });
+
+  it("does not re-run when the confirmation is dismissed", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => false));
+    const { coord, fetchSpy } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status") ? COVERAGE : {},
+    );
+    coord.bindPanel();
+    await coord.fetchCoverage();
+
+    const rows = [...document.querySelectorAll(".analysis-coverage-row")];
+    rows[2]
+      .querySelector<HTMLButtonElement>(".analysis-coverage-rerun")!
+      .click();
+    await flush();
+
+    expect(
+      fetchSpy.mock.calls.some(
+        ([url, init]) =>
+          String(url) === "/api/embeddings/generate" &&
+          (init as RequestInit)?.method === "POST",
+      ),
+    ).toBe(false);
+  });
+
+  it("forces a re-run of every stage from Re-run all, after confirming", async () => {
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirm);
+    const { coord, fetchSpy } = makeHarness();
+    coord.bindPanel();
+
+    const all = document.querySelector<HTMLButtonElement>(
+      "#analysis-retrigger .analysis-retrigger-all",
+    );
+    all!.click();
+    await flush();
+
+    expect(confirm).toHaveBeenCalled();
+    const post = fetchSpy.mock.calls.find(
+      ([url, init]) =>
+        String(url) === "/api/embeddings/generate" &&
+        (init as RequestInit)?.method === "POST",
+    );
+    expect(JSON.parse((post![1] as RequestInit).body as string)).toEqual({
+      folder: "",
+      recursive: true,
+      stages: [],
+      force: true,
     });
   });
 });

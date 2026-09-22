@@ -7,11 +7,9 @@ const PANEL_HTML = `
     <section id="properties-section"></section>
     <nav id="rp-tabs">
       <button type="button" class="rp-tab" data-rp-tab="analysis"></button>
-      <button type="button" class="rp-tab" data-rp-tab="organise"></button>
       <button type="button" class="rp-tab" data-rp-tab="tracks"></button>
     </nav>
     <section id="analysis-section" data-rp-panel="analysis"></section>
-    <section id="head-section" data-rp-panel="organise"></section>
     <section id="batch-section" data-rp-panel="tracks"></section>
   </aside>
 `;
@@ -41,7 +39,6 @@ describe("RightPanelBinder", () => {
 
     expect(panel("tracks").hidden).toBe(false);
     expect(panel("analysis").hidden).toBe(true);
-    expect(panel("organise").hidden).toBe(true);
     expect(tab("tracks").classList.contains("active")).toBe(true);
     expect(tab("tracks").getAttribute("aria-selected")).toBe("true");
   });

@@ -117,7 +117,8 @@ export class InspectCoordinator {
     // cannot re-hide the library after e.g. a focus or close.
     if (action !== "proximity") this._cancelProximity();
     if (action === "close") {
-      // The card owns the preview once pinned, so closing it ends the audition.
+      // The card is what keeps the audition alive after the pointer leaves the
+      // dot, so closing it ends the audition.
       this.deps.stopPreview(path);
       this._describePath = null;
       this._describeInFlight = null;

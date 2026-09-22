@@ -19,7 +19,7 @@ import {
 } from "../model";
 import { toast } from "../lib/toast";
 import { clusterColor } from "../lib/colors";
-import { COLOR_MODES, colorModeTabs, type ColorMode } from "../lib/lenses";
+import { COLOR_MODES, stepColorMode, type ColorMode } from "../lib/lenses";
 import { api, postJSON } from "../lib/api";
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -33,6 +33,8 @@ export interface AnalysisDeps {
   /** Canvas hover state — hovering a cluster row glows its member points. */
   canvas: {
     hoverTarget: HoverTarget | null;
+    /** Clickable colour-mode tabs, for centring the head-confident fold-out. */
+    colorTabs?: { id: string; x0: number; x1: number }[];
   };
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): Promise<void> | void;
@@ -41,7 +43,11 @@ export interface AnalysisDeps {
   /** Fetch the source-weight Jacobian the approximation needs (optional). */
   fetchWeightJacobian?(): void;
   /** The head panel, so the queue can disable Train while a run is queued. */
-  head?: { syncTrainEnabled(disabled: boolean): void };
+  head?: {
+    syncTrainEnabled(disabled: boolean): void;
+    /** Refetch the trained head's info after a supervise run drains. */
+    refreshHeadInfo?(): void;
+  };
   /** Select one track and fit the view to it (broken-files row click). */
   focusTrack?(path: string): void;
 }
@@ -103,6 +109,8 @@ interface CoverageRow {
   pending: number;
   /** Terminal failures for this stage (from the queue), so a stalled bar is explained. */
   failed: number;
+  /** The canonical row for a retriggerable per-track stage, so it gets a re-run icon. */
+  retrigger?: boolean;
 }
 
 /** One track with a terminal job failure (``GET /api/analysis/problems``). */
@@ -121,17 +129,11 @@ interface ProblemsResponse {
   failed?: ProblemFailure[];
 }
 
-/** Retriggerable stages, in pipeline order. */
-const RETRIGGER_STAGES: [string, string][] = [
-  ["features", "Audio features"],
-  ["structure", "Structure"],
-  ["maest", "MAEST"],
-  ["clap", "CLAP"],
-];
-
 export class AnalysisCoordinator {
   private _jobsEventSource: EventSource | null = null;
   private _clusterFetchPending = false;
+  /** A resolution change landed mid-fetch; refetch the latest when it settles. */
+  private _clusterFetchAgain = false;
   private _predictionsFetchPending = false;
   /** Supervise jobs outstanding at the previous status poll, to spot a finish. */
   private _prevSuperviseOutstanding: number | null = null;
@@ -155,32 +157,13 @@ export class AnalysisCoordinator {
   bindPanel(): void {
     const m = this.deps.model;
 
-    const $cm = document.getElementById(
-      "color-mode-select",
-    ) as HTMLSelectElement | null;
-    if ($cm) {
-      // The modes are the tabber's own list, so the two surfaces cannot drift.
-      $cm.replaceChildren(
-        ...colorModeTabs().map(({ id, label }) => {
-          const option = document.createElement("option");
-          option.value = id;
-          option.textContent = label;
-          return option;
-        }),
-      );
-      $cm.value = m.colorMode;
-      $cm.addEventListener("change", () =>
-        this.applyColorMode($cm.value as ColorMode, false),
-      );
-    }
-
     const $hc = document.getElementById(
       "head-color-confident",
-    ) as HTMLSelectElement | null;
+    ) as HTMLInputElement | null;
     if ($hc) {
-      $hc.value = m.headColorConfident ? "1" : "0";
+      $hc.checked = m.headColorConfident;
       $hc.addEventListener("change", () => {
-        m.headColorConfident = $hc.value === "1";
+        m.headColorConfident = $hc.checked;
         m.saveLS();
         this.deps.scheduleDraw();
       });
@@ -200,14 +183,20 @@ export class AnalysisCoordinator {
         $cr.value = String(idx >= 0 ? idx : Math.floor(list.length / 2));
       };
       syncSlider();
-      $cr.addEventListener("change", () => {
+      // `input` fires continuously while the handle moves, `change` only on release.
+      // Apply live so the map recolours under the drag; coalesce overlapping fetches
+      // and refetch the final position once the in-flight one settles.
+      const applyResolution = () => {
         const list = m.clusterResolutions;
         if (!list.length) return;
         const idx = clamp(parseInt($cr.value, 10) || 0, 0, list.length - 1);
         m.clusterResolution = list[idx];
-        m.saveLS();
+        // Adjusting granularity is a cluster-colouring act: show the result.
+        if (m.colorMode !== "cluster") this.applyColorMode("cluster", false);
         void this.fetchClusters();
-      });
+      };
+      $cr.addEventListener("input", applyResolution);
+      $cr.addEventListener("change", () => m.saveLS());
     }
 
     const $rebuild = document.getElementById("btn-rebuild-clusters");
@@ -268,19 +257,11 @@ export class AnalysisCoordinator {
 
   /* ── Analysis coverage + per-stage retrigger ─────────────── */
 
-  /** Wire the coverage panel's per-stage retrigger buttons. */
+  /** Wire the forced "Re-run all" button; per-stage re-runs are row hover icons. */
   private _bindRetrigger(): void {
     const host = document.getElementById("analysis-retrigger");
     if (!host) return;
     host.replaceChildren();
-    for (const [stage, label] of RETRIGGER_STAGES) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = label;
-      btn.title = `Analyse every track missing ${label.toLowerCase()}`;
-      btn.addEventListener("click", () => void this._retrigger(stage, label));
-      host.appendChild(btn);
-    }
     const all = document.createElement("button");
     all.type = "button";
     all.className = "analysis-retrigger-all";
@@ -292,6 +273,11 @@ export class AnalysisCoordinator {
 
   /** Queue missing (or forced) work for one stage, or all stages. */
   private async _retrigger(stage: string | null, label: string): Promise<void> {
+    const message =
+      stage == null
+        ? "Re-run every analysis stage for all tracks, even where cached?"
+        : `Re-run ${label} for every track missing it?`;
+    if (!window.confirm(message)) return;
     try {
       await postJSON("/api/embeddings/generate", {
         folder: "",
@@ -441,6 +427,7 @@ export class AnalysisCoordinator {
         done: d.tracks_with_audio_features ?? 0,
         pending: d.tracks_pending_audio_features ?? 0,
         failed: d.tracks_failed_audio_features ?? 0,
+        retrigger: true,
       },
       {
         label: "Rhythm",
@@ -455,6 +442,7 @@ export class AnalysisCoordinator {
         done: d.tracks_with_structure ?? 0,
         pending: d.tracks_pending_structure ?? 0,
         failed: d.tracks_failed_structure ?? 0,
+        retrigger: true,
       },
       {
         label: "MAEST",
@@ -462,6 +450,7 @@ export class AnalysisCoordinator {
         done: d.tracks_with_maest ?? 0,
         pending: d.tracks_pending_maest ?? 0,
         failed: d.tracks_failed_maest ?? 0,
+        retrigger: true,
       },
       {
         label: "CLAP",
@@ -469,6 +458,7 @@ export class AnalysisCoordinator {
         done: d.tracks_with_clap ?? 0,
         pending: d.tracks_pending_clap ?? 0,
         failed: d.tracks_failed_clap ?? 0,
+        retrigger: true,
       },
       {
         label: "Supervised",
@@ -500,7 +490,7 @@ export class AnalysisCoordinator {
     if (failedTotal > 0)
       summary.title =
         "Some tracks could not be analysed (unreadable audio). " +
-        "Press a stage button below to retry its failed jobs.";
+        "Hover a stage row and press its reload icon to retry.";
     host.replaceChildren(summary);
 
     if (total === 0) return;
@@ -518,7 +508,7 @@ export class AnalysisCoordinator {
       count.textContent = `${row.done} / ${total}`;
       if (row.pending > 0) count.classList.add("has-pending");
       // A short bar with terminal failures is a real gap, not pending work: flag
-      // it and point at the retrigger button.
+      // it and point at the row's re-run icon.
       const failed = row.failed;
       if (failed > 0) count.classList.add("has-failed");
 
@@ -530,6 +520,21 @@ export class AnalysisCoordinator {
       bar.appendChild(fill);
 
       line.append(name, bar, count);
+      // The canonical row for a stage reveals a reload icon on hover, next to the
+      // counts it affects. Rows sharing a stage (Rhythm → features) or without a
+      // per-track stage (Supervised) stay icon-free.
+      if (row.retrigger) {
+        const rerun = document.createElement("button");
+        rerun.type = "button";
+        rerun.className = "analysis-coverage-rerun";
+        rerun.textContent = "↻";
+        rerun.title = `Re-run ${row.label} for every track missing it`;
+        rerun.setAttribute("aria-label", `Re-run ${row.label}`);
+        rerun.addEventListener("click", () =>
+          void this._retrigger(row.stage, row.label),
+        );
+        line.appendChild(rerun);
+      }
       line.title = `${row.done} of ${total} analysed${
         row.pending > 0 ? `, ${row.pending} pending` : ""
       }${failed > 0 ? `, ${failed} failed (retrigger to retry)` : ""}`;
@@ -679,6 +684,29 @@ export class AnalysisCoordinator {
     this._syncColorControls();
   }
 
+  /** Step the selection-bloom cursor; shared by **D** / **Shift+D**. */
+  moveSelectionBloom(dir: 1 | -1 = 1): void {
+    this.applySelectionBloom(stepColorMode(this.deps.model.selectionBloom, dir));
+  }
+
+  /**
+   * Point the selection-bloom cursor at *mode*. Independent of ``colorMode``, so
+   * the map can be coloured by one variable and bloom by another. A colour the
+   * cursor cannot place (cluster with no clusters, predicted folder with no head)
+   * simply blooms nothing; the cursor still moves, so the choice is never lost.
+   */
+  applySelectionBloom(mode: ColorMode): void {
+    const m = this.deps.model;
+    m.selectionBloom = mode;
+    m.saveLS();
+    // Predicted folders are only needed for the head colour/bloom, so a cursor
+    // move onto "head" fetches them the same way the colour mode does.
+    if (mode === "head" && !m.folderPredictionsLoaded) {
+      void this.fetchFolderPredictions();
+    }
+    this.deps.scheduleDraw();
+  }
+
   /** Invalidate the cached predictions (the head changed) and refetch if in use. */
   refreshFolderPredictions(): void {
     const m = this.deps.model;
@@ -691,6 +719,9 @@ export class AnalysisCoordinator {
     if (this._predictionsFetchPending) return;
     this._predictionsFetchPending = true;
     const m = this.deps.model;
+    // The fetch walks the library, so show it is working in the status bar.
+    m.folderPredictionsLoading = true;
+    this.deps.status.update(m);
     try {
       const d = await api<PredictionsResponse>("/api/supervised/predictions");
       m.folderPredictionsAvailable = Boolean(d.available);
@@ -705,6 +736,8 @@ export class AnalysisCoordinator {
       /* api() already toasted */
     } finally {
       this._predictionsFetchPending = false;
+      m.folderPredictionsLoading = false;
+      this.deps.status.update(m);
     }
   }
 
@@ -723,37 +756,26 @@ export class AnalysisCoordinator {
   private _syncColorControls(): void {
     const m = this.deps.model;
     const available = m.clustersAvailable;
-    const $cm = document.getElementById(
-      "color-mode-select",
-    ) as HTMLSelectElement | null;
-    if ($cm) {
-      $cm.value = m.colorMode;
-      const $cluster = $cm.querySelector<HTMLOptionElement>(
-        'option[value="cluster"]',
-      );
-      if ($cluster) {
-        $cluster.disabled = !available;
-        $cluster.title = available
-          ? "Colour tracks by their microgenre cluster"
-          : this._clusterUnavailableReason();
-      }
-      const $head = $cm.querySelector<HTMLOptionElement>('option[value="head"]');
-      if ($head && m.folderPredictionsLoaded && !m.folderPredictionsAvailable) {
-        $head.title = "Train the folder head to colour by predicted folder";
-      }
-    }
     const $cr = document.getElementById(
       "cluster-resolution-range",
     ) as HTMLInputElement | null;
     if ($cr) $cr.disabled = !available;
-    // The confidence gate only means anything for the predicted-folder colouring.
+    // The confident-only gate is a view option: it only exists while the
+    // predicted-folder colour mode is active. The panel shows whenever it has at
+    // least one visible option, so future options need no extra wiring here.
+    const $fold = document.getElementById("head-confident-fold");
+    if ($fold) $fold.classList.toggle("hidden", m.colorMode !== "head");
+    const $opts = document.getElementById("view-options");
+    if ($opts) {
+      const anyVisible = [...$opts.querySelectorAll(".view-option")].some(
+        (el) => !el.classList.contains("hidden"),
+      );
+      $opts.classList.toggle("hidden", !anyVisible);
+    }
     const $hc = document.getElementById(
       "head-color-confident",
-    ) as HTMLSelectElement | null;
-    if ($hc) {
-      $hc.value = m.headColorConfident ? "1" : "0";
-      $hc.disabled = m.colorMode !== "head";
-    }
+    ) as HTMLInputElement | null;
+    if ($hc) $hc.checked = m.headColorConfident;
   }
 
   /** Subscribe to queue progress.
@@ -906,6 +928,7 @@ export class AnalysisCoordinator {
         superviseOutstanding === 0
       ) {
         this.refreshFolderPredictions();
+        this.deps.head?.refreshHeadInfo?.();
       }
     } catch {
       /* transient; next tick retries */
@@ -914,7 +937,12 @@ export class AnalysisCoordinator {
 
   /** Fetch cluster assignments at the selected resolution. */
   async fetchClusters(): Promise<void> {
-    if (this._clusterFetchPending) return;
+    if (this._clusterFetchPending) {
+      // A drag moved the slider while this fetch was in flight; remember to fetch
+      // the latest position once it settles, so the final one is never dropped.
+      this._clusterFetchAgain = true;
+      return;
+    }
     this._clusterFetchPending = true;
     const m = this.deps.model;
     try {
@@ -953,6 +981,10 @@ export class AnalysisCoordinator {
       /* api() already toasted */
     } finally {
       this._clusterFetchPending = false;
+      if (this._clusterFetchAgain) {
+        this._clusterFetchAgain = false;
+        void this.fetchClusters();
+      }
     }
   }
 

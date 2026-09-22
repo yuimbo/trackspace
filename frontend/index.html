@@ -11,17 +11,10 @@
 <aside id="sidebar">
   <!-- component: folder-panel (folder list fragment from GET /partials/folder-tree via HTMX) -->
   <section id="folder-section" x-data>
-    <h2>Folders</h2>
-    <div id="folder-controls">
-      <label id="show-external-label" class="hidden" title="External roots are analysed, but kept out of My library. When on, their tracks are drawn on the map too.">
-        <input type="checkbox" id="show-external-toggle" /> Show external tracks
-      </label>
-      <label id="external-projection-label" class="hidden" title="When off, external tracks are placed onto the library layout, so showing them never moves your library. When on, the layout is refit with external tracks included.">
-        <input type="checkbox" id="external-projection-toggle" /> Refit with external
-      </label>
-      <button id="btn-add-root" type="button" title="Add root folder by path">+ Root</button>
+    <div id="folder-head">
+      <h2>Folders</h2>
+      <button id="btn-add-root" type="button" title="Add root folder by path" aria-label="Add root folder">+</button>
     </div>
-    <div id="root-drop-hint">Drop folders here to add roots. Drag a root row outside to remove.</div>
     <div id="folder-tree"></div>
   </section>
 </aside>
@@ -31,69 +24,62 @@
   <div id="selected-folders-overlay" class="selected-folders-overlay hidden"></div>
   <canvas id="viewport"></canvas>
 
-  <!-- Active view modifiers (search, proximity, scope, exclusions, filters,
-       external): one dismissible chip each, oldest → newest. Esc pops newest. -->
-  <div id="view-modifiers" class="view-modifiers hidden" role="list" aria-label="Active view modifiers"></div>
+  <!-- Drop zone to the right of the sidebar: drag a root row here to remove it
+       (a red gradient outline + trashcan), with a confirm before it is dropped. -->
+  <div id="root-drop-zone" class="root-drop-zone hidden" aria-hidden="true">
+    <svg class="root-drop-trash" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m1 0v14a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V6" />
+      <path d="M10 11v6M14 11v6" />
+    </svg>
+    <span class="root-drop-label">Drop to remove</span>
+  </div>
 
-  <!-- View options (lens, colour, hover preview) as a transparent panel on the
-       canvas edge rather than a sidebar tab. -->
-  <div id="view-options-panel" class="view-options-panel">
-    <details id="view-options-details" open>
-      <summary>View</summary>
-      <section id="options-section" x-data>
-        <div class="option-row hover-preview-row">
-          <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
-          <input
-            type="range"
-            id="hover-preview-volume"
-            min="0"
-            max="1"
-            step="0.01"
-            value="0.8"
-            title="Preview volume"
-            aria-label="Hover preview volume"
-          />
-          <span id="hover-preview-volume-value" class="option-value"></span>
-        </div>
-        <label class="folder-tune">
-          <span>Lens <kbd>E</kbd></span>
-          <select id="lens-select" title="What the canvas shows: tag axes, an embedding map, or a feature wheel"></select>
-        </label>
-        <label class="folder-tune">
-          <span>Colour <kbd>C</kbd></span>
-          <select id="color-mode-select" title="How dots are coloured: folder, predicted folder, microgenre cluster, tempo, or key"></select>
-        </label>
-        <label class="folder-tune">
-          <span>Predicted</span>
-          <select id="head-color-confident" title="Predicted folder colour: only tracks close enough to a learned folder, or every track's nearest">
-            <option value="1">Confident only</option>
-            <option value="0">All nearest</option>
-          </select>
-        </label>
-        <div class="cluster-weight-actions">
-          <button
-            id="lens-preset-save"
-            type="button"
-            title="Save the current lens and display options as a preset"
-          >
-            Save preset…
-          </button>
-          <button
-            id="lens-preset-delete"
-            type="button"
-            title="Delete the active preset"
-            disabled
-          >
-            Delete preset
-          </button>
-        </div>
-      </section>
-    </details>
+  <!-- Active view modifiers (search, proximity, scope, exclusions, filters,
+       external): one dismissible chip each, oldest → newest. Esc pops the newest
+       dismissible one; the external visibility chip is permanent (no ×). -->
+  <div id="view-modifiers" class="view-modifiers hidden" role="list" aria-label="Active view modifiers">
+    <div class="view-modifiers-heading" aria-hidden="true">Active viewport filters:</div>
+  </div>
+
+  <!-- Top-right view options: contextual display toggles for the current view.
+       The panel appears whenever at least one of its options is relevant. -->
+  <div id="view-options" class="view-options hidden" role="group" aria-label="View options">
+    <div class="view-options-heading" aria-hidden="true">View options</div>
+    <!-- Shown only in predicted-folder colour mode: only colour confident
+         matches, greying everything else. -->
+    <div id="head-confident-fold" class="view-option hidden">
+      <label title="Only colour tracks close enough to a learned folder; the rest are grey">
+        <input type="checkbox" id="head-color-confident" /> Confident only
+      </label>
+    </div>
   </div>
 
   <footer id="statusbar">
     <span id="status-text">Select a folder to begin</span>
-    <span id="shortcuts-hint"><kbd>F1</kbd> shortcuts</span>
+    <span id="shortcuts-hint"><kbd data-hotkey-action="toggle-shortcuts">F1</kbd> shortcuts</span>
+    <!-- Hover preview: a speaker toggle + volume, right-aligned. -->
+    <span id="status-preview" data-hotkey-action="toggle-preview" data-hotkey-template="Hover preview streams the track under the pointer. Hold {key} + scroll to adjust the volume.">
+      <label class="status-speaker" data-hotkey-title="toggle-preview">
+        <input type="checkbox" id="hover-preview-toggle" aria-label="Toggle hover preview" />
+        <svg class="status-speaker-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor" stroke="none" />
+          <path class="status-speaker-wave" d="M16 8.5a4.5 4.5 0 0 1 0 7" />
+          <path class="status-speaker-wave" d="M18.6 6a8 8 0 0 1 0 12" />
+          <path class="status-speaker-slash" d="M16 9.5l6 5M22 9.5l-6 5" />
+        </svg>
+      </label>
+      <input
+        type="range"
+        id="hover-preview-volume"
+        min="0"
+        max="1"
+        step="0.01"
+        value="0.8"
+        title="Volume"
+        aria-label="Preview volume"
+      />
+      <span id="hover-preview-volume-value" class="option-value"></span>
+    </span>
   </footer>
 </main>
 
@@ -109,7 +95,6 @@
        `data-rp-panel` in place (their cross-tab DOM order is irrelevant). -->
   <nav id="rp-tabs" role="tablist" aria-label="Right panel sections">
     <button type="button" class="rp-tab" data-rp-tab="analysis" role="tab" aria-selected="false">Analysis</button>
-    <button type="button" class="rp-tab" data-rp-tab="organise" role="tab" aria-selected="false">Organise</button>
     <button type="button" class="rp-tab" data-rp-tab="tracks" role="tab" aria-selected="false">Tracks</button>
   </nav>
 
@@ -173,112 +158,42 @@
     <button id="btn-rebuild-clusters" type="button" title="Recompute clusters">
       Rebuild clusters
     </button>
-    <button
-      id="btn-train-supervised"
-      type="button"
-      title="Train the folder-supervised view (retrains on your folder structure)"
-    >
-      Train folder view
-    </button>
   </section>
 
-  <!-- component: head-panel (folder head: export/import/compare, training folders, imprint) -->
-  <section id="head-section" data-rp-panel="organise" x-data>
+  <!-- component: head-panel (folder head: trained-head info + train/export/import/compare) -->
+  <section id="head-section" data-rp-panel="analysis" x-data>
     <h2>Folder head</h2>
-    <details id="head-tools-details">
-      <summary>Head tools</summary>
-      <div class="head-actions">
-        <button
-          id="btn-export-head"
-          type="button"
-          title="Download this library's trained folder head"
-        >
-          Export
+    <div id="head-info"></div>
+    <div class="head-actions">
+      <button
+        id="btn-train-supervised"
+        type="button"
+        title="Train the folder head on your folder structure"
+      >
+        Train
+      </button>
+      <button id="btn-export-head" type="button" title="Download this library's trained folder head">
+        Export
+      </button>
+      <button id="btn-import-head" type="button" title="Load someone else's head">
+        Import
+      </button>
+      <button id="btn-compare-head" type="button" title="Compare a head with this one">
+        Compare
+      </button>
+      <input type="file" id="head-import-file" accept=".pt" hidden />
+      <input type="file" id="head-compare-file" accept=".pt" hidden />
+    </div>
+    <details id="head-train-folders-details">
+      <summary>Training folders</summary>
+      <div id="head-train-folders" class="head-folder-tree"></div>
+      <div class="cluster-weight-actions">
+        <button id="btn-head-folders-all" type="button" title="Train on every My library root (the default)">
+          All library folders
         </button>
-        <button id="btn-import-head" type="button" title="Load someone else's head">
-          Import
-        </button>
-        <button id="btn-compare-head" type="button" title="Compare a head with this one">
-          Compare
-        </button>
-        <input type="file" id="head-import-file" accept=".pt" hidden />
-        <input type="file" id="head-compare-file" accept=".pt" hidden />
       </div>
-      <details id="head-train-folders-details">
-        <summary>Training folders</summary>
-        <div id="head-train-folders" class="head-folder-tree"></div>
-        <div class="cluster-weight-actions">
-          <button
-            id="btn-head-folders-all"
-            type="button"
-            title="Train on every My library root (the default)"
-          >
-            All library folders
-          </button>
-        </div>
-      </details>
-      <details id="head-imprint-details">
-        <summary>Imprint on a folder…</summary>
-        <label class="head-fanout-folder">
-          <span>Folder path</span>
-          <input
-            id="head-imprint-path"
-            type="text"
-            placeholder="/Users/me/Downloads"
-            spellcheck="false"
-            title="An absolute path to a folder outside your library"
-          />
-        </label>
-        <label
-          class="head-fanout-folder"
-          title="Tracks that fit no learned folder are filed under their Discogs genre/style"
-        >
-          <input id="imprint-generic-toggle" type="checkbox" checked />
-          <span>Sort unmatched into Generic/&lt;genre&gt;/&lt;style&gt;</span>
-        </label>
-        <div class="cluster-weight-actions">
-          <button
-            id="btn-imprint-analyze"
-            type="button"
-            title="Scan and analyse that folder's tracks"
-          >
-            Analyze
-          </button>
-          <button
-            id="btn-imprint-plan"
-            type="button"
-            title="Review the predicted moves without touching disk"
-          >
-            Review plan
-          </button>
-          <button
-            id="btn-imprint-apply"
-            type="button"
-            title="Move the tracks into the head's folders"
-          >
-            Apply moves
-          </button>
-          <button
-            id="btn-imprint-undo"
-            type="button"
-            title="No fan-out moves to undo"
-            disabled
-          >
-            Undo moves
-          </button>
-          <button
-            id="btn-imprint-discard"
-            type="button"
-            title="Drop an unfinished imprint without moving files"
-            hidden
-          >
-            Discard
-          </button>
-        </div>
-        <p id="imprint-note" class="cluster-weights-note"></p>
-      </details>
-      <p id="head-note" class="cluster-weights-note"></p>
     </details>
+    <p id="head-note" class="cluster-weights-note"></p>
   </section>
 
   <section id="features-section" data-rp-panel="tracks" x-data>
@@ -310,13 +225,63 @@
   </div>
 </div>
 
+<!-- component: head-modal — right-click a folder inside an External root and
+     choose "Project folder structure onto here". The imprint target and its
+     analyze/plan/apply/undo controls live in this dialog; training and the head
+     tools live in the Analysis panel's Folder head section. -->
+<div id="head-modal" class="head-modal hidden">
+  <div id="head-modal-content">
+    <div id="head-modal-head">
+      <h2>Project folder structure</h2>
+      <button id="head-modal-close" type="button" title="Close (Esc)" aria-label="Close">×</button>
+    </div>
+    <p id="head-modal-target" class="head-modal-target"></p>
+
+    <label class="head-fanout-folder">
+      <span>Project onto</span>
+      <input
+        id="head-imprint-path"
+        type="text"
+        placeholder="/Users/me/Downloads"
+        spellcheck="false"
+        title="An absolute path to the destination folder"
+      />
+    </label>
+    <label
+      class="head-fanout-folder"
+      title="Tracks that fit no learned folder are filed under their Discogs genre/style"
+    >
+      <input id="imprint-generic-toggle" type="checkbox" checked />
+      <span>Sort unmatched into Generic/&lt;genre&gt;/&lt;style&gt;</span>
+    </label>
+    <div class="cluster-weight-actions">
+      <button id="btn-imprint-analyze" type="button" title="Scan and analyse that folder's tracks">
+        Analyze
+      </button>
+      <button id="btn-imprint-plan" type="button" title="Review the predicted moves without touching disk">
+        Review plan
+      </button>
+      <button id="btn-imprint-apply" type="button" title="Move the tracks into the head's folders">
+        Apply moves
+      </button>
+      <button id="btn-imprint-undo" type="button" title="No fan-out moves to undo" disabled>
+        Undo moves
+      </button>
+      <button id="btn-imprint-discard" type="button" title="Drop an unfinished imprint without moving files" hidden>
+        Discard
+      </button>
+    </div>
+    <p id="imprint-note" class="cluster-weights-note"></p>
+  </div>
+</div>
+
 <!-- component: shortcuts-modal (Alpine) -->
 <div
   id="shortcuts-modal"
   x-data="{ open: false }"
   x-cloak
-  @keydown.window="if ($event.key === 'F1') { $event.preventDefault(); open = true }"
-  @keyup.window="if ($event.key === 'F1') open = false"
+  @keydown.window="if ($event.key === $el.dataset.hotkeyKey) { $event.preventDefault(); open = true }"
+  @keyup.window="if ($event.key === $el.dataset.hotkeyKey) open = false"
   @click.self="open = false"
   :class="open ? '' : 'hidden'"
 >

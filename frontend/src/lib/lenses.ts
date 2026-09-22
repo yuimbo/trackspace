@@ -64,6 +64,13 @@ export function colorModeTabs(): { id: string; label: string }[] {
   return COLOR_MODES.map((id) => ({ id, label: COLOR_MODE_LABELS[id] }));
 }
 
+/** Step a colour mode through the **C** / **D** order; wraps at either end. */
+export function stepColorMode(mode: ColorMode, dir: 1 | -1 = 1): ColorMode {
+  const idx = COLOR_MODES.indexOf(mode);
+  const n = COLOR_MODES.length;
+  return COLOR_MODES[(idx + dir + n) % n];
+}
+
 /** A saved view: a base lens plus the display options the user tweaked. */
 export interface LensPreset {
   id: string;
@@ -193,9 +200,9 @@ export const BUILTIN_LENSES: readonly Lens[] = [
   { id: "tags", label: "Tags", kind: "tags" },
   { id: "combined", label: "Combined map", kind: "projection" },
   { id: "maest", label: "MAEST genre", kind: "projection", sources: ["maest_logits", "maest"] },
+  { id: "supervised", label: "Folder head", kind: "projection", sources: ["supervised"] },
   { id: "clap", label: "CLAP timbre", kind: "projection", sources: ["clap"] },
   { id: "rhythm", label: "Rhythm", kind: "projection", sources: ["rhythm"] },
-  { id: "supervised", label: "Folder head", kind: "projection", sources: ["supervised"] },
   { id: "camelot", label: "Camelot wheel", kind: "deterministic", compute: camelotPosition, guide: "camelot" },
   { id: "tempo", label: "Tempo spiral", kind: "deterministic", compute: tempoSpiralPosition, guide: "spiral" },
 ];

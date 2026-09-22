@@ -929,17 +929,8 @@ export class EmbeddingCoordinator {
     await this.switchToLens(target === "tags" ? "tags" : "combined");
   }
 
-  /** Mirror the active lens into the View-tab select and the weight-panel visibility. */
+  /** Sync the source-weight panel visibility to the active lens. */
   syncLensChrome(): void {
-    const m = this.deps.model;
-    const sel = document.getElementById("lens-select") as HTMLSelectElement | null;
-    if (sel) sel.value = m.lensId;
-    // A preset carries its colour mode too; mirror it so the View-tab select
-    // matches the canvas after a preset switch.
-    const cm = document.getElementById(
-      "color-mode-select",
-    ) as HTMLSelectElement | null;
-    if (cm) cm.value = m.colorMode;
     // Source weights only re-weight the combined lens; a per-source lens fixes
     // them, so hide the sliders where they would do nothing.
     const lens = this.deps.model.lens();

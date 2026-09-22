@@ -254,11 +254,12 @@ ${maestError}
       this.$el.appendChild(a);
     }
 
-    if (model.viewMode === "embeddings") {
+    // The head's predictions walk the whole library; say so while it runs.
+    if (model.folderPredictionsLoading) {
       addSep();
-      const mode = document.createElement("span");
-      mode.textContent = `Lens: ${model.lens().label}`;
-      this.$el.appendChild(mode);
+      const s = document.createElement("span");
+      s.textContent = "Predicting folders…";
+      this.$el.appendChild(s);
     }
 
     const prog = pipelineProgress(model.queueStatus);

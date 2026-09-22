@@ -14,6 +14,9 @@
 // mixed blob blends proportionally; dividing by the summed weight keeps the interior
 // at full saturation however many points stack. Point alpha dims the colour (search
 // fade, external tracks) without shrinking the geometry, so faded points still merge.
+// A down-prioritised (grey) point contributes almost none of its colour, and grey
+// points are splatted and composited *before* the coloured ones, so a grey dot never
+// occludes a coloured one in the merged field.
 //
 // The 2-D canvas stays the single source of truth for *where* things are: this
 // module is handed the same screen positions the scatter would have drawn, and the
@@ -32,6 +35,13 @@ export interface PointSpec {
   color: [number, number, number];
   /** Point opacity 0..1: dims the blob's colour without changing its shape. */
   alpha: number;
+  /**
+   * Colour priority 0..1, default 1: scales how much this point's colour counts
+   * in a merged blob, **without** changing its geometry. A grey point (a track the
+   * head cannot place, or an unanalysed one) is down-prioritised, so its greyness
+   * cannot wash out the hue of the information-bearing points it merges with.
+   */
+  weight?: number;
 }
 
 /** Default splat half-extent, tuned so an isolated point is the old 4 px dot. */
@@ -50,7 +60,7 @@ const EDGE_FLOOR = 0.002;
 const OUTLINE_PX = 1.5;
 const OUTLINE_ALPHA = 0.35;
 
-const FLOATS_PER_VERTEX = 9;
+const FLOATS_PER_VERTEX = 10;
 const VERTICES_PER_POINT = 6;
 
 const SPLAT_VERT_SRC = `#version 300 es
@@ -58,10 +68,12 @@ in vec2 a_center;
 in vec2 a_corner;
 in float a_radius;
 in vec4 a_color;
+in float a_weight;
 uniform vec2 u_resolution;
 out vec2 v_local;
 out float v_radius;
 out vec4 v_color;
+out float v_weight;
 void main() {
   vec2 px = a_center + a_corner * a_radius;
   vec2 clip = px / u_resolution * 2.0 - 1.0;
@@ -69,21 +81,25 @@ void main() {
   v_local = a_corner * a_radius;
   v_radius = a_radius;
   v_color = a_color;
+  v_weight = a_weight;
 }`;
 
-// Deposits `color * weight * alpha` into RGB and the raw geometry `weight` into
-// A. Summing over every overlapping point builds the field the composite reads.
+// Deposits `color * weight * alpha * priority` into RGB and the raw geometry
+// `weight` into A. Summing over every overlapping point builds the field the
+// composite reads; the priority scales only the colour, so a down-prioritised grey
+// point still adds shape without desaturating its neighbours.
 const SPLAT_FRAG_SRC = `#version 300 es
 precision mediump float;
 in vec2 v_local;
 in float v_radius;
 in vec4 v_color;
+in float v_weight;
 uniform float u_core;
 out vec4 outColor;
 void main() {
   float d = length(v_local) / v_radius;
   float w = 1.0 - smoothstep(u_core, 1.0, d);
-  outColor = vec4(v_color.rgb * w * v_color.a, w);
+  outColor = vec4(v_color.rgb * w * v_color.a * v_weight, w);
 }`;
 
 const COMPOSITE_VERT_SRC = `#version 300 es
@@ -146,6 +162,7 @@ export function packPointVertices(
       data[o++] = p.color[1];
       data[o++] = p.color[2];
       data[o++] = p.alpha;
+      data[o++] = p.weight ?? 1;
     }
   }
   return data.length === need ? data : data.subarray(0, need);
@@ -241,6 +258,7 @@ export class MetaballLayer {
       a_corner: gl.getAttribLocation(splat, "a_corner"),
       a_radius: gl.getAttribLocation(splat, "a_radius"),
       a_color: gl.getAttribLocation(splat, "a_color"),
+      a_weight: gl.getAttribLocation(splat, "a_weight"),
     };
     this.compositeCornerLoc = gl.getAttribLocation(composite, "a_corner");
     this.gl = gl;
@@ -283,17 +301,41 @@ export class MetaballLayer {
       gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
   }
 
-  /** Threshold every splatted point into one gooey layer on the canvas. */
+  /**
+   * Threshold the splatted points into one gooey layer on the canvas.
+   *
+   * Down-prioritised (grey) points are splatted and composited **first**, then
+   * the coloured points over them, so a grey dot never occludes a coloured one in
+   * the merged field. The first pass clears the canvas; the rest blend over it.
+   */
   render(points: readonly PointSpec[]): void {
     const gl = this.gl;
     // A frame may draw before the first `sync`; the target has no storage yet, so
     // skip it rather than clear an incomplete framebuffer.
     if (!gl || !this.ready || gl.isContextLost()) return;
+    const grey: PointSpec[] = [];
+    const colour: PointSpec[] = [];
+    for (const p of points) ((p.weight ?? 1) < 1 ? grey : colour).push(p);
+    if (!grey.length && !colour.length) {
+      // No points: still clear the canvas so a stale frame is not left behind.
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      return;
+    }
+    const first = grey.length ? grey : colour;
+    const second = grey.length ? colour : null;
+    this._pass(first, true);
+    if (second) this._pass(second, false);
+  }
+
+  /** Splat *points* into the field target, then composite it onto the canvas. */
+  private _pass(points: readonly PointSpec[], clearCanvas: boolean): void {
+    const gl = this.gl!;
     const dpr = devicePixelRatio || 1;
     const pw = Math.max(1, Math.round(this.width * dpr));
     const ph = Math.max(1, Math.round(this.height * dpr));
 
-    // Pass 1: accumulate every kernel into the field target.
+    // Pass A: accumulate every kernel into the field target.
     gl.bindFramebuffer(gl.FRAMEBUFFER, this.framebuffer);
     gl.viewport(0, 0, pw, ph);
     gl.clearColor(0, 0, 0, 0);
@@ -315,16 +357,15 @@ export class MetaballLayer {
     this._pointAttrib("a_corner", 2, stride, 2 * Float32Array.BYTES_PER_ELEMENT);
     this._pointAttrib("a_radius", 1, stride, 4 * Float32Array.BYTES_PER_ELEMENT);
     this._pointAttrib("a_color", 4, stride, 5 * Float32Array.BYTES_PER_ELEMENT);
+    this._pointAttrib("a_weight", 1, stride, 9 * Float32Array.BYTES_PER_ELEMENT);
     gl.uniform2f(this.splatResolutionLoc, this.width, this.height);
     gl.uniform1f(this.splatCoreLoc, CORE);
-    if (points.length) {
-      gl.drawArrays(gl.TRIANGLES, 0, points.length * VERTICES_PER_POINT);
-    }
+    gl.drawArrays(gl.TRIANGLES, 0, points.length * VERTICES_PER_POINT);
 
-    // Pass 2: threshold the field onto the canvas, premultiplied over.
+    // Pass B: threshold the field onto the canvas, premultiplied over.
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, pw, ph);
-    gl.clear(gl.COLOR_BUFFER_BIT);
+    if (clearCanvas) gl.clear(gl.COLOR_BUFFER_BIT);
     gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(this.compositeProgram);
     this._disableAttribs();
@@ -356,7 +397,9 @@ export class MetaballLayer {
   ): void {
     const gl = this.gl!;
     const loc = this.splatAttribs[name];
-    if (loc < 0) return;
+    // A missing attribute resolves to `undefined`, which would otherwise be
+    // coerced to attribute 0 and corrupt every point's centre.
+    if (!Number.isInteger(loc) || loc < 0) return;
     gl.enableVertexAttribArray(loc);
     gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, offset);
   }

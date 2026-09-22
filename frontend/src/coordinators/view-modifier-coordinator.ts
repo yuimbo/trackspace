@@ -78,6 +78,8 @@ export class ViewModifierCoordinator {
   dismiss(id: string): void {
     const clear = this._clearers.get(id);
     if (!clear) return;
+    // A permanent chip (no ×) is never dismissed; its state is a view filter.
+    if (this.deps.model.viewModifiers.find((m) => m.id === id)?.permanent) return;
     this._clearers.delete(id);
     this.deps.model.viewModifiers = this.deps.model.viewModifiers.filter(
       (m) => m.id !== id,
@@ -100,12 +102,15 @@ export class ViewModifierCoordinator {
     this._render();
   }
 
-  /** **Esc**: dismiss the newest modifier. False when the stack is empty. */
+  /** **Esc**: dismiss the newest modifier. False when none can be dismissed. */
   popNewest(): boolean {
     const stack = this.deps.model.viewModifiers;
-    if (!stack.length) return false;
-    this.dismiss(stack[stack.length - 1].id);
-    return true;
+    for (let i = stack.length - 1; i >= 0; i--) {
+      if (stack[i].permanent) continue;
+      this.dismiss(stack[i].id);
+      return true;
+    }
+    return false;
   }
 
   /** The active modifier of a kind, if any (a chip's state to read). */

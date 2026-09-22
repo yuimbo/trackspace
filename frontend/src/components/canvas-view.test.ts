@@ -12,7 +12,13 @@ import {
   parseColor,
   tempoColor,
 } from "../lib/colors";
-import { CanvasView, nearestInBlob, tabAt, type DotPosition } from "./canvas-view";
+import {
+  CanvasView,
+  CONFIDENT_MISS_COLOR,
+  nearestInBlob,
+  tabAt,
+  type DotPosition,
+} from "./canvas-view";
 
 function makeTrack(over: Partial<Track> = {}): Track {
   return {
@@ -111,6 +117,35 @@ describe("CanvasView cluster hover glow", () => {
     cv.model.clusterAssignments = new Map([["a.mp3", 2]]);
     cv.draw();
     expect(cv.collectHoverGlowPoints(cv.model.tracks)).toEqual([]);
+  });
+
+  it("blooms the hovered dot's selection-cursor family, not its folder", () => {
+    const cv = makeCanvas();
+    cv.model.clusterAssignments = new Map([
+      ["a.mp3", 2],
+      ["b.mp3", 2],
+    ]);
+    cv.model.selectionBloom = "cluster";
+    cv.hoveredBloomTrack = cv.model.tracks[0];
+    cv.draw();
+    const pts = cv.collectHoverGlowPoints(cv.model.tracks);
+    // Both tracks share cluster 2, though their folders differ.
+    expect(pts).toHaveLength(2);
+    expect(pts[0].color).toEqual(parseColor(clusterColor(2)));
+  });
+
+  it("blooms folder ancestors as the range widens", () => {
+    const cv = makeCanvas();
+    cv.model.selectionBloom = "folder";
+    cv.model.setBloomRange(0);
+    cv.hoveredBloomTrack = cv.model.tracks[0];
+    cv.draw();
+    // a.mp3 is at the root; b.mp3 is in House. At range 0 only the exact
+    // folder matches, so the root track blooms alone.
+    expect(cv.collectHoverGlowPoints(cv.model.tracks)).toHaveLength(1);
+    // +2 parent levels: both share the "" root ancestor.
+    cv.model.setBloomRange(0.5);
+    expect(cv.collectHoverGlowPoints(cv.model.tracks)).toHaveLength(2);
   });
 
   it("sets and clears the hover target from a card element", () => {
@@ -521,6 +556,38 @@ describe("CanvasView hovered-row info card", () => {
     expect(cv.onSearchTerm).toHaveBeenCalledWith("a techno track");
   });
 
+  it("routes a seekbar click to onSeek with the clicked fraction", () => {
+    const cv = makeCanvas();
+    cv.inspect = {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: null,
+      results: [],
+      proximity: 100,
+      tab: "navigate",
+      describe: {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        results: [],
+        coordinates: [],
+      },
+    };
+    cv.onSeek = vi.fn();
+    const track = document.createElement("div");
+    track.dataset.seek = "";
+    track.getBoundingClientRect = () => ({ left: 100, width: 200 }) as DOMRect;
+    cv.$tip.appendChild(track);
+
+    track.dispatchEvent(
+      new MouseEvent("mousedown", { clientX: 150, bubbles: true }),
+    );
+    expect(cv.onSeek).toHaveBeenCalledWith("a.mp3", 0.25);
+    // The drag listens on the document; end it so it cannot leak between tests.
+    document.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+  });
+
   it("folds the Describe content into a panel beside the card", () => {
     const cv = makeCanvas();
     cv.inspect = {
@@ -705,14 +772,22 @@ describe("CanvasView track colour modes", () => {
     expect(cv.trackColor(t)).toBe(clusterColor(4));
   });
 
+  it("accepts an explicit colour mode for the selection bloom", () => {
+    const t = makeTrack({ path: "a.mp3", folder: "House" });
+    const cv = view(t);
+    cv.model.clusterAssignments = new Map([["a.mp3", 4]]);
+    cv.model.colorMode = "folder";
+    expect(cv.trackColor(t, "cluster")).toBe(clusterColor(4));
+  });
+
   it("colours by the head's predicted folder, gated by confidence", () => {
     const t = makeTrack({ path: "a.mp3", folder: "House" });
     const cv = view(t);
     cv.model.colorMode = "head";
     cv.model.folderPredictions = new Map([["a.mp3", "Root/Techno"]]);
-    // Confident (default): a weak match keeps its own folder colour.
+    // Confident (default): a weak match is grey, not its own folder colour.
     cv.model.folderPredictionMatches = new Set();
-    expect(cv.trackColor(t)).toBe(dirColor("House"));
+    expect(cv.trackColor(t)).toBe(CONFIDENT_MISS_COLOR);
     // A confident match takes the predicted folder's colour.
     cv.model.folderPredictionMatches = new Set(["a.mp3"]);
     expect(cv.trackColor(t)).toBe(dirColor("Root/Techno"));
@@ -722,12 +797,19 @@ describe("CanvasView track colour modes", () => {
     expect(cv.trackColor(t)).toBe(dirColor("Root/Techno"));
   });
 
-  it("falls back to the folder colour when there is no prediction", () => {
+  it("greys only a track the head has no prediction for", () => {
     const t = makeTrack({ path: "a.mp3", folder: "House" });
     const cv = view(t);
     cv.model.colorMode = "head";
     cv.model.folderPredictions = new Map();
     cv.model.folderPredictionMatches = new Set();
+    expect(cv.trackColor(t)).toBe(CONFIDENT_MISS_COLOR);
+    cv.model.headColorConfident = false;
+    expect(cv.trackColor(t)).toBe(CONFIDENT_MISS_COLOR);
+
+    // A prediction equal to the current folder still takes that folder's colour.
+    cv.model.folderPredictions = new Map([["a.mp3", "House"]]);
+    cv.model.folderPredictionMatches = new Set(["a.mp3"]);
     expect(cv.trackColor(t)).toBe(dirColor("House"));
   });
 });
@@ -774,6 +856,65 @@ describe("CanvasView top tabbers", () => {
     const gap = (cv.lensTabs[0].y1 + cv.colorTabs[0].y0) / 2;
     expect(cv.topLensTabAt(lensCx, gap)).toBeNull();
     expect(cv.topColorTabAt(lensCx, gap)).toBeNull();
+  });
+});
+
+describe("CanvasView volume HUD", () => {
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = "";
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("renders a labelled progress bar for the preview volume", () => {
+    const m = new Model();
+    const cv = new CanvasView(m);
+    m.previewVolume = 0.4;
+    cv.showVolumeHud(100, 100);
+    const hud = document.getElementById("volume-hud")!;
+    expect(hud.classList.contains("hidden")).toBe(false);
+    expect(hud.querySelector(".volume-hud-label")?.textContent).toBe(
+      "Volume 40%",
+    );
+    expect(
+      (hud.querySelector(".volume-hud-track > i") as HTMLElement).style.width,
+    ).toBe("40%");
+  });
+
+  it("renders the bloom range with its per-variable meaning", () => {
+    const m = new Model();
+    const cv = new CanvasView(m);
+    m.selectionBloom = "tempo";
+    m.setBloomRange(0.6);
+    cv.showBloomHud(100, 100);
+    const hud = document.getElementById("bloom-hud")!;
+    expect(hud.classList.contains("hidden")).toBe(false);
+    // 0.6 of a full range is ±15% BPM.
+    expect(hud.querySelector(".bloom-hud-label")?.textContent).toBe(
+      "Bloom · ±15% BPM",
+    );
+    expect(
+      (hud.querySelector(".bloom-hud-track > i") as HTMLElement).style.width,
+    ).toBe("60%");
+  });
+
+  it("omits the slider when the bloom variable has no range", () => {
+    const m = new Model();
+    const cv = new CanvasView(m);
+    m.selectionBloom = "cluster";
+    cv.showBloomHud(100, 100);
+    const hud = document.getElementById("bloom-hud")!;
+    expect(hud.classList.contains("hidden")).toBe(false);
+    expect(hud.querySelector(".bloom-hud-label")?.textContent).toBe(
+      "Bloom · no range",
+    );
+    expect(hud.querySelector(".bloom-hud-track")).toBeNull();
   });
 });
 

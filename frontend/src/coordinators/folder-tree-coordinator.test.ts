@@ -50,14 +50,9 @@ const TREE_HTML = `
 const SHELL_HTML = `
   <div id="toast-container"></div>
   <div id="folder-section">
-    <label id="show-external-label" class="hidden">
-      <input type="checkbox" id="show-external-toggle" />
-    </label>
-    <label id="external-projection-label" class="hidden">
-      <input type="checkbox" id="external-projection-toggle" />
-    </label>
     <div id="folder-tree">${TREE_HTML}</div>
   </div>
+  <div id="root-drop-zone" class="hidden"></div>
   <div id="selected-folders-overlay" class="hidden"></div>
   <div id="root-add-modal" class="hidden">
     <input id="root-add-input" />
@@ -86,7 +81,7 @@ function makeCanvas() {
   return {
     hoveredIdx: -1,
     hoverTarget: null as HoverTarget | null,
-    hoveredSiblingFolder: null as string | null,
+    hoveredBloomTrack: null as Track | null,
     scheduleDraw: vi.fn(),
   };
 }
@@ -454,6 +449,118 @@ describe("FolderTreeCoordinator active labels and overlay", () => {
     expect($overlay().classList.contains("hidden")).toBe(true);
     expect($overlay().innerHTML).toBe("");
   });
+
+  it("adds a BPMs tab and groups the selection by rounded tempo", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House", bpm: 127.6 }),
+      makeTrack({ path: "House/b.mp3", folder: "House", bpm: 128.4 }),
+      makeTrack({ path: "Techno/c.mp3", folder: "Techno", bpm: 140.2 }),
+    ]);
+    for (const p of ["House/a.mp3", "House/b.mp3", "Techno/c.mp3"])
+      model.selected.add(p);
+    coord.syncActiveLabels();
+    const tabs = [...$overlay().querySelectorAll("[data-overlay-tab]")];
+    expect(tabs.map((t) => t.getAttribute("data-overlay-tab"))).toEqual([
+      "folders",
+      "bpms",
+    ]);
+    (tabs[1] as HTMLElement).click();
+    const labels = $overlay().querySelectorAll(".folder-label");
+    expect(labels).toHaveLength(2);
+    expect(labels[0].textContent).toContain("128 BPM");
+    expect(labels[0].textContent).toContain("(2)");
+    expect(labels[1].textContent).toContain("140 BPM");
+  });
+
+  it("hovers and selects a non-folder class row", () => {
+    const { model, coord, canvas } = makeHarness();
+    const am = {
+      tempo: 0.5,
+      key: 0.25,
+      mode: 0,
+      energy: 0.5,
+      danceability: 0.5,
+    };
+    const cm = { ...am, key: 0 };
+    model.setAllTracks([
+      makeTrack({
+        path: "House/a.mp3",
+        folder: "House",
+        musical_key: "Am",
+        audio_features: am,
+      }),
+      makeTrack({
+        path: "Techno/b.mp3",
+        folder: "Techno",
+        musical_key: "Am",
+        audio_features: am,
+      }),
+      makeTrack({
+        path: "House/c.mp3",
+        folder: "House",
+        musical_key: "Cm",
+        audio_features: cm,
+      }),
+    ]);
+    for (const p of ["House/a.mp3", "Techno/b.mp3", "House/c.mp3"])
+      model.selected.add(p);
+    coord.syncActiveLabels();
+    (
+      $overlay().querySelector("[data-overlay-tab='keys']") as HTMLElement
+    ).click();
+    const rowEl = $overlay().querySelector(".folder-row") as HTMLElement;
+    rowEl.dispatchEvent(new MouseEvent("mouseenter"));
+    expect(canvas.hoverTarget).toMatchObject({
+      kind: "paths",
+      paths: ["House/a.mp3", "Techno/b.mp3"],
+    });
+    rowEl.click();
+    expect([...model.selected]).toEqual(["House/a.mp3", "Techno/b.mp3"]);
+  });
+
+  it("merges BPM rows as the tempo bloom widens", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House", bpm: 127 }),
+      makeTrack({ path: "House/b.mp3", folder: "House", bpm: 129 }),
+    ]);
+    model.selected.add("House/a.mp3");
+    model.selected.add("House/b.mp3");
+    model.bloomRanges.tempo = 1;
+    coord.syncActiveLabels();
+    (
+      $overlay().querySelector("[data-overlay-tab='bpms']") as HTMLElement
+    ).click();
+    const labels = $overlay().querySelectorAll(".folder-label");
+    expect(labels).toHaveLength(1);
+    expect(labels[0].textContent).toContain("127–129 BPM");
+    expect(labels[0].textContent).toContain("(2)");
+    expect(
+      ($overlay().querySelector(".folder-swatch") as HTMLElement).style.background,
+    ).toContain("linear-gradient");
+  });
+
+  it("lists clusters with their names", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "Techno/b.mp3", folder: "Techno" }),
+    ]);
+    model.clusterAssignments.set("House/a.mp3", 3);
+    model.clusterAssignments.set("Techno/b.mp3", 3);
+    model.clusterNames.set(3, "Deep House");
+    model.selected.add("House/a.mp3");
+    model.selected.add("Techno/b.mp3");
+    coord.syncActiveLabels();
+    (
+      $overlay().querySelector("[data-overlay-tab='clusters']") as HTMLElement
+    ).click();
+    const labels = $overlay().querySelectorAll(".folder-label");
+    expect(labels).toHaveLength(1);
+    expect(labels[0].textContent).toContain("Deep House");
+    expect(labels[0].textContent).toContain("(2)");
+  });
 });
 
 // ─── Hover ──────────────────────────────────────────────
@@ -577,7 +684,53 @@ describe("FolderTreeCoordinator roots", () => {
     expect(urls.filter((u) => u.includes("/api/roots/add"))).toHaveLength(0);
   });
 
-  it("removes a root dragged out of the sidebar", async () => {
+  it("ignores an internal root drag released as a Finder drop", async () => {
+    const { coord, onRootsChanged, fetchSpy } = makeHarness(() => ({ ok: true }));
+    const rootRow = document.createElement("div");
+    rootRow.className = "folder-row";
+    rootRow.dataset.rootId = "r1";
+    $tree().appendChild(rootRow);
+    await coord.refresh();
+    // Start an internal root drag, then drop it back on the sidebar.
+    rootRow.dispatchEvent(new Event("dragstart", { bubbles: true }));
+    const ev = new Event("drop", { bubbles: true, cancelable: true });
+    Object.assign(ev, {
+      dataTransfer: { files: [], getData: () => "" },
+      clientX: 10,
+      clientY: 10,
+    });
+    document.getElementById("folder-section")!.dispatchEvent(ev);
+    // The cancel is a no-op: no add-root request.
+    const urls = fetchSpy.mock.calls.map(([u]) => String(u));
+    expect(urls.filter((u) => u.includes("/api/roots/add"))).toHaveLength(0);
+    expect(onRootsChanged).not.toHaveBeenCalled();
+  });
+
+  it("confirms before removing a root dragged outside the sidebar", async () => {
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal("confirm", confirm);
+    const { coord, onRootsChanged, fetchSpy } = makeHarness(() => ({ ok: true }));
+    const rootRow = document.createElement("div");
+    rootRow.className = "folder-row";
+    rootRow.dataset.rootId = "r1";
+    $tree().appendChild(rootRow);
+    await coord.refresh();
+    rootRow.dispatchEvent(new Event("dragstart", { bubbles: true }));
+    // The drop zone is revealed while a root is dragged.
+    expect(
+      document.getElementById("root-drop-zone")!.classList.contains("hidden"),
+    ).toBe(false);
+    rootRow.dispatchEvent(
+      new MouseEvent("dragend", { bubbles: true, clientX: 900, clientY: 900 }),
+    );
+    expect(confirm).toHaveBeenCalled();
+    await vi.waitFor(() => expect(onRootsChanged).toHaveBeenCalled());
+    const urls = fetchSpy.mock.calls.map(([u]) => String(u));
+    expect(urls).toContain("/api/roots/remove");
+  });
+
+  it("keeps the root when the removal confirm is dismissed", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => false));
     const { coord, onRootsChanged, fetchSpy } = makeHarness(() => ({ ok: true }));
     const rootRow = document.createElement("div");
     rootRow.className = "folder-row";
@@ -588,9 +741,9 @@ describe("FolderTreeCoordinator roots", () => {
     rootRow.dispatchEvent(
       new MouseEvent("dragend", { bubbles: true, clientX: 900, clientY: 900 }),
     );
-    await vi.waitFor(() => expect(onRootsChanged).toHaveBeenCalled());
     const urls = fetchSpy.mock.calls.map(([u]) => String(u));
-    expect(urls).toContain("/api/roots/remove");
+    expect(urls).not.toContain("/api/roots/remove");
+    expect(onRootsChanged).not.toHaveBeenCalled();
   });
 
   it("removes a root from its row's action popout", async () => {
@@ -628,17 +781,73 @@ describe("FolderTreeCoordinator roots", () => {
     expect(onImprintRoot).toHaveBeenCalledWith("/music/ext");
   });
 
-  it("redraws without refetching when externals are shown", () => {
-    const { model, canvas, refreshProjection } = makeHarness();
-    const $toggle = document.getElementById(
-      "show-external-toggle",
-    ) as HTMLInputElement;
-    $toggle.checked = true;
-    $toggle.dispatchEvent(new Event("change"));
+  it("projects onto a folder inside an External root from its right-click popout", async () => {
+    const { model, onImprintRoot, coord } = makeHarness();
+    model.showExternal = true;
+    $tree().innerHTML = `
+      <div class="folder-section-external">
+        <div class="folder-row folder-row-external" data-folder-path="ext"
+             data-root-id="ext" data-root-abs="/music/ext" data-root-role="external">
+          <span class="folder-label" data-path="ext">ext</span>
+        </div>
+        <div class="folder-children" style="display:block">
+          <div class="folder-row" data-folder-path="ext/Techno">
+            <span class="folder-label" data-path="ext/Techno">Techno</span>
+          </div>
+        </div>
+      </div>`;
+    await coord.refresh();
+    const sub = $tree().querySelector<HTMLElement>(
+      '[data-folder-path="ext/Techno"]',
+    )!;
+    sub.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    const actions = document.getElementById("folder-actions")!;
+    expect(actions.classList.contains("hidden")).toBe(false);
+    const item = actions.querySelector<HTMLElement>(
+      "[data-folder-action='project-here']",
+    )!;
+    expect(item.dataset.folderActionPath).toBe("/music/ext/Techno");
+    item.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(onImprintRoot).toHaveBeenCalledWith("/music/ext/Techno");
+  });
+
+  it("greys the projection item and offers to show externals while hidden", async () => {
+    const { model, coord } = makeHarness();
+    $tree().innerHTML = `
+      <div class="folder-section-external">
+        <div class="folder-row folder-row-external" data-folder-path="ext"
+             data-root-id="ext" data-root-abs="/music/ext" data-root-role="external">
+          <span class="folder-label" data-path="ext">ext</span>
+        </div>
+      </div>`;
+    await coord.refresh();
+    const row = $tree().querySelector<HTMLElement>('[data-folder-path="ext"]')!;
+    row.dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    const actions = document.getElementById("folder-actions")!;
+    const project = actions.querySelector<HTMLButtonElement>(
+      "[data-folder-action='project-here']",
+    )!;
+    expect(project.disabled).toBe(true);
+    const show = actions.querySelector<HTMLElement>(
+      "[data-folder-action='show-external']",
+    )!;
+    show.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     expect(model.showExternal).toBe(true);
-    // External positions ride along with every chart, so this is a pure redraw.
-    expect(refreshProjection).not.toHaveBeenCalled();
-    expect(canvas.scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("offers no project-here action outside an External root", async () => {
+    const { coord } = makeHarness();
+    await coord.refresh();
+    // Right-clicking a library row opens no popout for it.
+    row("House").dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, cancelable: true }),
+    );
+    const actions = document.getElementById("folder-actions")!;
+    expect(actions.querySelector("[data-folder-action='project-here']")).toBeNull();
   });
 
   it("heals a chart missing external positions after a tree swap", async () => {
@@ -669,16 +878,5 @@ describe("FolderTreeCoordinator roots", () => {
     await coord.refresh();
     expect(model.externalRootIds.has("ext")).toBe(true);
     expect(refreshProjection).not.toHaveBeenCalled();
-  });
-
-  it("refits the projection when the external fit scope is toggled", () => {
-    const { model, refreshProjection } = makeHarness();
-    const $toggle = document.getElementById(
-      "external-projection-toggle",
-    ) as HTMLInputElement;
-    $toggle.checked = true;
-    $toggle.dispatchEvent(new Event("change"));
-    expect(model.externalInProjection).toBe(true);
-    expect(refreshProjection).toHaveBeenCalled();
   });
 });

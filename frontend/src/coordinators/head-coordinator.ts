@@ -9,7 +9,7 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model, type RightPanelTab } from "../model";
+import { type Model } from "../model";
 import { toast } from "../lib/toast";
 import { api, postJSON, postForm } from "../lib/api";
 
@@ -23,8 +23,6 @@ export interface HeadDeps {
   refreshPredictions?(): void;
   /** Refresh the folder tree after an imprint root is added or removed. */
   onRootsChanged?(): Promise<void> | void;
-  /** Reveal a right-panel tab (the imprint controls live in Organise). */
-  showRightPanel?(tab: RightPanelTab): void;
 }
 
 /** One node of ``GET /api/folders`` — the training-folder selector's tree. */
@@ -53,6 +51,25 @@ interface UndoStatus {
   total?: number;
 }
 
+/** Shape of ``GET /api/supervised/head`` — the installed head's metadata. */
+interface HeadInfo {
+  available: boolean;
+  run_id?: number;
+  /** Unix seconds the head was trained locally. */
+  trained_at?: number;
+  /** Unix seconds the head was imported (present instead of a local train). */
+  imported_at?: number;
+  n_classes?: number;
+  in_dim?: number;
+  input_sources?: string[];
+  train_folders?: string[];
+  source_versions?: Record<string, number>;
+  /** Percentile (0–100) used to calibrate each class's match floor. */
+  match_percentile?: number;
+  has_match_thresholds?: boolean;
+  has_centroids?: boolean;
+}
+
 export class HeadCoordinator {
   /** Checked virtual folders for the next training run; empty = all roots. */
   private _trainFolders: Set<string>;
@@ -73,6 +90,7 @@ export class HeadCoordinator {
   start(): void {
     void this._checkStaleImprints();
     void this._refreshUndo();
+    void this.refreshHeadInfo();
   }
 
   stop(): void {
@@ -150,6 +168,8 @@ export class HeadCoordinator {
     if ($discard) {
       $discard.addEventListener("click", () => void this._discardImprints());
     }
+
+    this._bindHeadModal();
   }
 
   /** Disable Train while a supervise job is outstanding (queue owns dedupe). */
@@ -257,21 +277,54 @@ export class HeadCoordinator {
 
   /* ── Imprint (fan-out an external folder) ─────────────────── */
 
-  /** Fill the imprint target from a folder-tree root row and open the panel. */
+  /** Fill the imprint target from a folder row and open the head modal. */
   prefillImprint(absPath: string): void {
-    // The imprint controls live in the Organise tab, which may be hidden.
-    this.deps.showRightPanel?.("organise");
+    this.openModal(absPath);
+  }
+
+  /** Open the head modal (the only home for head tools + Train folder view). */
+  openModal(absPath = ""): void {
+    const $modal = document.getElementById("head-modal");
     const $path = document.getElementById(
       "head-imprint-path",
     ) as HTMLInputElement | null;
-    const $details = document.getElementById(
-      "head-imprint-details",
-    ) as HTMLDetailsElement | null;
-    if ($path) {
-      $path.value = absPath;
-      $path.focus();
+    const $target = document.getElementById("head-modal-target");
+    if ($path && absPath) $path.value = absPath;
+    if ($target) {
+      $target.textContent = absPath
+        ? `Projecting onto ${absPath}`
+        : "Project the folder head onto a destination folder.";
     }
-    if ($details) $details.open = true;
+    $modal?.classList.remove("hidden");
+    this._refreshUndo();
+    if (absPath) $path?.focus();
+  }
+
+  closeModal(): void {
+    document.getElementById("head-modal")?.classList.add("hidden");
+  }
+
+  private _bindHeadModal(): void {
+    const $modal = document.getElementById("head-modal");
+    if (!$modal) return;
+    document
+      .getElementById("head-modal-close")
+      ?.addEventListener("click", () => this.closeModal());
+    $modal.addEventListener("click", (e) => {
+      if (e.target === $modal) this.closeModal();
+    });
+    // Capture phase + stopImmediatePropagation, so Esc closes the modal without
+    // also reaching the global Esc handler (which would clear the selection).
+    document.addEventListener(
+      "keydown",
+      (e) => {
+        if (e.key === "Escape" && !$modal.classList.contains("hidden")) {
+          e.stopImmediatePropagation();
+          this.closeModal();
+        }
+      },
+      true,
+    );
   }
 
   private _setImprintNote(text: string): void {
@@ -544,6 +597,58 @@ export class HeadCoordinator {
     if (el) el.textContent = text;
   }
 
+  /** Fetch the installed head's metadata and render the info block. */
+  async refreshHeadInfo(): Promise<void> {
+    try {
+      const info = await api<HeadInfo>("/api/supervised/head");
+      this._renderHeadInfo(info);
+    } catch {
+      /* transient; the next train/import refreshes it */
+    }
+  }
+
+  /** Render one row per head fact, or a "train me" hint when there is none. */
+  private _renderHeadInfo(info: HeadInfo): void {
+    const host = document.getElementById("head-info");
+    if (!host) return;
+    host.replaceChildren();
+    if (!info.available) {
+      const empty = document.createElement("p");
+      empty.className = "head-info-empty";
+      empty.textContent =
+        "No folder head yet — Train to learn your folder structure.";
+      host.appendChild(empty);
+      return;
+    }
+    const rows: [string, string][] = [];
+    const when = info.imported_at ?? info.trained_at;
+    if (when) {
+      rows.push([
+        info.imported_at ? "Imported" : "Trained",
+        new Date(when * 1000).toLocaleString(),
+      ]);
+    }
+    if (info.n_classes != null) rows.push(["Folders", String(info.n_classes)]);
+    if (info.input_sources?.length)
+      rows.push(["Sources", info.input_sources.join(", ")]);
+    if (info.in_dim != null) rows.push(["Input", `${info.in_dim}-D`]);
+    if (info.match_percentile != null)
+      rows.push(["Match floor", `${Math.round(info.match_percentile)}th pct`]);
+    if (info.run_id != null) rows.push(["Run", String(info.run_id)]);
+    for (const [label, value] of rows) {
+      const line = document.createElement("div");
+      line.className = "head-info-row";
+      const key = document.createElement("span");
+      key.className = "head-info-key";
+      key.textContent = label;
+      const val = document.createElement("span");
+      val.className = "head-info-value";
+      val.textContent = value;
+      line.append(key, val);
+      host.appendChild(line);
+    }
+  }
+
   /** Download this library's trained head as a portable bundle. */
   private async _exportHead(): Promise<void> {
     try {
@@ -594,6 +699,7 @@ export class HeadCoordinator {
       toast("Imported folder head — re-projecting…", "ok");
       // The imported run id invalidates every cached supervised row, so the map
       // must be refetched (and the next cluster pass re-embeds).
+      void this.refreshHeadInfo();
       this.deps.refreshProjection?.();
       this.deps.refreshClusters?.();
       this.deps.refreshPredictions?.();

@@ -19,14 +19,17 @@ function jsonResponse(body: unknown, ok = true): Response {
 
 const PANEL_HTML = `
   <div id="toast-container"></div>
+  <div id="head-info"></div>
   <button id="btn-train-supervised"></button>
   <div id="head-train-folders"></div>
   <details id="head-train-folders-details"></details>
   <button id="btn-head-folders-all"></button>
-  <details id="head-imprint-details">
+  <div id="head-modal" class="hidden">
+    <button id="head-modal-close"></button>
+    <p id="head-modal-target"></p>
     <input id="head-imprint-path" />
     <input id="imprint-generic-toggle" type="checkbox" checked />
-  </details>
+  </div>
   <input id="head-import-file" type="file" hidden />
   <input id="head-compare-file" type="file" hidden />
   <button id="btn-export-head"></button>
@@ -378,7 +381,7 @@ describe("HeadCoordinator imprint", () => {
     expect(note).toContain("1 left unmatched");
   });
 
-  it("prefills the imprint target from a root row", () => {
+  it("opens the head modal and prefills the projection target", () => {
     const { coord } = makeHarness();
     coord.bindPanel();
     coord.prefillImprint("/tmp/Downloads");
@@ -386,18 +389,23 @@ describe("HeadCoordinator imprint", () => {
     const $path = document.getElementById(
       "head-imprint-path",
     ) as HTMLInputElement;
-    const $details = document.getElementById(
-      "head-imprint-details",
-    ) as HTMLDetailsElement;
+    const $modal = document.getElementById("head-modal")!;
     expect($path.value).toBe("/tmp/Downloads");
-    expect($details.open).toBe(true);
+    expect($modal.classList.contains("hidden")).toBe(false);
+    expect(document.getElementById("head-modal-target")?.textContent).toContain(
+      "/tmp/Downloads",
+    );
   });
 
-  it("reveals the Organise tab when prefilling an imprint target", () => {
-    const showRightPanel = vi.fn();
-    const coord = new HeadCoordinator({ model: new Model(), showRightPanel });
+  it("closes the head modal from its close button", () => {
+    const { coord } = makeHarness();
+    coord.bindPanel();
     coord.prefillImprint("/tmp/Downloads");
-    expect(showRightPanel).toHaveBeenCalledWith("organise");
+    const $modal = document.getElementById("head-modal")!;
+    document
+      .getElementById("head-modal-close")!
+      .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect($modal.classList.contains("hidden")).toBe(true);
   });
 
   it("undoes the last fan-out from the Undo button", async () => {
@@ -449,6 +457,44 @@ describe("HeadCoordinator imprint", () => {
   });
 });
 
+describe("HeadCoordinator head info", () => {
+  it("renders the installed head's metadata", async () => {
+    const { coord } = makeHarness((url) => {
+      if (url === "/api/supervised/head") {
+        return {
+          available: true,
+          run_id: 7,
+          trained_at: 1_700_000_000,
+          n_classes: 12,
+          in_dim: 128,
+          input_sources: ["maest", "clap"],
+          match_percentile: 5,
+        };
+      }
+      return {};
+    });
+    coord.bindPanel();
+    await coord.refreshHeadInfo();
+
+    const text = document.getElementById("head-info")!.textContent ?? "";
+    expect(text).toContain("12");
+    expect(text).toContain("maest, clap");
+    expect(text).toContain("128-D");
+    expect(text).toContain("5th pct");
+  });
+
+  it("shows a train hint when no head is installed", async () => {
+    const { coord } = makeHarness((url) =>
+      url === "/api/supervised/head" ? { available: false } : {},
+    );
+    coord.bindPanel();
+    await coord.refreshHeadInfo();
+    expect(document.getElementById("head-info")!.textContent).toContain(
+      "No folder head",
+    );
+  });
+});
+
 describe("HeadCoordinator import", () => {
   it("retries with force after a version-mismatch refusal", async () => {
     vi.stubGlobal("confirm", vi.fn(() => true));
@@ -461,7 +507,10 @@ describe("HeadCoordinator import", () => {
       refreshProjection,
       refreshPredictions,
     });
-    const fetchSpy = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+    const fetchSpy = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/api/supervised/head") {
+        return Promise.resolve(jsonResponse({ available: true }));
+      }
       const form = init?.body as FormData;
       if (form.get("force") === "1") {
         sawForce = true;

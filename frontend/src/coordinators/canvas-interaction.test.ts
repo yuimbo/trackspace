@@ -24,7 +24,7 @@ interface FakeCanvas {
   $canvas: HTMLCanvasElement;
   $tip: HTMLElement;
   hoveredIdx: number;
-  hoveredSiblingFolder: string | null;
+  hoveredBloomTrack: Track | null;
   hoverTarget: HoverTarget | null;
   inspect: unknown;
   boxSel: { x0: number; y0: number; x1: number; y1: number } | null;
@@ -48,6 +48,7 @@ interface FakeCanvas {
   unpinInspect: ReturnType<typeof vi.fn>;
   toggleInspect: ReturnType<typeof vi.fn>;
   showVolumeHud: ReturnType<typeof vi.fn>;
+  showBloomHud: ReturnType<typeof vi.fn>;
 }
 
 function makeCanvas(): FakeCanvas {
@@ -55,7 +56,7 @@ function makeCanvas(): FakeCanvas {
     $canvas: document.createElement("canvas"),
     $tip: document.createElement("div"),
     hoveredIdx: -1,
-    hoveredSiblingFolder: null,
+    hoveredBloomTrack: null,
     hoverTarget: null,
     inspect: null,
     boxSel: null,
@@ -80,6 +81,7 @@ function makeCanvas(): FakeCanvas {
     unpinInspect: vi.fn(() => false),
     toggleInspect: vi.fn(),
     showVolumeHud: vi.fn(),
+    showBloomHud: vi.fn(),
   };
 }
 
@@ -114,9 +116,13 @@ function makeHarness(): Harness {
     closeScope: vi.fn(),
     switchLens: vi.fn(),
     setColorMode: vi.fn(),
+    moveSelectionBloom: vi.fn(),
+    setSelectionBloom: vi.fn(),
     togglePreview: vi.fn(),
     adjustPreviewVolume: vi.fn(),
     commitPreviewVolume: vi.fn(),
+    adjustBloomRange: vi.fn(),
+    commitBloomRange: vi.fn(),
   } as CanvasInteractionDeps;
   const coord = new CanvasInteractionController(deps);
   coord.bind();
@@ -417,6 +423,55 @@ describe("CanvasInteractionController gesture state", () => {
     expect(deps.closeScope).toHaveBeenCalledTimes(1);
   });
 
+  it("cycles the scope lens on a bare X tap near the scope", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.scope = { shape: "circle", cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    move(canvas, 100, 100); // pointer at the scope centre
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyX", bubbles: true }),
+    );
+    // Near the scope a tap switches its lens instead of closing it.
+    expect(deps.setScopeLens).toHaveBeenCalled();
+    expect(deps.closeScope).not.toHaveBeenCalled();
+  });
+
+  it("cycles the scope lens backward on Shift+X near the scope", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.scope = { shape: "circle", cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    move(canvas, 100, 100);
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyX", shiftKey: true, bubbles: true }),
+    );
+    expect(deps.setScopeLens).toHaveBeenCalled();
+    expect(deps.closeScope).not.toHaveBeenCalled();
+  });
+
+  it("closes the scope on a bare X tap far outside it", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.scope = { shape: "circle", cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    move(canvas, 800, 800); // world (0.8, 0.8), far outside the scope
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyX", bubbles: true }),
+    );
+    expect(deps.closeScope).toHaveBeenCalledTimes(1);
+    expect(deps.setScopeLens).not.toHaveBeenCalled();
+  });
+
   it("opens or resizes a scope on X + scroll", () => {
     const { model, canvas, deps } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
@@ -510,6 +565,61 @@ describe("CanvasInteractionController gesture state", () => {
     expect(deps.commitPreviewVolume).toHaveBeenCalledTimes(1);
   });
 
+  it("moves the selection-bloom cursor on a bare D tap", () => {
+    const { deps } = makeHarness();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyD", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyD", bubbles: true }),
+    );
+    expect(deps.moveSelectionBloom).toHaveBeenCalledWith(1);
+    expect(deps.commitBloomRange).not.toHaveBeenCalled();
+  });
+
+  it("moves the bloom cursor backward on Shift+D", () => {
+    const { deps } = makeHarness();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyD", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", {
+        code: "KeyD",
+        shiftKey: true,
+        bubbles: true,
+      }),
+    );
+    expect(deps.moveSelectionBloom).toHaveBeenCalledWith(-1);
+  });
+
+  it("adjusts the bloom amount on D + scroll and suppresses the move", () => {
+    const { canvas, deps } = makeHarness();
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyD", bubbles: true }),
+    );
+    canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
+    expect(deps.adjustBloomRange).toHaveBeenCalledTimes(1);
+    // A scroll up scales the amount up by a factor > 1.
+    expect(
+      (deps.adjustBloomRange as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toBeGreaterThan(1);
+    expect(canvas.showBloomHud).toHaveBeenCalled();
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyD", bubbles: true }),
+    );
+    expect(deps.moveSelectionBloom).not.toHaveBeenCalled();
+    expect(deps.commitBloomRange).toHaveBeenCalledTimes(1);
+  });
+
+  it("sets the selection-bloom cursor from a colour-tab click", () => {
+    const { canvas, deps } = makeHarness();
+    canvas.topColorTabAt.mockReturnValue("cluster");
+    down(canvas, 500, 40);
+    expect(deps.setColorMode).toHaveBeenCalledWith("cluster");
+    expect(deps.setSelectionBloom).toHaveBeenCalledWith("cluster");
+  });
+
   it("disarms the scope gesture on X keyup", () => {
     const { canvas } = makeHarness();
     document.dispatchEvent(
@@ -524,12 +634,14 @@ describe("CanvasInteractionController gesture state", () => {
     expect(canvas.boxSel).not.toBeNull();
   });
 
-  it("toggles the inspect card on the Alt key", () => {
-    const { canvas } = makeHarness();
+  it("toggles the inspect card on the Alt key without ending the audition", () => {
+    const { canvas, deps } = makeHarness();
     document.dispatchEvent(
       new KeyboardEvent("keydown", { key: "Alt", bubbles: true }),
     );
     expect(canvas.toggleInspect).toHaveBeenCalled();
+    // Unpinning only releases the card's hold; the hover audition keeps playing.
+    expect(deps.stopPreview).not.toHaveBeenCalled();
   });
 
   it("ignores Alt while typing in a text field", () => {
@@ -568,7 +680,7 @@ describe("CanvasInteractionController gesture state", () => {
     canvas.inspect = { path: "pinned.mp3" };
     move(canvas, 10, 10);
     expect(canvas.hoveredIdx).toBe(0);
-    expect(canvas.hoveredSiblingFolder).toBe("A");
+    expect(canvas.hoveredBloomTrack?.path).toBe("pinned.mp3");
     expect(deps.onHoverPreview).not.toHaveBeenCalled();
     expect(deps.onHoverFolderChanged).not.toHaveBeenCalled();
   });
@@ -694,6 +806,35 @@ describe("CanvasInteractionController fitViewToPaths", () => {
 // ─── Solo (isolate) ──────────────────────────────────────
 
 describe("CanvasInteractionController solo", () => {
+  it("isolates the hovered dot's bloom class", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3", bpm: 128 }),
+      makeTrack({ path: "b.mp3", bpm: 128 }),
+      makeTrack({ path: "c.mp3", bpm: 150 }),
+    ]);
+    model.selectionBloom = "tempo";
+    canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
+    coord.solo();
+    expect(model.isTrackHidden(model.trackByPath("c.mp3")!)).toBe(true);
+    expect(model.isTrackHidden(model.trackByPath("b.mp3")!)).toBe(false);
+  });
+
+  it("isolates the hovered folder's whole subtree for folder colour", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "House/sub/b.mp3", folder: "House/sub" }),
+      makeTrack({ path: "Techno/c.mp3", folder: "Techno" }),
+    ]);
+    model.selectionBloom = "folder";
+    canvas.hoveredBloomTrack = model.trackByPath("House/a.mp3")!;
+    coord.solo();
+    expect(model.isTrackHidden(model.trackByPath("Techno/c.mp3")!)).toBe(true);
+    expect(model.isTrackHidden(model.trackByPath("House/a.mp3")!)).toBe(false);
+    expect(model.isTrackHidden(model.trackByPath("House/sub/b.mp3")!)).toBe(false);
+  });
+
   it("isolates to a hovered cluster", () => {
     const { model, canvas, deps, coord } = makeHarness();
     model.setAllTracks([

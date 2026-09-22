@@ -14,7 +14,11 @@ import {
   ViewModifierView,
 } from "./components";
 import { Controller } from "./controller";
-import { renderShortcutList } from "./hotkeys";
+import {
+  applyHotkeyLabels,
+  hotkeyKey,
+  renderShortcutList,
+} from "./hotkeys";
 
 window.htmx = htmx;
 
@@ -59,3 +63,8 @@ const ctrl = new Controller(
 void ctrl.init();
 
 renderShortcutList(document.getElementById("shortcut-list")!);
+applyHotkeyLabels();
+
+// The F1 shortcuts modal is Alpine-owned, so it only needs the configured key.
+document.getElementById("shortcuts-modal")!.dataset.hotkeyKey =
+  hotkeyKey("toggle-shortcuts") ?? "";

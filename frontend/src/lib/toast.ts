@@ -3,12 +3,22 @@ let _$toasts: HTMLElement | null = null;
 export function toast(
   msg: string,
   type: "info" | "ok" | "error" | "warn" = "info",
+  /** Optional viewport point to anchor the toast near (e.g. a failed drop). */
+  at?: { x: number; y: number },
 ): void {
   _$toasts ??= document.getElementById("toast-container");
   const el = document.createElement("div");
   el.className = `toast toast-${type}`;
   el.textContent = msg;
-  _$toasts!.appendChild(el);
+  if (at) {
+    // Anchor it at the point the user acted, rather than the global stack.
+    el.classList.add("toast-anchored");
+    el.style.left = `${Math.max(8, Math.min(at.x, window.innerWidth - 8))}px`;
+    el.style.top = `${Math.max(8, Math.min(at.y, window.innerHeight - 8))}px`;
+    document.body.appendChild(el);
+  } else {
+    _$toasts!.appendChild(el);
+  }
   setTimeout(() => {
     el.classList.add("out");
     setTimeout(() => el.remove(), 400);

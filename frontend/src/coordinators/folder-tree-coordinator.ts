@@ -1,7 +1,7 @@
 // ─── FolderTreeCoordinator ─────────────────────────────────────
 //
 // Owns the sidebar folder tree (HTMX partial), root import/removal, folder-row
-// interaction, the selected-folders overlay, and folder highlight/auto-open state.
+// interaction, the selected-tracks overlay, and folder highlight/auto-open state.
 // Extracted from `Controller` — the tree is self-contained DOM UX whose only
 // outward effects are model mutations, the undoable rename command, and a library
 // reload after roots change.
@@ -9,12 +9,18 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type HoverTarget, type Model } from "../model";
+import { type HoverTarget, type Model, type Track } from "../model";
 import { toast } from "../lib/toast";
-import { dirColor } from "../lib/colors";
+import { clusterColor, dirColor, keyColor, tempoColor } from "../lib/colors";
+import { trackTempoNorm } from "../lib/lenses";
+import {
+  clusterTracksByKey,
+  clusterTracksByTempo,
+  trackCamelotFifths,
+} from "../lib/bloom";
 import { postJSON } from "../lib/api";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
-import { HOTKEY_MAP } from "../hotkeys";
+import { hotkeyLabel } from "../hotkeys";
 import htmx from "htmx.org";
 
 /** Hotkey-driven canvas actions the folder popout can trigger. */
@@ -30,17 +36,48 @@ interface FolderAction {
   glyph: string;
   label: string;
   hotkey?: string;
+  /** Greyed out while the action cannot apply (externals off the map). */
+  disabled?: boolean;
+  /** Absolute path a `project-here` action projects onto. */
+  path?: string;
 }
 
-const hotkeyLabel = (action: string): string | undefined =>
-  HOTKEY_MAP.find((b) => b.action === action)?.label;
+/**
+ * Tabs of the selected-tracks overlay, in strip order: the classes the current
+ * selection is broken down by. Only tabs with data are shown; folders is always
+ * present while anything is selected.
+ */
+export const OVERLAY_TABS = ["folders", "bpms", "keys", "clusters"] as const;
+export type OverlayTab = (typeof OVERLAY_TABS)[number];
+
+/** One row of a selected-tracks overlay tab: a class value and its count. */
+interface OverlayItem {
+  /** Display text, without the count. */
+  text: string;
+  /** Hover tooltip. */
+  title: string;
+  count: number;
+  /** Swatch colour, or a gradient across a cluster's class colours. */
+  swatch?: string;
+  /** The canvas navigation element this row glows while hovered. */
+  hover: HoverTarget;
+  /** Folder path (folder rows only), for tree-action semantics on hover/click. */
+  folderPath?: string;
+}
+
+/** One tab of the selected-tracks overlay: a class and its selected members. */
+interface OverlayClass {
+  id: OverlayTab;
+  label: string;
+  items: OverlayItem[];
+}
 
 export interface FolderTreeDeps {
   model: Model;
   canvas: {
     hoveredIdx: number;
     hoverTarget: HoverTarget | null;
-    hoveredSiblingFolder: string | null;
+    hoveredBloomTrack: Track | null;
     scheduleDraw(): void;
   };
   /** True while a canvas drag/transform is in progress (hover clearing is suppressed). */
@@ -83,6 +120,9 @@ export class FolderTreeCoordinator {
   private _actionsEl!: HTMLElement;
   private _hideActionsTimer: number | null = null;
 
+  /** Active tab of the selected-tracks overlay; falls back to folders when empty. */
+  private _overlayTab: OverlayTab = "folders";
+
   constructor(private deps: FolderTreeDeps) {
     this.$folderTree = document.getElementById("folder-tree")!;
   }
@@ -93,9 +133,46 @@ export class FolderTreeCoordinator {
     this._bindFolderActions();
     this._bindFolderTree();
     this._bindRootImport();
-    this._bindShowExternal();
-    this._bindExternalProjection();
+    this._bindFolderContextMenu();
     this._bindOverlay();
+  }
+
+  /* ── Right-click (reuses the row action popout) ────────────── */
+
+  /**
+   * Right-clicking a folder inside an External root opens the ordinary row action
+   * popout, which carries *Project folder structure onto here* (and, while
+   * externals are hidden, *Show external tracks* at the top). There is no separate
+   * context-menu system.
+   */
+  private _bindFolderContextMenu(): void {
+    this.$folderTree.addEventListener("contextmenu", (e) => {
+      const row = (e.target as HTMLElement).closest<HTMLElement>(".folder-row");
+      if (!row || row.classList.contains("folder-row-create")) return;
+      if (!this._externalFolderAbsPath(row)) return;
+      e.preventDefault();
+      this._showFolderActions(row);
+    });
+  }
+
+  /** Absolute path of a folder row inside an External root, or null. */
+  private _externalFolderAbsPath(row: HTMLElement): string | null {
+    const section = row.closest(".folder-section-external");
+    if (!section) return null;
+    const rootRow = section.querySelector<HTMLElement>(
+      ".folder-row[data-root-id]",
+    );
+    const rootAbs = rootRow?.dataset.rootAbs;
+    const rootId = rootRow?.dataset.rootId;
+    if (!rootAbs || !rootId) return null;
+    const vpath = row.dataset.folderPath ?? ".";
+    const rest =
+      vpath === "." || vpath === rootId
+        ? ""
+        : vpath.startsWith(rootId + "/")
+          ? vpath.slice(rootId.length + 1)
+          : "";
+    return rest ? `${rootAbs}/${rest}` : rootAbs;
   }
 
   /* ── Row action popout ──────────────────────────────────── */
@@ -146,6 +223,8 @@ export class FolderTreeCoordinator {
       btn.type = "button";
       btn.className = "folder-action-btn";
       btn.dataset.folderAction = def.action;
+      btn.disabled = !!def.disabled;
+      if (def.path) btn.dataset.folderActionPath = def.path;
       btn.title = def.label;
       btn.setAttribute("aria-label", def.label);
       const glyph = document.createElement("span");
@@ -172,25 +251,51 @@ export class FolderTreeCoordinator {
     const isRoot = row.dataset.rootId != null;
     const isExternal = row.dataset.rootRole === "external";
     const isLeaf = row.querySelector("[data-folder-toggle]") == null;
-    const defs: FolderAction[] = [
+    const projectAbs = this._externalFolderAbsPath(row);
+    const hidden = projectAbs != null && !this.deps.model.showExternal;
+
+    const defs: FolderAction[] = [];
+    if (hidden) {
+      // Externals are off the map: offer to show them first, then grey out
+      // everything below (there is nothing to act on while they are hidden).
+      defs.push({
+        action: "show-external",
+        glyph: "◉",
+        label: "Show external tracks",
+        hotkey: hotkeyLabel("toggle-external"),
+      });
+    }
+    const base: FolderAction[] = [
       { action: "focus-folder", glyph: "◆", label: "Select tracks", hotkey: hotkeyLabel("focus-folder") },
       { action: "isolate-selection", glyph: "◉", label: "Isolate", hotkey: hotkeyLabel("isolate-selection") },
       { action: "fit-view", glyph: "⤢", label: "Fit view", hotkey: hotkeyLabel("fit-view") },
       { action: "exclude-selection", glyph: "⊘", label: "Exclude", hotkey: hotkeyLabel("exclude-selection") },
       { action: "reveal", glyph: "↗", label: "Reveal in Finder" },
     ];
-    if (path !== ".") defs.push({ action: "rename", glyph: "✎", label: "Rename" });
-    if (isLeaf) defs.push({ action: "add-subfolder", glyph: "+", label: "New subfolder" });
+    if (path !== ".") base.push({ action: "rename", glyph: "✎", label: "Rename" });
+    if (isLeaf) base.push({ action: "add-subfolder", glyph: "+", label: "New subfolder" });
     if (isRoot) {
-      defs.push({
+      base.push({
         action: "role",
         glyph: isExternal ? "▤" : "◇",
         label: isExternal ? "Move to My library" : "Mark as External",
       });
       if (isExternal)
-        defs.push({ action: "imprint", glyph: "⇥", label: "Imprint structure…" });
-      defs.push({ action: "remove", glyph: "✕", label: "Remove root" });
+        base.push({ action: "imprint", glyph: "⇥", label: "Imprint structure…" });
+      base.push({ action: "remove", glyph: "✕", label: "Remove root" });
     }
+    if (projectAbs) {
+      // Any folder inside an External root is a projection destination.
+      base.push({
+        action: "project-here",
+        glyph: "⇥",
+        label: "Project folder structure onto here",
+        path: projectAbs,
+        disabled: hidden,
+      });
+    }
+    if (hidden) for (const d of base) d.disabled = true;
+    defs.push(...base);
     return defs;
   }
 
@@ -235,6 +340,13 @@ export class FolderTreeCoordinator {
       case "imprint":
         this.deps.onImprintRoot?.(row.dataset.rootAbs ?? "");
         break;
+      case "project-here":
+        this.deps.onImprintRoot?.(btn.dataset.folderActionPath ?? "");
+        break;
+      case "show-external":
+        this.deps.model.setShowExternal(true);
+        this.deps.model.saveLS();
+        break;
       case "remove":
         this._confirmRemoveRoot(row);
         break;
@@ -264,7 +376,7 @@ export class FolderTreeCoordinator {
   private _setHoveredRow(row: HTMLElement | null): void {
     const path = row?.dataset.folderPath;
     if (row == null || path == null) return;
-    this.deps.canvas.hoveredSiblingFolder = null;
+    this.deps.canvas.hoveredBloomTrack = null;
     this.deps.canvas.hoverTarget = {
       kind: "folder",
       prefix: path === "." ? "" : path,
@@ -272,51 +384,15 @@ export class FolderTreeCoordinator {
     this.deps.canvas.scheduleDraw();
   }
 
-  /** Toggle whether external-root tracks are drawn (persisted on the model). */
-  private _bindShowExternal(): void {
-    const $toggle = document.getElementById(
-      "show-external-toggle",
-    ) as HTMLInputElement | null;
-    if (!$toggle) return;
-    $toggle.checked = this.deps.model.showExternal;
-    $toggle.addEventListener("change", () => {
-      this.deps.model.setShowExternal($toggle.checked);
-      this.deps.model.saveLS();
-      // External positions ride along with every chart, so this is a pure redraw:
-      // no refetch, no wait. A chart fetched before the tree revealed the
-      // roots is healed once in the background by `_syncExternalRoots`.
-      this.deps.canvas.scheduleDraw();
-    });
-  }
-
-  /** Toggle whether the projection is refit with external roots (persisted). */
-  private _bindExternalProjection(): void {
-    const $toggle = document.getElementById(
-      "external-projection-toggle",
-    ) as HTMLInputElement | null;
-    if (!$toggle) return;
-    $toggle.checked = this.deps.model.externalInProjection;
-    $toggle.addEventListener("change", () => {
-      this.deps.model.setExternalInProjection($toggle.checked);
-      this.deps.model.saveLS();
-      void this.deps.refreshProjection?.();
-    });
-  }
-
   /**
-   * Mirror the external visibility toggles onto the folder controls. The model can be
-   * changed from outside this panel (an active-view-modifier chip), so the checkboxes
-   * must follow every "change", not only their own input events.
+   * Dim the External section while its tracks are off the map. The visibility is
+   * owned by the external view-modifier chip now, so this follows every
+   * "change" rather than a checkbox this panel owns.
    */
-  syncExternalToggles(): void {
-    const $toggle = document.getElementById(
-      "show-external-toggle",
-    ) as HTMLInputElement | null;
-    if ($toggle) $toggle.checked = this.deps.model.showExternal;
-    const $projection = document.getElementById(
-      "external-projection-toggle",
-    ) as HTMLInputElement | null;
-    if ($projection) $projection.checked = this.deps.model.externalInProjection;
+  syncExternalVisibility(): void {
+    document
+      .getElementById("folder-tree")
+      ?.classList.toggle("externals-off", !this.deps.model.showExternal);
   }
 
   private _bindFolderTree(): void {
@@ -337,10 +413,19 @@ export class FolderTreeCoordinator {
     });
   }
 
-  /** The selected-folders overlay shares label activation and hover semantics. */
+  /** The selected-tracks overlay shares label activation and hover semantics. */
   private _bindOverlay(): void {
     const $overlay = document.getElementById("selected-folders-overlay");
     $overlay?.addEventListener("click", (e) => {
+      const tab = (e.target as HTMLElement).closest<HTMLElement>(
+        "[data-overlay-tab]",
+      );
+      if (tab) {
+        e.stopPropagation();
+        this._overlayTab = tab.dataset.overlayTab as OverlayTab;
+        this._renderSelectionOverlay();
+        return;
+      }
       const label = (e.target as HTMLElement).closest<HTMLElement>(
         ".folder-label[data-path]",
       );
@@ -394,7 +479,7 @@ export class FolderTreeCoordinator {
     this._wireRootRowDrags();
   }
 
-  /** Read root roles from the swapped-in tree and update the model + toggle. */
+  /** Read root roles from the swapped-in tree and update the model. */
   private _syncExternalRoots(): void {
     const external = new Set<string>();
     for (const row of this.$folderTree.querySelectorAll<HTMLElement>(
@@ -404,17 +489,7 @@ export class FolderTreeCoordinator {
       if (rid) external.add(rid);
     }
     this.deps.model.setExternalRoots(external);
-    const $toggle = document.getElementById(
-      "show-external-toggle",
-    ) as HTMLInputElement | null;
-    if ($toggle) $toggle.checked = this.deps.model.showExternal;
-    const $projection = document.getElementById(
-      "external-projection-toggle",
-    ) as HTMLInputElement | null;
-    if ($projection) $projection.checked = this.deps.model.externalInProjection;
-    for (const id of ["show-external-label", "external-projection-label"]) {
-      document.getElementById(id)?.classList.toggle("hidden", external.size === 0);
-    }
+    this.syncExternalVisibility();
     this._healExternalPositions();
   }
 
@@ -521,6 +596,13 @@ export class FolderTreeCoordinator {
     $section.addEventListener("drop", (e) => {
       e.preventDefault();
       $section.classList.remove("root-drop-active");
+      // An internal root-row drag is not a Finder drop: releasing it in place is
+      // a cancel, so it must not offer to add a root.
+      if (this._rootDragId) {
+        this._rootDragId = null;
+        this._rootDragRow = null;
+        return;
+      }
       const dt = e.dataTransfer;
       if (!dt) return;
       const candidates: string[] = [];
@@ -532,7 +614,11 @@ export class FolderTreeCoordinator {
       if (text) candidates.push(text);
       const first = candidates.find((p) => p.startsWith("/"));
       if (!first) {
-        toast("Drop a folder from Finder, or paste an absolute path.", "warn");
+        toast(
+          "Drop a folder from Finder, or paste an absolute path.",
+          "warn",
+          { x: e.clientX, y: e.clientY },
+        );
         return;
       }
       // Confirm the role in the modal rather than silently adding a library root:
@@ -563,6 +649,8 @@ export class FolderTreeCoordinator {
         this._rootDragId = rootId;
         this._rootDragRow = row;
         row.classList.add("root-dragging");
+        // Reveal the drop zone to the right of the sidebar.
+        document.getElementById("root-drop-zone")?.classList.remove("hidden");
       });
       row.addEventListener("dragend", (e) => {
         const rootId = this._rootDragId;
@@ -570,17 +658,25 @@ export class FolderTreeCoordinator {
         this._rootDragId = null;
         this._rootDragRow = null;
         rowEl?.classList.remove("root-dragging");
+        const zone = document.getElementById("root-drop-zone");
+        zone?.classList.add("hidden");
+        if (!rootId || !rowEl) return;
         const panel = document.getElementById("folder-section");
-        const underPanel = panel
-          ? e.clientX >= panel.getBoundingClientRect().left &&
-            e.clientX <= panel.getBoundingClientRect().right &&
-            e.clientY >= panel.getBoundingClientRect().top &&
-            e.clientY <= panel.getBoundingClientRect().bottom
+        const inZone = zone ? this._isInside(e.clientX, e.clientY, zone) : false;
+        const inPanel = panel
+          ? this._isInside(e.clientX, e.clientY, panel)
           : false;
-        if (!rootId || underPanel) return;
-        void this._removeRoot(rootId);
+        // Dropping back in the sidebar is a no-op; the drop zone (or anywhere
+        // outside the sidebar) removes the root, after a confirmation.
+        if (inPanel && !inZone) return;
+        this._confirmRemoveRoot(rowEl);
       });
     }
+  }
+
+  private _isInside(x: number, y: number, el: HTMLElement): boolean {
+    const r = el.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   }
 
   private async _removeRoot(rootId: string): Promise<void> {
@@ -697,12 +793,12 @@ export class FolderTreeCoordinator {
   syncActiveLabels(): void {
     const activeNorm = new Set<string>([this.deps.model.folder]);
     for (const label of document.querySelectorAll<HTMLElement>(
-      "#folder-tree .folder-label, #selected-folders-overlay .folder-label",
+      "#folder-tree .folder-label[data-path], #selected-folders-overlay .folder-label[data-path]",
     )) {
       const norm = this._normFolderPath(label.dataset.path ?? ".");
       label.classList.toggle("active", activeNorm.has(norm));
     }
-    this._renderSelectedLeafFoldersOverlay();
+    this._renderSelectionOverlay();
   }
 
   private _onFolderLabelActivate(label: HTMLElement, e: MouseEvent): void {
@@ -947,70 +1043,273 @@ export class FolderTreeCoordinator {
     }
   }
 
-  private _renderSelectedLeafFoldersOverlay(): void {
+  /**
+   * Render the selected-tracks overlay: a tab strip plus the active class's rows.
+   * Folders group by folder path, BPMs by rounded tempo, keys by musical key,
+   * clusters by assignment. Only classes present in the selection get a tab, so an
+   * unanalysed selection shows folders alone.
+   */
+  private _renderSelectionOverlay(): void {
     const host = document.getElementById("selected-folders-overlay");
     if (!host) return;
-    const counts = new Map<string, number>();
-    for (const path of this.deps.model.selected) {
-      const t = this.deps.model.trackByPath(path);
-      if (!t) continue;
-      const folder = t.folder ?? "";
-      counts.set(folder, (counts.get(folder) ?? 0) + 1);
-    }
-    if (counts.size === 0) {
+    const classes = this._overlayClasses();
+    if (classes.length === 0) {
       host.classList.add("hidden");
       host.innerHTML = "";
       return;
     }
-    const items = [...counts.entries()].sort((a, b) => {
-      if (b[1] !== a[1]) return b[1] - a[1];
-      return a[0].localeCompare(b[0]);
-    });
-    const current = this.deps.model.folder;
+    // A class can vanish when the selection changes; fall back to folders.
+    if (!classes.some((c) => c.id === this._overlayTab))
+      this._overlayTab = "folders";
+    const active = classes.find((c) => c.id === this._overlayTab) ?? classes[0];
     host.innerHTML = "";
     const title = document.createElement("div");
     title.className = "selected-folders-title";
-    title.textContent = "Selected folders";
+    title.textContent = "Selected";
     host.appendChild(title);
-    for (const [folder, count] of items) {
-      const row = document.createElement("div");
-      row.className = "folder-row selected-folder-row";
-      row.dataset.folderPath = folder === "" ? "." : folder;
-      row.addEventListener("mouseenter", () => {
-        row.classList.add("folder-hover");
+    if (classes.length > 1) host.appendChild(this._buildOverlayTabs(classes));
+    for (const item of active.items)
+      host.appendChild(this._buildOverlayRow(item, active.id));
+    host.classList.remove("hidden");
+  }
+
+  /** Count the selection by each class, then build one tab per non-empty class. */
+  private _overlayClasses(): OverlayClass[] {
+    const m = this.deps.model;
+    const selectedTracks: Track[] = [];
+    for (const path of m.selected) {
+      const t = m.trackByPath(path);
+      if (t) selectedTracks.push(t);
+    }
+    if (selectedTracks.length === 0) return [];
+    const folderCounts = new Map<string, number>();
+    const clusterCounts = new Map<number, number>();
+    for (const t of selectedTracks) {
+      const folder = t.folder ?? "";
+      folderCounts.set(folder, (folderCounts.get(folder) ?? 0) + 1);
+      const cid = m.clusterAssignments.get(t.path);
+      if (cid !== undefined) clusterCounts.set(cid, (clusterCounts.get(cid) ?? 0) + 1);
+    }
+    const classes: OverlayClass[] = [
+      {
+        id: "folders",
+        label: "Folders",
+        items: this._sortedCounts(folderCounts).map(([folder, count]) => ({
+          text: displayFolderLeaf(folder),
+          title: displayFolderPath(folder),
+          count,
+          swatch: dirColor(folder),
+          hover: { kind: "folder", prefix: folder },
+          folderPath: folder === "" ? "." : folder,
+        })),
+      },
+    ];
+    // BPMs and keys are clustered at the current bloom range, so their rows merge
+    // the way the hover bloom would — and each row's swatch spans its members'
+    // class colours.
+    const tempoClusters = clusterTracksByTempo(
+      selectedTracks,
+      m.bloomRange("tempo"),
+    );
+    if (tempoClusters.length > 0)
+      classes.push({
+        id: "bpms",
+        label: "BPMs",
+        items: this._sortedClusters(tempoClusters, (t) =>
+          Math.round(t.bpm as number),
+        ).map((cluster) => this._tempoItem(cluster)),
+      });
+    const keyClusters = clusterTracksByKey(selectedTracks, m.bloomRange("key"));
+    if (keyClusters.length > 0)
+      classes.push({
+        id: "keys",
+        label: "Keys",
+        items: this._sortedClusters(
+          keyClusters,
+          (t) => trackCamelotFifths(t) ?? 0,
+        ).map((cluster) => this._keyItem(cluster)),
+      });
+    if (clusterCounts.size > 0)
+      classes.push({
+        id: "clusters",
+        label: "Clusters",
+        items: this._sortedCounts(clusterCounts).map(([cid, count]) => {
+          const name = m.clusterNames.get(cid) || `Cluster ${cid}`;
+          return {
+            text: name,
+            title: name,
+            count,
+            swatch: clusterColor(cid),
+            hover: { kind: "cluster", id: cid },
+          };
+        }),
+      });
+    return classes;
+  }
+
+  /** One BPM cluster row: a tempo range, a gradient swatch, and a path-set target. */
+  private _tempoItem(cluster: Track[]): OverlayItem {
+    const byBpm = new Map<number, string>();
+    for (const t of cluster) {
+      const bpm = Math.round(t.bpm as number);
+      if (!byBpm.has(bpm)) byBpm.set(bpm, tempoColor(trackTempoNorm(t) as number));
+    }
+    const sorted = [...byBpm.entries()].sort((a, b) => a[0] - b[0]);
+    const lo = sorted[0][0];
+    const hi = sorted[sorted.length - 1][0];
+    const colours = sorted.map(([, c]) => c);
+    return {
+      text: lo === hi ? `${lo} BPM` : `${lo}–${hi} BPM`,
+      title:
+        lo === hi ? `${lo} BPM` : `Tracks from ${lo} to ${hi} BPM`,
+      count: cluster.length,
+      swatch: this._classSwatch(colours),
+      hover: {
+        kind: "paths",
+        paths: cluster.map((t) => t.path),
+        color: colours[0],
+      },
+    };
+  }
+
+  /** One key cluster row: the commonest key, a gradient swatch, and a path set. */
+  private _keyItem(cluster: Track[]): OverlayItem {
+    const nameCounts = new Map<string, number>();
+    const byFifth = new Map<number, string>();
+    for (const t of cluster) {
+      if (t.musical_key)
+        nameCounts.set(t.musical_key, (nameCounts.get(t.musical_key) ?? 0) + 1);
+      const f = trackCamelotFifths(t);
+      const af = t.audio_features;
+      if (f !== null && af && !byFifth.has(f))
+        byFifth.set(f, keyColor(af.key, af.mode));
+    }
+    const names = [...nameCounts.entries()].sort((a, b) =>
+      b[1] !== a[1] ? b[1] - a[1] : a[0] < b[0] ? -1 : 1,
+    );
+    const colours = [...byFifth.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, c]) => c);
+    return {
+      text: names[0]?.[0] ?? "—",
+      title: names.map(([n]) => n).join(", ") || "No key",
+      count: cluster.length,
+      swatch: this._classSwatch(colours),
+      hover: {
+        kind: "paths",
+        paths: cluster.map((t) => t.path),
+        color: colours[0],
+      },
+    };
+  }
+
+  /** A solid colour for one class, or a gradient spanning a cluster's classes. */
+  private _classSwatch(colours: string[]): string | undefined {
+    if (colours.length === 0) return undefined;
+    if (colours.length === 1) return colours[0];
+    return `linear-gradient(90deg, ${colours.join(", ")})`;
+  }
+
+  /** Clusters sorted by size (desc), then by their lowest sort key. */
+  private _sortedClusters(
+    clusters: Track[][],
+    key: (t: Track) => number,
+  ): Track[][] {
+    return [...clusters].sort((a, b) => {
+      if (b.length !== a.length) return b.length - a.length;
+      return Math.min(...a.map(key)) - Math.min(...b.map(key));
+    });
+  }
+
+  /** Counts sorted by frequency (desc), then by key. */
+  private _sortedCounts<K extends string | number>(
+    counts: Map<K, number>,
+  ): [K, number][] {
+    return [...counts.entries()].sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
+    });
+  }
+
+  private _buildOverlayTabs(classes: OverlayClass[]): HTMLElement {
+    const strip = document.createElement("div");
+    strip.className = "overlay-tabs";
+    strip.setAttribute("role", "tablist");
+    for (const c of classes) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "overlay-tab";
+      btn.dataset.overlayTab = c.id;
+      btn.setAttribute("role", "tab");
+      const selected = c.id === this._overlayTab;
+      btn.setAttribute("aria-selected", selected ? "true" : "false");
+      btn.classList.toggle("active", selected);
+      btn.textContent = c.label;
+      strip.appendChild(btn);
+    }
+    return strip;
+  }
+
+  /**
+   * One overlay row. Folder rows keep the tree's label semantics (folder-actions
+   * popout, label activation); every other class row is a plain navigation target:
+   * hover glows its class, click selects its tracks.
+   */
+  private _buildOverlayRow(item: OverlayItem, tab: OverlayTab): HTMLElement {
+    const isFolder = tab === "folders";
+    const row = document.createElement("div");
+    row.className = "folder-row selected-folder-row";
+    if (isFolder) row.dataset.folderPath = item.folderPath ?? ".";
+    row.addEventListener("mouseenter", () => {
+      row.classList.add("folder-hover");
+      if (isFolder) {
         this._setHoveredRow(row);
         this._showFolderActions(row);
+        return;
+      }
+      this.deps.canvas.hoveredBloomTrack = null;
+      this.deps.canvas.hoverTarget = item.hover;
+      this.deps.canvas.scheduleDraw();
+    });
+    row.addEventListener("mouseleave", (e) => {
+      row.classList.remove("folder-hover");
+      if (this.deps.isPointerBusy()) return;
+      const to = (e as MouseEvent).relatedTarget as Node | null;
+      if (isFolder && to && this._actionsEl.contains(to)) {
+        this._cancelHideActions();
+        return;
+      }
+      this.deps.canvas.hoverTarget = null;
+      this.deps.canvas.scheduleDraw();
+      if (isFolder) this._scheduleHideActions();
+    });
+    if (!isFolder) {
+      row.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this.deps.model.selectOnlyHoverTarget(item.hover);
+        this.deps.model.saveLS();
       });
-      row.addEventListener("mouseleave", (e) => {
-        row.classList.remove("folder-hover");
-        if (this.deps.isPointerBusy()) return;
-        const to = (e as MouseEvent).relatedTarget as Node | null;
-        if (to && this._actionsEl.contains(to)) {
-          this._cancelHideActions();
-          return;
-        }
-        this.deps.canvas.hoverTarget = null;
-        this.deps.canvas.scheduleDraw();
-        this._scheduleHideActions();
-      });
-      const arrow = document.createElement("span");
-      arrow.className = "folder-arrow";
-      arrow.textContent = "\u2003";
-      row.appendChild(arrow);
+    }
+    const arrow = document.createElement("span");
+    arrow.className = "folder-arrow";
+    arrow.textContent = "\u2003";
+    row.appendChild(arrow);
+    if (item.swatch) {
       const swatch = document.createElement("span");
       swatch.className = "folder-swatch";
-      swatch.style.background = dirColor(folder);
+      swatch.style.background = item.swatch;
       row.appendChild(swatch);
-      const item = document.createElement("span");
-      item.className = "folder-label";
-      if (current === folder) item.classList.add("active");
-      item.dataset.path = folder === "" ? "." : folder;
-      item.title = displayFolderPath(folder);
-      const label = displayFolderLeaf(folder);
-      item.textContent = `${label} (${count})`;
-      row.appendChild(item);
-      host.appendChild(row);
     }
-    host.classList.remove("hidden");
+    const label = document.createElement("span");
+    label.className = "folder-label";
+    if (isFolder) {
+      const norm = this._normFolderPath(item.folderPath ?? ".");
+      if (this.deps.model.folder === norm) label.classList.add("active");
+      label.dataset.path = item.folderPath ?? ".";
+    }
+    label.title = item.title;
+    label.textContent = `${item.text} (${item.count})`;
+    row.appendChild(label);
+    return row;
   }
 }

@@ -1,4 +1,5 @@
 import {
+  type HoverTarget,
   type Model,
   type PreviewSection,
   type Track,
@@ -18,6 +19,7 @@ import type {
 import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
+import { bloomRangeLabel } from "./lib/bloom";
 import {
   CommandManager,
   RenameTagCommand,
@@ -49,6 +51,8 @@ import {
 
 // ─── Constants ───────────────────────────────────────────────
 const FLUSH_MS = 500;
+/** Range added per D + scroll step, at the gesture's clamped max (±0.4 → ±0.2). */
+const BLOOM_RANGE_SCROLL_STEP = 0.5;
 
 // ─── Utilities ───────────────────────────────────────────────
 function debounce<Args extends unknown[]>(
@@ -85,12 +89,12 @@ export class Controller {
   private viewModifiers: ViewModifierView;
 
   private previewPath: string | null = null;
+  /** Fraction to seek to once a freshly-started preview's metadata lands. */
+  private pendingSeekFraction: number | null = null;
   /** Paths with an in-flight structure fetch, so a hover burst fetches once. */
   private structurePending = new Set<string>();
   /** Filter-tag → its chip id, so each active range filter has one chip. */
   private filterModifierIds = new Map<string, string>();
-  /** Signature of the last exclusion set, so its hidden count recomputes only on change. */
-  private _exclusionKey = "";
   private $audio: HTMLAudioElement;
   private pending = new Map<string, PendingUpdate>();
   private cmdMgr: CommandManager;
@@ -105,7 +109,7 @@ export class Controller {
   /** Embedding-space view: layout cache, generation SSE, position animations. */
   private embedding: EmbeddingCoordinator;
 
-  /** Sidebar folder tree: HTMX refresh, roots, highlights, selected-folders overlay. */
+  /** Sidebar folder tree: HTMX refresh, roots, highlights, selected-tracks overlay. */
   private folders: FolderTreeCoordinator;
 
   /** Canvas pointer gestures: selection, drag, transforms, pan/zoom, folder-drop. */
@@ -176,8 +180,6 @@ export class Controller {
       // An imprint registers/removes a root, so the library and tree must
       // follow: the root set and the visible track set stay in step.
       onRootsChanged: () => this._reloadLibraryAndTree(),
-      // Prefilling an imprint target must reveal the Organise tab it lives in.
-      showRightPanel: (tab) => this.rightPanel.setTab(tab),
     });
 
     this.rightPanel = new RightPanelBinder({ model });
@@ -232,6 +234,12 @@ export class Controller {
       togglePreview: () => this._togglePreview(),
       adjustPreviewVolume: (factor) => this._adjustPreviewVolume(factor),
       commitPreviewVolume: () => this.model.saveLS(),
+      // D owns the selection-bloom cursor (bare tap moves it, hold + scroll
+      // adjusts the bloom range), so it is handled here, not by HotkeyManager.
+      moveSelectionBloom: (dir) => this.analysis.moveSelectionBloom(dir),
+      setSelectionBloom: (mode) => this.analysis.applySelectionBloom(mode),
+      adjustBloomRange: (factor) => this._adjustBloomRange(factor),
+      commitBloomRange: () => this.model.saveLS(),
       // Viewport moves (focus/homing) tween on the shared canvas frame.
       tweenViewport: (target) => this.embedding.tweenViewport(target),
       // The scope's lens is switched from its on-canvas tab bar.
@@ -257,8 +265,11 @@ export class Controller {
         ),
       fitToPaths: (paths) => this.interaction.fitViewToPaths(paths),
       // The landmark field is purely visual: it lives on the canvas, not the model.
+      // A live field *is* the search-active state, so clearing it also hides the
+      // field even when the popup has already been committed closed.
       setField: (field) => {
         this.canvas.searchField = field;
+        this.canvas.searchActive = field !== null;
         this.canvas.scheduleDraw();
       },
       // The matched paths drive the fade; purely visual, so on the canvas.
@@ -305,6 +316,8 @@ export class Controller {
     };
     // A Describe-tab term is a semantic search: run it like a typed query.
     canvasView.onSearchTerm = (term) => this.searchView.setQuery(term);
+    // Clicking or dragging the card's seekbar seeks the audition and resumes it.
+    canvasView.onSeek = (path, fraction) => this._seekPreview(path, fraction);
 
     this.folders = new FolderTreeCoordinator({
       model,
@@ -324,29 +337,6 @@ export class Controller {
 
     this.options = new OptionsPanelBinder({
       model,
-      selectLens: (id) => {
-        void this.embedding.switchToLens(id);
-        // A preset carries its colour mode. `switchToLens` applies it
-        // synchronously before its first await, so re-applying it here syncs the
-        // colour controls and fetches predicted folders if that mode needs them.
-        this.analysis.applyColorMode(model.colorMode, false);
-      },
-      saveLensPreset: () => {
-        const name = window.prompt("Preset name");
-        if (!name || !name.trim()) return;
-        model.addLensPreset(name.trim());
-        model.saveLS();
-        this.options.sync();
-      },
-      deleteLensPreset: () => {
-        const preset = model.lensPresets.find((p) => p.id === model.lensId);
-        if (!preset) return;
-        if (!window.confirm(`Delete preset “${preset.name}”?`)) return;
-        model.deleteLensPreset(preset.id);
-        model.saveLS();
-        this.embedding.ensureAndProject();
-        this.options.sync();
-      },
       stopPreview: () => this._stopPreview(),
       applyPreviewGain: (gain) => {
         this.$audio.volume = gain;
@@ -386,7 +376,7 @@ export class Controller {
       this.options.sync();
       this.folders.updateHighlights();
       this.folders.syncActiveLabels();
-      this.folders.syncExternalToggles();
+      this.folders.syncExternalVisibility();
       this._syncViewModifierChips();
       // ``m.tracks`` is rebuilt when hides/filters change; ``hoveredIdx`` must be
       // re-derived from the pointer after the next paint or hotkeys see a stale index.
@@ -478,10 +468,11 @@ export class Controller {
     this.viewModifiers.onProximityInput = (_id, percent) => {
       void this.inspect.setProximityFromChip(percent);
     };
-    this.viewModifiers.onExternalRefit = (_id, checked) => {
-      m.setExternalInProjection(checked);
+    this.viewModifiers.onExternalRefit = (_id, checked) =>
+      this._setExternalRefit(checked);
+    this.viewModifiers.onExternalToggle = () => {
+      m.setShowExternal(!m.showExternal);
       m.saveLS();
-      void this.embedding.refreshProjection();
     };
 
     this.batch.onApply = (tag, updates) => {
@@ -516,26 +507,14 @@ export class Controller {
   }
 
   private _syncExclusionsModifier(): void {
-    const m = this.model;
-    const active = this.viewMods.find("exclusions");
-    if (!m.hasExclusions) {
-      if (active) this.viewMods.remove(active.id);
-      this._exclusionKey = "";
-      return;
+    // One chip per solo/exclude action, pushed where the action runs. When no
+    // exclusions remain — Alt+S or a chip's × cleared them all — drop the rest.
+    if (this.model.hasExclusions) return;
+    for (const mod of this.viewMods.stack.filter(
+      (x) => x.kind === "exclusions",
+    )) {
+      this.viewMods.remove(mod.id);
     }
-    const key = `${m.hiddenPaths.size}|${[...m.hiddenFolderPrefixes].sort().join(",")}`;
-    let detail = active?.detail ?? "";
-    if (key !== this._exclusionKey) {
-      this._exclusionKey = key;
-      let n = 0;
-      for (const t of m.allTracks) if (m.isTrackHidden(t)) n++;
-      detail = `${n} hidden`;
-    }
-    if (active) this.viewMods.update(active.id, { detail });
-    else
-      this.viewMods.push({ kind: "exclusions", label: "Excluded", detail }, () =>
-        m.clearExclusions(),
-      );
   }
 
   private _syncFilterModifiers(): void {
@@ -570,23 +549,28 @@ export class Controller {
   private _syncExternalModifier(): void {
     const m = this.model;
     const active = this.viewMods.find("external");
-    if (!m.showExternal) {
-      if (active) this.viewMods.remove(active.id);
-      return;
-    }
+    // A permanent two-state chip — Library + External (shown) or Library Only
+    // (hidden) — with no ×: V toggles the visibility and R toggles the refit.
     const patch = {
-      label: "External tracks",
-      detail: m.externalInProjection ? "refit" : "library layout",
-      checked: m.externalInProjection,
+      label: m.showExternal ? "Library + External" : "Library Only",
+      detail: undefined,
+      checked: m.showExternal ? m.externalInProjection : undefined,
+      permanent: true,
     };
     if (active) {
       this.viewMods.update(active.id, patch);
     } else {
-      this.viewMods.push({ kind: "external", ...patch }, () => {
-        m.setShowExternal(false);
-        m.saveLS();
-      });
+      this.viewMods.push({ kind: "external", ...patch }, () => {});
     }
+  }
+
+  /** Opt in/out of refitting the layout with external tracks (persisted). */
+  private _setExternalRefit(included: boolean): void {
+    if (this.model.externalInProjection === included) return;
+    this.model.setExternalInProjection(included);
+    this.model.saveLS();
+    // The fit scope only matters while the externals are on the map.
+    if (this.model.showExternal) void this.embedding.refreshProjection();
   }
 
   /* ── Data loading ───────────────────────────────────────── */
@@ -772,11 +756,16 @@ export class Controller {
 
   /* ── Hover preview ──────────────────────────────────────── */
 
-  /** Bare **M** tap: toggle hover preview, ending any audition when turned off. */
+  /**
+   * Bare **M** tap: toggle hover preview. Turning it off ends any audition;
+   * turning it on auditions the track already under the pointer, so **M** works
+   * without moving the mouse first.
+   */
   private _togglePreview(): void {
     const m = this.model;
     m.hoverPreview = !m.hoverPreview;
-    if (!m.hoverPreview) this._stopPreview();
+    if (m.hoverPreview) this._handlePreview();
+    else this._stopPreview();
     this.options.sync();
     m.saveLS();
   }
@@ -787,6 +776,19 @@ export class Controller {
     m.previewVolume = Math.max(0, Math.min(1, m.previewVolume * factor));
     this.$audio.volume = previewGain(m.previewVolume);
     this.options.syncPreviewVolume();
+  }
+
+  /** **D + scroll**: widen/narrow the cursor variable's bloom range and redraw. */
+  private _adjustBloomRange(factor: number): void {
+    const m = this.model;
+    // A variable with no range (cluster) has nothing to widen.
+    if (bloomRangeLabel(m.selectionBloom, m.bloomRange()) === null) return;
+    // Additive, not multiplicative: range 0 (exact class) is a real state a
+    // scroll must be able to leave, unlike the volume's scaled taper.
+    m.setBloomRange(
+      m.bloomRange() + (factor - 1) * BLOOM_RANGE_SCROLL_STEP,
+    );
+    this.canvas.scheduleDraw();
   }
 
   private _handlePreview(): void {
@@ -810,6 +812,8 @@ export class Controller {
     this.previewPath = track.path;
     this.model.previewTrackPath = track.path;
     this.model.previewSection = null;
+    this.model.previewTime = 0;
+    this.model.previewDuration = 0;
     // A search hit auditions the section that matched the query; otherwise the
     // preview seeks to the detected drop (structure lands asynchronously).
     const matchSection = this.model.searchSections.get(track.path);
@@ -817,12 +821,30 @@ export class Controller {
     this.$audio.src = `/api/audio/${encodeURIComponent(track.path)}`;
     this.$audio.onloadedmetadata = () => {
       const s = this.model.trackStructure.get(track.path);
-      this.model.previewSection = s?.peak_start != null ? "drop" : null;
-      this.$audio.currentTime = previewStartSeconds(
-        s,
-        this.$audio.duration,
-        matchSection,
-      );
+      this.model.previewDuration = Number.isFinite(this.$audio.duration)
+        ? this.$audio.duration
+        : 0;
+      // A seekbar click seeks to its fraction; otherwise the preview seeks to the
+      // detected drop (or the search hit's matching section).
+      const pending = this.pendingSeekFraction;
+      this.pendingSeekFraction = null;
+      if (pending != null) {
+        this.model.previewSection = null;
+        this.model.previewTime = pending * this.$audio.duration;
+        this.$audio.currentTime = this.model.previewTime;
+      } else {
+        this.model.previewSection = s?.peak_start != null ? "drop" : null;
+        this.$audio.currentTime = previewStartSeconds(
+          s,
+          this.$audio.duration,
+          matchSection,
+        );
+      }
+      this.canvas.scheduleDraw();
+    };
+    // The seekbar fill follows playback, so every position tick redraws the card.
+    this.$audio.ontimeupdate = () => {
+      this.model.previewTime = this.$audio.currentTime;
       this.canvas.scheduleDraw();
     };
     this.$audio.play().catch(() => {});
@@ -832,10 +854,40 @@ export class Controller {
   }
 
   /**
-   * Cycle the hover preview between the sections the track actually has
-   * (drop → break → intro) and re-seek. No-op when nothing is auditioning.
+   * Seek the audition to *fraction* of the track and resume playback — a seekbar
+   * click or drag. Seeking also turns the hover preview on, since the seekbar is
+   * the hover-preview timeline. A different track is started first and seeks once
+   * its metadata lands.
    */
-  private _cyclePreviewSection(): void {
+  private _seekPreview(path: string, fraction: number): void {
+    const m = this.model;
+    if (!m.hoverPreview) {
+      m.hoverPreview = true;
+      this.options.sync();
+      m.saveLS();
+    }
+    if (this.previewPath !== path) {
+      const track = m.trackByPath(path);
+      if (!track) return;
+      this.pendingSeekFraction = fraction;
+      this._startPreview(track);
+      return;
+    }
+    const dur = this.$audio.duration;
+    if (!Number.isFinite(dur) || dur <= 0) return;
+    const t = Math.max(0, Math.min(dur - 0.05, fraction * dur));
+    this.$audio.currentTime = t;
+    m.previewTime = t;
+    if (this.$audio.paused) this.$audio.play().catch(() => {});
+    this.canvas.scheduleDraw();
+  }
+
+  /**
+   * Cycle the hover preview between the sections the track actually has
+   * (drop → break → intro) and re-seek. **W** forward, **Shift+W** backward.
+   * No-op when nothing is auditioning.
+   */
+  private _cyclePreviewSection(dir: 1 | -1 = 1): void {
     const m = this.model;
     const path = this.previewPath;
     if (!path) return;
@@ -846,12 +898,20 @@ export class Controller {
       toast("No cached structure for this track yet", "info");
       return;
     }
-    const idx = m.previewSection ? present.indexOf(m.previewSection) : -1;
-    const next = present[(idx + 1) % present.length];
+    // Forward from nothing starts at the first section, backward at the last.
+    const idx = m.previewSection
+      ? present.indexOf(m.previewSection)
+      : dir > 0
+        ? -1
+        : 0;
+    const next = present[(idx + dir + present.length) % present.length];
     const start = sectionStartSeconds(structure, next);
     if (start == null) return;
     m.previewSection = next;
-    if (this.$audio.duration > 0) this.$audio.currentTime = start;
+    if (this.$audio.duration > 0) {
+      this.$audio.currentTime = start;
+      m.previewTime = start;
+    }
     this.canvas.scheduleDraw();
   }
 
@@ -905,6 +965,9 @@ export class Controller {
     this.previewPath = null;
     this.model.previewTrackPath = null;
     this.model.previewSection = null;
+    this.model.previewTime = 0;
+    this.model.previewDuration = 0;
+    this.pendingSeekFraction = null;
     this.$audio.pause();
     this.$audio.removeAttribute("src");
     this.$audio.load();
@@ -939,17 +1002,40 @@ export class Controller {
    * Each acts on the *effective hover target* — the pinned card's navigation
    * element wins over the pointer, exactly as the hotkeys always did.
    */
+  /** Push one visibility-filter chip (solo / exclude), with its own reverse. */
+  private _pushExclusionChip(
+    label: string,
+    detail: string,
+    clear: () => void,
+  ): void {
+    this.viewMods.push({ kind: "exclusions", label, detail }, clear);
+  }
+
+  /** A short readout of how many tracks a hover target covers. */
+  private _targetDetail(target: HoverTarget): string {
+    const n = this.model.hoverTargetPaths(target).size;
+    return `${n} track${n === 1 ? "" : "s"}`;
+  }
+
   private _runCanvasAction(action: FolderCanvasAction): void {
     const m = this.model;
     if (action === "fit-view") {
       this.interaction.fitView();
       return;
     }
+    const target = this.interaction.effectiveHoverTarget();
     if (action === "isolate-selection") {
+      // Solo is a visibility filter, so it pushes a chip that reveals again.
+      const had = m.hasExclusions;
       this.interaction.solo();
+      if (!had && m.hasExclusions) {
+        const detail = target
+          ? this._targetDetail(target)
+          : `${m.selected.size} selected`;
+        this._pushExclusionChip("Solo", detail, () => m.clearExclusions());
+      }
       return;
     }
-    const target = this.interaction.effectiveHoverTarget();
     if (!target) return;
     if (action === "focus-folder") {
       m.selectOnlyHoverTarget(target);
@@ -964,12 +1050,21 @@ export class Controller {
         m.revealFolderSubtree(target.prefix);
       } else {
         m.hideFolderTree(target.prefix);
+        this._pushExclusionChip("Excluded", this._targetDetail(target), () =>
+          m.revealFolderSubtree(target.prefix),
+        );
       }
     } else {
       const paths = m.hoverTargetPaths(target);
       if (paths.size === 0) return;
-      if (m.pathsFullyHidden(paths)) m.revealPaths(paths);
-      else m.hidePaths(paths);
+      if (m.pathsFullyHidden(paths)) {
+        m.revealPaths(paths);
+      } else {
+        m.hidePaths(paths);
+        this._pushExclusionChip("Excluded", this._targetDetail(target), () =>
+          m.revealPaths(paths),
+        );
+      }
     }
     m.saveLS();
   }
@@ -996,7 +1091,23 @@ export class Controller {
       m.saveLS();
     });
 
-    hk.on("cycle-preview-section", () => this._cyclePreviewSection());
+    hk.on("cycle-preview-section", () => this._cyclePreviewSection(1));
+
+    hk.on("cycle-preview-section-prev", () => this._cyclePreviewSection(-1));
+
+    // D is owned by CanvasInteractionController (bare tap moves the selection-bloom
+    // cursor, hold + scroll adjusts the bloom range), so HotkeyManager lists it
+    // but does not dispatch it.
+
+    hk.on("toggle-external", () => {
+      // Hiding externals is a visibility filter, so the chip stack tracks it.
+      m.setShowExternal(!m.showExternal);
+      m.saveLS();
+    });
+
+    hk.on("toggle-external-refit", () =>
+      this._setExternalRefit(!m.externalInProjection),
+    );
 
     hk.on("select-all", () => m.selectAll());
 

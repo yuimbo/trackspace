@@ -113,14 +113,7 @@ function pump(ms = 600): void {
 
 const HTML = `
   <div id="toast-container"></div>
-  <select id="lens-select">
-    <option value="tags">Tags</option>
-    <option value="combined">Combined</option>
-  </select>
-  <select id="color-mode-select">
-    <option value="folder">Folder</option>
-    <option value="key">Key</option>
-  </select>
+  <details id="cluster-weights-details"></details>
 `;
 
 interface Harness {
@@ -477,9 +470,9 @@ describe("EmbeddingCoordinator lens switching", () => {
       "tags",
       "combined",
       "maest",
+      "supervised",
       "clap",
       "rhythm",
-      "supervised",
       "camelot",
       "tempo",
       "tags",
@@ -702,17 +695,17 @@ describe("EmbeddingCoordinator scopes", () => {
     expect(model.lensId).toBe("tags");
   });
 
-  it("mirrors the switched lens and colour mode into the View-tab selects", async () => {
+  it("hides the source-weight sliders for a per-source lens", async () => {
     const { model, coord } = makeHarness(projectionRoute);
     vi.spyOn(model, "saveLS").mockImplementation(() => {});
-    model.colorMode = "key";
+    await coord.switchToLens("clap");
+    expect(
+      document.getElementById("cluster-weights-details")!.hidden,
+    ).toBe(true);
     await coord.switchToLens("combined");
     expect(
-      (document.getElementById("lens-select") as HTMLSelectElement).value,
-    ).toBe("combined");
-    expect(
-      (document.getElementById("color-mode-select") as HTMLSelectElement).value,
-    ).toBe("key");
+      document.getElementById("cluster-weights-details")!.hidden,
+    ).toBe(false);
   });
 });
 

@@ -68,7 +68,7 @@ describe("lens registry", () => {
 
   it("cycles from a preset's base lens", () => {
     expect(nextLensId("preset:1", "clap")).toBe("rhythm");
-    expect(prevLensId("preset:1", "clap")).toBe("maest");
+    expect(prevLensId("preset:1", "clap")).toBe("supervised");
   });
 
   it("scope lenses exclude the tag lens", () => {

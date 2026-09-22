@@ -119,4 +119,15 @@ describe("StatusView analysis progress", () => {
     view.update(model);
     expect(statusText()).not.toContain("Clustering");
   });
+
+  it("shows a note while the head's predictions are being fetched", () => {
+    const view = new StatusView();
+    const model = new Model();
+    model.folderPredictionsLoading = true;
+    view.update(model);
+    expect(statusText()).toContain("Predicting folders");
+    model.folderPredictionsLoading = false;
+    view.update(model);
+    expect(statusText()).not.toContain("Predicting folders");
+  });
 });

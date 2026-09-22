@@ -16,15 +16,24 @@ import {
   type Track,
   isAudioFeatureAxisId,
   scopeContains,
+  scopeHalfExtents,
 } from "../model";
 import type { CanvasView, TxHandle } from "../components";
-import { isTextEntryTarget } from "../hotkeys";
-import type { ColorMode } from "../lib/lenses";
+import { hotkeyCode, hotkeyKey, isTextEntryTarget } from "../hotkeys";
+import { scopeLenses, type ColorMode } from "../lib/lenses";
+
+/** Physical keys for the gesture bindings, sourced from the hotkey config. */
+const SCOPE_KEY = hotkeyCode("scope-gesture");
+const PREVIEW_KEY = hotkeyCode("toggle-preview");
+const BLOOM_KEY = hotkeyCode("cycle-selection-bloom");
+const INSPECT_KEY = hotkeyKey("pin-inspect");
 
 const DRAG_THRESH = 4;
 const ZOOM_FACTOR = 1.12;
 /** Starting radius (screen px) for a scope opened by X + scroll. */
 const SCOPE_SCROLL_START_PX = 14;
+/** Screen margin (px) around a scope that still counts as "near" for X / Shift+X. */
+const SCOPE_NEAR_PX = 40;
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
@@ -133,12 +142,20 @@ export interface CanvasInteractionDeps {
   switchLens(lensId: string): void;
   /** Set the dot colour mode from the persistent top tabber. */
   setColorMode(mode: ColorMode): void;
+  /** Move the selection-bloom cursor across the colour tabs (**D** / **Shift+D**). */
+  moveSelectionBloom(dir: 1 | -1): void;
+  /** Set the selection-bloom cursor from a colour-tab click. */
+  setSelectionBloom(mode: ColorMode): void;
   /** Toggle hover preview on/off (a bare **M** tap). */
   togglePreview(): void;
   /** Scale the preview volume by *factor* (**M + scroll**). */
   adjustPreviewVolume(factor: number): void;
   /** Persist the volume after an M + scroll gesture ends. */
   commitPreviewVolume(): void;
+  /** Scale the selection-bloom range by *factor* (**D + scroll**). */
+  adjustBloomRange(factor: number): void;
+  /** Persist the bloom range after a D + scroll gesture ends. */
+  commitBloomRange(): void;
 }
 
 export class CanvasInteractionController {
@@ -153,6 +170,10 @@ export class CanvasInteractionController {
   private _previewArmed = false;
   /** Whether the current M hold produced a scroll (vs a bare tap to toggle). */
   private _previewGestureUsed = false;
+  /** True while **D** is held: a scroll adjusts the bloom range, a tap moves. */
+  private _bloomArmed = false;
+  /** Whether the current D hold produced a scroll (vs a bare tap to move). */
+  private _bloomGestureUsed = false;
 
   constructor(private deps: CanvasInteractionDeps) {
     this.mouse = {
@@ -174,11 +195,12 @@ export class CanvasInteractionController {
     };
   }
 
-  /** Wire canvas pointer events, the scope key and the preview key. */
+  /** Wire canvas pointer events, the scope key, the preview key and the bloom key. */
   bind(): void {
     this._bindCanvas();
     this._bindScopeKeys();
     this._bindPreviewKeys();
+    this._bindBloomKeys();
     this._bindInspectKey();
   }
 
@@ -238,6 +260,9 @@ export class CanvasInteractionController {
     const colorTab = cv.topColorTabAt(sx, sy);
     if (colorTab) {
       this.deps.setColorMode(colorTab as ColorMode);
+      // Clicking a colour tab also parks the bloom cursor there, so a mouse user
+      // can choose the bloom variable without reaching for the D key.
+      this.deps.setSelectionBloom(colorTab as ColorMode);
       return;
     }
 
@@ -490,8 +515,8 @@ export class CanvasInteractionController {
     // target it, and resume free hover on the next move after the card closes.
     if (cv.inspect) {
       cv.hoveredIdx = m.tracks.findIndex((t) => t.path === cv.inspect!.path);
-      cv.hoveredSiblingFolder =
-        cv.hoveredIdx >= 0 ? (m.tracks[cv.hoveredIdx].folder ?? null) : null;
+      cv.hoveredBloomTrack =
+        cv.hoveredIdx >= 0 ? m.tracks[cv.hoveredIdx] : null;
       return;
     }
 
@@ -503,12 +528,7 @@ export class CanvasInteractionController {
     const newPath =
       cv.hoveredIdx >= 0 ? (m.tracks[cv.hoveredIdx]?.path ?? null) : null;
 
-    if (cv.hoveredIdx >= 0) {
-      const ht = m.tracks[cv.hoveredIdx];
-      cv.hoveredSiblingFolder = ht ? (ht.folder ?? "") : null;
-    } else {
-      cv.hoveredSiblingFolder = null;
-    }
+    cv.hoveredBloomTrack = cv.hoveredIdx >= 0 ? m.tracks[cv.hoveredIdx] : null;
 
     if (cv.hoveredIdx === prevIdx && newPath === prevPath) return;
 
@@ -848,6 +868,16 @@ export class CanvasInteractionController {
       return;
     }
 
+    // D + scroll adjusts the selection-bloom range. A scroll marks the gesture
+    // as used, so the D keyup does not also move the cursor (mirrors M).
+    if (this._bloomArmed) {
+      this._bloomGestureUsed = true;
+      const factor = Math.exp(clamp(-dy / 600, -0.4, 0.4));
+      this.deps.adjustBloomRange(factor);
+      cv.showBloomHud(e.clientX, e.clientY);
+      return;
+    }
+
     if (e.ctrlKey) {
       const factor = Math.exp(-dy * 0.005);
       const [wx, wy] = cv.s2w(sx, sy);
@@ -1131,12 +1161,30 @@ export class CanvasInteractionController {
   }
 
   /**
-   * Isolate hotkey (S): the hovered navigation element, else the selection, else
-   * everything. A second press on an already-isolated target clears the exclusions
-   * (show all); with nothing hovered and no selection it also shows all.
+   * Isolate hotkey (S): a hovered dot isolates its bloom class (the folder
+   * subtree for folder colour), else the hovered navigation element, else the
+   * selection, else everything. A second press on an already-isolated target
+   * clears the exclusions (show all); with nothing hovered and no selection it
+   * also shows all.
    */
   solo(): void {
     const m = this.deps.model;
+    const cv = this.deps.canvas;
+
+    // A hovered dot blooms a class: S isolates exactly that class.
+    if (cv.hoverTarget === null && cv.hoveredBloomTrack) {
+      const keep = m.bloomPaths(cv.hoveredBloomTrack);
+      if (keep.size === 0) return;
+      if (m.pathsFullyHidden(keep)) {
+        m.revealThenFocusPaths(keep);
+      } else if (m.hasVisibleTracksOutside(keep)) {
+        m.focusPaths(keep);
+      } else {
+        m.clearExclusions();
+      }
+      m.saveLS();
+      return;
+    }
 
     const target = this.effectiveHoverTarget();
     if (target) {
@@ -1267,24 +1315,55 @@ export class CanvasInteractionController {
     return !isTextEntryTarget(target);
   }
 
+  /** True while the last pointer position is in the scope region or just outside. */
+  private _pointerNearScope(scope: Scope): boolean {
+    const cv = this.deps.canvas;
+    const [wx, wy] = cv.s2w(this.mouse.lx, this.mouse.ly);
+    // A ~40 px screen margin covers the lens tab bar drawn just outside.
+    const [mx] = cv.s2w(this.mouse.lx + SCOPE_NEAR_PX, this.mouse.ly);
+    const margin = Math.abs(mx - wx);
+    const { hw, hh } = scopeHalfExtents(scope);
+    if (scope.shape === "box")
+      return (
+        Math.abs(wx - scope.cx) <= hw + margin &&
+        Math.abs(wy - scope.cy) <= hh + margin
+      );
+    return Math.hypot(wx - scope.cx, wy - scope.cy) <= scope.r + margin;
+  }
+
+  /** X / Shift+X: step the open scope through the lens list and switch it. */
+  private _cycleScopeLens(scope: Scope, dir: 1 | -1): void {
+    const lenses = scopeLenses();
+    const idx = lenses.findIndex((l) => l.id === scope.lensId);
+    const next = lenses[(idx + dir + lenses.length) % lenses.length];
+    if (next && next.id !== scope.lensId) this.deps.setScopeLens(next.id);
+  }
+
   /**
    * **X** arms the scope gesture: **X + drag** draws a box, **X + scroll**
-   * opens a circle or resizes the open scope, and a bare **X** tap closes an open
-   * scope (**Esc** does too).
+   * opens a circle or resizes the open scope. With the pointer in or near an open
+   * scope a bare **X** / **Shift+X** tap cycles its lens; far outside (or with
+   * none open) it closes the scope (**Esc** does too).
    */
   private _bindScopeKeys(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
-      if (e.code !== "KeyX" || e.repeat) return;
+      if (e.code !== SCOPE_KEY || e.repeat) return;
       if (!this._keysAllowed(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       this._scopeArmed = true;
       this._scopeGestureUsed = false;
     });
     document.addEventListener("keyup", (e: KeyboardEvent) => {
-      if (e.code !== "KeyX" || !this._scopeArmed) return;
+      if (e.code !== SCOPE_KEY || !this._scopeArmed) return;
       this._scopeArmed = false;
-      // A bare tap (no drag/scroll) toggles the open scope closed.
-      if (!this._scopeGestureUsed && this.deps.model.scope) {
+      if (this._scopeGestureUsed) return;
+      const scope = this.deps.model.scope;
+      if (!scope) return;
+      // A bare tap (no drag/scroll) with the pointer in or near the scope cycles
+      // its lens (X forward, Shift+X backward); far outside, it closes it.
+      if (this._pointerOverCanvas && this._pointerNearScope(scope)) {
+        this._cycleScopeLens(scope, e.shiftKey ? -1 : 1);
+      } else {
         this.deps.closeScope();
       }
     });
@@ -1301,14 +1380,14 @@ export class CanvasInteractionController {
    */
   private _bindPreviewKeys(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
-      if (e.code !== "KeyM" || e.repeat) return;
+      if (e.code !== PREVIEW_KEY || e.repeat) return;
       if (!this._keysAllowed(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       this._previewArmed = true;
       this._previewGestureUsed = false;
     });
     document.addEventListener("keyup", (e: KeyboardEvent) => {
-      if (e.code !== "KeyM" || !this._previewArmed) return;
+      if (e.code !== PREVIEW_KEY || !this._previewArmed) return;
       this._previewArmed = false;
       // A scroll already adjusted the volume; a bare tap toggles the preview.
       if (this._previewGestureUsed) this.deps.commitPreviewVolume();
@@ -1321,15 +1400,42 @@ export class CanvasInteractionController {
   }
 
   /**
+   * **D** moves the selection-bloom cursor on a bare tap (**Shift+D** backward),
+   * but **D + scroll** adjusts the bloom range instead: a scroll during the hold
+   * marks the gesture used, so the keyup does not also move the cursor.
+   */
+  private _bindBloomKeys(): void {
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.code !== BLOOM_KEY || e.repeat) return;
+      if (!this._keysAllowed(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      this._bloomArmed = true;
+      this._bloomGestureUsed = false;
+    });
+    document.addEventListener("keyup", (e: KeyboardEvent) => {
+      if (e.code !== BLOOM_KEY || !this._bloomArmed) return;
+      this._bloomArmed = false;
+      // A scroll already adjusted the range; a bare tap moves the cursor.
+      if (this._bloomGestureUsed) this.deps.commitBloomRange();
+      else this.deps.moveSelectionBloom(e.shiftKey ? -1 : 1);
+    });
+    window.addEventListener("blur", () => {
+      this._bloomArmed = false;
+      this._bloomGestureUsed = false;
+    });
+  }
+
+  /**
    * **Alt** over a hovered dot pins its inspect card open (and again closes it).
    * The card then survives leaving the canvas so it can be clicked.
    */
   private _bindInspectKey(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
-      if (e.key !== "Alt" || e.repeat) return;
+      if (e.key !== INSPECT_KEY || e.repeat) return;
       if (!this._keysAllowed(e.target)) return;
-      // Unpinning ends the audition the card owned.
-      if (this.deps.canvas.toggleInspect()) this.deps.stopPreview();
+      // Unpinning only releases the card's hold; the hover audition keeps
+      // playing while the pointer is still over the track.
+      this.deps.canvas.toggleInspect();
     });
   }
 }

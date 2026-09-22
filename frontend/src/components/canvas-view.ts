@@ -1,5 +1,11 @@
 import type { HoverTarget, Model, Track } from "../model";
-import { isAudioFeatureAxisId, scopeContains, scopeHalfExtents } from "../model";
+import {
+  isAudioFeatureAxisId,
+  scopeContains,
+  scopeHalfExtents,
+} from "../model";
+import { bloomFolderLevels, bloomRangeKey, bloomRangeLabel } from "../lib/bloom";
+import { displayFolderPath } from "../lib/path-presenter";
 import {
   clusterColor,
   dirColor,
@@ -16,6 +22,7 @@ import {
   scopeLenses,
   spiralGuide,
   trackTempoNorm,
+  type ColorMode,
 } from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
 import { GlowLayer, type GlowPoint } from "../lib/glow-layer";
@@ -29,10 +36,9 @@ import {
   describeKey,
   emptyDescribe,
   renderDescribePanel,
-  renderGenrePop,
   renderTooltip,
+  updateSeekProgress,
   type InspectState,
-  type TooltipCard,
 } from "../lib/tooltip";
 
 
@@ -92,6 +98,13 @@ const PAD = 40;
 const TOP_TABS_BOTTOM = 50;
 const DOT_R = 4;
 const DOT_R_SEL = 6;
+/** A track the folder head cannot place confidently, under "Confident only". */
+export const CONFIDENT_MISS_COLOR = "#6b7280";
+/**
+ * Colour priority of a grey dot in a merged blob: it still adds shape, but almost
+ * none of its colour, so it cannot wash out the hue of its coloured neighbours.
+ */
+const GREY_COLOUR_WEIGHT = 0.15;
 const HIT_RADIUS = 10;
 /** Screen-grid cell for the blob-aware hit fallback; ~3×3 cells ≈ 72 px reach. */
 const HIT_CELL = 24;
@@ -109,6 +122,8 @@ const FIELD_GLOW_R = 64;
 const HOVER_GLOW_R = DOT_R + 20;
 const HOVER_GLOW_CORE = 0.42;
 const HOVER_GLOW_ALPHA = 0.64;
+/** Selection-bloom cursor ring when no dot is hovered (no class colour to borrow). */
+const CURSOR_COLOR = "rgba(255,190,90,0.95)";
 
 /**
  * Nearest track when the cursor sits inside a merged blob rather than on a single
@@ -193,14 +208,12 @@ export class CanvasView {
    * rather than on the model (see `ui_conventions.md` → *Adding new interaction surfaces*).
    */
   hoverTarget: HoverTarget | null = null;
-  /** Exact folder path (``""`` = library root): glow siblings while hovering a dot. */
-  hoveredSiblingFolder: string | null = null;
+  /** Hovered track: bloom every dot sharing its value on the selection cursor. */
+  hoveredBloomTrack: Track | null = null;
   tipReady = false;
   tipTimer = 0;
   /** Identity of the rendered tooltip card, so pan/zoom frames do not rebuild it. */
   private _tipKey = "";
-  /** The currently rendered card, for the genre chip's hover pop-over. */
-  private _tipCard: TooltipCard | null = null;
   /** Identity of the rendered Describe panel (``""`` while hidden). */
   private _describeKey = "";
   /**
@@ -217,6 +230,10 @@ export class CanvasView {
     null;
   /** A Describe-tab term clicked: run it as a CLAP search for similar tracks. */
   onSearchTerm: ((term: string) => void) | null = null;
+  /** Seekbar clicked or dragged: seek the audition to *fraction* of the track. */
+  onSeek: ((path: string, fraction: number) => void) | null = null;
+  /** True while the pointer is dragging the card's seekbar. */
+  private _seekDragging = false;
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
@@ -232,6 +249,8 @@ export class CanvasView {
   colorTabs: TabHit[] = [];
   private _waitTimer = 0;
   _rafId = 0;
+  /** Bottom of the top tabbers this frame, so status pills dock below the bloom chip. */
+  private _topTabsBottom = TOP_TABS_BOTTOM;
 
   txHandles: TxHandle[] = [];
   _txBox: TxBox | null = null;
@@ -270,6 +289,7 @@ export class CanvasView {
     this.$tip = document.getElementById("tooltip")!;
     this.$coords = document.getElementById("coords-panel")!;
     this.$tip.addEventListener("click", (e) => this._onTipClick(e));
+    this.$tip.addEventListener("mousedown", (e) => this._onTipSeekDown(e));
     this.$tip.addEventListener("input", (e) => this._onTipInput(e));
     this.$tip.addEventListener("mouseover", (e) => this._onTipOver(e));
     this.$tip.addEventListener("mouseout", (e) => this._onTipOut(e));
@@ -433,7 +453,7 @@ export class CanvasView {
     this._drawTopTabs(w);
     // Docked status pills start below the tabbers, so a running analysis never
     // covers the persistent E/C feedback.
-    this._drawModeBadge(w, h, TOP_TABS_BOTTOM + 8);
+    this._drawModeBadge(w, h, this._topTabsBottom + 8);
     this._updateTooltip(tracks);
   }
 
@@ -533,9 +553,9 @@ export class CanvasView {
     });
   }
 
-  /** Glow points for the hovered navigation target / sibling folder. */
+  /** Glow points for the hovered navigation target / selection-bloom family. */
   collectHoverGlowPoints(tracks: Track[]): GlowPoint[] {
-    if (this.hoverTarget === null && this.hoveredSiblingFolder === null) {
+    if (this.hoverTarget === null && this.hoveredBloomTrack === null) {
       return [];
     }
     const points: GlowPoint[] = [];
@@ -882,12 +902,16 @@ export class CanvasView {
   private _pointSpec(sx: number, sy: number, track: Track): PointSpec {
     const faded =
       this.searchResults !== null && !this.searchResults.has(track.path);
+    const colour = this.trackColor(track);
     return {
       x: sx,
       y: sy,
       radius: POINT_SPLAT_R,
-      color: parseColor(this.trackColor(track)),
+      color: parseColor(colour),
       alpha: faded ? 0.15 : this.model.isExternalTrack(track) ? 0.5 : 1,
+      // A grey dot contributes shape but almost no colour, so a blob it merges
+      // into keeps the hue of its coloured members instead of desaturating.
+      weight: colour === CONFIDENT_MISS_COLOR ? GREY_COLOUR_WEIGHT : 1,
     };
   }
 
@@ -906,24 +930,28 @@ export class CanvasView {
     for (const c of this._crispDots) this._dot(c.sx, c.sy, tracks[c.idx], c.idx);
   }
 
-  /* ── Hover glow pass (navigation targets + sibling folder) ── */
+  /* ── Hover glow pass (navigation targets + selection bloom) ── */
 
-  /** Tracks that get the navigation-target halo: sidebar/card hover, or dot sibling folder. */
+  /** Tracks that get the halo: sidebar/card hover, or the hovered dot's bloom family. */
   private _inHoverGlow(track: Track): boolean {
     if (this.hoverTarget !== null)
       return this.model.trackMatchesHoverTarget(track, this.hoverTarget);
-    const sib = this.hoveredSiblingFolder;
-    if (sib === null) return false;
-    return (track.folder ?? "") === sib;
+    const hovered = this.hoveredBloomTrack;
+    if (hovered === null) return false;
+    return this.model.trackBloomsWith(track, hovered);
   }
 
   /** Halo colour: cluster swatch, folder colour, or the neutral accent for key/BPM. */
   private _hoverGlowColor(track: Track): string {
     const t = this.hoverTarget;
     if (t?.kind === "cluster") return clusterColor(t.id);
+    if (t?.kind === "paths") return t.color ?? TARGET_GLOW_COLOR;
     if (t?.kind === "key" || t?.kind === "bpm" || t?.kind === "track")
       return TARGET_GLOW_COLOR;
-    return this.trackColor(track);
+    // A navigation-target hover uses the active dot colour; the selection bloom
+    // glows in its own variable's colour, so the family reads even when the map
+    // is coloured by something else.
+    return this.trackColor(track, t ? this.model.colorMode : this.model.selectionBloom);
   }
 
   /* ── Drag ghosts (original positions while dragging) ────── */
@@ -955,22 +983,25 @@ export class CanvasView {
    * Feature modes (tempo, key) reuse the matching lens's polar geometry, so a
    * track's colour tracks its position on that map. Falls back to the folder
    * colour whenever the chosen mode has nothing to say about the track — no cluster
-   * yet, or no cached features — so partially analysed libraries never render as a
-   * field of grey dots.
+   * yet, or no cached features. The predicted-folder mode is the exception: it
+   * greys only a track the head has no prediction for, so a track the head keeps
+   * in its own folder still takes that folder's colour.
    */
-  trackColor(track: Track): string {
+  trackColor(track: Track, mode: ColorMode = this.model.colorMode): string {
     const m = this.model;
-    switch (m.colorMode) {
+    switch (mode) {
       case "head": {
-        const predicted = m.folderPredictions.get(track.path);
-        // "Confident only" leaves a weak match on its real folder, so a novel
-        // track never reads as a folder it merely resembles.
-        const ok =
-          predicted !== undefined &&
-          (!m.headColorConfident ||
-            m.folderPredictionMatches.has(track.path));
-        if (ok) return dirColor(predicted);
-        break;
+        const projected = m.folderPredictions.get(track.path);
+        // No prediction at all — the head has nothing to say about this track — is
+        // grey. A prediction equal to the track's current folder still takes that
+        // folder's colour, so the map never hides a track the head places.
+        if (projected === undefined) return CONFIDENT_MISS_COLOR;
+        // "Confident only" greys a match too weak to count; "All nearest"
+        // takes every track's nearest projected folder.
+        const confident =
+          !m.headColorConfident ||
+          m.folderPredictionMatches.has(track.path);
+        return confident ? dirColor(projected) : CONFIDENT_MISS_COLOR;
       }
       case "cluster": {
         const cid = m.clusterAssignments.get(track.path);
@@ -1335,13 +1366,6 @@ export class CanvasView {
     const ctx = this.ctx;
     ctx.save();
 
-    // Small top-right badge
-    ctx.font = "bold 10px monospace";
-    ctx.textAlign = "right";
-    ctx.textBaseline = "top";
-    ctx.fillStyle = "rgba(120,200,255,0.6)";
-    ctx.fillText("EMBEDDING SPACE", w - 8, 8);
-
     const wait = this._embeddingWait(m);
     const prog = pipelineProgress(m.queueStatus);
     // The speculative per-lens prefetch is background work: the status bar reports
@@ -1492,6 +1516,162 @@ export class CanvasView {
       16,
     );
     this.colorTabs = this._drawTabs(colorModeTabs(), m.colorMode, w / 2, 40);
+    // The selection-bloom cursor is a second marker on the colour row, separate
+    // from the active-mode highlight: **D** moves it, a colour-tab click sets
+    // both, so the map can be coloured by one variable and bloom by another. Its
+    // ring borrows the hovered class's colour, so it reads as that class.
+    const cursorTab = this.colorTabs.find((t) => t.id === m.selectionBloom);
+    const hovered = this.hoveredBloomTrack;
+    const cursorColor = hovered
+      ? this.trackColor(hovered, m.selectionBloom)
+      : CURSOR_COLOR;
+    this._drawTabCursor(cursorTab, cursorColor);
+    this._topTabsBottom = TOP_TABS_BOTTOM;
+    if (cursorTab && hovered) {
+      const bottom = this._drawBloomChip(cursorTab, hovered, cursorColor, w);
+      if (bottom !== null) this._topTabsBottom = bottom;
+    }
+  }
+
+  /** Draw the selection-bloom cursor ring around a colour tab, in *color*. */
+  private _drawTabCursor(tab: TabHit | undefined, color: string): void {
+    if (!tab) return;
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    this._roundRect(
+      tab.x0 - 3,
+      tab.y0 - 3,
+      tab.x1 - tab.x0 + 6,
+      tab.y1 - tab.y0 + 6,
+      7,
+    );
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  /** The hovered dot's class path segments on the bloom variable, or null. */
+  private _bloomClassSegments(track: Track): string[] | null {
+    const m = this.model;
+    switch (m.selectionBloom) {
+      case "folder":
+        return this._folderSegments(track.folder ?? "");
+      case "head": {
+        const p = m.folderPredictions.get(track.path);
+        return p !== undefined ? this._folderSegments(p) : null;
+      }
+      case "cluster": {
+        const id = m.clusterAssignments.get(track.path);
+        return id === undefined
+          ? null
+          : [m.clusterNames.get(id) ?? `Cluster ${id}`];
+      }
+      case "tempo":
+        return track.bpm != null && Number.isFinite(track.bpm)
+          ? [`${Math.round(track.bpm)} BPM`]
+          : null;
+      case "key":
+        return track.musical_key ? [track.musical_key] : null;
+    }
+  }
+
+  /** A virtual folder path as display segments (root id → its tree label). */
+  private _folderSegments(folder: string): string[] {
+    return displayFolderPath(folder).split("/").filter(Boolean);
+  }
+
+  /**
+   * The bloom chip under the cursor: the hovered class and, where the variable
+   * has a range, its semantic meaning (`+2 parent directories`, `±13% BPM`). For a
+   * folder (or predicted folder) the path is drawn segment by segment and the
+   * segment the range climbed to is highlighted — deeper segments fade to grey, so
+   * the chip shows *which ancestor* the bloom reached. Its border borrows the class
+   * colour, so the chip and the halo agree. Returns the chip's bottom edge, so the
+   * status pills dock below it.
+   */
+  private _drawBloomChip(
+    tab: TabHit,
+    track: Track,
+    color: string,
+    canvasW: number,
+  ): number | null {
+    const m = this.model;
+    const segs = this._bloomClassSegments(track);
+    if (!segs || !segs.length) return null;
+    const range = bloomRangeLabel(m.selectionBloom, m.bloomRange());
+    // Only the folder climb has ancestors to point at; other variables are a
+    // single segment that is always the highlight.
+    const levels =
+      bloomRangeKey(m.selectionBloom) === "folder"
+        ? bloomFolderLevels(m.bloomRange())
+        : 0;
+    const anchor = Math.max(0, segs.length - 1 - levels);
+
+    const ctx = this.ctx;
+    const padX = 10;
+    const h = 20;
+    const gap = 6;
+    ctx.save();
+    ctx.textBaseline = "middle";
+    // Each segment is measured in its own font, since the anchor is bold.
+    const segW = segs.map((s, i) => {
+      ctx.font = i === anchor ? "bold 11px monospace" : "11px monospace";
+      return ctx.measureText(s).width;
+    });
+    const sepW = ctx.measureText("/").width + gap * 2;
+    const rangeText = range ? `·  ${range}` : "";
+    const rangeW = rangeText ? ctx.measureText(rangeText).width + gap * 2 : 0;
+    const chipW =
+      segW.reduce((a, b) => a + b, 0) +
+      sepW * (segs.length - 1) +
+      rangeW +
+      padX * 2;
+    const cx = (tab.x0 + tab.x1) / 2;
+    const x = Math.max(4, Math.min(canvasW - chipW - 4, cx - chipW / 2));
+    const y = tab.y1 + 6;
+    const mid = y + h / 2 + 0.5;
+
+    this._roundRect(x, y, chipW, h, 6);
+    ctx.fillStyle = "rgba(18,20,24,0.92)";
+    ctx.fill();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    ctx.textAlign = "left";
+    let tx = x + padX;
+    segs.forEach((seg, i) => {
+      if (i > 0) {
+        ctx.font = "11px monospace";
+        ctx.fillStyle = "rgba(150,158,168,0.55)";
+        ctx.fillText("/", tx + gap, mid);
+        tx += sepW;
+      }
+      ctx.font = i === anchor ? "bold 11px monospace" : "11px monospace";
+      ctx.fillStyle = this._bloomSegColor(i, anchor, color);
+      ctx.fillText(seg, tx, mid);
+      tx += segW[i];
+    });
+    if (rangeText) {
+      ctx.font = "11px monospace";
+      ctx.fillStyle = "rgba(170,180,192,0.7)";
+      ctx.fillText(rangeText, tx + gap, mid);
+    }
+    ctx.restore();
+    return y + h;
+  }
+
+  /** Chip segment colour: the anchor is the class colour, deeper segments fade. */
+  private _bloomSegColor(i: number, anchor: number, color: string): string {
+    if (i === anchor) return color;
+    if (i > anchor) {
+      // One below the anchor is "a bit faded", further below greys out.
+      const depth = i - anchor;
+      return `rgba(150,158,168,${Math.max(0.3, 0.65 - 0.3 * (depth - 1)).toFixed(2)})`;
+    }
+    return "rgba(230,236,242,0.92)";
   }
 
   /**
@@ -1600,8 +1780,6 @@ export class CanvasView {
       this.$tip.classList.add("hidden");
       this.$coords.classList.add("hidden");
       this._describeKey = "";
-      this._tipCard = null;
-      this._hideGenrePop();
       return;
     }
 
@@ -1614,13 +1792,16 @@ export class CanvasView {
     if (card.key !== this._tipKey) {
       this._tipKey = card.key;
       renderTooltip(this.$tip, card);
-      // The old target elements are gone; a stale hover would keep glowing, and
-      // a rebuilt chip cannot keep the old pop-over.
+      // The old target elements are gone; a stale hover would keep glowing.
       this.hoverTarget = null;
       this._previewRow = null;
-      this._hideGenrePop();
     }
-    this._tipCard = card;
+    // Playback advances far faster than the card key changes, so the seekbar fill,
+    // playhead, and readout are moved directly each frame instead of rebuilding the
+    // card. Only the auditioning card follows the live position; every other card keeps
+    // the zeroed values it was rendered with.
+    if (card.seek.playing)
+      updateSeekProgress(this.$tip, this.model.previewTime, card.seek.duration);
     // The panel is a sibling of the card, so it needs its own identity gate: a
     // pan/zoom frame must not replace the term rows under the pointer.
     const panelKey = showPanel ? describeKey(describe) : "";
@@ -1689,8 +1870,6 @@ export class CanvasView {
     this._pinPos = null;
     this._previewRow = null;
     this._tipKey = "";
-    this._tipCard = null;
-    this._hideGenrePop();
     this.hoverTarget = null;
     this.$tip.classList.remove("pinned");
     this.$coords.classList.add("hidden");
@@ -1712,6 +1891,50 @@ export class CanvasView {
     this._tipKey = "";
     this.scheduleDraw();
   }
+
+  /** The path of the card under the pointer: the pinned track, else the hover. */
+  private _cardPath(): string | null {
+    if (this.inspect) return this.inspect.path;
+    if (this.hoveredPath) return this.hoveredPath;
+    if (this.hoveredIdx >= 0)
+      return this.model.tracks[this.hoveredIdx]?.path ?? null;
+    return null;
+  }
+
+  /** Fraction of the track at the pointer's x within the seekbar track. */
+  private _seekFraction(track: HTMLElement, clientX: number): number {
+    const r = track.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+  }
+
+  /** Start a seek drag on the card's seekbar; the first move seeks too. */
+  private _onTipSeekDown(e: MouseEvent): void {
+    const track = (e.target as HTMLElement).closest<HTMLElement>("[data-seek]");
+    if (!track) return;
+    const path = this._cardPath();
+    if (!path) return;
+    e.preventDefault();
+    this._seekDragging = true;
+    document.addEventListener("mousemove", this._onDocSeekMove);
+    document.addEventListener("mouseup", this._onDocSeekUp);
+    this.onSeek?.(path, this._seekFraction(track, e.clientX));
+  }
+
+  // The track is re-queried on each move: a seek rebuilds the card (its play
+  // state is part of the re-render key), so a held element would go stale.
+  private _onDocSeekMove = (e: MouseEvent): void => {
+    if (!this._seekDragging) return;
+    const track = this.$tip.querySelector<HTMLElement>("[data-seek]");
+    const path = this._cardPath();
+    if (!track || !path) return;
+    this.onSeek?.(path, this._seekFraction(track, e.clientX));
+  };
+
+  private _onDocSeekUp = (): void => {
+    this._seekDragging = false;
+    document.removeEventListener("mousemove", this._onDocSeekMove);
+    document.removeEventListener("mouseup", this._onDocSeekUp);
+  };
 
   /** Delegated click handling for the inspect card's buttons and result rows. */
   private _onTipClick(e: MouseEvent): void {
@@ -1771,10 +1994,6 @@ export class CanvasView {
       this._previewRow = preview;
       this.onInspectAction?.("hover", preview.dataset.preview!);
     }
-    // Hovering the genre chip opens a pop-over with the full name, so a truncated
-    // one can be read without the fixed-width card reflowing.
-    const genre = t.closest<HTMLElement>("[data-genre-pop]");
-    if (genre) this._showGenrePop(genre);
     const el = t.closest<HTMLElement>("[data-hover-target]");
     const raw = el?.dataset.hoverTarget;
     if (!raw) return;
@@ -1795,11 +2014,6 @@ export class CanvasView {
       "[data-preview]",
     );
     if (preview && previewTo !== preview) this._previewRow = null;
-    const genre = t.closest<HTMLElement>("[data-genre-pop]");
-    const genreTo = (e.relatedTarget as HTMLElement | null)?.closest?.(
-      "[data-genre-pop]",
-    );
-    if (genre && genreTo !== genre) this._hideGenrePop();
     const el = t.closest<HTMLElement>("[data-hover-target]");
     if (!el) return;
     const to = (e.relatedTarget as HTMLElement | null)?.closest?.(
@@ -1811,68 +2025,73 @@ export class CanvasView {
   }
 
   /**
-   * The genre chip's hover pop-over. It is a body-level fixed element, not a
-   * child of the card, so expanding a truncated name never reflows the card.
+   * Cursor-adjacent readout while a held key + scroll adjusts a meter (**M**
+   * preview volume, **D** bloom range). A body-level fixed element, so it
+   * follows the pointer without touching layout, and it fades after a short pause
+   * so it never lingers.
    */
-  private _genrePop: HTMLElement | null = null;
+  private _meterHuds = new Map<string, HTMLElement>();
+  private _meterTimers = new Map<string, number>();
 
-  private _ensureGenrePop(): HTMLElement {
-    if (!this._genrePop) {
-      const pop = document.createElement("div");
-      pop.id = "tt-pop";
-      pop.className = "tt-pop hidden";
-      document.body.appendChild(pop);
-      this._genrePop = pop;
-    }
-    return this._genrePop;
-  }
-
-  /** Show the full genre name (and projected folder) above the chip. */
-  private _showGenrePop(anchor: HTMLElement): void {
-    const genre = this._tipCard?.genre;
-    if (!genre) return;
-    const pop = this._ensureGenrePop();
-    renderGenrePop(pop, genre);
-    const r = anchor.getBoundingClientRect();
-    const pw = pop.offsetWidth,
-      ph = pop.offsetHeight;
-    let top = r.top - ph - 6;
-    if (top < 4) top = r.bottom + 6;
-    const left = Math.max(4, Math.min(r.left, window.innerWidth - pw - 4));
-    pop.style.left = `${left}px`;
-    pop.style.top = `${Math.max(4, Math.min(top, window.innerHeight - ph - 4))}px`;
-  }
-
-  private _hideGenrePop(): void {
-    this._genrePop?.classList.add("hidden");
-  }
-
-  /**
-   * Cursor-adjacent readout while **M + scroll** adjusts the preview volume. A
-   * body-level fixed element, so it follows the pointer without touching layout,
-   * and it fades after a short pause so it never lingers.
-   */
-  private _volumeHud: HTMLElement | null = null;
-  private _volumeHudTimer = 0;
-
+  /** **M + scroll** readout: the preview-volume level. */
   showVolumeHud(clientX: number, clientY: number): void {
-    if (!this._volumeHud) {
-      const hud = document.createElement("div");
-      hud.id = "volume-hud";
-      hud.className = "volume-hud hidden";
+    const pct = Math.round(this.model.previewVolume * 100);
+    this._showMeterHud("volume", "volume-hud", `Volume ${pct}%`, pct, clientX, clientY);
+  }
+
+  /** **D + scroll** readout: the selection-bloom range, named per variable. */
+  showBloomHud(clientX: number, clientY: number): void {
+    const m = this.model;
+    const label = bloomRangeLabel(m.selectionBloom, m.bloomRange()) ?? "no range";
+    // A variable with no range (cluster) has nothing to slide, so the panel shows
+    // the label without a slider rather than a bar that cannot move.
+    const pct = bloomRangeLabel(m.selectionBloom, m.bloomRange())
+      ? Math.round(m.bloomRange() * 100)
+      : null;
+    this._showMeterHud("bloom", "bloom-hud", `Bloom · ${label}`, pct, clientX, clientY);
+  }
+
+  private _showMeterHud(
+    key: string,
+    cls: string,
+    label: string,
+    pct: number | null,
+    clientX: number,
+    clientY: number,
+  ): void {
+    let hud = this._meterHuds.get(key);
+    if (!hud) {
+      hud = document.createElement("div");
+      hud.id = cls;
+      hud.className = `${cls} hidden`;
+      const labelEl = document.createElement("div");
+      labelEl.className = `${cls}-label`;
+      hud.appendChild(labelEl);
       document.body.appendChild(hud);
-      this._volumeHud = hud;
+      this._meterHuds.set(key, hud);
     }
-    const hud = this._volumeHud;
-    hud.textContent = `${Math.round(this.model.previewVolume * 100)}%`;
+    (hud.querySelector(`.${cls}-label`) as HTMLElement).textContent = label;
+    // No pct → no slider: a variable with no range has nothing to slide.
+    let track = hud.querySelector<HTMLElement>(`.${cls}-track`);
+    if (pct === null) {
+      track?.remove();
+    } else {
+      if (!track) {
+        track = document.createElement("div");
+        track.className = `${cls}-track`;
+        track.appendChild(document.createElement("i"));
+        hud.appendChild(track);
+      }
+      (track.querySelector("i") as HTMLElement).style.width = `${pct}%`;
+    }
     hud.classList.remove("hidden");
     hud.style.left = `${clientX + 14}px`;
     hud.style.top = `${clientY + 14}px`;
-    clearTimeout(this._volumeHudTimer);
-    this._volumeHudTimer = setTimeout(
-      () => hud.classList.add("hidden"),
-      700,
-    ) as unknown as number;
+    clearTimeout(this._meterTimers.get(key));
+    this._meterTimers.set(
+      key,
+      setTimeout(() => hud!.classList.add("hidden"), 700) as unknown as number,
+    );
   }
 
   clearHover(): void {
@@ -1880,12 +2099,11 @@ export class CanvasView {
     this.tipReady = false;
     this.hoveredIdx = -1;
     this.hoveredPath = null;
-    this.hoveredSiblingFolder = null;
+    this.hoveredBloomTrack = null;
     // The pinned inspect card outlives the pointer leaving the canvas.
     if (!this.inspect) {
       this.$tip.classList.add("hidden");
       this.$coords.classList.add("hidden");
-      this._hideGenrePop();
     }
   }
 }

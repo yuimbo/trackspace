@@ -79,6 +79,50 @@ describe("ViewModifierView", () => {
     expect(onExternalRefit).toHaveBeenCalledWith("vm-4", false);
   });
 
+  it("hides the refit row while externals are off the map", () => {
+    const { view, el } = makeView();
+    view.render([
+      mod({ id: "vm-4", kind: "external", label: "Library Only" }),
+    ]);
+    expect(el.querySelector<HTMLElement>(".vm-refit")?.hidden).toBe(true);
+    expect(el.querySelector(".vm-label")?.textContent).toBe("Library Only");
+  });
+
+  it("gives a permanent external chip a toggle and no ×", () => {
+    const { view, el } = makeView();
+    const onExternalToggle = vi.fn();
+    view.onExternalToggle = onExternalToggle;
+    view.render([
+      mod({
+        id: "vm-4",
+        kind: "external",
+        label: "Library + External",
+        checked: false,
+        permanent: true,
+      }),
+    ]);
+    expect(el.querySelector(".vm-dismiss")).toBeNull();
+    el.querySelector<HTMLElement>("[data-modifier-toggle]")!.click();
+    expect(onExternalToggle).toHaveBeenCalledWith("vm-4");
+  });
+
+  it("shows the V and R hotkey hints on the external chip", () => {
+    const { view, el } = makeView();
+    view.render([
+      mod({
+        id: "vm-4",
+        kind: "external",
+        label: "Library + External",
+        checked: false,
+        permanent: true,
+      }),
+    ]);
+    const hints = [...el.querySelectorAll(".vm-hotkey")].map(
+      (k) => k.textContent,
+    );
+    expect(hints).toEqual(["V", "R"]);
+  });
+
   it("reuses the chip element across a re-render, so a drag keeps its input", () => {
     const { view, el } = makeView();
     view.render([mod({ id: "vm-3", kind: "proximity", value: 40 })]);

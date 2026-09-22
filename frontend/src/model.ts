@@ -3,10 +3,22 @@ import {
   getLens,
   nextLensId,
   prevLensId,
+  stepColorMode,
   type ColorMode,
   type Lens,
   type LensPreset,
 } from "./lib/lenses";
+import {
+  BLOOM_RANGE_KEYS,
+  DEFAULT_BLOOM_RANGE,
+  bloomFolderLevels,
+  bloomKeySteps,
+  bloomRangeKey,
+  bloomTempoPct,
+  camelotSteps,
+  folderAncestor,
+  type BloomRangeKey,
+} from "./lib/bloom";
 
 /** Cached librosa descriptors ([0,1]) when the fingerprint has a features row. */
 export interface TrackAudioFeatures {
@@ -27,6 +39,8 @@ export interface TrackStructure {
   peak_end: number | null;
   break_start: number | null;
   break_end: number | null;
+  /** Track length in seconds, probed from the file header; the seekbar timeline. */
+  duration?: number | null;
   /** True when the track's excerpts disagree (intro vs drop). */
   genre_spanning?: boolean;
 }
@@ -204,6 +218,33 @@ function _migrateColorMode(raw: unknown, legacyCluster?: unknown): ColorMode {
   return Boolean(legacyCluster) ? "cluster" : "folder";
 }
 
+/**
+ * Read the per-variable bloom ranges. A legacy scalar (the old shared
+ * ``bloomRange`` or the older visual ``bloomAmount``) seeds every slot; a stored
+ * record overrides slot by slot. A stored 0 is a real range (exact class), so only
+ * a missing or non-numeric value falls back to the default.
+ */
+function _migrateBloomRanges(
+  raw: unknown,
+  legacy: unknown,
+): Record<BloomRangeKey, number> {
+  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
+  const out = Object.fromEntries(
+    BLOOM_RANGE_KEYS.map((k) => [k, DEFAULT_BLOOM_RANGE]),
+  ) as Record<BloomRangeKey, number>;
+  if (typeof legacy === "number" && Number.isFinite(legacy)) {
+    for (const k of BLOOM_RANGE_KEYS) out[k] = clamp01(legacy);
+  }
+  if (raw && typeof raw === "object") {
+    const r = raw as Record<string, unknown>;
+    for (const k of BLOOM_RANGE_KEYS) {
+      const v = r[k];
+      if (typeof v === "number" && Number.isFinite(v)) out[k] = clamp01(v);
+    }
+  }
+  return out;
+}
+
 function _migrateLensPresets(raw: unknown): LensPreset[] {
   if (!Array.isArray(raw)) return [];
   const out: LensPreset[] = [];
@@ -234,24 +275,27 @@ export type ViewMode = "tags" | "embeddings";
  * the brim. The view options live on the canvas edge instead. See
  * `ui_conventions.md` → *Right panel*.
  */
-export const RIGHT_PANEL_TABS = ["analysis", "organise", "tracks"] as const;
+export const RIGHT_PANEL_TABS = ["analysis", "tracks"] as const;
 export type RightPanelTab = (typeof RIGHT_PANEL_TABS)[number];
 
-/** Hover-preview audition section; cycled with **D** and highlighted in the tooltip. */
+/** Hover-preview audition section; cycled with **W** and highlighted in the tooltip. */
 export type PreviewSection = "intro" | "drop" | "break";
 
 /**
- * A list-like navigation element under the pointer: a folder row, a cluster row, or a
- * card chip (key / BPM). One concept so the glow, **s** (solo), **h** (fit), **f**
- * (select) and **Shift+s** (exclude) affordances behave the same wherever the element
- * is rendered. See `design-patterns.md` → *Navigation targets*.
+ * A list-like navigation element under the pointer: a folder row, a cluster row, a
+ * card chip (key / BPM), or an overlay row whose class is a set of tracks (a bloom
+ * cluster of BPMs / keys). One concept so the glow, **s**, **h**, **f** (select) and
+ * **Shift+s** (exclude) affordances behave the same wherever the element is rendered.
+ * See `design-patterns.md` → *Navigation targets*.
  */
 export type HoverTarget =
   | { kind: "folder"; prefix: string }
   | { kind: "cluster"; id: number }
   | { kind: "key"; value: string }
   | { kind: "bpm"; value: number }
-  | { kind: "track"; path: string };
+  | { kind: "track"; path: string }
+  /** An explicit path set (a bloom cluster); `color` tints the halo. */
+  | { kind: "paths"; paths: string[]; color?: string };
 
 /** BPM window that counts as "the same tempo" for the BPM chip's hover target. */
 export const BPM_MATCH_TOLERANCE = 2;
@@ -286,6 +330,11 @@ export interface ViewModifier {
   value?: number;
   /** Toggle state for an `external` chip (refit with external). */
   checked?: boolean;
+  /**
+   * A chip with no × — a permanent view filter (the external toggle) that Esc and
+   * a direct close must leave in place.
+   */
+  permanent?: boolean;
 }
 
 export interface Viewport {
@@ -395,6 +444,10 @@ export class Model extends EventBus {
   previewTrackPath: string | null = null;
   /** Section the hover preview is auditioning; ``null`` while not previewing. */
   previewSection: PreviewSection | null = null;
+  /** Playback position of the hover preview, in seconds (in-memory only). */
+  previewTime = 0;
+  /** Duration of the auditioned track, in seconds; ``0`` until metadata loads. */
+  previewDuration = 0;
   vp: Viewport = { ox: 0, oy: 0, zoom: 1 };
   _knownTags: string[] = [];
 
@@ -550,6 +603,33 @@ export class Model extends EventBus {
   /** How dots are coloured (folder, cluster, tempo, key); persisted. */
   colorMode: ColorMode = "folder";
   /**
+   * Variable the selection-bloom cursor points at: hovering a dot blooms every
+   * track that matches it on this variable. Independent of ``colorMode`` so the map
+   * can be coloured by one variable while blooming by another; moved with **D** /
+   * **Shift+D** across the colour tabs. Persisted.
+   */
+  selectionBloom: ColorMode = "folder";
+  /**
+   * Per-variable selection-bloom range [0,1]; **D + scroll** widens the range of
+   * the cursor's current variable. Each variable keeps its own value so widening the
+   * tempo bloom does not also widen the folder bloom; folder and predicted folder
+   * share one slot. The meaning is per-variable (parent folders / ±BPM / ±key steps)
+   * — see `lib/bloom.ts`. Persisted.
+   */
+  bloomRanges: Record<BloomRangeKey, number> = Object.fromEntries(
+    BLOOM_RANGE_KEYS.map((k) => [k, DEFAULT_BLOOM_RANGE]),
+  ) as Record<BloomRangeKey, number>;
+
+  /** The bloom range for *mode* (default: the cursor's variable). */
+  bloomRange(mode: ColorMode = this.selectionBloom): number {
+    return this.bloomRanges[bloomRangeKey(mode)];
+  }
+
+  /** Set the bloom range for *mode* (default: the cursor's variable). */
+  setBloomRange(value: number, mode: ColorMode = this.selectionBloom): void {
+    this.bloomRanges[bloomRangeKey(mode)] = Math.max(0, Math.min(1, value));
+  }
+  /**
    * Per-source weights for clustering and the layout; persisted. One vector drives
    * both pipelines so the map and cluster assignments describe the same space.
    */
@@ -572,6 +652,8 @@ export class Model extends EventBus {
   folderPredictionMatches: Set<string> = new Set();
   folderPredictionsLoaded = false;
   folderPredictionsAvailable = false;
+  /** True while the head's predictions are being fetched, for the status bar. */
+  folderPredictionsLoading = false;
   /** Predicted-folder colour: confident matches only, or every nearest. Persisted. */
   headColorConfident = true;
 
@@ -605,8 +687,14 @@ export class Model extends EventBus {
    */
   private _visibleTreePrefixes: Set<string> | null = null;
 
-  /** Hidden by path (session-only). */
+  /** Explicitly excluded by path (session-only; Alt+click / Shift+S). */
   hiddenPaths = new Set<string>();
+  /**
+   * Hidden by the distance-filter slider, tracked apart from ``hiddenPaths`` so
+   * the Excluded chip counts only explicit exclusions and the two filters can be
+   * dismissed independently. Session-only.
+   */
+  proximityHiddenPaths = new Set<string>();
   /** Hide every track in this folder and subfolders (normalised "", not "."). */
   hiddenFolderPrefixes = new Set<string>();
   /** Root ids whose role is "external" (not My library); from `/api/folders`. */
@@ -643,6 +731,7 @@ export class Model extends EventBus {
 
   isTrackHidden(t: Track): boolean {
     if (this.hiddenPaths.has(t.path)) return true;
+    if (this.proximityHiddenPaths.has(t.path)) return true;
     const tf = t.folder ?? "";
     for (const p of this.hiddenFolderPrefixes) {
       if (p === "") return true;
@@ -893,7 +982,7 @@ export class Model extends EventBus {
     keep: ReadonlySet<string>,
     previouslyHidden: ReadonlySet<string>,
   ): Set<string> {
-    const next = new Set(this.hiddenPaths);
+    const next = new Set(this.proximityHiddenPaths);
     for (const p of previouslyHidden) next.delete(p);
     const newlyHidden = new Set<string>();
     for (const t of this.allTracks) {
@@ -903,11 +992,18 @@ export class Model extends EventBus {
       next.add(t.path);
       newlyHidden.add(t.path);
     }
-    this.hiddenPaths = next;
+    this.proximityHiddenPaths = next;
     this._invalidateView();
-    this._clearExclusionsIfNoneVisible();
     this.emit("change");
     return newlyHidden;
+  }
+
+  /** Reveal every track the distance-filter slider hid (dismiss its chip). */
+  clearProximityHidden(): void {
+    if (this.proximityHiddenPaths.size === 0) return;
+    this.proximityHiddenPaths = new Set();
+    this._invalidateView();
+    this.emit("change");
   }
 
   /** Every known track in *paths* is excluded (and at least one exists). */
@@ -948,7 +1044,78 @@ export class Model extends EventBus {
         );
       case "track":
         return track.path === target.path;
+      case "paths":
+        return target.paths.includes(track.path);
     }
+  }
+
+  /**
+   * True when *track* falls inside the hovered track's bloom on the selection
+   * variable (``selectionBloom``) at the current ``bloomRange``, so hovering a dot
+   * blooms its "family" the way the old same-folder rule did. Folder and predicted
+   * folder climb ``bloomFolderLevels`` parent directories, tempo allows a
+   * ``bloomTempoPct`` window, key allows ``bloomKeySteps`` Camelot steps; cluster
+   * is an exact id match. A track the variable cannot place never blooms.
+   */
+  trackBloomsWith(track: Track, hovered: Track): boolean {
+    switch (this.selectionBloom) {
+      case "folder": {
+        const lv = bloomFolderLevels(this.bloomRange());
+        return (
+          folderAncestor(track.folder ?? "", lv) ===
+          folderAncestor(hovered.folder ?? "", lv)
+        );
+      }
+      case "head": {
+        const a = this.folderPredictions.get(track.path);
+        const b = this.folderPredictions.get(hovered.path);
+        if (a === undefined || b === undefined) return false;
+        return folderAncestor(a, bloomFolderLevels(this.bloomRange())) ===
+          folderAncestor(b, bloomFolderLevels(this.bloomRange()));
+      }
+      case "cluster": {
+        const a = this.clusterAssignments.get(track.path);
+        const b = this.clusterAssignments.get(hovered.path);
+        return a !== undefined && a === b;
+      }
+      case "tempo": {
+        if (track.bpm == null || hovered.bpm == null) return false;
+        if (!Number.isFinite(track.bpm) || !Number.isFinite(hovered.bpm))
+          return false;
+        const tol = (Math.abs(hovered.bpm) * bloomTempoPct(this.bloomRange())) / 100;
+        return Math.abs(track.bpm - hovered.bpm) <= tol + 1e-9;
+      }
+      case "key": {
+        const steps = camelotSteps(track, hovered);
+        return steps !== null && steps <= bloomKeySteps(this.bloomRange());
+      }
+    }
+  }
+
+  /** Step the selection-bloom cursor through the colour tabs (**D** / **Shift+D**). */
+  moveSelectionBloom(dir: 1 | -1 = 1): void {
+    this.selectionBloom = stepColorMode(this.selectionBloom, dir);
+  }
+
+  /**
+   * Paths in the hovered dot's bloom class, for **S** to isolate. Folder colour
+   * isolates the whole subtree under the bloom's ancestor — the left-browser
+   * folder-click behaviour, so **S** over a folder behaves like clicking it in the
+   * tree. Every other variable isolates the range-aware bloom set.
+   */
+  bloomPaths(hovered: Track): Set<string> {
+    if (this.selectionBloom === "folder") {
+      const prefix = folderAncestor(
+        hovered.folder ?? "",
+        bloomFolderLevels(this.bloomRange()),
+      );
+      return this.hoverTargetPaths({ kind: "folder", prefix });
+    }
+    const out = new Set<string>();
+    for (const t of this.allTracks) {
+      if (this.trackBloomsWith(t, hovered)) out.add(t.path);
+    }
+    return out;
   }
 
   /** Known paths belonging to *target*, hidden or not (the solo/fit keep-set). */
@@ -1273,6 +1440,8 @@ export class Model extends EventBus {
         scopeLensId: this.scopeLensId,
         clusterResolution: this.clusterResolution,
         colorMode: this.colorMode,
+        selectionBloom: this.selectionBloom,
+        bloomRanges: this.bloomRanges,
         headColorConfident: this.headColorConfident,
         clusterWeights: this.clusterWeights,
         trainFolders: this.trainFolders,
@@ -1321,6 +1490,17 @@ export class Model extends EventBus {
         this.colorMode = _migrateColorMode(
           (d as { colorMode?: unknown }).colorMode,
           (d as { colorByCluster?: unknown }).colorByCluster,
+        );
+        this.selectionBloom = _migrateColorMode(
+          (d as { selectionBloom?: unknown }).selectionBloom,
+        );
+        // Legacy ``bloomAmount`` (a visual scale) and the single ``bloomRange``
+        // both predate the per-variable ranges; carry either over into every
+        // slot so an existing value is not lost.
+        this.bloomRanges = _migrateBloomRanges(
+          (d as { bloomRanges?: unknown }).bloomRanges,
+          (d as { bloomRange?: unknown }).bloomRange ??
+            (d as { bloomAmount?: unknown }).bloomAmount,
         );
         this.headColorConfident =
           (d as { headColorConfident?: unknown }).headColorConfident !== false;

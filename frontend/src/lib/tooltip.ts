@@ -2,8 +2,9 @@
 //
 // The tooltip is a small card rather than a block of text: a title/artist header
 // (collapsing to the filename when metadata is missing), a location stack of the
-// folder and cluster as icon-distinguished coloured tags, structure chips (the
-// audition sections), and two stat areas — user tags and audio features. BPM and key
+// folder and cluster as icon-distinguished coloured tags, a preview seekbar (the
+// audition timeline with its structure sections as markers), and two stat areas — user
+// tags and audio features. BPM and key
 // appear only in Features, as chips filled with the same colours as the tempo/key
 // colour modes, so they are not duplicated near the title. `buildTooltip` is pure
 // (unit-testable) and `renderTooltip` is the only DOM code, so the canvas view
@@ -27,7 +28,12 @@ import {
 } from "./colors";
 import { trackTempoNorm } from "./lenses";
 import { displayFolderPath } from "./path-presenter";
-import { structureChips, type StructureChip } from "./structure";
+import { hotkeyBinding, hotkeyLabel } from "../hotkeys";
+import {
+  formatTimestamp,
+  structureMarkers,
+  type StructureMarker,
+} from "./structure";
 
 /** One stat row: a 0–1 bar (or a chip for categorical stats) plus its readout. */
 export interface TooltipBar {
@@ -50,16 +56,26 @@ export interface TooltipGenre {
   spanning: boolean;
   /** Hover target for the cluster name (``null`` when unassigned). */
   target: HoverTarget | null;
-  /** Folder head's predicted destination, when it differs from the track's folder. */
-  projectedFolder: string | null;
-  /** Whether that prediction clears its class's match floor. */
-  projectedConfident: boolean;
 }
 
 /** One ranked neighbour: the raw path plus the similarity score. */
 export interface TooltipResult {
   path: string;
   score: number;
+}
+
+/**
+ * The preview seekbar: the auditioned track's timeline. ``time``/``duration`` are
+ * seconds, so the fill and playhead show how far playback has run and the readout
+ * pairs the current position with the total; ``markers`` place the cached structure
+ * sections along the same timeline. ``playing`` is false when the track is not the one
+ * currently auditioning, which renders the inactive state.
+ */
+export interface TooltipSeek {
+  time: number;
+  duration: number;
+  playing: boolean;
+  markers: StructureMarker[];
 }
 
 /** One zero-shot phrase CLAP ranked for the track (a phrase bank candidate). */
@@ -147,11 +163,25 @@ export interface TooltipCard {
   folderColors: string[];
   /** Hover target for the folder tag (the track's folder). */
   folderTarget: HoverTarget;
+  /** Folder head's predicted destination, or ``null`` when it has no prediction. */
+  projectedFolder: string | null;
+  /** Icon colour stops for the projected folder (``[]`` when there is none). */
+  projectedColors: string[];
+  /**
+   * One short word for the projected row when the head has no destination to show:
+   * ``No head``, ``Not analysed``, or ``Loading…``. ``null`` when a projected
+   * folder is shown. The sentence that explains it lives in ``projectedHint``,
+   * shown only on hover.
+   */
+  projectedNote: string | null;
+  /** Hover elaboration for the projected row (full path, confidence, or why not). */
+  projectedHint: string | null;
   /** Bold primary line: the title, falling back to the filename. */
   title: string;
   /** Secondary artist line, or ``null`` when the track has no artist metadata. */
   artist: string | null;
-  chips: StructureChip[];
+  /** The preview seekbar: always rendered, active only while auditioning. */
+  seek: TooltipSeek;
   genre: TooltipGenre | null;
   tags: TooltipBar[];
   features: TooltipBar[];
@@ -263,18 +293,52 @@ export function buildTooltip(
   const title = (track.title || "").trim() || track.filename;
 
   const structure = m.trackStructure.get(track.path);
-  const chips = structureChips(structure);
-  const activeSection =
-    m.previewTrackPath === track.path ? m.previewSection : null;
+  const auditioning = m.previewTrackPath === track.path;
+  const activeSection = auditioning ? m.previewSection : null;
+  // The timeline is always rendered: its length is the probed structure duration,
+  // falling back to the audio element's own duration while the fetch is in flight — but
+  // only for the track being auditioned, since a non-auditioned track has no length of
+  // its own. Without a duration the seekbar renders as an empty, inactive track.
+  const structureDuration = structure?.duration ?? 0;
+  const timeline =
+    structureDuration > 0 ? structureDuration : auditioning ? m.previewDuration : 0;
+  const playing = auditioning && timeline > 0;
+  const seek: TooltipSeek = {
+    time: playing ? m.previewTime : 0,
+    duration: timeline,
+    playing,
+    markers: structureMarkers(structure, timeline),
+  };
 
   const cid = m.clusterAssignments.get(track.path);
   const spanning = structure?.genre_spanning === true;
-  // The head's predicted destination, shown only when it would actually move the
-  // track (a prediction equal to the current folder says nothing new).
+  // The head's nearest learned folder, shown whenever the head has a prediction —
+  // including one equal to the current folder, so the chip always names where the
+  // head places the track rather than falling back to a bare "Same".
   const predicted = m.folderPredictions.get(track.path);
-  const projectedFolder =
-    predicted && predicted !== folderPath ? displayFolderPath(predicted) : null;
+  const projected = predicted ?? null;
+  const projectedFolder = projected !== null ? displayFolderPath(projected) : null;
+  const projectedColors = projected !== null ? dirTagColors(projected) : [];
   const projectedConfident = m.folderPredictionMatches.has(track.path);
+  // The row reads one short word only when the head has nothing to say; the
+  // sentence that explains it — or the full destination path and confidence —
+  // lives in the hover title, so the chip keeps its width for the value itself.
+  let projectedNote: string | null = null;
+  let projectedHint: string | null = null;
+  if (projected !== null) {
+    projectedHint =
+      `${projectedFolder} — the head's nearest match` +
+      (projectedConfident ? "" : " · low confidence");
+  } else if (!m.folderPredictionsLoaded) {
+    projectedNote = "Loading…";
+    projectedHint = "Loading the head's predicted folders…";
+  } else if (!m.folderPredictionsAvailable) {
+    projectedNote = "No head";
+    projectedHint = "No trained folder head yet.";
+  } else {
+    projectedNote = "Not analysed";
+    projectedHint = "Not analysed yet — the head has no embedding for it.";
+  }
   const genre: TooltipGenre | null =
     cid === undefined && !spanning
       ? null
@@ -286,8 +350,6 @@ export function buildTooltip(
           color: cid === undefined ? null : clusterColor(cid),
           spanning,
           target: cid === undefined ? null : { kind: "cluster", id: cid },
-          projectedFolder,
-          projectedConfident,
         };
 
   const tags = tagRows(track);
@@ -309,12 +371,17 @@ export function buildTooltip(
     track.title,
     track.folder ?? "",
     structure ? JSON.stringify(structure) : "",
-    chips.map((c) => c.text).join("|"),
     tags.map((t) => `${t.label}:${t.readout}`).join("|"),
     features.map((f) => `${f.label}:${f.readout}:${f.value}`).join("|"),
     activeSection ?? "",
+    // The seekbar's length and play state gate the markers and active label, so
+    // they rebuild the card; the live position deliberately does not (see
+    // `updateSeekProgress`).
+    `${seek.duration}:${seek.playing ? "play" : ""}`,
     cid ?? "",
     projectedFolder ?? "",
+    projectedNote ?? "",
+    projectedHint ?? "",
     m.clusterRevision ?? "",
     effectiveInspect ? inspectKey(effectiveInspect) : "",
   ].join("\u0001");
@@ -325,9 +392,13 @@ export function buildTooltip(
     folder,
     folderColors: dirTagColors(folderPath),
     folderTarget: { kind: "folder", prefix: track.folder ?? "" },
+    projectedFolder,
+    projectedColors,
+    projectedNote,
+    projectedHint,
     title,
     artist,
-    chips,
+    seek,
     genre,
     tags,
     features,
@@ -402,11 +473,11 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const FOLDER_GLYPH = "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z";
 const TAG_GLYPH = "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z";
 
-/** Folder or tag glyph, stroked in `currentColor` so the tag sets the contrast. */
-function locationIcon(kind: "folder" | "tag"): SVGSVGElement {
+/** Folder or tag glyph, stroked in `currentColor` so the chip sets the contrast. */
+function chipIcon(kind: "folder" | "tag"): SVGSVGElement {
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("class", "tt-loc-icon");
+  svg.setAttribute("class", `tt-chip-icon tt-chip-icon-${kind}`);
   svg.setAttribute("aria-hidden", "true");
   svg.setAttribute("fill", "none");
   svg.setAttribute("stroke", "currentColor");
@@ -453,81 +524,133 @@ function tagTextColor(colors: string[]): string {
   return avg > 0.179 ? "#0d1219" : "#f4f7fb";
 }
 
-/** One filled location chip: a coloured type icon plus its name. */
+/**
+ * The one chip in the card. Every pill — the folder/cluster location tags, the
+ * genre rows, the tempo/key stats, the projected-head state, and the structure
+ * sections — is this, so they share one geometry, fill, and contrast rule. Only
+ * *value* is required; *icon* and *label* are the optional visible parts, and
+ * *title* carries any elaboration on hover so the chip itself stays short.
+ */
+interface ChipParts {
+  /** The chip's main text. */
+  value: string;
+  /** Leading glyph, stroked in the chip's contrast colour. */
+  icon?: "folder" | "tag";
+  /** Small uppercase caption before the value (e.g. "Tempo"). */
+  label?: string;
+  /** Colour stops: a solid fill or a parent→own gradient; `[]` = neutral. */
+  colors?: string[];
+  /** Navigation target: glow/solo/fit, like a sidebar row. */
+  target?: HoverTarget | null;
+  /** Hover elaboration; the navigation hint is appended when the chip is a target. */
+  title?: string | null;
+}
+
+function chip(parts: ChipParts): HTMLElement {
+  const node = el("span", "tt-chip");
+  const colors = parts.colors ?? [];
+  const fill = tagFill(colors);
+  if (fill) {
+    node.classList.add("tt-chip-filled");
+    node.style.background = fill;
+    node.style.color = tagTextColor(colors);
+  }
+  if (parts.icon) node.appendChild(chipIcon(parts.icon));
+  if (parts.label) node.appendChild(el("span", "tt-chip-label", parts.label));
+  node.appendChild(el("span", "tt-chip-value", parts.value));
+  if (parts.target) {
+    // Keep the S / H hint discoverable; prepend the chip's own elaboration.
+    const hint = parts.title ? `${parts.title} · ${TARGET_HINT}` : TARGET_HINT;
+    markTarget(node, parts.target, hint);
+  } else if (parts.title) {
+    node.title = parts.title;
+  }
+  return node;
+}
+
+/** Folder location chip on the plain card: a folder glyph plus its name. */
 function locationTag(
   kind: "folder" | "tag",
   label: string,
   colors: string[],
   target: HoverTarget,
+  title?: string,
 ): HTMLElement {
-  const tag = el("span", `tt-loc-tag tt-${kind}`);
-  const fill = tagFill(colors);
-  if (fill) {
-    tag.classList.add("tt-loc-filled");
-    tag.style.background = fill;
-    tag.style.color = tagTextColor(colors);
-  }
-  tag.appendChild(locationIcon(kind));
-  tag.appendChild(el("span", "tt-loc-name", label));
-  return markTarget(tag, target);
+  return chip({ icon: kind, value: label, colors, target, title });
 }
 
-/** Cluster chip: filled tag colour + tag icon + name + spanning badge. */
+/** Cluster chip on the plain card: a tag glyph, its colour, and its name. */
 function clusterTag(genre: TooltipGenre): HTMLElement {
-  const tag = el("span", "tt-loc-tag tt-cluster");
-  const colors = genre.color ? [genre.color] : [];
-  const fill = tagFill(colors);
-  if (fill) {
-    tag.classList.add("tt-loc-filled");
-    tag.style.background = fill;
-    tag.style.color = tagTextColor(colors);
-  }
-  tag.appendChild(locationIcon("tag"));
-  if (genre.name) tag.appendChild(el("span", "tt-loc-name", genre.name));
-  if (genre.spanning) {
-    const badge = el("span", "tt-badge", "genre-spanning");
-    badge.title = SPANNING_HINT;
-    tag.appendChild(badge);
-  }
-  if (genre.target) markTarget(tag, genre.target);
-  // The chip truncates long names; hovering it shows the full one in a pop-over.
-  tag.dataset.genrePop = "";
-  return tag;
+  return chip({
+    icon: "tag",
+    value: genre.name ?? "",
+    colors: genre.color ? [genre.color] : [],
+    target: genre.target,
+    title: genre.spanning ? SPANNING_HINT : null,
+  });
+}
+
+/** One genre row: a caption above a value chip (a nav target). */
+function genreRow(
+  label: string,
+  value: string,
+  colors: string[],
+  target: HoverTarget | null,
+  title: string,
+  icon?: "folder" | "tag",
+): HTMLElement {
+  const row = el("div", "tt-genre-row");
+  row.appendChild(el("div", "tt-genre-label", label));
+  row.appendChild(chip({ icon, value, colors, target, title }));
+  return row;
 }
 
 /**
- * Render the genre chip's hover pop-over: the chip's full (untruncated) name,
- * plus the folder head's projected destination when it differs from the track's
- * current folder. A fixed overlay, so it never reflows the card underneath.
+ * The genres list, expanded inline in the pinned card: the track's Folder, the
+ * folder head's Projected folder, and its Cluster — all styled the same, each a
+ * caption above a chip. The folder and cluster chips are navigation targets, so the
+ * S / H / F hotkeys act on them like a sidebar row. Anything that needs a
+ * sentence (a weak projection, the head's reasoning, or the genre-spanning flag)
+ * is only shown on hover, so the chips stay short.
  */
-export function renderGenrePop(host: HTMLElement, genre: TooltipGenre): void {
-  const pop = el("div", "tt-pop-card");
-  const chip = el("span", "tt-pop-genre");
-  if (genre.color) {
-    chip.classList.add("tt-loc-filled");
-    chip.style.background = genre.color;
-    chip.style.color = tagTextColor([genre.color]);
-  }
-  chip.appendChild(locationIcon("tag"));
-  chip.appendChild(el("span", "tt-pop-name", genre.name ?? "No genre"));
-  pop.appendChild(chip);
-  if (genre.spanning)
-    pop.appendChild(el("div", "tt-pop-note", SPANNING_HINT));
-  if (genre.projectedFolder) {
-    const proj = el("div", "tt-pop-proj");
-    proj.appendChild(el("div", "tt-pop-proj-label", "Projected folder"));
-    const line = el("div", "tt-pop-proj-path");
-    line.appendChild(
-      locationIcon("folder"),
-    );
-    line.appendChild(el("span", "tt-pop-proj-name", genre.projectedFolder));
-    if (!genre.projectedConfident)
-      line.appendChild(el("span", "tt-pop-proj-low", "low confidence"));
-    proj.appendChild(line);
-    pop.appendChild(proj);
-  }
-  host.replaceChildren(pop);
-  host.classList.remove("hidden");
+function genreList(card: TooltipCard): HTMLElement {
+  const genre = card.genre;
+  const folderPath =
+    card.folderTarget.kind === "folder" ? card.folderTarget.prefix : "";
+  const list = el("div", "tt-genres");
+  list.appendChild(
+    genreRow(
+      "Folder",
+      card.folder,
+      card.folderColors,
+      card.folderTarget,
+      folderPath || "(library root)",
+      "folder",
+    ),
+  );
+  // A missing projected folder reads one short word ("No head", …); the
+  // sentence that explains it — and any low-confidence note — is the hover title.
+  list.appendChild(
+    genreRow(
+      "Projected folder",
+      card.projectedFolder ?? card.projectedNote ?? "—",
+      card.projectedColors,
+      null,
+      card.projectedHint ?? "",
+      card.projectedFolder ? "folder" : undefined,
+    ),
+  );
+  list.appendChild(
+    genreRow(
+      "Cluster",
+      genre?.name ?? "—",
+      genre?.color ? [genre.color] : [],
+      genre?.target ?? null,
+      genre?.spanning ? SPANNING_HINT : "",
+      "tag",
+    ),
+  );
+  return list;
 }
 
 function statSection(
@@ -537,21 +660,21 @@ function statSection(
 ): HTMLElement {
   const section = el("div", `tt-section${extra ? " " + extra : ""}`);
   section.appendChild(el("div", "tt-section-title", title));
+  let chipBox: HTMLElement | null = null;
   for (const r of rows) {
     if (r.chip) {
       // Categorical stat (key/BPM): the value has no magnitude to bar, so show a
       // chip in the same row style as the other stats. A feature-lens colour fills
       // it, so the card reads with the same palette as the map.
-      const chip = el("span", "tt-stat-chip");
-      if (r.color) {
-        chip.classList.add("tt-stat-chip-filled");
-        chip.style.background = r.color;
-        chip.style.color = tagTextColor([r.color]);
-      }
-      chip.appendChild(el("span", "tt-stat-chip-label", r.label));
-      chip.appendChild(el("span", "tt-stat-chip-value", r.readout));
-      if (r.target) markTarget(chip, r.target);
-      section.appendChild(chip);
+      chipBox ??= section.appendChild(el("div", "tt-stat-chips"));
+      chipBox.appendChild(
+        chip({
+          label: r.label,
+          value: r.readout,
+          colors: r.color ? [r.color] : [],
+          target: r.target,
+        }),
+      );
       continue;
     }
     const row = el("div", "tt-stat");
@@ -576,23 +699,28 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   if (card.artist) head.appendChild(el("div", "tt-artist", card.artist));
   root.appendChild(head);
 
-  const location = el("div", "tt-loc");
-  location.appendChild(
-    locationTag("folder", card.folder, card.folderColors, card.folderTarget),
-  );
-  if (card.genre) location.appendChild(clusterTag(card.genre));
-  root.appendChild(location);
-
-  if (card.chips.length) {
-    const chips = el("div", "tt-chips");
-    for (const c of card.chips) {
-      const chip = el("span", "tt-chip", c.text);
-      chip.dataset.section = c.section;
-      if (c.section === card.activeSection) chip.classList.add("active");
-      chips.appendChild(chip);
-    }
-    root.appendChild(chips);
+  if (card.inspect) {
+    // Pinned card: the genres expand inline (Folder / Projected folder /
+    // Cluster), so Alt-focusing the card shows the placement without a hover.
+    root.appendChild(genreList(card));
+  } else {
+    const location = el("div", "tt-loc");
+    const folderPath =
+      card.folderTarget.kind === "folder" ? card.folderTarget.prefix : "";
+    location.appendChild(
+      locationTag(
+        "folder",
+        card.folder,
+        card.folderColors,
+        card.folderTarget,
+        folderPath || "(library root)",
+      ),
+    );
+    if (card.genre) location.appendChild(clusterTag(card.genre));
+    root.appendChild(location);
   }
+
+  root.appendChild(seekbar(card.seek, card.activeSection));
 
   if (card.tags.length) root.appendChild(statSection("Personal tags", card.tags));
   if (card.features.length)
@@ -603,6 +731,95 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   if (card.hint) root.appendChild(el("div", "tt-hint", card.hint));
 
   host.replaceChildren(root);
+}
+
+/** 0–100 % of *time* through *duration*, clamped and finite-safe. */
+function progressPct(time: number, duration: number): number {
+  if (!(duration > 0) || !Number.isFinite(time)) return 0;
+  return Math.max(0, Math.min(100, (time / duration) * 100));
+}
+
+/**
+ * The preview seekbar: a track filled to the current playback position, with a
+ * playhead at the leading edge, a ``pos / total`` readout, the hotkey hint, and the
+ * cached structure sections as markers along it. Only the auditioned section's marker
+ * carries a label, so the timeline stays legible. When the track is not auditioning
+ * the seekbar is rendered inactive — dimmed, with an empty fill and the playhead at
+ * the start. Playback advances far faster than the card is rebuilt, so
+ * `updateSeekProgress` moves the fill, playhead, and readout.
+ */
+function seekbar(seek: TooltipSeek, active: PreviewSection | null): HTMLElement {
+  const box = el("div", `tt-seek${seek.playing ? "" : " tt-seek-inactive"}`);
+  const track = el("div", "tt-seek-track");
+  // The track is the seek surface: the card's delegated mousedown/drag reads
+  // `data-seek` to seek the audition to the clicked/dragged fraction.
+  track.dataset.seek = "";
+  const pct = progressPct(seek.time, seek.duration);
+  const fill = el("i", "tt-seek-fill");
+  fill.style.width = `${pct}%`;
+  track.appendChild(fill);
+  for (const marker of seek.markers) {
+    const node = el("span", "tt-seek-marker");
+    node.dataset.section = marker.section;
+    node.style.left = `${marker.fraction * 100}%`;
+    if (marker.section === active) node.classList.add("active");
+    else node.title = marker.text;
+    track.appendChild(node);
+    // The label is a track child, not a marker child, so its `%` is the track
+    // width. Anchoring it on the marker's side keeps it inside the card at either
+    // end without measuring it.
+    if (marker.section === active) {
+      const label = el("span", "tt-seek-label", marker.text);
+      if (marker.fraction <= 0.5)
+        label.style.left = `${marker.fraction * 100}%`;
+      else label.style.right = `${(1 - marker.fraction) * 100}%`;
+      track.appendChild(label);
+    }
+  }
+  // The playhead is added last so it sits above the fill and the section markers.
+  const head = el("i", "tt-seek-head");
+  head.style.left = `${pct}%`;
+  track.appendChild(head);
+  box.appendChild(track);
+  // The hotkey hint floats in the readout row's empty left space, so it never
+  // reflows the card; the full descriptions live in its hover title.
+  const hint = el("div", "tt-seek-hint", SEEK_HINT);
+  hint.title = SEEK_HINT_TITLE;
+  box.appendChild(hint);
+  box.appendChild(
+    el("div", "tt-seek-time", seekReadout(seek.time, seek.duration)),
+  );
+  return box;
+}
+
+/** Compact seekbar hotkey hint; the elaborations live in `SEEK_HINT_TITLE`. */
+const SEEK_W = hotkeyLabel("cycle-preview-section");
+const SEEK_W_PREV = hotkeyLabel("cycle-preview-section-prev");
+const SEEK_M = hotkeyLabel("toggle-preview");
+const SEEK_HINT = `${SEEK_W} seek · ${SEEK_M} mute · ${SEEK_M}+scroll volume`;
+const SEEK_HINT_TITLE =
+  `${SEEK_W} / ${SEEK_W_PREV} — ${hotkeyBinding("cycle-preview-section")!.description}\n` +
+  `${SEEK_M} — ${hotkeyBinding("toggle-preview")!.description}\n` +
+  `${SEEK_M} + scroll — adjust the preview volume`;
+
+/** ``m:ss / m:ss`` for the seekbar; an unknown total renders as an em dash. */
+function seekReadout(time: number, duration: number): string {
+  return `${formatTimestamp(time)} / ${duration > 0 ? formatTimestamp(duration) : "—"}`;
+}
+
+/** Advance the rendered seekbar fill, playhead, and readout without rebuilding. */
+export function updateSeekProgress(
+  host: HTMLElement,
+  time: number,
+  duration: number,
+): void {
+  const pct = progressPct(time, duration);
+  const fill = host.querySelector<HTMLElement>(".tt-seek-fill");
+  if (fill) fill.style.width = `${pct}%`;
+  const head = host.querySelector<HTMLElement>(".tt-seek-head");
+  if (head) head.style.left = `${pct}%`;
+  const readout = host.querySelector<HTMLElement>(".tt-seek-time");
+  if (readout) readout.textContent = seekReadout(time, duration);
 }
 
 /** Pinned card: a Navigate / Describe tab strip plus the active tab's body. */

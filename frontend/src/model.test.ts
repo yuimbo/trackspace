@@ -84,6 +84,32 @@ describe("Model proximity keep", () => {
     expect(m.isTrackHidden(m.trackByPath("b.mp3")!)).toBe(false);
     expect(m.isTrackHidden(m.trackByPath("c.mp3")!)).toBe(true);
   });
+
+  it("does not count a proximity hide as an explicit exclusion", () => {
+    const m = new Model();
+    fourTracks(m);
+    m.setProximityKeep(new Set(["a.mp3"]), new Set());
+    // The Excluded chip counts only explicit exclusions, not the distance filter.
+    expect(m.hasExclusions).toBe(false);
+    m.hidePaths(["b.mp3"]);
+    expect(m.hasExclusions).toBe(true);
+    // Clearing exclusions leaves the proximity filter's hides in place.
+    m.clearExclusions();
+    expect(m.isTrackHidden(m.trackByPath("b.mp3")!)).toBe(true);
+    expect(m.isTrackHidden(m.trackByPath("c.mp3")!)).toBe(true);
+  });
+
+  it("reveals only the proximity filter's hides when it is dismissed", () => {
+    const m = new Model();
+    fourTracks(m);
+    m.hidePaths(["a.mp3"]); // an explicit exclusion
+    m.setProximityKeep(new Set(["a.mp3"]), new Set());
+    expect(m.isTrackHidden(m.trackByPath("c.mp3")!)).toBe(true);
+    m.clearProximityHidden();
+    expect(m.isTrackHidden(m.trackByPath("c.mp3")!)).toBe(false);
+    // The explicit exclusion survives the proximity dismiss.
+    expect(m.isTrackHidden(m.trackByPath("a.mp3")!)).toBe(true);
+  });
 });
 
 describe("Model visible tree prefixes", () => {
@@ -205,6 +231,43 @@ describe("Model lens", () => {
     expect(m3.colorMode).toBe("cluster");
   });
 
+  it("persists the per-variable selection-bloom ranges", () => {
+    localStorage.clear();
+    const m = new Model();
+    m.selectionBloom = "cluster";
+    m.setBloomRange(0.9, "cluster");
+    m.setBloomRange(0.4, "tempo");
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.selectionBloom).toBe("cluster");
+    expect(m2.bloomRange("cluster")).toBeCloseTo(0.9, 6);
+    expect(m2.bloomRange("tempo")).toBeCloseTo(0.4, 6);
+    // Folder and predicted folder share one persisted slot.
+    m2.setBloomRange(0.3, "head");
+    expect(m2.bloomRange("folder")).toBeCloseTo(0.3, 6);
+  });
+
+  it("keeps a stored zero bloom range as the exact class", () => {
+    localStorage.clear();
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ bloomRanges: { tempo: 0 } }),
+    );
+    const m = new Model();
+    m.loadLS();
+    expect(m.bloomRange("tempo")).toBe(0);
+  });
+
+  it("migrates the legacy bloom range into every variable", () => {
+    localStorage.clear();
+    localStorage.setItem("trackspace", JSON.stringify({ bloomAmount: 0.7 }));
+    const m = new Model();
+    m.loadLS();
+    expect(m.bloomRange("tempo")).toBeCloseTo(0.7, 6);
+    expect(m.bloomRange("key")).toBeCloseTo(0.7, 6);
+  });
+
   it("persists the predicted-folder confidence gate, defaulting to on", () => {
     localStorage.clear();
     const m = new Model();
@@ -237,5 +300,141 @@ describe("Model lens", () => {
     m.deleteLensPreset(p.id);
     expect(m.lensId).toBe("tags");
     expect(m.lensPresets).toEqual([]);
+  });
+});
+
+describe("Model selection bloom", () => {
+  function makeTrack(over: Partial<Track> = {}): Track {
+    return {
+      path: "a.mp3",
+      filename: "a.mp3",
+      folder: "",
+      tags: {},
+      artist: "",
+      title: "",
+      ...over,
+    };
+  }
+
+  it("steps the cursor through the colour modes and wraps", () => {
+    const m = new Model();
+    m.selectionBloom = "folder";
+    m.moveSelectionBloom(1);
+    expect(m.selectionBloom).toBe("head");
+    m.moveSelectionBloom(-1);
+    expect(m.selectionBloom).toBe("folder");
+    // Backward from the first wraps to the last.
+    m.moveSelectionBloom(-1);
+    expect(m.selectionBloom).toBe("key");
+  });
+
+  it("blooms same-folder tracks by default", () => {
+    const m = new Model();
+    const a = makeTrack({ path: "House/a.mp3", folder: "House" });
+    expect(m.trackBloomsWith(a, makeTrack({ path: "House/b.mp3", folder: "House" }))).toBe(true);
+    expect(m.trackBloomsWith(a, makeTrack({ path: "Techno/c.mp3", folder: "Techno" }))).toBe(false);
+  });
+
+  it("blooms by cluster, key, tempo and predicted folder", () => {
+    const m = new Model();
+    const af = (key: number, mode: number) => ({
+      tempo: 0.5,
+      key,
+      mode,
+      energy: 0.5,
+      danceability: 0.5,
+    });
+    // a/b share a key; c is five Camelot steps away (minor vs major).
+    const a = makeTrack({ path: "a.mp3", bpm: 128, audio_features: af(0, 0) });
+    const b = makeTrack({ path: "b.mp3", bpm: 129, audio_features: af(0, 0) });
+    const c = makeTrack({ path: "c.mp3", bpm: 150, audio_features: af(4 / 12, 1) });
+
+    m.selectionBloom = "cluster";
+    m.clusterAssignments = new Map([
+      ["a.mp3", 3],
+      ["b.mp3", 3],
+      ["c.mp3", 7],
+    ]);
+    expect(m.trackBloomsWith(a, b)).toBe(true);
+    expect(m.trackBloomsWith(a, c)).toBe(false);
+
+    m.selectionBloom = "key";
+    expect(m.trackBloomsWith(a, b)).toBe(true);
+    expect(m.trackBloomsWith(a, c)).toBe(false);
+    // A full range reaches ±6 Camelot steps, so c's five steps now bloom.
+    m.setBloomRange(1);
+    expect(m.trackBloomsWith(a, c)).toBe(true);
+
+    m.selectionBloom = "tempo";
+    m.setBloomRange(0);
+    expect(m.trackBloomsWith(a, b)).toBe(false);
+    // 0.5 → ±13%: 128 vs 129 blooms, 128 vs 150 does not.
+    m.setBloomRange(0.5);
+    expect(m.trackBloomsWith(a, b)).toBe(true);
+    expect(m.trackBloomsWith(a, c)).toBe(false);
+
+    m.selectionBloom = "head";
+    m.folderPredictions = new Map([
+      ["a.mp3", "Root/Techno"],
+      ["b.mp3", "Root/Techno"],
+      ["c.mp3", "Root/House"],
+    ]);
+    m.setBloomRange(0);
+    expect(m.trackBloomsWith(a, b)).toBe(true);
+    expect(m.trackBloomsWith(a, c)).toBe(false);
+    // One parent level up, both predicted folders share "Root".
+    m.setBloomRange(0.25);
+    expect(m.trackBloomsWith(a, c)).toBe(true);
+  });
+
+  it("keeps a separate range per variable, sharing folder and predicted folder", () => {
+    const m = new Model();
+    m.setBloomRange(0.9, "tempo");
+    m.setBloomRange(0.2, "cluster");
+    // Widening the tempo range leaves the others untouched.
+    expect(m.bloomRange("tempo")).toBeCloseTo(0.9, 6);
+    expect(m.bloomRange("cluster")).toBeCloseTo(0.2, 6);
+    expect(m.bloomRange("key")).toBe(0);
+    // Folder and predicted folder are the same directory climb, so one slot.
+    m.setBloomRange(0.4, "head");
+    expect(m.bloomRange("folder")).toBeCloseTo(0.4, 6);
+  });
+
+  it("isolates the folder subtree for folder colour, the class otherwise", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "GENRES/Ambient/a.mp3", folder: "GENRES/Ambient", bpm: 128 }),
+      makeTrack({ path: "GENRES/Ambient/sub/b.mp3", folder: "GENRES/Ambient/sub", bpm: 128 }),
+      makeTrack({ path: "GENRES/dark/c.mp3", folder: "GENRES/dark", bpm: 150 }),
+    ]);
+    const a = m.trackByPath("GENRES/Ambient/a.mp3")!;
+
+    // Folder colour: the whole subtree, like the left browser.
+    m.selectionBloom = "folder";
+    expect([...m.bloomPaths(a)].sort()).toEqual([
+      "GENRES/Ambient/a.mp3",
+      "GENRES/Ambient/sub/b.mp3",
+    ]);
+
+    // Any other variable: the range-aware bloom class.
+    m.selectionBloom = "tempo";
+    expect([...m.bloomPaths(a)].sort()).toEqual([
+      "GENRES/Ambient/a.mp3",
+      "GENRES/Ambient/sub/b.mp3",
+    ]);
+  });
+
+  it("never blooms a track the variable cannot place", () => {
+    const m = new Model();
+    const a = makeTrack({ path: "a.mp3" });
+    const b = makeTrack({ path: "b.mp3" });
+    m.selectionBloom = "cluster";
+    expect(m.trackBloomsWith(a, b)).toBe(false);
+    m.selectionBloom = "head";
+    expect(m.trackBloomsWith(a, b)).toBe(false);
+    m.selectionBloom = "tempo";
+    expect(m.trackBloomsWith(a, b)).toBe(false);
+    m.selectionBloom = "key";
+    expect(m.trackBloomsWith(a, b)).toBe(false);
   });
 });

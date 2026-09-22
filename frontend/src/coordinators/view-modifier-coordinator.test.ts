@@ -82,4 +82,38 @@ describe("ViewModifierCoordinator", () => {
     const { coord } = makeHarness();
     expect(() => coord.dismiss("vm-999")).not.toThrow();
   });
+
+  it("never dismisses a permanent modifier", () => {
+    const { coord, model } = makeHarness();
+    const clear = vi.fn();
+    const id = coord.push(
+      { kind: "external", label: "Library Only", permanent: true },
+      clear,
+    );
+    coord.dismiss(id);
+    expect(model.viewModifiers).toHaveLength(1);
+    expect(clear).not.toHaveBeenCalled();
+  });
+
+  it("pops the newest dismissible modifier, skipping permanent ones", () => {
+    const { coord, model } = makeHarness();
+    coord.push(
+      { kind: "external", label: "Library Only", permanent: true },
+      () => {},
+    );
+    const clearSearch = vi.fn();
+    coord.push({ kind: "search", label: "x" }, clearSearch);
+    expect(coord.popNewest()).toBe(true);
+    expect(clearSearch).toHaveBeenCalledTimes(1);
+    expect(model.viewModifiers.map((m) => m.kind)).toEqual(["external"]);
+  });
+
+  it("reports false when only permanent modifiers remain", () => {
+    const { coord } = makeHarness();
+    coord.push(
+      { kind: "external", label: "Library Only", permanent: true },
+      () => {},
+    );
+    expect(coord.popNewest()).toBe(false);
+  });
 });
