@@ -418,22 +418,8 @@ export class EmbeddingCoordinator {
     }) as EventListener);
 
     es.addEventListener("progress", ((e: MessageEvent) => {
-      const data = JSON.parse(e.data) as {
-        path: string;
-        ok: boolean;
-        done: number;
-        total: number;
-        failures?: string[];
-      };
+      const data = JSON.parse(e.data) as { done: number; total: number };
       const m = this.deps.model;
-      m.embeddingProgress = {
-        done: data.done,
-        total: data.total,
-        lastPath: data.path,
-        lastOk: data.ok,
-        lastFailures:
-          data.failures && data.failures.length ? data.failures : undefined,
-      };
       this.deps.status.update(m);
       this.deps.canvas.scheduleDraw();
 
@@ -455,7 +441,6 @@ export class EmbeddingCoordinator {
       this._closeEmbeddingStream();
       const m = this.deps.model;
       m.embeddingsGenerating = false;
-      m.embeddingProgress = null;
       this.invalidateLayoutCache();
       toast("Embeddings ready", "ok");
       this.deps.status.update(m);
@@ -469,7 +454,6 @@ export class EmbeddingCoordinator {
       this._closeEmbeddingStream();
       const m = this.deps.model;
       m.embeddingsGenerating = false;
-      m.embeddingProgress = null;
       this.deps.status.update(m);
       this.deps.canvas.scheduleDraw();
     });
@@ -513,6 +497,7 @@ export class EmbeddingCoordinator {
   private async _fetchProjectionIncremental(): Promise<void> {
     this._projectionFetchPending = true;
     const m = this.deps.model;
+    const reqSeq = this._projectionSeq.next();
     const qs = this._projectionQueryString("pca");
     m.projectionPending = true;
     m.pendingProjectionQuery = qs;
@@ -523,6 +508,9 @@ export class EmbeddingCoordinator {
       const raw = await api<unknown>(
         `/api/embeddings/projection?${qs}`,
       );
+      // A newer projection (a lens switch, or the full layout after the batch)
+      // may have started; its response must win, not this stale PCA preview.
+      if (!this._projectionSeq.isCurrent(reqSeq)) return;
       const { positions } = parseProjectionResponse(raw);
       if (!positions.length) return;
 
@@ -543,11 +531,7 @@ export class EmbeddingCoordinator {
       console.warn("[trackspace] incremental PCA fetch failed:", e);
     } finally {
       this._projectionFetchPending = false;
-      m.projectionPending = false;
-      m.pendingProjectionQuery = null;
-      m.projectionStartedAt = null;
-      m.layoutProgress = null;
-      this.deps.canvas.scheduleDraw();
+      this._settleProjection(reqSeq);
     }
   }
 

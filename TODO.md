@@ -300,8 +300,14 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 - [ ] **Optional: `lib/event-bus.ts`, `model/persistence.ts`, `api/types.ts`.**
       Extract the EventBus base, localStorage persistence, and shared API response
       types out of `model.ts` / `lib/api.ts`.
-- [ ] **Nit:** `clamp` is duplicated in `coordinators/options-panel.ts`,
-      `coordinators/canvas-interaction.ts`, and `coordinators/analysis-coordinator.ts`.
+- [ ] **ApiClient dependency injection.** `Analysis`, `Embedding`, `Head` and
+      `FolderTree` coordinators import `lib/api` directly, while `Search` and
+      `Inspect` take injectable fetchers — so only the latter are unit-testable
+      without `vi.stubGlobal("fetch")`. Introduce one `ApiClient` interface in
+      `lib/api.ts`, add it to each coordinator's deps (defaulting to the module
+      singleton), and build the four test harnesses from a shared fake. Files:
+      `frontend/src/lib/api.ts`, `coordinators/{analysis,embedding,head,folder-tree}-coordinator.ts`
+      and their tests.
 - [ ] **Structure preview follow-up.** `_fetchStructure` (`controller.ts`) fetches one
       path per hover — a batched request for the visible tracks would cut the
       round-trips.

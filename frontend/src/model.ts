@@ -542,13 +542,6 @@ export class Model extends EventBus {
   embeddingPositions: Map<string, { x: number; y: number }> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
-  embeddingProgress: {
-    done: number;
-    total: number;
-    lastPath?: string;
-    lastOk?: boolean;
-    lastFailures?: string[];
-  } | null = null;
   projectionPending = false;
   /**
    * Query string of the layout request currently in flight. ``layout_progress``

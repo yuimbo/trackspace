@@ -412,14 +412,12 @@ describe("EmbeddingCoordinator generation stream", () => {
     const es = FakeEventSource.instances.at(-1)!;
 
     es.emit("progress", { path: "a.mp3", ok: true, done: 1, total: 3 });
-    expect(model.embeddingProgress?.done).toBe(1);
     expect(update).toHaveBeenCalled();
 
     const projectionsBefore = fetchCalls(fetchSpy, "/api/embeddings/projection");
     es.emit("done");
     await flush();
     expect(model.embeddingsGenerating).toBe(false);
-    expect(model.embeddingProgress).toBeNull();
     expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(
       projectionsBefore + 1,
     );

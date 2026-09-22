@@ -49,3 +49,20 @@ export function postJSON<T = unknown>(url: string, body: unknown, silent = false
 export function postForm<T = unknown>(url: string, form: FormData, silent = false): Promise<T> {
   return request<T>(url, { method: "POST", body: form }, silent);
 }
+
+/** Fetch a binary response (a file download), surfacing errors the same way. */
+export async function apiBlob(url: string, silent = false): Promise<Blob> {
+  const res = await fetch(url);
+  if (!res.ok) {
+    let detail = `${res.status} ${res.statusText}`;
+    try {
+      const body = (await res.json()) as { error?: unknown };
+      if (body && typeof body.error === "string" && body.error) detail = body.error;
+    } catch {
+      /* non-JSON error body; keep the status line */
+    }
+    if (!silent) toast(detail, "error");
+    throw new Error(detail);
+  }
+  return res.blob();
+}

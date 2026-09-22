@@ -11,7 +11,7 @@
 
 import { type Model } from "../model";
 import { toast } from "../lib/toast";
-import { api, postJSON, postForm } from "../lib/api";
+import { api, apiBlob, postJSON, postForm } from "../lib/api";
 import { confirmAction } from "../lib/util";
 import { Poller } from "../lib/async";
 
@@ -647,20 +647,15 @@ export class HeadCoordinator {
   /** Download this library's trained head as a portable bundle. */
   private async _exportHead(): Promise<void> {
     try {
-      const res = await fetch("/api/supervised/export");
-      if (!res.ok) {
-        const body = (await res.json().catch(() => ({}))) as { error?: string };
-        toast(body.error || `${res.status} ${res.statusText}`, "error");
-        return;
-      }
-      const url = URL.createObjectURL(await res.blob());
+      const blob = await apiBlob("/api/supervised/export", true);
+      const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = "trackspace_head.pt";
       a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      toast("Export failed", "error");
+    } catch (e) {
+      toast(e instanceof Error ? e.message : "Export failed", "error");
     }
   }
 

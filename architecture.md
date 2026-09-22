@@ -54,6 +54,7 @@ frontend/src/
   lib/toast.ts            shared DOM helpers
   lib/api.ts              shared fetch / postJSON
   lib/util.ts             shared clamp / escape / confirm / cycle helpers
+  lib/async.ts            shared debounce / throttle / seq / in-flight / SSE helpers
   lib/lenses.ts           lens registry + deterministic feature geometry
 tests/                    pytest suite (backend); vitest lives beside frontend sources
 data/                     SQLite caches (gitignored, created at runtime)
