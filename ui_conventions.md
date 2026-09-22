@@ -681,8 +681,11 @@ produced per track, and the way to re-run one stage.
 - `AnalysisCoordinator.fetchCoverage()` reads `/api/embeddings/status` (whole
   library) and renders one row per source (Audio features, Rhythm, Structure, MAEST,
   CLAP, Supervised) as a determinate bar `done / total`; a pending count renders
-  red. The summary line is `fingerprinted / total`. This is how a missing
-  **structure** row (no section timestamps) becomes visible.
+  red. The payload is already one `sources[]` row per source in display order
+  (`id`/`label`/`done`/`pending`/`failed`); the frontend maps the source id to its
+  job kind, so adding a source is a one-place backend change. The summary line is
+  `fingerprinted / total`. This is how a missing **structure** row (no section
+  timestamps) becomes visible.
 - Each retriggerable stage's coverage row reveals a **reload icon on hover**
   (`↻`, at the row's trailing edge) that POSTs `/api/embeddings/generate` with
   `stages: ["<kind>"]`, queueing only tracks missing that stage; a row that only

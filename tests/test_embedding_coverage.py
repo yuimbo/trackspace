@@ -10,6 +10,26 @@ from backend.embeddings.layout_revision import compute_layout_revision
 from backend.embeddings.projection_config import PROJECTION_RECIPE_VERSION
 
 
+def _source(payload, source):
+    """One source row from the status payload, by id."""
+    return next(s for s in payload["sources"] if s["id"] == source)
+
+
+def test_coverage_payload_lists_sources_in_display_order():
+    maps = CachedSourceMaps(clap={"fp1": object()}, features={})
+    infos = [{"path": "a.mp3", "fingerprint": "fp1"}]
+    p = coverage_payload(infos, maps, SourceVersions(2, 1, 1))
+    assert [s["id"] for s in p["sources"]] == [
+        "features",
+        "rhythm",
+        "structure",
+        "maest",
+        "clap",
+        "supervised",
+    ]
+    assert _source(p, "clap")["label"] == "CLAP"
+
+
 def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
     maps = CachedSourceMaps(
         clap={"fp1": object()},
@@ -22,10 +42,8 @@ def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
     ]
     p = coverage_payload(infos, maps, SourceVersions(2, 1, 1))
     assert p["tracks_with_fingerprint"] == 3
-    assert p["tracks_with_clap"] == 2
-    assert p["tracks_pending_clap"] == 1
-    assert p["embedded"] == 2
-    assert p["pending"] == 1
+    assert _source(p, "clap")["done"] == 2
+    assert _source(p, "clap")["pending"] == 1
 
 
 def test_coverage_payload_reports_structure():
@@ -41,8 +59,8 @@ def test_coverage_payload_reports_structure():
         {"path": "b.mp3", "fingerprint": "fp2"},
     ]
     p = coverage_payload(infos, maps, SourceVersions(2, 1, 1, structure=3))
-    assert p["tracks_with_structure"] == 1
-    assert p["tracks_pending_structure"] == 1
+    assert _source(p, "structure")["done"] == 1
+    assert _source(p, "structure")["pending"] == 1
     assert p["cache_versions"]["structure"] == 3
 
 
@@ -64,10 +82,10 @@ def test_coverage_pending_excludes_terminal_failures():
         SourceVersions(2, 1, 1),
         failed_by_source={"clap": {"fp1"}, "features": {"fp1"}},
     )
-    assert p["tracks_pending_clap"] == 1
-    assert p["tracks_failed_clap"] == 1
-    assert p["tracks_pending_audio_features"] == 1
-    assert p["tracks_failed_audio_features"] == 1
+    assert _source(p, "clap")["pending"] == 1
+    assert _source(p, "clap")["failed"] == 1
+    assert _source(p, "features")["pending"] == 1
+    assert _source(p, "features")["failed"] == 1
 
 
 def test_coverage_failure_covered_by_duplicate_is_not_a_gap():
@@ -83,8 +101,8 @@ def test_coverage_failure_covered_by_duplicate_is_not_a_gap():
         SourceVersions(2, 1, 1),
         failed_by_source={"clap": {"fp1"}},
     )
-    assert p["tracks_pending_clap"] == 0
-    assert p["tracks_failed_clap"] == 0
+    assert _source(p, "clap")["pending"] == 0
+    assert _source(p, "clap")["failed"] == 0
 
 
 def test_eligible_paths_requires_all_sources():

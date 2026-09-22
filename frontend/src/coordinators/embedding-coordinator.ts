@@ -35,29 +35,27 @@ type EmbeddingLayoutStatusHint = {
 
 const LAYOUT_CACHE_MAX = 8;
 
-/** Status coverage fields the "wait for analysis" gate reads, per lens source. */
-const PENDING_FIELD: Record<string, string> = {
-  maest_logits: "tracks_pending_maest",
-  maest: "tracks_pending_maest",
-  clap: "tracks_pending_clap",
-  rhythm: "tracks_pending_rhythm",
-  features: "tracks_pending_audio_features",
-  supervised: "tracks_pending_supervised",
-};
-
-/** Human label for each pending field in the "Analysing N tracks" toast. */
-const PENDING_LABEL: Record<string, string> = {
-  tracks_pending_maest: "MAEST",
-  tracks_pending_clap: "CLAP",
-  tracks_pending_rhythm: "rhythm",
-  tracks_pending_audio_features: "features",
-  tracks_pending_supervised: "folder head",
-};
-
-function _numField(status: object, field: string): number {
-  const v = (status as Record<string, unknown>)[field];
-  return typeof v === "number" ? v : 0;
+/** One per-source coverage row from ``GET /api/embeddings/status``. */
+interface CoverageSource {
+  id: string;
+  label: string;
+  done: number;
+  pending: number;
+  failed: number;
 }
+
+/**
+ * Lens source name → coverage source id. The MAEST pair is one cache source
+ * (``maest``), so a lens waiting on both must not count it twice.
+ */
+const COVERAGE_SOURCE: Record<string, string> = {
+  maest_logits: "maest",
+  maest: "maest",
+  clap: "clap",
+  rhythm: "rhythm",
+  features: "features",
+  supervised: "supervised",
+};
 
 /** True when *w* equals the frozen defaults, so the default query key is unchanged. */
 function _weightsAreDefault(w: Record<string, number>): boolean {
@@ -271,25 +269,13 @@ export class EmbeddingCoordinator {
     }
     try {
       const status = await api<{
-        total: number;
-        fingerprinted: number;
-        embedded: number;
-        pending: number;
         model_ready: boolean;
         maest_model_ready?: boolean;
         maest_error?: string | null;
-        tracks_with_maest?: number;
-        tracks_pending_maest?: number;
-        tracks_pending_rhythm?: number;
-        tracks_pending_clap?: number;
-        tracks_pending_audio_features?: number;
-        tracks_pending_supervised?: number;
-        tracks_with_supervised?: number;
-        features_extracted: number;
-        features_pending: number;
         generating: boolean;
         embedding_version?: number;
         layout_revision?: string;
+        sources?: CoverageSource[];
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
 
       // Only a lens that needs MAEST waits on the MAEST model: a CLAP/rhythm
@@ -312,29 +298,30 @@ export class EmbeddingCoordinator {
 
       if (
         lens.sources?.includes("supervised") &&
-        (status.tracks_with_supervised ?? 0) === 0
+        (this._coverageSource(status, "supervised")?.done ?? 0) === 0
       ) {
         toast("Train the folder head to use this lens", "warn");
       }
 
-      // One pending count per status field, deduped across sources that share a
-      // field (maest_logits and maest are the same stage).
-      const pending = new Map<string, number>();
+      // One pending count per coverage source, deduped across lens sources that
+      // share one (maest_logits and maest are the same stage).
+      const pending = new Map<string, { pending: number; label: string }>();
       for (const s of waitSources) {
-        const field = PENDING_FIELD[s];
-        if (!field) continue;
-        pending.set(
-          field,
-          (pending.get(field) ?? 0) + _numField(status, field),
-        );
+        const row = this._coverageSource(status, s);
+        if (!row) continue;
+        const cur = pending.get(row.id);
+        pending.set(row.id, {
+          pending: (cur?.pending ?? 0) + row.pending,
+          label: row.label,
+        });
       }
-      const needsWork = [...pending.values()].some((n) => n > 0);
+      const needsWork = [...pending.values()].some((v) => v.pending > 0);
 
       if (needsWork && !status.generating) {
-        const total = Math.max(...pending.values());
-        const workParts = [...pending]
-          .filter(([, n]) => n > 0)
-          .map(([field, n]) => `${n} ${PENDING_LABEL[field] ?? field}`);
+        const total = Math.max(...[...pending.values()].map((v) => v.pending));
+        const workParts = [...pending.values()]
+          .filter((v) => v.pending > 0)
+          .map((v) => `${v.pending} ${v.label}`);
         const detail =
           workParts.length > 1 ? ` (${workParts.join(", ")})` : "";
         toast(`Analysing ${total} tracks${detail}…`, "ok");
@@ -384,6 +371,15 @@ export class EmbeddingCoordinator {
     }
     m.embeddingsReady = true;
     this._applyPositions(positions);
+  }
+
+  /** The coverage row for a lens source, or undefined when it has none. */
+  private _coverageSource(
+    status: { sources?: CoverageSource[] },
+    source: string,
+  ): CoverageSource | undefined {
+    const id = COVERAGE_SOURCE[source];
+    return status.sources?.find((s) => s.id === id);
   }
 
   private _pollModelReady(): void {

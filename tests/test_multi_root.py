@@ -259,8 +259,9 @@ def test_status_empty_folder_covers_all_roots(client):
     body = r.get_json()
     assert body["tracks_total"] == 6
     assert body["tracks_with_fingerprint"] == 6
-    assert body["tracks_with_maest"] == 0
-    assert body["tracks_pending_maest"] == 6
+    maest = next(s for s in body["sources"] if s["id"] == "maest")
+    assert maest["done"] == 0
+    assert maest["pending"] == 6
 
 
 def test_status_scoped_to_one_root(client):
@@ -275,7 +276,8 @@ def test_status_with_empty_folder_is_zero_not_error(client):
     body = r.get_json()
     assert body["tracks_total"] == 0
     assert body["tracks_with_fingerprint"] == 0
-    assert body["tracks_pending_maest"] == 0
+    maest = next(s for s in body["sources"] if s["id"] == "maest")
+    assert maest["pending"] == 0
 
 
 def test_projection_empty_folder_covers_library_roots(client):

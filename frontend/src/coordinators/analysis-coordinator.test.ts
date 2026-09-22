@@ -947,18 +947,14 @@ describe("AnalysisCoordinator coverage panel", () => {
   const COVERAGE = {
     tracks_total: 10,
     tracks_with_fingerprint: 10,
-    tracks_with_audio_features: 8,
-    tracks_pending_audio_features: 2,
-    tracks_with_rhythm: 7,
-    tracks_pending_rhythm: 3,
-    tracks_with_structure: 6,
-    tracks_pending_structure: 4,
-    tracks_with_maest: 9,
-    tracks_pending_maest: 1,
-    tracks_with_clap: 5,
-    tracks_pending_clap: 5,
-    tracks_with_supervised: 0,
-    tracks_pending_supervised: 10,
+    sources: [
+      { id: "features", label: "Audio features", done: 8, pending: 2, failed: 0 },
+      { id: "rhythm", label: "Rhythm", done: 7, pending: 3, failed: 0 },
+      { id: "structure", label: "Structure", done: 6, pending: 4, failed: 0 },
+      { id: "maest", label: "MAEST", done: 9, pending: 1, failed: 0 },
+      { id: "clap", label: "CLAP", done: 5, pending: 5, failed: 0 },
+      { id: "supervised", label: "Supervised", done: 0, pending: 10, failed: 0 },
+    ],
   };
 
   it("renders one row per source with done / total", async () => {
@@ -994,9 +990,9 @@ describe("AnalysisCoordinator coverage panel", () => {
       url.startsWith("/api/embeddings/status")
         ? {
             ...COVERAGE,
-            tracks_with_structure: 6,
-            tracks_pending_structure: 0,
-            tracks_failed_structure: 4,
+            sources: COVERAGE.sources.map((s) =>
+              s.id === "structure" ? { ...s, pending: 0, failed: 4 } : s,
+            ),
           }
         : {},
     );

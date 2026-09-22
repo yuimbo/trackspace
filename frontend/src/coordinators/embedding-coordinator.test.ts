@@ -132,19 +132,29 @@ interface Harness {
 }
 
 const STATUS_OK = {
-  total: 1,
-  fingerprinted: 1,
-  embedded: 1,
-  pending: 0,
   model_ready: true,
   maest_model_ready: true,
-  tracks_pending_maest: 0,
-  tracks_pending_rhythm: 0,
-  features_extracted: 1,
-  features_pending: 0,
   generating: false,
   layout_revision: "rev-1",
+  sources: [
+    { id: "features", label: "Audio features", done: 1, pending: 0, failed: 0 },
+    { id: "rhythm", label: "Rhythm", done: 1, pending: 0, failed: 0 },
+    { id: "structure", label: "Structure", done: 1, pending: 0, failed: 0 },
+    { id: "maest", label: "MAEST", done: 1, pending: 0, failed: 0 },
+    { id: "clap", label: "CLAP", done: 1, pending: 0, failed: 0 },
+    { id: "supervised", label: "Supervised", done: 1, pending: 0, failed: 0 },
+  ],
 };
+
+/** A status payload with the MAEST source left with *n* tracks pending. */
+function withMaestPending(n: number): typeof STATUS_OK {
+  return {
+    ...STATUS_OK,
+    sources: STATUS_OK.sources.map((s) =>
+      s.id === "maest" ? { ...s, pending: n } : s,
+    ),
+  };
+}
 
 /** Route a URL to its response body (default: `{}`). */
 function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
@@ -381,7 +391,7 @@ describe("EmbeddingCoordinator generation stream", () => {
   it("queues generation and opens the stream when work is pending", async () => {
     const { model, coord, fetchSpy } = makeHarness((url) => {
       if (url.startsWith("/api/embeddings/status")) {
-        return { ...STATUS_OK, tracks_pending_maest: 5 };
+        return withMaestPending(5);
       }
       return {};
     });
@@ -400,7 +410,7 @@ describe("EmbeddingCoordinator generation stream", () => {
   it("tracks progress and refetches the layout on done", async () => {
     const { model, coord, update, fetchSpy } = makeHarness((url) => {
       if (url.startsWith("/api/embeddings/status")) {
-        return { ...STATUS_OK, tracks_pending_maest: 3 };
+        return withMaestPending(3);
       }
       if (url.startsWith("/api/embeddings/projection")) {
         return { positions: [{ path: "a.mp3", x: 0.1, y: 0.1 }], revision: "rev-2" };
@@ -426,7 +436,7 @@ describe("EmbeddingCoordinator generation stream", () => {
   it("closes the stream on stop", async () => {
     const { model, coord } = makeHarness((url) =>
       url.startsWith("/api/embeddings/status")
-        ? { ...STATUS_OK, tracks_pending_maest: 3 }
+        ? withMaestPending(3)
         : {},
     );
     model.viewMode = "embeddings";

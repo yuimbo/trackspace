@@ -76,28 +76,20 @@ interface PredictionsResponse {
   matched?: string[];
 }
 
-/** Per-track coverage from ``GET /api/embeddings/status``. */
+/** One per-source coverage row from ``GET /api/embeddings/status``. */
+interface CoverageSource {
+  id: string;
+  label: string;
+  done: number;
+  pending: number;
+  failed: number;
+}
+
+/** Coverage from ``GET /api/embeddings/status``. */
 interface CoverageResponse {
   tracks_total?: number;
   tracks_with_fingerprint?: number;
-  tracks_with_clap?: number;
-  tracks_pending_clap?: number;
-  tracks_failed_clap?: number;
-  tracks_with_audio_features?: number;
-  tracks_pending_audio_features?: number;
-  tracks_failed_audio_features?: number;
-  tracks_with_rhythm?: number;
-  tracks_pending_rhythm?: number;
-  tracks_failed_rhythm?: number;
-  tracks_with_maest?: number;
-  tracks_pending_maest?: number;
-  tracks_failed_maest?: number;
-  tracks_with_supervised?: number;
-  tracks_pending_supervised?: number;
-  tracks_failed_supervised?: number;
-  tracks_with_structure?: number;
-  tracks_pending_structure?: number;
-  tracks_failed_structure?: number;
+  sources?: CoverageSource[];
   generating?: boolean;
 }
 
@@ -112,6 +104,19 @@ interface CoverageRow {
   /** The canonical row for a retriggerable per-track stage, so it gets a re-run icon. */
   retrigger?: boolean;
 }
+
+/**
+ * Per-source job kind to retrigger. The status payload carries the cache sources;
+ * the retriggerable stage and its job kind are a UI concern, so they live here.
+ */
+const SOURCE_STAGE: Record<string, { stage: string; retrigger?: boolean }> = {
+  features: { stage: "features", retrigger: true },
+  rhythm: { stage: "features" },
+  structure: { stage: "structure", retrigger: true },
+  maest: { stage: "maest", retrigger: true },
+  clap: { stage: "clap", retrigger: true },
+  supervised: { stage: "supervise" },
+};
 
 /** One track with a terminal job failure (``GET /api/analysis/problems``). */
 interface ProblemFailure {
@@ -420,54 +425,15 @@ export class AnalysisCoordinator {
     const fingerprinted = d.tracks_with_fingerprint ?? 0;
     // Failures come from the backend, already deduped by fingerprint against the
     // cache: a stale failure for a duplicate that is actually analysed is not a gap.
-    const rows: CoverageRow[] = [
-      {
-        label: "Audio features",
-        stage: "features",
-        done: d.tracks_with_audio_features ?? 0,
-        pending: d.tracks_pending_audio_features ?? 0,
-        failed: d.tracks_failed_audio_features ?? 0,
-        retrigger: true,
-      },
-      {
-        label: "Rhythm",
-        stage: "features",
-        done: d.tracks_with_rhythm ?? 0,
-        pending: d.tracks_pending_rhythm ?? 0,
-        failed: d.tracks_failed_rhythm ?? 0,
-      },
-      {
-        label: "Structure",
-        stage: "structure",
-        done: d.tracks_with_structure ?? 0,
-        pending: d.tracks_pending_structure ?? 0,
-        failed: d.tracks_failed_structure ?? 0,
-        retrigger: true,
-      },
-      {
-        label: "MAEST",
-        stage: "maest",
-        done: d.tracks_with_maest ?? 0,
-        pending: d.tracks_pending_maest ?? 0,
-        failed: d.tracks_failed_maest ?? 0,
-        retrigger: true,
-      },
-      {
-        label: "CLAP",
-        stage: "clap",
-        done: d.tracks_with_clap ?? 0,
-        pending: d.tracks_pending_clap ?? 0,
-        failed: d.tracks_failed_clap ?? 0,
-        retrigger: true,
-      },
-      {
-        label: "Supervised",
-        stage: "supervise",
-        done: d.tracks_with_supervised ?? 0,
-        pending: d.tracks_pending_supervised ?? 0,
-        failed: d.tracks_failed_supervised ?? 0,
-      },
-    ];
+    // The status payload is already one row per source, in display order.
+    const rows: CoverageRow[] = (d.sources ?? []).map((s) => ({
+      label: s.label,
+      stage: SOURCE_STAGE[s.id]?.stage ?? s.id,
+      done: s.done,
+      pending: s.pending,
+      failed: s.failed,
+      retrigger: SOURCE_STAGE[s.id]?.retrigger,
+    }));
 
     // Per-stage failure counts (deduped: features and rhythm share one stage, so a
     // track whose features job failed must count once, not twice).
