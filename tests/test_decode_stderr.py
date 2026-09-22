@@ -101,18 +101,48 @@ def test_librosa_load_falls_back_when_soundfile_cannot_open(monkeypatch):
 
 
 def test_librosa_get_duration_serializes_the_native_probe(monkeypatch):
+    """The lock covers the native ``soundfile.info`` open."""
     probe = _Probe()
 
-    def _fake_get_duration(**kwargs):
+    class _FakeInfo:
+        duration = 1.0
+
+    def _fake_info(path):
         probe.enter()
         try:
-            return 1.0
+            return _FakeInfo()
         finally:
             probe.exit()
 
-    monkeypatch.setattr(decode_stderr._librosa, "get_duration", _fake_get_duration)
+    monkeypatch.setattr(decode_stderr._soundfile, "info", _fake_info)
 
     _run_concurrently(lambda: decode_stderr.librosa_get_duration(path="a.mp3"))
 
+    assert probe.calls == 100
+    assert probe.peak == 1
+
+
+def test_librosa_get_duration_falls_back_when_soundfile_cannot_open(monkeypatch):
+    """A path soundfile rejects must reach librosa's own probe, serialised."""
+    probe = _Probe()
+    seen = {}
+
+    def _boom(path):
+        raise decode_stderr._soundfile.SoundFileRuntimeError("unsupported")
+
+    def _fake_get_duration(**kwargs):
+        seen["path"] = kwargs.get("path")
+        probe.enter()
+        try:
+            return 2.0
+        finally:
+            probe.exit()
+
+    monkeypatch.setattr(decode_stderr._soundfile, "info", _boom)
+    monkeypatch.setattr(decode_stderr._librosa, "get_duration", _fake_get_duration)
+
+    _run_concurrently(lambda: decode_stderr.librosa_get_duration(path="weird.ogg"))
+
+    assert seen["path"] == "weird.ogg"
     assert probe.calls == 100
     assert probe.peak == 1

@@ -71,7 +71,10 @@ from backend.services.analysis_pipeline import (
 from backend.services.dir_colors import dir_color
 from backend.services.layout_revision_for_status import layout_revision_for_projection
 from backend.services.lens_layout import compute_lens_projection
-from backend.services.library_scan import emit_scan_progress_events
+from backend.services.library_scan import (
+    emit_scan_progress_events,
+    prefetch_track_cache,
+)
 from backend.services.roots_registry import (
     add_root as roots_add,
     library_root_ids as roots_library_ids,
@@ -143,53 +146,47 @@ DEFAULT_FEATURES_WORKERS = 4
 #: cost the features process pool pays. Override with ``TRACKSPACE_STRUCTURE_WORKERS``.
 DEFAULT_STRUCTURE_WORKERS = 4
 
+#: CLAP embedding batch. Throughput still improves from 4 to 8 (measured
+#: 153 -> 115 ms/track). Override with ``TRACKSPACE_CLAP_BATCH``.
+DEFAULT_CLAP_BATCH = 8
+
+#: MAEST is saturated at 4 (measured 310 -> 306 ms/track from 4 to 8).
+#: Override with ``TRACKSPACE_MAEST_BATCH``.
+DEFAULT_MAEST_BATCH = 4
+
 
 def _features_worker_count() -> int:
     """``TRACKSPACE_FEATURES_WORKERS`` if valid, else the measured default."""
-    raw = (os.environ.get("TRACKSPACE_FEATURES_WORKERS") or "").strip()
+    return _int_env("TRACKSPACE_FEATURES_WORKERS", DEFAULT_FEATURES_WORKERS)
+
+
+def _int_env(name: str, default: int) -> int:
+    """A positive int from *name*, or *default* (with a warning) when invalid."""
+    raw = (os.environ.get(name) or "").strip()
     if not raw:
-        return DEFAULT_FEATURES_WORKERS
+        return default
     try:
         n = int(raw)
     except ValueError:
-        log.warning(
-            "TRACKSPACE_FEATURES_WORKERS=%r is not an integer; using %d",
-            raw,
-            DEFAULT_FEATURES_WORKERS,
-        )
-        return DEFAULT_FEATURES_WORKERS
+        log.warning("%s=%r is not an integer; using %d", name, raw, default)
+        return default
     if n < 1:
-        log.warning(
-            "TRACKSPACE_FEATURES_WORKERS=%d < 1; using %d",
-            n,
-            DEFAULT_FEATURES_WORKERS,
-        )
-        return DEFAULT_FEATURES_WORKERS
+        log.warning("%s=%d < 1; using %d", name, n, default)
+        return default
     return n
+
+
+def _clap_batch_size() -> int:
+    return _int_env("TRACKSPACE_CLAP_BATCH", DEFAULT_CLAP_BATCH)
+
+
+def _maest_batch_size() -> int:
+    return _int_env("TRACKSPACE_MAEST_BATCH", DEFAULT_MAEST_BATCH)
 
 
 def _structure_worker_count() -> int:
     """``TRACKSPACE_STRUCTURE_WORKERS`` if valid, else the measured default."""
-    raw = (os.environ.get("TRACKSPACE_STRUCTURE_WORKERS") or "").strip()
-    if not raw:
-        return DEFAULT_STRUCTURE_WORKERS
-    try:
-        n = int(raw)
-    except ValueError:
-        log.warning(
-            "TRACKSPACE_STRUCTURE_WORKERS=%r is not an integer; using %d",
-            raw,
-            DEFAULT_STRUCTURE_WORKERS,
-        )
-        return DEFAULT_STRUCTURE_WORKERS
-    if n < 1:
-        log.warning(
-            "TRACKSPACE_STRUCTURE_WORKERS=%d < 1; using %d",
-            n,
-            DEFAULT_STRUCTURE_WORKERS,
-        )
-        return DEFAULT_STRUCTURE_WORKERS
-    return n
+    return _int_env("TRACKSPACE_STRUCTURE_WORKERS", DEFAULT_STRUCTURE_WORKERS)
 
 
 def _purge_stale_embedding_cache_rows(ts: TrackspaceState) -> dict[str, int]:
@@ -471,6 +468,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         """
         root_ids = None if include_external else _library_root_ids()
         paths = _list_mp3s(folder_vpath, recursive, root_ids=root_ids)
+        prefetch_track_cache(state.track_cache, paths)
         infos = []
         for p, info in iter_parallel_reads(
             paths, read_fn=_cached_read_all, executor=state.thread_pool,
@@ -711,24 +709,26 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 on_event=_job_event_sink,
             )
         )
+        maest_batch = _maest_batch_size()
         state.workers.add(
             JobWorker(
                 state.job_queue,
                 KIND_MAEST,
-                make_maest_handler(ANALYSIS_DEPS, batch_size=4),
-                batch_size=4,
+                make_maest_handler(ANALYSIS_DEPS, batch_size=maest_batch),
+                batch_size=maest_batch,
                 on_event=_job_event_sink,
                 # Idle until the model has finished loading rather than failing
                 # every claimed job during the first minute after startup.
                 gate=maest_mod.is_model_ready,
             )
         )
+        clap_batch = _clap_batch_size()
         state.workers.add(
             JobWorker(
                 state.job_queue,
                 KIND_CLAP,
-                make_clap_handler(ANALYSIS_DEPS, batch_size=4),
-                batch_size=4,
+                make_clap_handler(ANALYSIS_DEPS, batch_size=clap_batch),
+                batch_size=clap_batch,
                 on_event=_job_event_sink,
                 # Idle until the model has finished loading rather than failing
                 # every claimed job during the first minute after startup.
@@ -928,6 +928,11 @@ def main():
     pruned = state.track_cache.prune_missing()
     if pruned:
         print(f"Cache: pruned {pruned} stale entr{'y' if pruned == 1 else 'ies'}")
+    # Completed jobs are never pruned otherwise (61k rows after a few sessions);
+    # drop the older ones at startup so the queue table stays bounded.
+    purged = state.job_queue.purge_done(older_than=7 * 24 * 3600)
+    if purged:
+        print(f"Queue: pruned {purged} completed job(s)")
     for name, n in startup_purges.items():
         if n:
             print(
