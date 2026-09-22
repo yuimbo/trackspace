@@ -252,6 +252,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
         create_api_supervised_blueprint(
             analysis_deps=deps.analysis_deps,
             build_track_infos_fn=deps.build_track_infos_fn,
+            library_root_ids=deps.library_root_ids,
         )
     )
     app.register_blueprint(

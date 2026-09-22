@@ -28,6 +28,7 @@ from backend.services.analysis_pipeline import (
     make_supervised_handler,
     project_supervised_missing,
     supervised_imprint_status,
+    supervised_predictions,
     train_supervised,
     undo_fanout_supervised,
 )
@@ -836,6 +837,49 @@ def test_fanout_plans_then_moves_into_predicted_folders(tmp_path):
     assert (loose / "Folder0" / "t0.mp3").exists()
     assert (loose / "Folder1" / "t1.mp3").exists()
     assert not (loose / "t0.mp3").exists()
+
+
+def test_predictions_and_fanout_drop_external_root_classes(tmp_path):
+    fc = FeatureCache(str(tmp_path / "features.db"))
+    infos = _two_root_infos(fc)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    # The head really did learn the external root's classes ...
+    assert "B/Folder0" in sup.read_meta(str(tmp_path))["class_names"]
+
+    # ... but a prediction that supplies the library roots never targets one.
+    preds = supervised_predictions(
+        _deps(tmp_path, fc),
+        build_track_infos=lambda _f, _r: infos,
+        library_root_ids=["A"],
+    )
+    assert preds["available"] is True and preds["assignments"]
+    assert all(
+        not name.startswith("B/") for name in preds["assignments"].values()
+    )
+
+    # The fan-out moves files, so it must not create a folder named after the
+    # external structure either.
+    root = tmp_path / "dest"
+    loose = root / "loose"
+    loose.mkdir(parents=True)
+    fanout_infos = []
+    rng = np.random.default_rng(1)
+    for i in range(2):
+        fp = f"loose-{i}"
+        fc.put_maest(
+            fp, rng.normal(size=768).astype(np.float32), np.ones(519, np.float32), version=1
+        )
+        (loose / f"t{i}.mp3").write_bytes(b"ID3\x00fake")
+        fanout_infos.append({"path": f"loose/t{i}.mp3", "fingerprint": fp})
+    plan = fanout_supervised(
+        _fanout_deps(tmp_path, fc, root),
+        build_track_infos=lambda _f, _r: fanout_infos,
+        folder_vpath="loose",
+        library_root_ids=["A"],
+    )
+    assert plan["ok"] is True
+    assert all(not e["folder"].startswith("B/") for e in plan["plan"])
 
 
 def _fanout_scenario(

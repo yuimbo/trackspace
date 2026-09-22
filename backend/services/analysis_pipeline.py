@@ -1333,11 +1333,16 @@ class _HeadParts:
     thresholds: np.ndarray | None
 
 
-def _load_head_parts(deps: AnalysisDeps) -> _HeadParts:
+def _load_head_parts(
+    deps: AnalysisDeps, *, library_root_ids: Sequence[str] | None = None
+) -> _HeadParts:
     """Load the installed head, its class names, centroids, and match thresholds.
 
     A missing head or centroids comes back as ``None`` rather than an error: each
-    caller has its own message and availability semantics.
+    caller has its own message and availability semantics. *library_root_ids* drops
+    any class under an external root — a head trained before a root was marked
+    external, or imported from another library, can still carry one, and external
+    roots are projection targets, never prediction or fan-out destinations.
     """
     head = supervised_mod.load_head(deps.data_dir)
     if head is None:
@@ -1350,19 +1355,23 @@ def _load_head_parts(deps: AnalysisDeps) -> _HeadParts:
         if isinstance(raw_thresholds, (list, tuple)) and raw_thresholds
         else None
     )
-    return _HeadParts(
-        head,
-        meta,
-        class_names,
-        supervised_mod.head_centroids(deps.data_dir, head),
-        thresholds,
-    )
+    centroids = supervised_mod.head_centroids(deps.data_dir, head)
+    if library_root_ids is not None and class_names:
+        keep = supervised_mod.library_class_mask(class_names, library_root_ids)
+        if len(keep) != len(class_names):
+            class_names = [class_names[i] for i in keep]
+            if centroids is not None:
+                centroids = centroids[keep]
+            if thresholds is not None:
+                thresholds = thresholds[keep]
+    return _HeadParts(head, meta, class_names, centroids, thresholds)
 
 
 def supervised_predictions(
     deps: AnalysisDeps,
     *,
     build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+    library_root_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Nearest learned folder per track, from the installed head's centroids.
 
@@ -1371,8 +1380,10 @@ def supervised_predictions(
     track that has a row to its nearest folder; ``matched`` is the subset that also
     clears its class's training-distance floor — the same rule a fan-out uses to
     decide whether a track is close enough to a learned folder to be placed in it.
+    *library_root_ids* drops external-root classes so a stale or imported head can
+    never project a track into a folder outside My library.
     """
-    parts = _load_head_parts(deps)
+    parts = _load_head_parts(deps, library_root_ids=library_root_ids)
     if parts.head is None or parts.centroids is None:
         return {"available": False, "assignments": {}, "matched": []}
     if not parts.class_names or parts.centroids.shape[0] != len(parts.class_names):
@@ -1457,6 +1468,7 @@ def fanout_supervised(
     recursive: bool = False,
     apply: bool = False,
     generic_unmatched: bool = False,
+    library_root_ids: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Sort the tracks in *folder_vpath* into the head's folder subpaths.
 
@@ -1478,8 +1490,11 @@ def fanout_supervised(
     fingerprint, and the emptied old directories are swept afterwards. On *apply*,
     every move is journalled before it happens so
     :func:`undo_fanout_supervised` can restore the previous layout.
+
+    *library_root_ids* drops external-root classes, so a stale or imported head
+    can never move a track into a folder named after an external structure.
     """
-    parts = _load_head_parts(deps)
+    parts = _load_head_parts(deps, library_root_ids=library_root_ids)
     if parts.head is None:
         return {"ok": False, "error": "no trained head to fan out with"}
     if parts.centroids is None:

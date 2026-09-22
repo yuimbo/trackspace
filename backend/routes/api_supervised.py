@@ -54,8 +54,18 @@ def create_api_supervised_blueprint(
     *,
     analysis_deps: Any,
     build_track_infos_fn: Callable[[str, bool], list[dict[str, Any]]],
+    library_root_ids: Callable[[], list[str]] | None = None,
 ) -> Blueprint:
     bp = Blueprint("api_supervised", __name__)
+
+    def _library_roots() -> list[str] | None:
+        """Library root ids, or ``None`` when the wiring does not supply them.
+
+        Passing the ids lets a stale or imported head's external-root classes be
+        dropped before a prediction or a fan-out, so neither can target a folder
+        outside My library.
+        """
+        return list(library_root_ids()) if library_root_ids is not None else None
 
     def _cleanup_after(path: str) -> None:
         @after_this_request
@@ -80,7 +90,9 @@ def create_api_supervised_blueprint(
         """
         return jsonify(
             pipeline.supervised_predictions(
-                analysis_deps, build_track_infos=build_track_infos_fn
+                analysis_deps,
+                build_track_infos=build_track_infos_fn,
+                library_root_ids=_library_roots(),
             )
         )
 
@@ -176,6 +188,7 @@ def create_api_supervised_blueprint(
                 recursive=recursive,
                 apply=apply,
                 generic_unmatched=generic,
+                library_root_ids=_library_roots(),
             )
         except ApiValidationError as e:
             return jsonify({"ok": False, "error": str(e)}), 400

@@ -38,7 +38,7 @@ import logging
 import os
 import time
 from collections import Counter
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -150,6 +150,26 @@ def derive_folder_labels(
     index = {c: i for i, c in enumerate(classes)}
     labels = np.array([index.get(f, -1) for f in folders], dtype=np.int64)
     return labels, classes
+
+
+def class_root(class_name: str) -> str:
+    """Root id of a class's virtual path (``root/Sub/Leaf`` → ``root``)."""
+    norm = str(class_name).replace("\\", "/").strip("/")
+    return norm.split("/", 1)[0]
+
+
+def library_class_mask(
+    class_names: Sequence[str], library_root_ids: Iterable[str]
+) -> list[int]:
+    """Indices of classes whose root is one of *library_root_ids*.
+
+    A head trained before a root was marked external — or imported from another
+    library — can still carry classes under an external root. Those roots are
+    projection *targets*, not labels, so a prediction or a fan-out must drop them:
+    otherwise a track is moved into a folder named after the external structure.
+    """
+    roots = set(library_root_ids)
+    return [i for i, name in enumerate(class_names) if class_root(name) in roots]
 
 
 # ──────────────────────────────────────────────────────────────
