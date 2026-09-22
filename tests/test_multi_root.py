@@ -160,6 +160,7 @@ def client(roots, tmp_path):
         cached_read_all=cached_read_all,
         executor=executor,
         feature_cache=feature_cache,
+        track_cache=None,
         features_version=1,
         audio_features_mod=_FakeAudioFeatures(),
         read_paths_parallel=read_paths_parallel,
@@ -290,8 +291,9 @@ def test_projection_empty_folder_covers_library_roots(client):
     assert "revision" in body
 
 
-def test_projection_include_external_covers_all_roots(client):
-    r = client.get("/api/embeddings/projection?include_external=1")
+def test_projection_fit_scope_all_refits_with_external(client):
+    """The old external-inclusive layout is now an explicit opt-in."""
+    r = client.get("/api/embeddings/projection?include_external=1&fit_scope=all")
     assert r.status_code == 200
     body = r.get_json()
     assert {p["path"] for p in body["positions"]} == {
@@ -302,6 +304,35 @@ def test_projection_include_external_covers_all_roots(client):
         "b/shared/three.mp3",
         "b/shared/b_only.mp3",
     }
+
+
+def test_projection_fit_scope_library_keeps_the_library_layout(client):
+    """The default external scope places externals; it does not refit the map."""
+    r = client.get("/api/embeddings/projection?include_external=1&fit_scope=library")
+    assert r.status_code == 200
+    body = r.get_json()
+    # The fake cache has no feature rows, so the external roots cannot be placed;
+    # the library tracks still come from the (unchanged) library fit.
+    assert {p["path"] for p in body["positions"]} == {
+        "a/one.mp3",
+        "a/sub/deep.mp3",
+        "a/shared/a_only.mp3",
+    }
+
+
+def test_projection_fit_scope_rejects_unknown_value(client):
+    r = client.get("/api/embeddings/projection?fit_scope=everything")
+    assert r.status_code == 400
+    assert r.get_json()["error"]
+
+
+def test_projection_fit_scope_library_matches_default_revision(client):
+    """The default and library fit scopes are the same chart (one revision)."""
+    default = client.get("/api/embeddings/projection").get_json()
+    scoped = client.get(
+        "/api/embeddings/projection?include_external=1&fit_scope=library"
+    ).get_json()
+    assert scoped["revision"] == default["revision"]
 
 
 def test_list_mp3s_root_ids_limits_all_roots_walk(roots):

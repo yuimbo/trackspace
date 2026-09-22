@@ -9,6 +9,8 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
+from backend.services.library_scan import prefetch_track_cache
+
 
 def create_api_library_blueprint(
     *,
@@ -16,6 +18,7 @@ def create_api_library_blueprint(
     cached_read_all: Callable[[str], dict[str, Any]],
     executor: Executor,
     feature_cache: Any,
+    track_cache: Any,
     features_version: int,
     audio_features_mod: Any,
     read_paths_parallel: Callable[..., dict[str, dict[str, Any]]],
@@ -56,6 +59,7 @@ def create_api_library_blueprint(
         rel = request.args.get("folder", "")
         recursive = request.args.get("recursive", "0") == "1"
         paths = list_mp3s(rel, recursive)
+        prefetch_track_cache(track_cache, paths)
         results = read_paths_parallel(paths, read_fn=cached_read_all, executor=executor)
         return jsonify(_build_track_list(paths, results))
 
@@ -74,6 +78,9 @@ def create_api_library_blueprint(
                 executor=executor,
                 track_from_read=_track_dict_from_read,
                 emit=q.put_nowait,
+                track_cache=track_cache,
+                feature_cache=feature_cache,
+                features_version=features_version,
             )
 
         threading.Thread(target=_scan, daemon=True).start()
@@ -97,6 +104,7 @@ def create_api_library_blueprint(
         rel = request.args.get("folder", "")
         recursive = request.args.get("recursive", "1") == "1"
         paths = list_mp3s(rel, recursive)
+        prefetch_track_cache(track_cache, paths)
         names: set[str] = set()
         for _, info in iter_parallel_reads(paths, read_fn=cached_read_all, executor=executor):
             names.update(info.get("tags", {}).keys())
