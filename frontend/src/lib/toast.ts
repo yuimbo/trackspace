@@ -1,4 +1,6 @@
 // ─── Toasts ──────────────────────────────────────────────────
+import { clamp01 } from "./util";
+
 let _$toasts: HTMLElement | null = null;
 export function toast(
   msg: string,
@@ -61,7 +63,7 @@ export function setLoadBar(fraction: number | null): void {
     _$loadBarFill.style.width = "";
   } else {
     _$loadBar.classList.remove("indeterminate");
-    const pct = Math.round(Math.max(0, Math.min(1, fraction)) * 100);
+    const pct = Math.round(clamp01(fraction) * 100);
     _$loadBarFill.style.width = `${pct}%`;
   }
 }

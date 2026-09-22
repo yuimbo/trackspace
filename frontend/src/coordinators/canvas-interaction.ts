@@ -21,6 +21,7 @@ import {
 import type { CanvasView, TxHandle } from "../components";
 import { hotkeyCode, hotkeyKey, isTextEntryTarget } from "../hotkeys";
 import { scopeLenses, type ColorMode } from "../lib/lenses";
+import { clamp } from "../lib/util";
 
 /** Physical keys for the gesture bindings, sourced from the hotkey config. */
 const SCOPE_KEY = hotkeyCode("scope-gesture");
@@ -34,8 +35,6 @@ const ZOOM_FACTOR = 1.12;
 const SCOPE_SCROLL_START_PX = 14;
 /** Screen margin (px) around a scope that still counts as "near" for X / Shift+X. */
 const SCOPE_NEAR_PX = 40;
-
-const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
 
 function axisWritable(axis: string | null): boolean {
   return !!(axis && !isAudioFeatureAxisId(axis));

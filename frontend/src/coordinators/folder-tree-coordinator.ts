@@ -19,6 +19,7 @@ import {
   trackCamelotFifths,
 } from "../lib/bloom";
 import { postJSON } from "../lib/api";
+import { confirmAction } from "../lib/util";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
 import { hotkeyLabel } from "../hotkeys";
 import htmx from "htmx.org";
@@ -695,7 +696,7 @@ export class FolderTreeCoordinator {
     if (!rootId) return;
     const label = row.dataset.rootAbs || rootId;
     if (
-      !window.confirm(
+      !confirmAction(
         `Remove "${label}" from trackspace?\n\n` +
           "Its files stay on disk and its cached analysis is kept, so " +
           "re-adding the folder restores it instantly.",

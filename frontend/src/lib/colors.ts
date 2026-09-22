@@ -6,6 +6,7 @@ import {
   bpmSpiralPolar,
   camelotPolar,
 } from "./lenses";
+import { clamp } from "./util";
 
 // ─── CSS colour parsing ─────────────────────────────────────
 //
@@ -131,7 +132,7 @@ export function clusterColor(id: number): string {
 /** Polar colour: angle → hue, radius (normalised over `rLo`..`rHi`) → lightness. */
 function polarColor(angle: number, radius: number, rLo: number, rHi: number): string {
   const hue = ((((angle / (2 * Math.PI)) % 1) + 1) % 1) * 360;
-  const t = rHi > rLo ? Math.max(0, Math.min(1, (radius - rLo) / (rHi - rLo))) : 0;
+  const t = rHi > rLo ? clamp((radius - rLo) / (rHi - rLo)) : 0;
   // 36%..72% keeps both rings legible on the dark canvas while still reading
   // as "near = dark, far = bright".
   return `hsl(${hue.toFixed(1)},72%,${(36 + t * 36).toFixed(1)}%)`;

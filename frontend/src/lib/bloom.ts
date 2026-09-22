@@ -16,6 +16,7 @@
 
 import type { Track } from "../model";
 import type { ColorMode } from "./lenses";
+import { clamp01 } from "./util";
 
 /**
  * Default bloom range: exact. The bloom starts as the hovered dot's own class and
@@ -49,8 +50,6 @@ export const BLOOM_TEMPO_MAX_PCT = 25;
 export const BLOOM_KEY_MAX_STEPS = 6;
 /** Range [0,1] → this many parent directory levels, at full range. */
 export const BLOOM_FOLDER_MAX_LEVELS = 4;
-
-const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
 /** Parent directory levels the folder/head bloom climbs at *range*. */
 export function bloomFolderLevels(range: number): number {

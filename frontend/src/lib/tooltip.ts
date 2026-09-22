@@ -27,6 +27,7 @@ import {
   tempoColor,
 } from "./colors";
 import { trackTempoNorm } from "./lenses";
+import { clamp, clamp01 } from "./util";
 import { displayFolderPath } from "./path-presenter";
 import { hotkeyBinding, hotkeyLabel } from "../hotkeys";
 import {
@@ -208,8 +209,6 @@ const SPANNING_HINT =
 
 /** Footer hint on the plain hover card: how to open the interactive card. */
 const HOLD_ALT_HINT = "Hold ⌥ (Alt) to interact";
-
-const clamp01 = (v: number): number => Math.max(0, Math.min(1, v));
 
 function audioFeatureRows(track: Track, m: Model): TooltipBar[] {
   const row = track.audio_features;
@@ -736,7 +735,7 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
 /** 0–100 % of *time* through *duration*, clamped and finite-safe. */
 function progressPct(time: number, duration: number): number {
   if (!(duration > 0) || !Number.isFinite(time)) return 0;
-  return Math.max(0, Math.min(100, (time / duration) * 100));
+  return clamp((time / duration) * 100, 0, 100);
 }
 
 /**

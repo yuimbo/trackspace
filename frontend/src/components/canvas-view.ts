@@ -1,4 +1,5 @@
 import type { HoverTarget, Model, Track } from "../model";
+import { clamp01 } from "../lib/util";
 import {
   isAudioFeatureAxisId,
   scopeContains,
@@ -1252,7 +1253,7 @@ export class CanvasView {
       ctx.roundRect(bx, by, barW, barH, barH / 2);
       ctx.fill();
     } else {
-      const fw = Math.max(barH, barW * Math.max(0, Math.min(1, prog.fraction)));
+      const fw = Math.max(barH, barW * clamp01(prog.fraction));
       ctx.fillStyle = "rgba(120,200,255,0.9)";
       ctx.beginPath();
       ctx.roundRect(bx, by, fw, barH, barH / 2);
@@ -1312,7 +1313,7 @@ export class CanvasView {
     ctx.roundRect(bx, by, barW, barH, barH / 2);
     ctx.fill();
     if (fraction != null && Number.isFinite(fraction)) {
-      const fw = Math.max(barH, barW * Math.max(0, Math.min(1, fraction)));
+      const fw = Math.max(barH, barW * clamp01(fraction));
       ctx.fillStyle = "rgba(120,200,255,0.9)";
       ctx.beginPath();
       ctx.roundRect(bx, by, fw, barH, barH / 2);
@@ -1904,7 +1905,7 @@ export class CanvasView {
   /** Fraction of the track at the pointer's x within the seekbar track. */
   private _seekFraction(track: HTMLElement, clientX: number): number {
     const r = track.getBoundingClientRect();
-    return Math.max(0, Math.min(1, (clientX - r.left) / Math.max(1, r.width)));
+    return clamp01((clientX - r.left) / Math.max(1, r.width));
   }
 
   /** Start a seek drag on the card's seekbar; the first move seeks too. */

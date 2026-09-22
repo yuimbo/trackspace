@@ -7,6 +7,8 @@
 // recompute happens on release. It is deliberately a cheap approximation — the sign
 // and direction are right, the magnitude only to first order.
 
+import { clamp01 } from "./util";
+
 export interface WeightJacobian {
   /** The weights the Jacobian was evaluated at (the drag's origin). */
   weights: Record<string, number>;
@@ -46,8 +48,6 @@ export function parseWeightJacobian(raw: unknown): WeightJacobian | null {
     jacobian,
   };
 }
-
-const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
 /** Approximate positions at *weights* by a first-order step from the base layout.
  *

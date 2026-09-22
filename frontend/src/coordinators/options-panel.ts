@@ -8,8 +8,7 @@
 // DOM-heavy component classes.
 
 import { previewGain, type Model } from "../model";
-
-const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
+import { clamp } from "../lib/util";
 
 export interface OptionsPanelDeps {
   model: Model;

@@ -19,6 +19,7 @@ import { type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSour
 import { type Lens, getLens, lensWaitSources, lensWeights } from "../lib/lenses";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
+import { clamp } from "../lib/util";
 import type { ViewModifierSink } from "./view-modifier-coordinator";
 import {
   approximatePositions,
@@ -1120,7 +1121,7 @@ export class EmbeddingCoordinator {
 
   /** Scale a scope's region by *factor*, clamped to the min/max size. */
   private _scaleScope(scope: Scope, factor: number): Scope {
-    const clampR = (v: number) => Math.min(Math.max(v, SCOPE_MIN_R), SCOPE_MAX_R);
+    const clampR = (v: number) => clamp(v, SCOPE_MIN_R, SCOPE_MAX_R);
     const { hw, hh } = scopeHalfExtents(scope);
     if (scope.shape === "box") {
       const rx = clampR(hw * factor);

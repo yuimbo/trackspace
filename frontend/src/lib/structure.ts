@@ -7,6 +7,7 @@
 // controller free of formatting.
 
 import type { TrackStructure } from "../model";
+import { clamp01 } from "./util";
 
 /**
  * Where the hover preview should seek.
@@ -94,7 +95,7 @@ export function structureMarkers(
     markers.push({
       section,
       text,
-      fraction: Math.max(0, Math.min(1, seconds / duration)),
+      fraction: clamp01(seconds / duration),
     });
   };
 

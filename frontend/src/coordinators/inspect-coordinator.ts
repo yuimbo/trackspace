@@ -16,6 +16,7 @@ import {
   emptyDescribe,
 } from "../lib/tooltip";
 import type { ViewModifierSink } from "./view-modifier-coordinator";
+import { clamp } from "../lib/util";
 
 /** Neighbours requested for the "nearest" ranking. */
 export const NEAR_K = 5;
@@ -327,7 +328,7 @@ export class InspectCoordinator {
     seq: number,
   ): Promise<void> {
     const m = this.deps.model;
-    const p = Math.max(0, Math.min(100, percent));
+    const p = clamp(percent, 0, 100);
     if (p >= 100) {
       const all = new Set(m.allTracks.map((t) => t.path));
       this._proximityHidden = m.setProximityKeep(all, this._proximityHidden);
@@ -371,7 +372,7 @@ export class InspectCoordinator {
    * every track the slider hid.
    */
   private _syncProximityModifier(path: string, percent: number): void {
-    const p = Math.max(0, Math.min(100, percent));
+    const p = clamp(percent, 0, 100);
     this._proximityPercent = p;
     if (p >= 100) {
       this._removeProximityModifier();

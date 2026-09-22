@@ -1,5 +1,6 @@
 import type { Model } from "../model";
 import { isAudioFeatureAxisId } from "../model";
+import { clamp, clamp01 } from "../lib/util";
 
 
 export class BatchView {
@@ -130,7 +131,7 @@ export class BatchView {
     let val = initVal;
 
     const update = () => {
-      val = Math.max(0, Math.min(1, val));
+      val = clamp01(val);
       knob.style.left = `calc(${val * 100}% - 6px)`;
     };
     update();
@@ -145,7 +146,7 @@ export class BatchView {
           [...snap.values()].reduce((a, b) => a + b, 0) / snap.size;
         const delta = val - snapAvg;
         for (const [path, origVal] of snap)
-          updates.set(path, Math.max(0, Math.min(1, origVal + delta)));
+          updates.set(path, clamp01(origVal + delta));
       }
       this.onApply?.(tag, updates);
     };
@@ -162,7 +163,7 @@ export class BatchView {
       const W = outer.getBoundingClientRect().width || 100;
 
       knob.onpointermove = (e) => {
-        val = Math.max(0, Math.min(1, startVal + (e.clientX - startX) / W));
+        val = clamp01(startVal + (e.clientX - startX) / W);
         update();
         fireTransform();
       };
@@ -207,8 +208,8 @@ export class BatchView {
       hi = origHi;
 
     const update = () => {
-      lo = Math.max(0, Math.min(1, lo));
-      hi = Math.max(0, Math.min(1, hi));
+      lo = clamp01(lo);
+      hi = clamp01(hi);
       if (hi < lo) hi = lo;
       fill.style.left = lo * 100 + "%";
       fill.style.right = (1 - hi) * 100 + "%";
@@ -232,7 +233,7 @@ export class BatchView {
           range < 0.0001
             ? (lo + hi) / 2
             : lo + ((origVal - sLo) / range) * targetRange;
-        updates.set(path, Math.max(0, Math.min(1, nv)));
+        updates.set(path, clamp01(nv));
       }
       this.onApply?.(tag, updates);
     };
@@ -258,12 +259,12 @@ export class BatchView {
         el.onpointermove = (e) => {
           const delta = (e.clientX - startX) / W;
           if (!isKnob) {
-            lo = Math.max(0, Math.min(1 - span, startLo + delta));
+            lo = clamp(startLo + delta, 0, 1 - span);
             hi = lo + span;
           } else if (isLo) {
-            lo = Math.max(0, Math.min(hi, startLo + delta));
+            lo = clamp(startLo + delta, 0, hi);
           } else {
-            hi = Math.max(lo, Math.min(1, startHi + delta));
+            hi = clamp(startHi + delta, lo, 1);
           }
           update();
           fireTransform();

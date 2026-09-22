@@ -53,8 +53,8 @@ frontend/src/
   components/             one view per file (canvas, tags, properties, batch, status, search)
   lib/toast.ts            shared DOM helpers
   lib/api.ts              shared fetch / postJSON
+  lib/util.ts             shared clamp / escape / confirm / cycle helpers
   lib/lenses.ts           lens registry + deterministic feature geometry
-  lib/scope-menu.ts       scope lens picker menu DOM
 tests/                    pytest suite (backend); vitest lives beside frontend sources
 data/                     SQLite caches (gitignored, created at runtime)
 ```

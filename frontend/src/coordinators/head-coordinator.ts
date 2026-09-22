@@ -12,6 +12,7 @@
 import { type Model } from "../model";
 import { toast } from "../lib/toast";
 import { api, postJSON, postForm } from "../lib/api";
+import { confirmAction } from "../lib/util";
 
 export interface HeadDeps {
   model: Model;
@@ -424,7 +425,7 @@ export class HeadCoordinator {
     }
     if (
       apply &&
-      !window.confirm(
+      !confirmAction(
         `Move every track under "${this._imprintFolder}" into the head's folders? ` +
           "You can undo this from the head panel afterwards.",
       )
@@ -706,7 +707,7 @@ export class HeadCoordinator {
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       if (!force && message.includes("different encoder versions")) {
-        if (window.confirm(`${message}\n\nImport it anyway?`)) {
+        if (confirmAction(`${message}\n\nImport it anyway?`)) {
           await this._uploadHead(file, true);
         }
         return;

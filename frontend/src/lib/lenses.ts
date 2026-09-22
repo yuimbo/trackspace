@@ -15,6 +15,7 @@
 // this module is the built-in registry and the deterministic geometry.
 
 import type { Track } from "../model";
+import { clamp } from "./util";
 
 // Mirrors ``backend/tuning.py`` BPM_LO / BPM_HI; keep in sync.
 export const BPM_LO = 60;
@@ -132,7 +133,7 @@ export function bpmSpiralPolar(tempoNorm: number): Polar {
   const bpm = Math.max(tempoNorm * (BPM_HI - BPM_LO) + BPM_LO, 1e-6);
   const octave = Math.log2(bpm / BPM_LO);
   const angle = 2 * Math.PI * (octave % 1);
-  const tt = Math.min(1, Math.max(0, octave / BPM_OCTAVES));
+  const tt = clamp(octave / BPM_OCTAVES);
   const radius = SPIRAL_R_MIN + tt * (SPIRAL_R_MAX - SPIRAL_R_MIN);
   return { angle, radius };
 }

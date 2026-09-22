@@ -19,10 +19,9 @@ import {
 } from "../model";
 import { toast } from "../lib/toast";
 import { clusterColor } from "../lib/colors";
-import { COLOR_MODES, stepColorMode, type ColorMode } from "../lib/lenses";
+import { stepColorMode, type ColorMode } from "../lib/lenses";
 import { api, postJSON } from "../lib/api";
-
-const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
+import { clamp, confirmAction } from "../lib/util";
 
 export interface AnalysisDeps {
   model: Model;
@@ -277,7 +276,7 @@ export class AnalysisCoordinator {
       stage == null
         ? "Re-run every analysis stage for all tracks, even where cached?"
         : `Re-run ${label} for every track missing it?`;
-    if (!window.confirm(message)) return;
+    if (!confirmAction(message)) return;
     try {
       await postJSON("/api/embeddings/generate", {
         folder: "",
@@ -656,9 +655,7 @@ export class AnalysisCoordinator {
   /** Cycle the dot-colouring mode; shared by the panel select and the hotkeys. */
   cycleColorMode(dir: 1 | -1 = 1): void {
     const m = this.deps.model;
-    const idx = COLOR_MODES.indexOf(m.colorMode);
-    const n = COLOR_MODES.length;
-    this.applyColorMode(COLOR_MODES[(idx + dir + n) % n], true);
+    this.applyColorMode(stepColorMode(m.colorMode, dir), true);
   }
 
   /**

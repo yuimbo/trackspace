@@ -19,6 +19,7 @@ import {
   folderAncestor,
   type BloomRangeKey,
 } from "./lib/bloom";
+import { clamp01 } from "./lib/util";
 
 /** Cached librosa descriptors ([0,1]) when the fingerprint has a features row. */
 export interface TrackAudioFeatures {
@@ -193,7 +194,7 @@ function _migrateClusterWeights(raw: unknown): Record<string, number> {
     for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
       if (!(k in out)) continue;
       const n = Number(v);
-      if (Number.isFinite(n)) out[k] = Math.min(1, Math.max(0, n));
+      if (Number.isFinite(n)) out[k] = clamp01(n);
     }
   }
   return out;
@@ -228,7 +229,6 @@ function _migrateBloomRanges(
   raw: unknown,
   legacy: unknown,
 ): Record<BloomRangeKey, number> {
-  const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
   const out = Object.fromEntries(
     BLOOM_RANGE_KEYS.map((k) => [k, DEFAULT_BLOOM_RANGE]),
   ) as Record<BloomRangeKey, number>;
@@ -416,7 +416,7 @@ export const DEFAULT_PREVIEW_VOLUME = 0.8;
  * in the top few pixels, so the preview jumps from inaudible to deafening.
  */
 export function previewGain(volume: number): number {
-  const v = Math.max(0, Math.min(1, volume));
+  const v = clamp01(volume);
   return v * v;
 }
 
@@ -627,7 +627,7 @@ export class Model extends EventBus {
 
   /** Set the bloom range for *mode* (default: the cursor's variable). */
   setBloomRange(value: number, mode: ColorMode = this.selectionBloom): void {
-    this.bloomRanges[bloomRangeKey(mode)] = Math.max(0, Math.min(1, value));
+    this.bloomRanges[bloomRangeKey(mode)] = clamp01(value);
   }
   /**
    * Per-source weights for clustering and the layout; persisted. One vector drives

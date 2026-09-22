@@ -19,6 +19,7 @@ import type {
 import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
+import { cycle, clamp01 } from "./lib/util";
 import { bloomRangeLabel } from "./lib/bloom";
 import {
   CommandManager,
@@ -773,7 +774,7 @@ export class Controller {
   /** **M + scroll**: scale the preview volume and mirror it on the slider. */
   private _adjustPreviewVolume(factor: number): void {
     const m = this.model;
-    m.previewVolume = Math.max(0, Math.min(1, m.previewVolume * factor));
+    m.previewVolume = clamp01(m.previewVolume * factor);
     this.$audio.volume = previewGain(m.previewVolume);
     this.options.syncPreviewVolume();
   }
@@ -899,12 +900,8 @@ export class Controller {
       return;
     }
     // Forward from nothing starts at the first section, backward at the last.
-    const idx = m.previewSection
-      ? present.indexOf(m.previewSection)
-      : dir > 0
-        ? -1
-        : 0;
-    const next = present[(idx + dir + present.length) % present.length];
+    const fallback = dir > 0 ? present[0] : present[present.length - 1];
+    const next = cycle(present, m.previewSection ?? fallback, dir);
     const start = sectionStartSeconds(structure, next);
     if (start == null) return;
     m.previewSection = next;

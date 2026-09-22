@@ -1,11 +1,8 @@
 import type { Model, QueueStatus } from "../model";
 import { pipelineProgress, phaseLabel, stageDetail } from "../lib/pipeline";
+import { escapeHtml as esc } from "../lib/util";
 
 const PANEL_HIDE_MS = 140;
-
-function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
 
 export class StatusView {
   $el: HTMLElement;
