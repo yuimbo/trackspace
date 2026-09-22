@@ -12,6 +12,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
+from backend.decode_stderr import librosa_get_duration
 from backend.routes.api_describe import create_api_describe_blueprint
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
@@ -190,6 +191,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             maest_version=deps.maest_mod.MAEST_VERSION,
             resolve_virtual_path=deps.resolve_virtual_path,
             cached_read_all=deps.cached_read_all,
+            probe_duration=lambda path: librosa_get_duration(path=path),
         )
     )
     app.register_blueprint(

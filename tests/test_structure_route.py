@@ -68,6 +68,7 @@ def _client(*, rows=None, structure_version: int = 1):
         cached_read_all=lambda abs_path: {
             "fingerprint": _INFOS.get(abs_path.removeprefix("/abs/"))
         },
+        probe_duration=lambda abs_path: 200.0,
     )
     return _app(bp).test_client()
 
@@ -84,9 +85,23 @@ def test_structure_returns_cached_sections():
             "peak_end": 94.0,
             "break_start": 192.0,
             "break_end": None,
+            "duration": 200.0,
             "genre_spanning": False,
         }
     ]
+
+
+def test_structure_omits_duration_when_the_probe_fails():
+    bp = create_api_structure_blueprint(
+        feature_cache=_FakeCache({"structure": _STRUCTURES}),
+        structure_version=1,
+        maest_version=1,
+        resolve_virtual_path=lambda p: f"/abs/{p}",
+        cached_read_all=lambda abs_path: {"fingerprint": "fp-a"},
+        probe_duration=lambda abs_path: (_ for _ in ()).throw(OSError("nope")),
+    )
+    body = _app(bp).test_client().get("/api/tracks/structure?paths=a.mp3").get_json()
+    assert body["tracks"][0]["duration"] is None
 
 
 def test_structure_omits_paths_without_a_row():
@@ -151,6 +166,7 @@ def test_structure_reads_only_requested_paths():
         maest_version=1,
         resolve_virtual_path=lambda p: f"/abs/{p}",
         cached_read_all=read,
+        probe_duration=lambda abs_path: 200.0,
     )
     _app(bp).test_client().get("/api/tracks/structure?paths=a.mp3,b.mp3")
     assert reads == ["/abs/a.mp3", "/abs/b.mp3"]

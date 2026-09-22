@@ -5,14 +5,18 @@ Read-only over ``FeatureCache``: the ``structure`` blob is written by the queue'
 ``maest_excerpts`` blob. Only the requested paths are resolved (via the track cache),
 so a hover is O(requested paths), not O(library) — no full-library scan per request.
 
-Absent sections are stored as ``NaN`` and surface as ``null``. Paths with no cached
-structure row are simply omitted from the response — the frontend falls back to a fixed
-preview position until the background backfill reaches the track.
+The structure blob carries no track length, so the seekbar cannot place its markers
+without one; ``probe_duration`` reads it from the file header (cheap, no decode) and
+it rides along in the response. Absent sections are stored as ``NaN`` and surface as
+``null``. Paths with no cached structure row are simply omitted from the response —
+the frontend falls back to a fixed preview position until the background backfill
+reaches the track.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -28,6 +32,17 @@ log = logging.getLogger(__name__)
 MAX_PATHS = 64
 
 
+def _safe_duration(
+    probe_duration: Callable[[str], float], abs_path: str
+) -> float | None:
+    """Track length in seconds from *abs_path*, or ``None`` when it cannot be read."""
+    try:
+        duration = float(probe_duration(abs_path))
+    except Exception:
+        return None
+    return duration if math.isfinite(duration) and duration > 0 else None
+
+
 def create_api_structure_blueprint(
     *,
     feature_cache: Any,
@@ -35,6 +50,7 @@ def create_api_structure_blueprint(
     maest_version: int,
     resolve_virtual_path: Callable[[str], str],
     cached_read_all: Callable[[str], dict[str, Any]],
+    probe_duration: Callable[[str], float],
 ) -> Blueprint:
     bp = Blueprint("api_structure", __name__)
 
@@ -50,6 +66,7 @@ def create_api_structure_blueprint(
             raise ApiValidationError(f"at most {MAX_PATHS} paths per request")
 
         by_path: dict[str, str] = {}
+        abs_by_path: dict[str, str] = {}
         fps: list[str] = []
         for path in wanted:
             try:
@@ -60,6 +77,7 @@ def create_api_structure_blueprint(
             fp = info.get("fingerprint")
             if isinstance(fp, str) and fp:
                 by_path[path] = fp
+                abs_by_path[path] = abs_path
                 fps.append(fp)
 
         structures = feature_cache.get_all(
@@ -76,6 +94,7 @@ def create_api_structure_blueprint(
                 continue
             entry: dict[str, Any] = {"path": path}
             entry.update(structure_mod.decode_structure(blob))
+            entry["duration"] = _safe_duration(probe_duration, abs_by_path[path])
             exc = excerpts.get(fp)
             entry["genre_spanning"] = supervised_mod.is_genre_spanning(
                 supervised_mod.decode_excerpts(exc) if exc is not None else None
