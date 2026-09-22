@@ -438,3 +438,61 @@ describe("Model selection bloom", () => {
     expect(m.trackBloomsWith(a, b)).toBe(false);
   });
 });
+
+describe("Model view rules", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("exposes the rule stack as the view modifiers", () => {
+    const m = new Model();
+    m.viewRules = [{ id: "vm-1", kind: "search", label: "kick" }];
+    expect(m.viewModifiers).toEqual([
+      { id: "vm-1", kind: "search", label: "kick" },
+    ]);
+  });
+
+  it("hides a track whose rule does not match", () => {
+    const m = new Model();
+    const a = track("a.mp3", "lib");
+    const b = track("b.mp3", "lib");
+    m.setAllTracks([a, b]);
+    m.viewRules = [
+      {
+        id: "vm-1",
+        kind: "filters",
+        label: "Tempo",
+        scope: "tags",
+        matches: (t) => t.path === "a.mp3",
+      },
+    ];
+    expect(m.isVisible(a)).toBe(true);
+    expect(m.isVisible(b)).toBe(false);
+    // The explicit-hidden predicate is untouched by the rule.
+    expect(m.isTrackHidden(b)).toBe(false);
+  });
+
+  it("applies a tags-scoped rule only in tags mode", () => {
+    const m = new Model();
+    const b = track("b.mp3", "lib");
+    m.setAllTracks([b]);
+    m.viewRules = [
+      {
+        id: "vm-1",
+        kind: "filters",
+        label: "Tempo",
+        scope: "tags",
+        matches: () => false,
+      },
+    ];
+    expect(m.isVisible(b)).toBe(false);
+    m.viewMode = "embeddings";
+    expect(m.isVisible(b)).toBe(true);
+  });
+
+  it("keeps a rule without a matcher from hiding anything", () => {
+    const m = new Model();
+    const b = track("b.mp3", "lib");
+    m.setAllTracks([b]);
+    m.viewRules = [{ id: "vm-1", kind: "search", label: "kick" }];
+    expect(m.isVisible(b)).toBe(true);
+  });
+});

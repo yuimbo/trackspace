@@ -171,9 +171,19 @@ clear callbacks, one chip stack in a canvas corner:
 type ViewModifierKind =
   | "search" | "proximity" | "scope" | "exclusions" | "filters" | "external";
 interface ViewModifier { id: string; kind: ViewModifierKind; label: string; detail?: string; value?: number; checked?: boolean; permanent?: boolean; }
+interface ViewRule extends ViewModifier {
+  matches?(track: Track): boolean;      // true = keep; absent = no visibility effect
+  scope?: "tags" | "all";              // a tag filter only applies in tags mode
+}
 ```
 
-- `Model.viewModifiers` is the stack, **oldest → newest**. Session-only, like the
+- `Model.viewRules` is the stack, **oldest → newest**; `Model.viewModifiers` is a
+  getter over the same array (the corner view renders the descriptors). A rule that
+  carries `matches` also decides visibility, so the chip stack and the visible set
+  share one source: `Model.isVisible(track)` ANDs the view union, the explicit
+  exclusions and the distance filter, then every active rule's `matches`. The
+  exclusions, proximity, tag-filter and external chips each carry their own
+  `matches`; a search fade or a scope re-layout has none. Session-only, like the
   exclusions and the scope it may describe.
 - `ViewModifierCoordinator` owns the stack operations and a `Map<id, clear>`:
   `push(mod, clear)`, `update(id, patch)`, `dismiss(id)`, `remove(id)`,
@@ -202,7 +212,10 @@ it without running the callback, for a path that already reverted the state.
 
 1. Add the kind to `VIEW_MODIFIER_KINDS`.
 2. Push/update it from the owner as its state changes (`ViewModifierSink`), and
-   register a clear callback that reverts the underlying model state.
+   register a clear callback that reverts the underlying model state. If the kind
+   *filters* tracks, give the descriptor a `matches(track)` predicate (and a
+   `scope: "tags"` when it only applies in tags mode), so `Model.isVisible`
+   consults it without a parallel branch.
 3. On the owner's direct-close path, call `viewMods.remove(id)` so the chip never
    goes stale.
 4. Refresh in place (`update`) rather than re-pushing on every step, so a slider drag

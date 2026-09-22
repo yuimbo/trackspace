@@ -337,6 +337,19 @@ export interface ViewModifier {
   permanent?: boolean;
 }
 
+/**
+ * One active view rule: a view modifier that may also filter visibility. A rule
+ * without ``matches`` (a search fade, a scope re-layout) only changes what the
+ * canvas draws; one with it also decides whether a track is shown. ``matches``
+ * returns true to *keep* the track, and ``scope`` says which view it applies to
+ * (a tag filter only applies in tags mode). See `design-patterns.md` → *Active
+ * view modifiers*.
+ */
+export interface ViewRule extends ViewModifier {
+  matches?(track: Track): boolean;
+  scope?: "tags" | "all";
+}
+
 export interface Viewport {
   ox: number;
   oy: number;
@@ -669,7 +682,17 @@ export class Model extends EventBus {
    * **Esc** dismisses the newest; a chip's × dismisses one. Session-only, like
    * the exclusions and the scope a modifier may describe.
    */
-  viewModifiers: ViewModifier[] = [];
+  /**
+   * Active view rules, oldest → newest. The chip stack the corner view renders;
+   * the rules that carry a ``matches`` predicate are also what ``isVisible``
+   * consults, so a filter chip and the visible set share one source.
+   */
+  viewRules: ViewRule[] = [];
+
+  /** The descriptors the corner chip view renders (rules are modifiers + matcher). */
+  get viewModifiers(): ViewModifier[] {
+    return this.viewRules;
+  }
 
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
@@ -722,15 +745,34 @@ export class Model extends EventBus {
     return this.externalRootIds.has(rootId);
   }
 
-  isTrackHidden(t: Track): boolean {
+  isExcludedTrack(t: Track): boolean {
     if (this.hiddenPaths.has(t.path)) return true;
-    if (this.proximityHiddenPaths.has(t.path)) return true;
     const tf = t.folder ?? "";
     for (const p of this.hiddenFolderPrefixes) {
       if (p === "") return true;
       if (tf === p || tf.startsWith(p + "/")) return true;
     }
     return false;
+  }
+
+  isTrackHidden(t: Track): boolean {
+    return this.isExcludedTrack(t) || this.proximityHiddenPaths.has(t.path);
+  }
+
+  /**
+   * True when the current view shows *t*: inside the view union, not excluded or
+   * distance-filtered, and passing every active filter rule. The one predicate the
+   * canvas and the fit/select paths share, so the chip stack and the visible set
+   * cannot disagree.
+   */
+  isVisible(t: Track): boolean {
+    if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) return false;
+    for (const r of this.viewRules) {
+      if (!r.matches) continue;
+      if (r.scope === "tags" && this.viewMode !== "tags") continue;
+      if (!r.matches(t)) return false;
+    }
+    return true;
   }
 
   /** True while any track or folder subtree is excluded from the current view. */
@@ -830,14 +872,22 @@ export class Model extends EventBus {
     return this._pathMap.get(path);
   }
 
+  /** True when *track*'s *tag* value is inside its active filter range. */
+  passesFilterTag(track: Track, tag: string): boolean {
+    const r = this.filterRanges[tag];
+    if (!r) return true;
+    const [lo, hi] = r;
+    let v: number | undefined;
+    if (isAudioFeatureAxisId(tag))
+      v = this._audioFeatureScalar(track, tag) ?? track.tags[tag];
+    else v = track.tags[tag];
+    if (v === undefined) return true;
+    return v >= lo && v <= hi;
+  }
+
   passesFilter(track: Track): boolean {
-    for (const [tag, [lo, hi]] of Object.entries(this.filterRanges)) {
-      let v: number | undefined;
-      if (isAudioFeatureAxisId(tag))
-        v = this._audioFeatureScalar(track, tag) ?? track.tags[tag];
-      else v = track.tags[tag];
-      if (v === undefined) continue;
-      if (v < lo || v > hi) return false;
+    for (const tag of Object.keys(this.filterRanges)) {
+      if (!this.passesFilterTag(track, tag)) return false;
     }
     return true;
   }

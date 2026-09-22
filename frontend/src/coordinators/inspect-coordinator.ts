@@ -356,7 +356,14 @@ export class InspectCoordinator {
       });
     } else {
       this._proximityModifierId = this.deps.viewMods.push(
-        { kind: "proximity", label, detail, value: p },
+        {
+          kind: "proximity",
+          label,
+          detail,
+          value: p,
+          matches: (t) =>
+            !this.deps.model.proximityHiddenPaths.has(t.path),
+        },
         () => this._clearProximity(),
       );
     }

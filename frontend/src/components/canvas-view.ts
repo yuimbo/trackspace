@@ -857,7 +857,7 @@ export class CanvasView {
     const h = this.$canvas.clientHeight;
     let anyFiltered = false;
     tracks.forEach((t, i) => {
-      if (m.viewMode === "tags" && !m.passesFilter(t)) {
+      if (!m.isVisible(t)) {
         anyFiltered = true;
         return;
       }
@@ -1076,7 +1076,7 @@ export class CanvasView {
       maxY = -Infinity;
     for (const path of m.selected) {
       const t = m.trackByPath(path);
-      if (!t || !m.passesFilter(t)) continue;
+      if (!t || !m.isVisible(t)) continue;
       const wx = m.axisX ? m.axisScalar(t, m.axisX) : 0.5;
       const wy = m.axisY ? m.axisScalar(t, m.axisY) : 0.5;
       if (wx < minX) minX = wx;

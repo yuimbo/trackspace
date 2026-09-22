@@ -1026,7 +1026,7 @@ export class CanvasInteractionController {
     // default viewport shows everything.
     if (m.viewMode === "embeddings") return { ox: 0, oy: 0, zoom: 1 };
 
-    const visible = m.tracks.filter((t) => m.passesFilter(t));
+    const visible = m.tracks.filter((t) => m.isVisible(t));
     if (visible.length === 0) return { ox: 0, oy: 0, zoom: 1 };
 
     let minX = Infinity,
@@ -1130,7 +1130,7 @@ export class CanvasInteractionController {
   private _targetTracks(target: HoverTarget): Track[] {
     const m = this.deps.model;
     return m.tracks.filter(
-      (t) => m.trackMatchesHoverTarget(t, target) && m.passesFilter(t),
+      (t) => m.trackMatchesHoverTarget(t, target) && m.isVisible(t),
     );
   }
 

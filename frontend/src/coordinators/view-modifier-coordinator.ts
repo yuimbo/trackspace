@@ -12,7 +12,7 @@
 // dropping a scope, `clearExclusions`) also removes its entry, so the stack never
 // goes stale. See `design-patterns.md` → *Active view modifiers*.
 
-import type { Model, ViewModifier, ViewModifierKind } from "../model";
+import type { Model, ViewModifier, ViewModifierKind, ViewRule } from "../model";
 
 /** The parts of the corner chip view this coordinator drives. */
 export interface ViewModifierViewLike {
@@ -24,7 +24,7 @@ export interface ViewModifierViewLike {
  * stub; `ViewModifierCoordinator` satisfies it.
  */
 export interface ViewModifierSink {
-  push(mod: Omit<ViewModifier, "id">, clear: () => void): string;
+  push(mod: Omit<ViewRule, "id">, clear: () => void): string;
   update(id: string, patch: Partial<Omit<ViewModifier, "id">>): void;
   dismiss(id: string): void;
   remove(id: string | null): void;
@@ -44,21 +44,18 @@ export class ViewModifierCoordinator {
   constructor(private deps: ViewModifierCoordinatorDeps) {}
 
   /** Every active modifier, oldest → newest (the rendered stack). */
-  get stack(): ViewModifier[] {
-    return this.deps.model.viewModifiers;
+  get stack(): ViewRule[] {
+    return this.deps.model.viewRules;
   }
 
   /**
    * Push a modifier on top of the stack. *clear* undoes the underlying state;
    * it must be idempotent, because a direct close may also call it.
    */
-  push(mod: Omit<ViewModifier, "id">, clear: () => void): string {
+  push(mod: Omit<ViewRule, "id">, clear: () => void): string {
     const id = `vm-${++this._seq}`;
     this._clearers.set(id, clear);
-    this.deps.model.viewModifiers = [
-      ...this.deps.model.viewModifiers,
-      { ...mod, id },
-    ];
+    this.deps.model.viewRules = [...this.deps.model.viewRules, { ...mod, id }];
     this._render();
     return id;
   }
@@ -66,7 +63,7 @@ export class ViewModifierCoordinator {
   /** Update a modifier's readout in place (a live slider drag, a refit toggle). */
   update(id: string, patch: Partial<Omit<ViewModifier, "id">>): void {
     let changed = false;
-    this.deps.model.viewModifiers = this.deps.model.viewModifiers.map((m) => {
+    this.deps.model.viewRules = this.deps.model.viewRules.map((m) => {
       if (m.id !== id) return m;
       changed = true;
       return { ...m, ...patch };
@@ -79,9 +76,9 @@ export class ViewModifierCoordinator {
     const clear = this._clearers.get(id);
     if (!clear) return;
     // A permanent chip (no ×) is never dismissed; its state is a view filter.
-    if (this.deps.model.viewModifiers.find((m) => m.id === id)?.permanent) return;
+    if (this.deps.model.viewRules.find((m) => m.id === id)?.permanent) return;
     this._clearers.delete(id);
-    this.deps.model.viewModifiers = this.deps.model.viewModifiers.filter(
+    this.deps.model.viewRules = this.deps.model.viewRules.filter(
       (m) => m.id !== id,
     );
     this._render();
@@ -96,7 +93,7 @@ export class ViewModifierCoordinator {
     if (!id) return;
     if (!this._clearers.has(id)) return;
     this._clearers.delete(id);
-    this.deps.model.viewModifiers = this.deps.model.viewModifiers.filter(
+    this.deps.model.viewRules = this.deps.model.viewRules.filter(
       (m) => m.id !== id,
     );
     this._render();
@@ -104,7 +101,7 @@ export class ViewModifierCoordinator {
 
   /** **Esc**: dismiss the newest modifier. False when none can be dismissed. */
   popNewest(): boolean {
-    const stack = this.deps.model.viewModifiers;
+    const stack = this.deps.model.viewRules;
     for (let i = stack.length - 1; i >= 0; i--) {
       if (stack[i].permanent) continue;
       this.dismiss(stack[i].id);
@@ -115,7 +112,7 @@ export class ViewModifierCoordinator {
 
   /** The active modifier of a kind, if any (a chip's state to read). */
   find(kind: ViewModifierKind): ViewModifier | undefined {
-    return this.deps.model.viewModifiers.find((m) => m.kind === kind);
+    return this.deps.model.viewRules.find((m) => m.kind === kind);
   }
 
   /** Re-render the chip stack from the model (used after an external clear). */
@@ -124,6 +121,6 @@ export class ViewModifierCoordinator {
   }
 
   private _render(): void {
-    this.deps.view.render(this.deps.model.viewModifiers);
+    this.deps.view.render(this.deps.model.viewRules);
   }
 }

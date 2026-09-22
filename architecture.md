@@ -244,7 +244,7 @@ recomputed on load (`services/roots_registry.py`). Each root carries a role:
   Nyström extension (`landmark_projection.build_landmark_model(..., place_infos=…)`).
   The external view-modifier chip's **Refit** toggle sends `fit_scope=all` to opt into
   the old external-inclusive refit. Visibility also gates their drawing
-  (`Model.trackInViewUnion`), and the head does not learn from their folder labels by
+  (`Model.isVisible`), and the head does not learn from their folder labels by
   default.
   Because analysis is content-addressed, marking a root external — or removing it —
   never discards its cached embeddings; re-adding restores it instantly.

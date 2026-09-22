@@ -525,7 +525,13 @@ export class Controller {
         this.filterModifierIds.set(
           tag,
           this.viewMods.push(
-            { kind: "filters", label: m.axisDisplayName(tag), detail },
+            {
+              kind: "filters",
+              label: m.axisDisplayName(tag),
+              detail,
+              scope: "tags",
+              matches: (t) => m.passesFilterTag(t, tag),
+            },
             () => {
               delete m.filterRanges[tag];
               m.emit("change");
@@ -991,7 +997,15 @@ export class Controller {
     detail: string,
     clear: () => void,
   ): void {
-    this.viewMods.push({ kind: "exclusions", label, detail }, clear);
+    this.viewMods.push(
+      {
+        kind: "exclusions",
+        label,
+        detail,
+        matches: (t) => !this.model.isExcludedTrack(t),
+      },
+      clear,
+    );
   }
 
   /** A short readout of how many tracks a hover target covers. */
