@@ -454,8 +454,13 @@ describe("HeadCoordinator import", () => {
     vi.stubGlobal("confirm", vi.fn(() => true));
     let sawForce = false;
     const refreshProjection = vi.fn();
+    const refreshPredictions = vi.fn();
     const model = new Model();
-    const coord = new HeadCoordinator({ model, refreshProjection });
+    const coord = new HeadCoordinator({
+      model,
+      refreshProjection,
+      refreshPredictions,
+    });
     const fetchSpy = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       const form = init?.body as FormData;
       if (form.get("force") === "1") {
@@ -489,6 +494,7 @@ describe("HeadCoordinator import", () => {
       "run 2",
     );
     expect(refreshProjection).toHaveBeenCalled();
+    expect(refreshPredictions).toHaveBeenCalled();
     expect(toast).toHaveBeenCalled();
   });
 });

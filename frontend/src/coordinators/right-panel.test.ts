@@ -4,18 +4,15 @@ import { RightPanelBinder } from "./right-panel";
 
 const PANEL_HTML = `
   <aside id="right-panel">
-    <section id="search-section"></section>
     <section id="properties-section"></section>
     <nav id="rp-tabs">
       <button type="button" class="rp-tab" data-rp-tab="analysis"></button>
       <button type="button" class="rp-tab" data-rp-tab="organise"></button>
       <button type="button" class="rp-tab" data-rp-tab="tracks"></button>
-      <button type="button" class="rp-tab" data-rp-tab="view"></button>
     </nav>
     <section id="analysis-section" data-rp-panel="analysis"></section>
     <section id="head-section" data-rp-panel="organise"></section>
     <section id="batch-section" data-rp-panel="tracks"></section>
-    <section id="options-section" data-rp-panel="view"></section>
   </aside>
 `;
 
@@ -45,7 +42,6 @@ describe("RightPanelBinder", () => {
     expect(panel("tracks").hidden).toBe(false);
     expect(panel("analysis").hidden).toBe(true);
     expect(panel("organise").hidden).toBe(true);
-    expect(panel("view").hidden).toBe(true);
     expect(tab("tracks").classList.contains("active")).toBe(true);
     expect(tab("tracks").getAttribute("aria-selected")).toBe("true");
   });
@@ -55,18 +51,18 @@ describe("RightPanelBinder", () => {
     const binder = new RightPanelBinder({ model });
     binder.bind();
 
-    tab("view").click();
+    tab("tracks").click();
 
-    expect(model.rightPanelTab).toBe("view");
-    expect(panel("view").hidden).toBe(false);
+    expect(model.rightPanelTab).toBe("tracks");
+    expect(panel("tracks").hidden).toBe(false);
     expect(panel("analysis").hidden).toBe(true);
-    expect(tab("view").classList.contains("active")).toBe(true);
+    expect(tab("tracks").classList.contains("active")).toBe(true);
     expect(tab("analysis").classList.contains("active")).toBe(false);
 
     // Persisted, so a fresh model reads the same tab back.
     const reloaded = new Model();
     reloaded.loadLS();
-    expect(reloaded.rightPanelTab).toBe("view");
+    expect(reloaded.rightPanelTab).toBe("tracks");
   });
 
   it("ignores an unknown persisted tab", () => {

@@ -25,6 +25,33 @@ flicker. `EmbeddingCoordinator` owns that frame and the overlay; the tag-axis an
 (`animateAxisChange`) lives there too, precisely because it writes the same overlay. New
 position animations must be routed through the coordinator, not start their own rAF loop.
 
+### Scatter points (metaballs)
+
+The scatter itself is one WebGL metaball pass (`lib/point-layer.ts`), not N 2-D discs
+plus a per-cell count badge. Two passes over a transparent canvas:
+
+1. **Splat** — every point is a screen-space quad whose fragment shader deposits a radial
+   kernel (flat core, smooth falloff) additively into a half-float render target.
+2. **Composite** — a full-screen quad thresholds the summed field with a `smoothstep`, so an
+   isolated point reads as the old 4 px disc and a dense knot bulges into one merged blob.
+
+`CanvasView` builds one `PointSpec` per visible track from the same screen positions the
+scatter would have drawn, then blits the layer's canvas between the grid and the overlays. When
+the layer is unsupported (no WebGL2 or no renderable half-float target) the scatter falls
+back to the plain 2-D `_dot` loop. The blob edge is anti-aliased with a screen-space
+derivative ramp (~1 px at any density), and a weak dark ring (~1.5 px, ~0.35 alpha) sits just
+outside it so blobs stay legible against the grid and the glow. Colour is the kernel-weighted
+average, so a blob of one hue stays pure and a mixed blob blends proportionally; the summed weight
+is divided out, so a blob's interior stays at full saturation however many points stack. Point alpha
+dims a blob's colour (search fade, external tracks) without shrinking its shape, so faded points still
+merge.
+
+**Hovered and selected points are excluded from the field** and drawn crisp on top
+(`_dot`), so a single track never dissolves into a blob. Hit testing stays CPU-side on
+`CanvasView.positions`; a click inside a merged blob falls back to `nearestInBlob`, which
+takes the nearest member of the cursor's 3×3 screen-grid neighbourhood (only when it holds
+at least two points, so a far lone dot is never grabbed).
+
 ---
 
 ## Tag values and persistence
@@ -80,24 +107,44 @@ means the track sits directly at the root.
   `pending_rename` = optional relative path for auto-opening rename after create.
 - Roots are grouped by role: My library first, then a muted **External** section
   (`.folder-section-label`, `.folder-row-external`). Root rows carry `data-root-id`,
-  `data-root-role` and `data-root-abs`; the `.folder-role-btn` flips a root via
-  `POST /api/roots/role`.
-- Root rows carry two more actions: `.folder-remove-btn` (✕, after a `confirm`) drops the
+  `data-root-role` and `data-root-abs`.
+- **Rows carry no inline action icons.** Hovering a row opens a single action popout
+  (`#folder-actions`, `.folder-actions`) to its right; `FolderTreeCoordinator` builds the
+  buttons from the row's data attributes and hides the popout on leave, scroll, or resize.
+  Each button shows a glyph, a label, and — where the action has a global hotkey — a `<kbd>`
+  badge (`focus-folder` **F**, `isolate-selection` **S**, `fit-view` **H**,
+  `exclude-selection` **Shift+S**). The buttons dispatch through `runCanvasAction` (the same
+  `Controller._runCanvasAction` the hotkeys call), `POST /api/folders/reveal`,
+  `POST /api/roots/role`, `POST /api/roots/remove` (after a `confirm`), `POST /api/folders/create`,
+  or the head panel's imprint prefill via `onImprintRoot`.
+- Root rows: *role* flips My library ↔ External via `POST /api/roots/role`; *remove* drops the
   root via `POST /api/roots/remove` — files stay on disk and cached analysis is kept, so
   re-adding restores it; dragging a root row out of the sidebar does the same without a
-  button. `.folder-imprint-btn` (external roots only) prefills the head panel's imprint
-  target with the root's absolute path through the controller's `onImprintRoot` dep.
+  button. *imprint* (external roots only) prefills the head panel's imprint target with the
+  root's absolute path through the controller's `onImprintRoot` dep.
 - **Adding a root is always an explicit role choice.** *+ Root* opens the modal (path from the
   clipboard); a **Finder drop** on the sidebar opens the same modal with the dropped path
   prefilled rather than silently adding a library root — a dropped folder may be a download the
   user wants **External**. The modal's *External (not My library)* checkbox sets the `role` sent
   to `POST /api/roots/add`.
 - `#show-external-toggle` (in `#folder-controls`, hidden while no external roots exist)
-  is bound to `model.showExternal`; toggling it redraws the canvas without a rescan.
-  When on, external dots are drawn at half alpha (`CanvasView._dot`) so they read as
-  secondary to My library. `FolderTreeCoordinator._syncExternalRoots` reads roles from
-  the swapped tree, so a role change only needs a tree `refresh()`, never the
-  expensive `onRootsChanged()` reload.
+  is bound to `model.showExternal`; toggling it is a **pure redraw**, never a refetch.
+  When on, external dots are drawn at half alpha (`CanvasView._pointSpec`) so they read as
+  secondary to My library. External positions ride along with **every** projection request
+  (`EmbeddingCoordinator._projectionQueryString` sends `include_external=1` whenever
+  `model.externalRootIds` is non-empty), so the toggle only has to reveal dots the chart
+  already carries. A chart fetched before the tree revealed the roots is healed once in the
+  background by `FolderTreeCoordinator._healExternalPositions`, so the toggle is never the
+  thing that waits. `FolderTreeCoordinator._syncExternalRoots` reads roles from the swapped
+  tree, so a role change only needs a tree `refresh()`, never the expensive
+  `onRootsChanged()` reload.
+- `#external-projection-toggle` (hidden with the same condition) is bound to
+  `model.externalInProjection`. It is **off by default**: showing externals keeps the
+  library t-SNE layout and the server places the external dots onto it by Nyström
+  extension (`fit_scope=library`, the default). Turning it on sends `fit_scope=all`
+  and refits the map with externals included — the old behaviour. Only this switch calls
+  `refreshProjection()`; it is the only one that changes the fitted track set, so only it
+  moves the library dots.
 
 ---
 
@@ -154,7 +201,7 @@ The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):
   folders are mirrored onto `model.trainFolders` and
   persisted in `localStorage`, so a selection survives a reload.
 - **Imprint on a folder…** takes an absolute path (or is prefilled from an external
-  root row's `.folder-imprint-btn`), calls
+  root row's hover action popout), calls
   `POST /api/supervised/imprint/analyze`, then polls
   `GET /api/supervised/imprint/status` until `pending == 0` before *Review plan* and
   *Apply moves* run the ordinary `POST /api/supervised/fanout`. The fan-out is always
@@ -235,10 +282,21 @@ folder); `Model.trackMatchesHoverTarget` is the only place a target is interpret
 the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active chip is
 highlighted in the tooltip (`model.previewSection`).
 
-**Colour by folder/cluster** (action `"toggle-clusters"`, **C**) flips `model.colorByCluster` and flashes a
-**transient HUD** (`CanvasView.flashHud`) with the two modes and the active one highlighted. A HUD flash
-*replaces* the previous one, so repeated presses show the current mode rather than stacking "Colouring by …"
-toasts. See `design-patterns.md` → *Transient canvas HUD*.
+**Colour mode** (action `"toggle-clusters"`, **C**; backward with **Shift+C**) cycles `model.colorMode` through
+folder → predicted folder → cluster → tempo → key. The active mode is always visible in the **top colour tabber** (below the lens
+tabber) and can also be clicked there; the **View** tab select mirrors it. Selecting cluster while none are
+available is refused with a warn toast. The tempo and key modes reuse the polar geometry of their lenses
+(`bpmSpiralPolar` / `camelotPolar`) — angle → hue, radius → brightness — so tracks close on that map read as
+close in colour. See `design-patterns.md` → *Persistent canvas tabbers*.
+
+**Predicted folder** colours each track by the folder head's nearest learned folder (`dirColor` of the predicted
+virtual path), not the track's own folder, so the map shows where the head *thinks* a track belongs. It is fetched
+lazily on first selection from `GET /api/supervised/predictions` (`model.folderPredictions` +
+`model.folderPredictionMatches`) and invalidated when the head changes (a drained supervise job or an import).
+The **Predicted** select in the View tab picks between *Confident only* (`model.headColorConfident`, the default: only
+tracks clearing their class's match floor, the same rule the fan-out uses) and *All nearest* (every track's nearest
+folder regardless of similarity). A track with no prediction, or a weak one under *Confident only*, falls back to its
+actual folder colour.
 
 **Inspect card** is pinned by **Alt** (not a `HOTKEY_MAP` action — it is a bare modifier over a hovered
 dot, so it lives in `CanvasInteractionController._bindInspectKey`). See *Inspect card* below.
@@ -261,13 +319,14 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   and the deterministic feature lenses (`camelot`, `tempo`). `model.viewMode` is a
   derived getter — `"tags"` for the tag lens, `"embeddings"` for every other — so
   the embedding-mode rules below need no per-lens branch.
-- Hotkey **E** cycles every built-in lens forward; **Shift+E** cycles backward. A
-  centre-screen tab bar flashes on every switch, with the active lens highlighted, so the
-  change is legible without checking the View tab. The **View** tab has a lens select
-  plus *Save preset…* / *Delete preset*; a preset captures the lens and the display
-  options it was saved with (source weights, cluster colouring, granularity) and is
-  listed in the same select. Source weights only affect the combined lens, so their
-  panel is hidden for the others.
+- Hotkey **E** cycles every built-in lens forward; **Shift+E** cycles backward. The
+  **top lens tabber** always shows the built-ins with the active lens highlighted, so the
+  change is legible without checking the View tab and a tab can be clicked directly. The
+  **View** tab has a lens select plus *Save preset…* / *Delete preset*; a preset captures
+  the lens and the display options it was saved with (source weights, colour mode,
+  granularity) and is listed in the same select. A preset's tabber highlight follows its
+  base lens. Source weights only affect the combined lens, so their panel is hidden for
+  the others.
 - A projection lens requests a source subset (`sources=`) from the backend; the
   combined lens projects every frozen source. The source set is part of
   `layout_revision`, so each lens caches its own coordinates.
@@ -328,25 +387,29 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 
 ### Scopes
 
-A scope is a circle on the canvas whose tracks are re-laid-out by another lens, so a
-cluster can be read in a different space without leaving the map.
+A scope is a circle or box on the canvas whose tracks are re-laid-out by another lens,
+so a cluster can be read in a different space without leaving the map.
 
-- Hold **X** and drag to draw a circle from the press point; **X + scroll** opens
-  a scope at the cursor or resizes the open one (it starts small in *screen* space and
-  grows outwards, so it reads the same at any zoom; growth is exponential in the wheel
+- Hold **X** and drag to draw a **box** from the press point; **X + scroll** opens a
+  **circle** scope at the cursor or scales the open one (it starts small in *screen* space
+  and grows outwards, so it reads the same at any zoom; growth is exponential in the wheel
   delta so a trackpad's burst of events accumulates). The scope starts on the last-used
-  scope lens immediately. A bare **X** tap, **Esc**, or a click outside the circle closes
+  scope lens immediately. A bare **X** tap, **Esc**, or a click outside the region closes
   it and animates its tracks back out.
-- A tab bar of the available lenses is drawn just outside the circle; clicking a tab
+- A tab bar of the available lenses is drawn just outside the region; clicking a tab
   switches the scope's lens (morphing between the two layouts) and remembers it as the
   default for the next scope.
 - Membership is frozen from the tracks' *outer* positions when the scope opens, so the
   re-layout cannot move a track across the boundary. A track the scope lens cannot place
-  but whose outer position is inside the circle is **hidden**, so the region only shows the
-  re-layout.
-- The in-scope positions are the scope lens's layout min-max normalised and mapped
-  into the circle's inscribed square; a deterministic scope lens is instant, a
-  projection scope lens reuses its cached global layout. The tab bar lists the built-ins
+  but whose outer position is inside the region is **hidden**, so the region only shows the
+  re-layout. Membership is a world-space test (`scopeContains`); the canvas draws the
+  region's screen image — an **ellipse** for a circle, a rectangle for a box, either
+  stretched by the non-square viewport — so the outline always encloses exactly the scoped
+  tracks and never an out-of-scope one.
+- The in-scope positions are the scope lens's layout min-max normalised and mapped into the
+  region: a circle's inscribed square, or a box's full extent (so a wide or tall box is
+  used). A deterministic scope lens is instant, a projection scope lens reuses its cached
+  global layout. The tab bar lists the built-ins
   except the tag lens.
 - While a scope is open, in-scope dots behave like embedding-mode dots: tag
   drag/transform is disabled. Switching the outer lens drops the scope.
@@ -355,18 +418,32 @@ cluster can be read in a different space without leaving the map.
 
 While the search box is **focused** and the **CLAP lens** is the one on screen (the
 scope's lens when a scope is open, else `model.lensId`), the canvas draws a
-**search field** under the dots: a glowing "where does my query match" layer.
+**search field**: a glowing "where does my query match" layer.
+
+- All canvas glow — this field and the hover halo — is one WebGL pass in
+  `lib/glow-layer.ts` on a transparent canvas layered **under** the scatter
+  (which is transparent, so the page background shows through). Each point
+  is an SDF quad, so N glowing points cost one draw call instead of N radial
+  gradients or a full-screen blur. Overlaps take the brightest coverage (a `MAX`
+  blend, not additive) with a gradual Gaussian falloff, so a dense region reads as
+  one soft zone rather than a pile of bright circles.
 
 - `/` or **⌘/Ctrl+F** focuses the box; **Esc** clears it and leaves the field,
   which is the only thing that hides the glow.
 - The box searches **as you type** (debounced ~300 ms; Enter searches at once, an
   emptied box clears at once). The input stays editable during a fetch, and a
-  response superseded by a newer query is dropped.
+  response superseded by a newer query is dropped. While a fetch is in flight the
+  box dims and a **Searching…** row shows above the previous results
+  (`SearchView.setBusy`), so a programmatic search has visible feedback.
+- **Matched tracks stand out.** `CanvasView.searchResults` (a `Set`, `null` = no
+  search) fades every track the query did *not* match to 15 % alpha, so the result
+  set reads against the rest of the map. The selected set *is* the result set, so the
+  fade follows `replaceSelection` and clears with the query.
 - The field is built from the backend's `field=1` landmark sample — the same
-  representative tracks the layout's weight chart selects — splatted additively at
-  their *current* map positions (scope/animation included) and weighted by their
-  query cosine. `CanvasView.searchActive` / `searchField` own it; the search
-  response carries the sample and the controller publishes it.
+  representative tracks the layout's weight chart selects — splatted at their
+  *current* map positions (scope/animation included) and weighted by their query
+  cosine. `CanvasView.searchActive` / `searchField` own it; the search response
+  carries the sample and the controller publishes it.
 - It shows *where matching tracks live*, not a calibrated similarity contour:
   t-SNE preserves only local neighbourhoods, so two tracks with equal CLAP cosine
   can sit far apart on screen.
@@ -376,7 +453,11 @@ scope's lens when a scope is open, else `model.lensId`), the canvas draws a
 ## Hover preview and tooltip
 
 - **Hover preview** (**M** toggles, volume slider in Options) streams the track
-  through `/api/audio/…`. It seeks to the **detected drop** when the track has a
+  through `/api/audio/…`. **M** is owned by `CanvasInteractionController`, not
+  `HotkeyManager` (`dispatch: false`): a bare tap toggles the preview, but **M +
+  scroll** scales `model.previewVolume` instead and shows a cursor-adjacent
+  percentage readout (`CanvasView.showVolumeHud`) — a scroll during the hold marks
+  the gesture used, so the keyup does not also toggle the preview. It seeks to the **detected drop** when the track has a
   cached structure row, else to 40 % of the track — `previewStartSeconds` in
   `lib/structure.ts` owns that choice. A **search hit** overrides that: the hit's
   best-matching CLAP segment centre (`model.searchSections`, a duration fraction)
@@ -409,9 +490,17 @@ scope's lens when a scope is open, else `model.lensId`), the canvas draws a
   its colour (`tt-loc-filled`; a nested folder gets a parent→own **gradient**,
   `dirTagColors`) with the icon/name in the dark canvas colour for contrast. The
   cluster tag also carries a `genre-spanning` badge whose hover text explains that the
-  intro and drop excerpts disagree. Feature axis ids never render as tags, and BPM/key
+  intro and drop excerpts disagree. The cluster tag truncates a long genre name, so
+  hovering it opens a **pop-over** (`renderGenrePop`, a body-level `.tt-pop` fixed
+  element — never a child of the card, so expanding a name cannot reflow it) with the
+  full name. When the folder head predicts a destination that differs from the track's
+  current folder, the pop-over also shows it as a **Projected folder** line (the
+  confident match floor is marked, a weak one is labelled *low confidence*); the
+  predictions are fetched the first time a card is pinned. Feature axis ids never render as tags, and BPM/key
   are **not** duplicated near the title: both render as **chips** in Features
-  (`TooltipBar.chip`) because a key or a BPM has no magnitude to bar. **Mode** is
+  (`TooltipBar.chip`) because a key or a BPM has no magnitude to bar. The BPM and key
+  chips are **filled** with the same colours as the tempo/key colour modes
+  (`tempoColor` / `keyColor`), so the card reads with the map's palette. **Mode** is
   folded into the Key chip — `musical_key` already carries the major/minor suffix
   ("Am" = minor, "A" = major) — so it stays a canvas axis/filter but has no tooltip
   row of its own.
@@ -453,12 +542,18 @@ produced per track, and the way to re-run one stage.
 The tooltip is `pointer-events: none` and follows the hover. **Alt** over a hovered
 dot pins it: `CanvasView.inspect` is set, the card anchors to the dot's
 *current* screen position (so a viewport tween carries it along), gets
-`pointer-events: auto` and a `Navigate` section. It stays
+`pointer-events: auto` and a **Navigate / Describe** tab strip. It stays
 open when the pointer leaves the canvas (that is how you reach it), and closes on
 **Esc**, a plain click on empty canvas, the card's `×`, or another Alt press.
 `CanvasInteractionController._bindInspectKey` owns the Alt toggle; `CanvasView`
 owns the pin/anchor state and delegates clicks (`data-inspect-action`,
 `data-inspect-focus`, `data-inspect-close`) to `onInspectAction`.
+
+While the card is pinned, the canvas hover is **paused**:
+`CanvasInteractionController._updateCanvasHoverAt` keeps `hoveredIdx` on the
+inspected track and returns before hit-testing, so moving across the map cannot
+retarget the glow, audition or tooltip to another track. Closing the card resumes
+free hover on the next move.
 
 In the pinned card the folder tag, cluster tag and the key/BPM feature rows are
 **navigation targets** (`data-hover-target`, `.tt-target`): hovering one glows the matching
@@ -469,23 +564,29 @@ dots and makes **S**/**H**/**F**/**Shift+S** act on that set, exactly like a sid
 `InspectCoordinator` (`coordinators/inspect-coordinator.ts`) owns the actions —
 same seam as `SearchCoordinator`:
 
-- **Anti-track** — `GET /api/tracks/similar?path=…&mode=far&k=10`, the `ANTI_K`
-  most distant tracks in the composite embedding space (what the map/clusters
-  describe), listed directly.
-- **Nearest** — `mode=near`, the `NEAR_K` closest tracks.
-- **Neighbourhood slider** — replaces the old discrete top-N *Solo*. It ranges 0–100 %
-  and starts at 100 % (the whole library is visible). Narrowing keeps the closest
-  *proximity*% of the ranked library, hides the rest, and re-homes the view to the
-  remaining set, so the camera moves gradually instead of snapping to ten neighbours.
-  The full ranking is fetched once per inspected track (`…&all=1`, paths only, no
-  scores) and cached, so a drag never hits the network; widening reveals exactly what
-  the previous step hid (`Model.setProximityKeep`). The slider is excluded from the
-  card's re-render key, so dragging does not rebuild the input under the pointer.
+- **Mode toggle** — one button that flips the **distance filter** between *Nearest*
+  (keep the closest tracks) and *Anti-track* (keep the furthest). It re-ranks the
+  result list for the new direction; the slider is the main affordance and follows the
+  toggle.
+- **Distance-filter slider** — replaces the old discrete top-N *Solo* and the separate
+  Anti-track / Nearest buttons. It ranges 0–100 % and starts at 100 % (the whole
+  library is visible). Narrowing keeps the nearest *proximity*% of the ranked library
+  (or the furthest *proximity*% in anti-track mode), and hides the rest. It
+  deliberately does **not** re-home the view, so adjusting the filter never yanks the
+  camera. The full ranking is fetched once per inspected track (`…&all=1`, paths
+  only, no scores), **pre-loaded when the card is pinned** and cached, so a drag never
+  hits the network; widening reveals exactly what the previous step hid
+  (`Model.setProximityKeep`). The slider is excluded from the card's re-render key,
+  so dragging does not rebuild the input under the pointer.
   Drag steps are **throttled** (`PROXIMITY_THROTTLE_MS`): a burst applies the first
-  step at once and the last on the trailing edge, so the neighbourhood still tracks
-  the drag without the re-hide/re-home/"change" cascade running on every pointer
-  move. A superseded step's async ranking result is dropped (`_proximitySeq`), and any
-  other card action cancels the pending step.
+  step at once and the last on the trailing edge, so the filter still tracks the drag
+  without the re-hide/"change" cascade running on every pointer move. A superseded
+  step's async ranking result is dropped (`_proximitySeq`), and any other card action
+  cancels the pending step. A failed pre-load is silent; the error is only shown when
+  the slider actually needs the ranking.
+- **Nearest / Anti-track list** — the ranked rows for the toggle's current direction
+  (`mode=near` → `NEAR_K` closest; `mode=far` → `ANTI_K` furthest), fetched when
+  the card is pinned and again when the toggle flips.
 - **Result row** — click focuses it: select alone, fit the view, audition it (only
   when hover preview is on). **Hovering** a row glows that track in the map
   (`{kind: "track", path}` hover target) and auditions it immediately, like a
@@ -495,6 +596,34 @@ same seam as `SearchCoordinator`:
   hovered. While the card is pinned the canvas hover does not stop it either
   (`controller._handlePreview`), so crossing the gap from the dot to the card keeps
   playing.
+- **Describe** — opening the tab **folds out a wide two-column panel** beside
+  the card (`#coords-panel`, `renderDescribePanel`); the card body stays empty
+  there, because the content needs more width than its 300 px. **Left column** is
+  the flat list of zero-shot phrases CLAP ranks closest to the track
+  (`GET /api/tracks/describe?path=…&limit=…`, `DESCRIBE_K`), each row a **search
+  term**: clicking it runs it as a semantic query (`data-search-term` →
+  `SearchView.setQuery` → `SearchCoordinator`), so the list is a way into the
+  collection, not just a label. Phrases below the backend's similarity floor
+  (`MIN_SIMILARITY`) are dropped, so the list stays short rather than padded
+  with weak matches; the top phrase is always kept. **Right column** is the
+  semantic coordinates (below). There is no panel title — the tab already says
+  Describe. The `PromptBank` (`embeddings/clap_describe.py`) is a fixed candidate
+  bank — CLAP has no text decoder, so these are ranked candidates, not generated
+  text. The fetch is lazy (the pinned card's `open` action loads it) and cached
+  per path; the state carries the path it belongs to, so a late response for a
+  previous track is never shown on the current card. The panel shows "Asking CLAP…"
+  while loading and an inline error note on failure.
+- **Coordinates** — the track's position on the contrastive semantic axes
+  (`dark <-> bright`, …), rendered in the panel's right column as a **bipolar
+  track**: both pole names with the leaning one highlighted and a marker at the
+  track's position, so the read is "leans this way, by this much" rather than a
+  percentile a non-statistician has to decode. Pole labels share a **fixed width**
+  with ellipsis, so a long name never shortens the slider relative to its
+  neighbours. Each axis is a difference of the two pole text embeddings, z-scored
+  against a reference mean/std, and ranked by `|z| × reliability` (`AXES` in
+  `embeddings/clap_describe.py`), so a non-discriminative axis does not crowd
+  out the informative ones. The marker position is relative to the reference
+  library, not an absolute cosine.
 
 Results are shown as title/artist/folder + similarity score, resolved against the
 loaded library (the endpoint returns only `path` + `score`). The card shows a

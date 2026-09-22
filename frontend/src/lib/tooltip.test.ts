@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Model, type Track } from "../model";
-import { buildTooltip, renderTooltip } from "./tooltip";
+import { keyColor, tempoColor } from "./colors";
+import {
+  buildTooltip,
+  renderDescribePanel,
+  renderGenrePop,
+  renderTooltip,
+  type DescribeState,
+} from "./tooltip";
 
 function makeTrack(over: Partial<Track> = {}): Track {
   return {
@@ -25,6 +32,17 @@ function structure(over: Partial<import("../model").TrackStructure> = {}) {
     ...over,
   };
 }
+
+/** One coordinate, leaning dark at the 98th percentile. */
+const coord = {
+  axis: "dark <-> bright",
+  pos: "dark",
+  neg: "bright",
+  pole: "dark",
+  z: 2.1,
+  percentile: 0.98,
+  reliability: 2.58,
+};
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -101,7 +119,41 @@ describe("buildTooltip", () => {
       color: null,
       spanning: true,
       target: null,
+      projectedFolder: null,
+      projectedConfident: false,
     });
+  });
+
+  it("shows the head's projected folder only when it differs from the track's", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Techno"]]);
+    m.folderPredictions = new Map([["a.mp3", "Root/House"]]);
+    m.folderPredictionMatches = new Set(["a.mp3"]);
+
+    // Differs from the track's folder ("" here) → shown, marked confident.
+    const differs = buildTooltip(makeTrack(), m);
+    expect(differs.genre?.projectedFolder).toBe("Root/House");
+    expect(differs.genre?.projectedConfident).toBe(true);
+
+    // A weak match still shows the destination, just not as confident.
+    m.folderPredictionMatches = new Set();
+    const weak = buildTooltip(makeTrack(), m);
+    expect(weak.genre?.projectedFolder).toBe("Root/House");
+    expect(weak.genre?.projectedConfident).toBe(false);
+
+    // Equal to the current folder → nothing to move, so no projected folder.
+    m.folderPredictions = new Map([["a.mp3", ""]]);
+    expect(buildTooltip(makeTrack(), m).genre?.projectedFolder).toBeNull();
+  });
+
+  it("re-renders when the head's projection changes", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Techno"]]);
+    const before = buildTooltip(makeTrack(), m).key;
+    m.folderPredictions = new Map([["a.mp3", "Root/House"]]);
+    expect(buildTooltip(makeTrack(), m).key).not.toBe(before);
   });
 
   it("renders user tags as bars and excludes feature axis ids", () => {
@@ -142,6 +194,7 @@ describe("buildTooltip", () => {
       value: 0,
       readout: "128 BPM",
       chip: true,
+      color: tempoColor(0.5),
       target: { kind: "bpm", value: 128.4 },
     });
     expect(card.features[1]).toEqual({
@@ -149,6 +202,7 @@ describe("buildTooltip", () => {
       value: 0,
       readout: "Am",
       chip: true,
+      color: keyColor(0.3, 1),
       target: { kind: "key", value: "Am" },
     });
     expect(card.features[2]).toEqual({ label: "Energy", value: 0.75, readout: "0.75" });
@@ -187,6 +241,14 @@ describe("buildTooltip", () => {
       mode: "far",
       results: [{ path: "b.mp3", score: -0.42 }],
       proximity: 100,
+      tab: "navigate",
+      describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
     });
     expect(card.inspect?.mode).toBe("far");
     expect(card.results).toEqual([
@@ -202,6 +264,14 @@ describe("buildTooltip", () => {
       mode: "near",
       results: [{ path: "new.mp3", score: 0.5 }],
       proximity: 100,
+      tab: "navigate",
+      describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
     });
     expect(card.results[0]).toMatchObject({ path: "new.mp3", title: "new.mp3" });
   });
@@ -287,6 +357,36 @@ describe("renderTooltip", () => {
     expect(host.querySelectorAll(".tt-stat-bar i").length).toBe(0);
   });
 
+  it("fills the key and BPM chips with the feature-lens colours", () => {
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(
+        makeTrack({
+          bpm: 128.4,
+          musical_key: "Am",
+          audio_features: {
+            tempo: 0.5,
+            key: 0.3,
+            mode: 1,
+            energy: 0.5,
+            danceability: 0.5,
+          },
+        }),
+        new Model(),
+      ),
+    );
+    const chips = [...host.querySelectorAll<HTMLElement>(".tt-stat-chip")];
+    const tempo = chips.find((c) => c.textContent?.startsWith("Tempo"))!;
+    const key = chips.find((c) => c.textContent?.startsWith("Key"))!;
+    expect(tempo.classList.contains("tt-stat-chip-filled")).toBe(true);
+    expect(key.classList.contains("tt-stat-chip-filled")).toBe(true);
+    // happy-dom normalises the `hsl()` spacing, so compare space-insensitively.
+    const norm = (c: string) => c.replace(/\s/g, "");
+    expect(norm(tempo.style.background)).toBe(norm(tempoColor(0.5)));
+    expect(norm(key.style.background)).toBe(norm(keyColor(0.3, 1)));
+  });
+
   it("uses textContent for tag names (no HTML injection)", () => {
     const host = document.createElement("div");
     renderTooltip(
@@ -324,6 +424,14 @@ describe("renderTooltip", () => {
         mode: "far",
         results: [{ path: "b.mp3", score: -0.42 }],
         proximity: 100,
+        tab: "navigate",
+        describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
       }),
     );
     // The hint is for the plain card; a pinned card is already interactive.
@@ -375,6 +483,8 @@ describe("renderTooltip", () => {
     expect(cluster?.dataset.hoverTarget).toBe(
       JSON.stringify({ kind: "cluster", id: 3 }),
     );
+    // The chip also marks itself as the trigger for the full-name pop-over.
+    expect(cluster?.dataset.genrePop).toBe("");
 
     const chips = [...host.querySelectorAll<HTMLElement>(".tt-stat-chip")];
     const tempo = chips.find((c) => c.textContent?.startsWith("Tempo"));
@@ -426,14 +536,25 @@ describe("renderTooltip", () => {
         mode: "far",
         results: [{ path: "b.mp3", score: -0.42 }],
         proximity: 100,
+        tab: "navigate",
+        describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
       }),
     );
 
+    // One toggle flips the filter direction; the slider is the main control.
     const actions = [...host.querySelectorAll(".tt-nav-btn")].map(
       (b) => (b as HTMLElement).dataset.inspectAction,
     );
-    expect(actions).toEqual(["anti", "near"]);
-    // The neighbourhood is a slider now, not a discrete top-N "solo" button.
+    expect(actions).toEqual(["toggle-rank-mode"]);
+    // The pinned state's mode is anti-track, so the toggle reads "Anti-track".
+    expect(host.querySelector(".tt-nav-btn")?.textContent).toBe("Anti-track");
+    // The distance filter is a slider, not a discrete top-N "solo" button.
     const range = host.querySelector<HTMLInputElement>(
       "[data-inspect-proximity]",
     );
@@ -447,7 +568,11 @@ describe("renderTooltip", () => {
       host.querySelector<HTMLElement>("[data-inspect-action='anti-more']"),
     ).toBeNull();
     expect(host.querySelector("[data-inspect-close]")).not.toBeNull();
-    expect(host.querySelector(".tt-section-title")?.textContent).not.toBe("Anti-track");
+    // The tab strip replaces the old "Navigate" heading; the ranking keeps its
+    // own heading.
+    expect(
+      [...host.querySelectorAll(".tt-tab")].map((t) => t.textContent),
+    ).toEqual(["Navigate", "Describe"]);
     expect(
       [...host.querySelectorAll(".tt-section-title")].some(
         (t) => t.textContent === "Anti-track",
@@ -476,11 +601,19 @@ describe("renderTooltip", () => {
         mode: null,
         results: [],
         proximity: 100,
+        tab: "navigate",
+        describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
       }),
     );
     expect(host.querySelector(".tt-note")?.textContent).toContain("Searching");
     expect(
-      (host.querySelector("[data-inspect-action]") as HTMLButtonElement).disabled,
+      (host.querySelector(".tt-nav-btn") as HTMLButtonElement).disabled,
     ).toBe(true);
   });
 
@@ -495,10 +628,178 @@ describe("renderTooltip", () => {
         mode: null,
         results: [],
         proximity: 100,
+        tab: "navigate",
+        describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
       }),
     );
     expect(host.querySelector(".tt-note-error")?.textContent).toBe(
       "No analysed tracks yet",
+    );
+  });
+
+  it("renders the Navigate / Describe tabs with the active one marked", () => {
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(makeTrack(), new Model(), {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        mode: null,
+        results: [],
+        proximity: 100,
+        tab: "navigate",
+        describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [],
+          coordinates: [],
+        },
+      }),
+    );
+    const tabs = [...host.querySelectorAll<HTMLElement>(".tt-tab")];
+    expect(tabs.map((t) => t.textContent)).toEqual(["Navigate", "Describe"]);
+    expect(tabs.map((t) => t.dataset.inspectAction)).toEqual([
+      "show-navigate",
+      "show-describe",
+    ]);
+    expect(tabs[0].classList.contains("active")).toBe(true);
+    expect(tabs[1].classList.contains("active")).toBe(false);
+    expect(tabs[0].getAttribute("aria-selected")).toBe("true");
+  });
+
+  it("folds the Describe content out of the card", () => {
+    const host = document.createElement("div");
+    renderTooltip(
+      host,
+      buildTooltip(makeTrack(), new Model(), {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        mode: null,
+        results: [],
+        proximity: 100,
+        tab: "describe",
+        describe: {
+          path: "a.mp3",
+          busy: false,
+          message: null,
+          results: [{ text: "a techno track", facet: "Genre", score: 0.31 }],
+          coordinates: [coord],
+        },
+      }),
+    );
+    // The tab strip stays; terms and coordinates fold out into the panel.
+    expect(host.querySelector(".tt-nav-btn")).toBeNull();
+    expect(host.querySelector(".tt-describe-row")).toBeNull();
+    expect(host.querySelector(".tt-coord")).toBeNull();
+  });
+});
+
+describe("renderGenrePop", () => {
+  it("shows the untruncated genre name and the projected folder", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Very Long Genre Name That Would Truncate"]]);
+    m.folderPredictions = new Map([["a.mp3", "Root/House"]]);
+    m.folderPredictionMatches = new Set(["a.mp3"]);
+    const host = document.createElement("div");
+    renderGenrePop(host, buildTooltip(makeTrack(), m).genre!);
+    expect(host.classList.contains("hidden")).toBe(false);
+    expect(host.querySelector(".tt-pop-name")?.textContent).toBe(
+      "Very Long Genre Name That Would Truncate",
+    );
+    expect(host.querySelector(".tt-pop-proj-path")?.textContent).toContain(
+      "House",
+    );
+    expect(host.querySelector(".tt-pop-proj-low")).toBeNull();
+  });
+
+  it("marks a low-confidence projection and a spanning genre", () => {
+    const m = new Model();
+    m.clusterAssignments = new Map([["a.mp3", 3]]);
+    m.clusterNames = new Map([[3, "Techno"]]);
+    m.trackStructure = new Map([
+      ["a.mp3", structure({ peak_start: 10, genre_spanning: true })],
+    ]);
+    m.folderPredictions = new Map([["a.mp3", "Root/House"]]);
+    m.folderPredictionMatches = new Set();
+    const host = document.createElement("div");
+    renderGenrePop(host, buildTooltip(makeTrack(), m).genre!);
+    expect(host.querySelector(".tt-pop-proj-low")).not.toBeNull();
+    expect(host.querySelector(".tt-pop-note")).not.toBeNull();
+  });
+});
+
+describe("renderDescribePanel", () => {
+  const describe = (over: Partial<DescribeState> = {}): DescribeState => ({
+    path: "a.mp3",
+    busy: false,
+    message: null,
+    results: [{ text: "a techno track", facet: "Genre", score: 0.31 }],
+    coordinates: [coord],
+    ...over,
+  });
+
+  it("renders the terms and coordinates as two columns, with no title", () => {
+    const host = document.createElement("div");
+    renderDescribePanel(host, describe(), true);
+    expect(host.classList.contains("hidden")).toBe(false);
+    // No title: the tab already says Describe.
+    expect(host.querySelector(".tt-section-title")).toBeNull();
+    const panel = host.querySelector(".tt-desc-panel");
+    const terms = panel?.querySelector(".tt-desc-col");
+    const coords = panel?.querySelector(".tt-coord-col");
+    // Terms: the phrase is the row, and clicking it runs a CLAP search.
+    const row = terms?.querySelector<HTMLElement>(".tt-describe-row");
+    expect(row?.textContent).toBe("a techno track");
+    expect(row?.dataset.searchTerm).toBe("a techno track");
+    // Coordinates: a bipolar row, leaning pole highlighted at its percentile.
+    const poles = [
+      ...(coords?.querySelectorAll<HTMLElement>(".tt-coord-pole") ?? []),
+    ];
+    expect(poles.map((p) => p.textContent)).toEqual(["dark", "bright"]);
+    expect(poles[0].classList.contains("lean")).toBe(true);
+    expect(coords?.querySelector<HTMLElement>(".tt-coord-marker")?.style.left).toBe(
+      "98%",
+    );
+  });
+
+  it("hides the panel while the Describe tab is not active", () => {
+    const host = document.createElement("div");
+    renderDescribePanel(host, describe(), false);
+    expect(host.classList.contains("hidden")).toBe(true);
+    expect(host.querySelector(".tt-desc-panel")).toBeNull();
+  });
+
+  it("shows the Describe busy and error notes", () => {
+    const busy = document.createElement("div");
+    renderDescribePanel(
+      busy,
+      describe({ busy: true, results: [], coordinates: [] }),
+      true,
+    );
+    expect(busy.querySelector(".tt-note")?.textContent).toContain("CLAP");
+
+    const failed = document.createElement("div");
+    renderDescribePanel(
+      failed,
+      describe({
+        message: "No cached CLAP embedding",
+        results: [],
+        coordinates: [],
+      }),
+      true,
+    );
+    expect(failed.querySelector(".tt-note-error")?.textContent).toBe(
+      "No cached CLAP embedding",
     );
   });
 });

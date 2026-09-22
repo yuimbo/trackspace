@@ -15,10 +15,11 @@
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight } from "../model";
+import { type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight, scopeContains, scopeHalfExtents } from "../model";
 import { type Lens, getLens, lensWaitSources, lensWeights } from "../lib/lenses";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
+import type { ViewModifierSink } from "./view-modifier-coordinator";
 import {
   approximatePositions,
   parseWeightJacobian,
@@ -97,6 +98,8 @@ export interface EmbeddingDeps {
   model: Model;
   /** Reflect view-mode / projection changes in the status bar. */
   status: { update(m: Model): void };
+  /** The active-view-modifier stack: an open scope is one chip. */
+  viewMods: ViewModifierSink;
   /** The canvas overlay the position animations drive (mutable, not just a repaint). */
   canvas: {
     animPositions: Map<string, { x: number; y: number }> | null;
@@ -105,20 +108,15 @@ export interface EmbeddingDeps {
     worldPosForTrack(t: Track): { wx: number; wy: number } | null;
     /** Position ignoring any scope, for membership and open/close anchors. */
     outerPosForTrack(t: Track): { wx: number; wy: number } | null;
-    /** Flash the centre-screen lens tab bar (lens-switch feedback). */
-    flashLensHud(): void;
   };
 }
 
-/** Smallest scope radius, in world units. */
+/** Smallest scope half-extent, in world units. */
 const SCOPE_MIN_R = 0.02;
-/** Largest scope radius, in world units (roughly the whole unit square). */
+/** Largest scope half-extent, in world units (roughly the whole unit square). */
 const SCOPE_MAX_R = 0.75;
 
 export class EmbeddingCoordinator {
-  /** Saved viewport state per view-mode so pan/zoom persists across toggles. */
-  private _savedVpByLens = new Map<string, { ox: number; oy: number; zoom: number }>();
-
   private _embedPollTimer = 0;
   private _embedEventSource: EventSource | null = null;
   private _embedBatchCount = 0;
@@ -136,6 +134,8 @@ export class EmbeddingCoordinator {
   private _projectionReqSeq = 0;
   /** Monotonic request id for scope recomputes (lens switch / resize). */
   private _scopeReqSeq = 0;
+  /** Id of the active `scope` modifier chip, or null when no scope is open. */
+  private _scopeModifierId: string | null = null;
 
   constructor(private deps: EmbeddingDeps) {}
 
@@ -490,8 +490,13 @@ export class EmbeddingCoordinator {
     const m = this.deps.model;
     const lens = lensOverride ?? m.lens();
     const base = `folder=&recursive=1&method=${method}`;
-    // External roots are laid out only on request: the default map is the library.
-    const ext = m.showExternal ? "&include_external=1" : "";
+    // External roots' positions ride along with every chart so toggling their
+    // visibility is a redraw, not a refetch: they are Nyström-placed onto the
+    // library chart, which never changes its fit. `fit_scope=all` is the only
+    // option that refits with them, so only it may move the library.
+    const ext = m.externalRootIds.size > 0 ? "&include_external=1" : "";
+    const fit =
+      m.showExternal && m.externalInProjection ? "&fit_scope=all" : "";
     // A per-source lens projects only its own blocks; the combined lens omits the
     // param so its default query key stays stable.
     const src = lens.sources ? `&sources=${lens.sources.join(",")}` : "";
@@ -499,7 +504,7 @@ export class EmbeddingCoordinator {
     // key must stay stable so existing cached layouts remain valid.
     const w = lensWeights(lens, m.clusterWeights);
     const wq = _weightsAreDefault(w) ? "" : `&w=${_encodeWeights(w)}`;
-    return `${base}${src}${wq}${ext}`;
+    return `${base}${src}${wq}${ext}${fit}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.
@@ -637,7 +642,10 @@ export class EmbeddingCoordinator {
         }
       }
       if (rev != null && rev === cached.revision) {
-        if (reqSeq === this._projectionReqSeq) this._applyPositions(cached.positions);
+        if (reqSeq === this._projectionReqSeq) {
+          this._applyPositions(cached.positions);
+          this._settleProjection(reqSeq);
+        }
         return;
       }
     }
@@ -668,14 +676,23 @@ export class EmbeddingCoordinator {
     } catch {
       /* api() already toasted */
     } finally {
-      if (reqSeq === this._projectionReqSeq) {
-        m.projectionPending = false;
-        m.pendingProjectionQuery = null;
-        m.projectionStartedAt = null;
-        m.layoutProgress = null;
-        this.deps.canvas.scheduleDraw();
-      }
+      this._settleProjection(reqSeq);
     }
+  }
+
+  /** Clear the "Loading <lens>" pill once the newest projection request settles.
+   *
+   *  Ownership is by sequence, not by which request happens to finish: a cache hit
+   *  can apply the final positions while an older, slower fit is still in flight,
+   *  and that stale fit must not leave the pill up (nor take it down twice). */
+  private _settleProjection(reqSeq: number): void {
+    if (reqSeq !== this._projectionReqSeq) return;
+    const m = this.deps.model;
+    m.projectionPending = false;
+    m.pendingProjectionQuery = null;
+    m.projectionStartedAt = null;
+    m.layoutProgress = null;
+    this.deps.canvas.scheduleDraw();
   }
 
   /** Apply a positions map to the model, animating the transition. */
@@ -864,10 +881,9 @@ export class EmbeddingCoordinator {
   /**
    * Switch to a lens (built-in id or preset id), animating the transition.
    *
-   * Each lens remembers its own viewport, so returning to one restores where the
-   * user left it. Tag-space ↔ map transitions animate through the shared
-   * `animPositions` overlay; map → map and feature → feature animate between
-   * their stored positions.
+   * The camera stays where it is across the switch. Tag-space ↔ map transitions
+   * animate through the shared `animPositions` overlay; map → map and feature →
+   * feature animate between their stored positions.
    */
   async switchToLens(target: string): Promise<void> {
     const m = this.deps.model;
@@ -877,10 +893,9 @@ export class EmbeddingCoordinator {
     if (m.scope) {
       m.scope = null;
       m.scopePositions = new Map();
+      this.deps.viewMods.remove(this._scopeModifierId);
+      this._scopeModifierId = null;
     }
-    // Persist the current viewport for the lens we're leaving.
-    this._savedVpByLens.set(m.lensId, { ...m.vp });
-
     m.lensId = target;
     // A preset carries the display options it was saved with; applying them here
     // keeps the select and the weights panel consistent with the canvas.
@@ -889,24 +904,11 @@ export class EmbeddingCoordinator {
     const lens = m.lens();
     m.embeddingModelsLoading = false;
 
-    // Restore a previously saved viewport, or default to the full [0,1] view.
-    const saved = this._savedVpByLens.get(target);
-    if (saved) {
-      m.vp.ox = saved.ox;
-      m.vp.oy = saved.oy;
-      m.vp.zoom = saved.zoom;
-    } else {
-      m.vp.ox = 0;
-      m.vp.oy = 0;
-      m.vp.zoom = 1;
-    }
-
-    // Feedback first: the tab bar and status must land before the (async) layout,
-    // so a slow fit never makes the switch feel unresponsive.
+    // Feedback first: the persistent tabber and status must land before the
+    // (async) layout, so a slow fit never makes the switch feel unresponsive.
     m.saveLS();
     this.deps.status.update(m);
     this.syncLensChrome();
-    this.deps.canvas.flashLensHud();
 
     if (lens.kind === "tags") {
       this._animateToTags();
@@ -929,8 +931,15 @@ export class EmbeddingCoordinator {
 
   /** Mirror the active lens into the View-tab select and the weight-panel visibility. */
   syncLensChrome(): void {
+    const m = this.deps.model;
     const sel = document.getElementById("lens-select") as HTMLSelectElement | null;
-    if (sel) sel.value = this.deps.model.lensId;
+    if (sel) sel.value = m.lensId;
+    // A preset carries its colour mode too; mirror it so the View-tab select
+    // matches the canvas after a preset switch.
+    const cm = document.getElementById(
+      "color-mode-select",
+    ) as HTMLSelectElement | null;
+    if (cm) cm.value = m.colorMode;
     // Source weights only re-weight the combined lens; a per-source lens fixes
     // them, so hide the sliders where they would do nothing.
     const lens = this.deps.model.lens();
@@ -941,12 +950,12 @@ export class EmbeddingCoordinator {
   }
 
   /**
-   * Open a scope: re-lay out the tracks inside its circle by ``lensId``.
+   * Open a scope: re-lay out the tracks inside its region by ``lensId``.
    *
    * Membership is decided from the tracks' outer positions (where the user drew
-   * the circle), then frozen into ``scopePositions`` so the re-layout cannot move
+   * the region), then frozen into ``scopePositions`` so the re-layout cannot move
    * a track across the boundary. Tracks the scope lens cannot place are hidden
-   * (the canvas hides in-circle dots that have no scope position).
+   * (the canvas hides in-region dots that have no scope position).
    */
   async openScope(
     scope: Scope,
@@ -978,6 +987,20 @@ export class EmbeddingCoordinator {
     const targets = this._mapIntoScope(raw, active);
     const start = this._startFromOuter(targets.keys());
     m.scopePositions = targets;
+    // The open scope is an active view modifier: one chip naming its lens.
+    if (this._scopeModifierId) {
+      this.deps.viewMods.update(this._scopeModifierId, {
+        label: getLens(lensId).label,
+      });
+    } else {
+      this._scopeModifierId = this.deps.viewMods.push(
+        { kind: "scope", label: getLens(lensId).label },
+        () => {
+          this._scopeModifierId = null;
+          this._closeScopeState();
+        },
+      );
+    }
     if (start.size > 0) this._animateOverlay(start, targets);
     else this.deps.canvas.scheduleDraw();
   }
@@ -1002,20 +1025,26 @@ export class EmbeddingCoordinator {
     const start = new Map(m.scopePositions);
     m.scope = next;
     m.scopePositions = targets;
+    // The chip names the scope's lens, so switching it refreshes the chip.
+    if (this._scopeModifierId) {
+      this.deps.viewMods.update(this._scopeModifierId, {
+        label: getLens(lensId).label,
+      });
+    }
     this._animateOverlay(start, targets);
   }
 
   /**
-   * Resize the open scope (X + scroll). Membership can change with the radius, so
-   * the in-scope set and the mapped positions are recomputed; the radius updates
-   * synchronously (so a rapid scroll accumulates and the circle moves at once),
+   * Scale the open scope (X + scroll). Membership can change with the region, so
+   * the in-scope set and the mapped positions are recomputed; the region updates
+   * synchronously (so a rapid scroll accumulates and the shape moves at once),
    * while the positions follow in the same tick.
    */
-  resizeScope(r: number): Promise<void> {
+  resizeScope(factor: number): Promise<void> {
     const m = this.deps.model;
     const scope = m.scope;
     if (!scope) return Promise.resolve();
-    const next = { ...scope, r: Math.min(Math.max(r, SCOPE_MIN_R), SCOPE_MAX_R) };
+    const next = this._scaleScope(scope, factor);
     m.scope = next;
     const seq = ++this._scopeReqSeq;
     return this._computeScopeRaw(next).then(({ raw }) => {
@@ -1027,6 +1056,17 @@ export class EmbeddingCoordinator {
 
   /** Close the active scope, animating its tracks back to their outer positions. */
   closeScope(): void {
+    if (this._scopeModifierId) {
+      const id = this._scopeModifierId;
+      this._scopeModifierId = null;
+      this.deps.viewMods.dismiss(id);
+    } else {
+      this._closeScopeState();
+    }
+  }
+
+  /** The raw scope close: drop the scope and animate its tracks back out. */
+  private _closeScopeState(): void {
     const m = this.deps.model;
     if (!m.scope) return;
     const start = new Map<string, { x: number; y: number }>();
@@ -1058,7 +1098,7 @@ export class EmbeddingCoordinator {
     const lens = getLens(scope.lensId);
     const inScope = m.allTracks.filter((t) => {
       const p = this.deps.canvas.outerPosForTrack(t);
-      return p != null && Math.hypot(p.wx - scope.cx, p.wy - scope.cy) <= scope.r;
+      return p != null && scopeContains(scope, p.wx, p.wy);
     });
     const all =
       lens.kind === "deterministic" && lens.compute
@@ -1087,7 +1127,24 @@ export class EmbeddingCoordinator {
     return out;
   }
 
-  /** Normalise a scope lens's subset and map it into the circle's inscribed square. */
+  /** Scale a scope's region by *factor*, clamped to the min/max size. */
+  private _scaleScope(scope: Scope, factor: number): Scope {
+    const clampR = (v: number) => Math.min(Math.max(v, SCOPE_MIN_R), SCOPE_MAX_R);
+    const { hw, hh } = scopeHalfExtents(scope);
+    if (scope.shape === "box") {
+      const rx = clampR(hw * factor);
+      const ry = clampR(hh * factor);
+      return { ...scope, rx, ry, r: Math.max(rx, ry) };
+    }
+    return { ...scope, r: clampR(hw * factor) };
+  }
+
+  /**
+   * Normalise a scope lens's subset and map it into the region.
+   *
+   * A circle gets the lens square inscribed in it (no dot escapes the outline); a
+   * box fills the box, so a wide or tall region uses its whole extent.
+   */
   private _mapIntoScope(
     raw: Map<string, { x: number; y: number }>,
     scope: Scope,
@@ -1105,13 +1162,14 @@ export class EmbeddingCoordinator {
     }
     const rx = maxX - minX || 1;
     const ry = maxY - minY || 1;
-    // Inscribe the lens square in the circle so no dot can escape the outline.
-    const side = scope.r * Math.SQRT2;
+    const { hw, hh } = scopeHalfExtents(scope);
+    const sideX = scope.shape === "box" ? hw * 2 : hw * Math.SQRT2;
+    const sideY = scope.shape === "box" ? hh * 2 : hh * Math.SQRT2;
     const out = new Map<string, { x: number; y: number }>();
     for (const [path, p] of raw) {
       out.set(path, {
-        x: scope.cx + ((p.x - minX) / rx - 0.5) * side,
-        y: scope.cy + ((p.y - minY) / ry - 0.5) * side,
+        x: scope.cx + ((p.x - minX) / rx - 0.5) * sideX,
+        y: scope.cy + ((p.y - minY) / ry - 0.5) * sideY,
       });
     }
     return out;

@@ -1,12 +1,48 @@
 import { describe, expect, it, vi } from "vitest";
-import { Model, type Track } from "../model";
+import { Model, type Track, type ViewModifier } from "../model";
 import {
   SearchCoordinator,
   SEARCH_LIMIT,
   type SearchResponse,
 } from "./search-coordinator";
+import type { ViewModifierSink } from "./view-modifier-coordinator";
 
 // ─── Fakes ───────────────────────────────────────────────────
+
+/** In-memory stand-in for the active-view-modifier stack. */
+function makeViewMods() {
+  let seq = 0;
+  const stack: ViewModifier[] = [];
+  const clearers = new Map<string, () => void>();
+  const sink: ViewModifierSink = {
+    push: (mod, clear) => {
+      const id = `vm-${++seq}`;
+      stack.push({ ...mod, id });
+      clearers.set(id, clear);
+      return id;
+    },
+    update: (id, patch) => {
+      const i = stack.findIndex((m) => m.id === id);
+      if (i >= 0) stack[i] = { ...stack[i], ...patch };
+    },
+    dismiss: (id) => {
+      const clear = clearers.get(id);
+      if (!clear) return;
+      clearers.delete(id);
+      const i = stack.findIndex((m) => m.id === id);
+      if (i >= 0) stack.splice(i, 1);
+      clear();
+    },
+    remove: (id) => {
+      if (!id) return;
+      clearers.delete(id);
+      const i = stack.findIndex((m) => m.id === id);
+      if (i >= 0) stack.splice(i, 1);
+    },
+    find: (kind) => stack.find((m) => m.kind === kind),
+  };
+  return { sink, stack };
+}
 
 function makeTrack(over: Partial<Track> = {}): Track {
   return {
@@ -32,17 +68,21 @@ function makeHarness(fetchImpl: (q: string, limit: number) => Promise<SearchResp
     showError: vi.fn(),
     renderResults: vi.fn(),
   };
+  const viewMods = makeViewMods();
   const fitToPaths = vi.fn();
   const setField = vi.fn();
+  const setResults = vi.fn();
   const fetchResults = vi.fn(fetchImpl);
   const coord = new SearchCoordinator({
     model,
     view,
+    viewMods: viewMods.sink,
     fetchResults,
     fitToPaths,
     setField,
+    setResults,
   });
-  return { model, view, fetchResults, fitToPaths, setField, coord };
+  return { model, view, viewMods, fetchResults, fitToPaths, setField, setResults, coord };
 }
 
 const HITS: SearchResponse = {
@@ -84,6 +124,12 @@ describe("SearchCoordinator", () => {
     });
     await coord.search("x");
     expect(setField).toHaveBeenCalledWith(null);
+  });
+
+  it("publishes the matched paths so the canvas can fade the rest", async () => {
+    const { coord, setResults } = makeHarness(async () => HITS);
+    await coord.search("x");
+    expect(setResults).toHaveBeenCalledWith(["b.mp3", "a.mp3"]);
   });
 
   it("trims the query and passes it with the result limit", async () => {
@@ -172,10 +218,60 @@ describe("SearchCoordinator", () => {
     expect(fitToPaths).toHaveBeenCalledWith(["b.mp3"]);
   });
 
-  it("clears the panel and the canvas field", () => {
-    const { coord, view, setField } = makeHarness(async () => HITS);
+  it("clears the panel, the canvas field, and the fade", () => {
+    const { coord, view, setField, setResults } = makeHarness(async () => HITS);
     coord.clear();
     expect(view.clear).toHaveBeenCalledTimes(1);
     expect(setField).toHaveBeenCalledWith(null);
+    expect(setResults).toHaveBeenCalledWith(null);
+  });
+
+  it("pushes one search chip once the search is active", async () => {
+    const { coord, viewMods } = makeHarness(async () => HITS);
+    await coord.search("dark techno");
+    expect(viewMods.stack).toEqual([
+      { id: "vm-1", kind: "search", label: "dark techno" },
+    ]);
+  });
+
+  it("refreshes the same chip on a later query instead of stacking", async () => {
+    const { coord, viewMods } = makeHarness(async () => HITS);
+    await coord.search("dark techno");
+    await coord.search("dark ambient");
+    expect(viewMods.stack).toHaveLength(1);
+    expect(viewMods.stack[0].label).toBe("dark ambient");
+  });
+
+  it("drops the chip when the search is cleared", async () => {
+    const { coord, viewMods } = makeHarness(async () => HITS);
+    await coord.search("x");
+    coord.clear();
+    expect(viewMods.stack).toEqual([]);
+  });
+
+  it("drops the chip for a blank query", async () => {
+    const { coord, viewMods } = makeHarness(async () => HITS);
+    await coord.search("x");
+    await coord.search("   ");
+    expect(viewMods.stack).toEqual([]);
+  });
+
+  it("drops the chip when the fetch fails", async () => {
+    const { coord, viewMods } = makeHarness(async () => {
+      throw new Error("boom");
+    });
+    await coord.search("x");
+    expect(viewMods.stack).toEqual([]);
+  });
+
+  it("clears the canvas state when the chip is dismissed", async () => {
+    const { coord, viewMods, setField, setResults, view } = makeHarness(
+      async () => HITS,
+    );
+    await coord.search("x");
+    viewMods.sink.dismiss("vm-1");
+    expect(setField).toHaveBeenCalledWith(null);
+    expect(setResults).toHaveBeenCalledWith(null);
+    expect(view.clear).toHaveBeenCalled();
   });
 });

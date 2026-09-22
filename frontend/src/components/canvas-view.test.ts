@@ -5,8 +5,14 @@ import {
   type QueueStatus,
   type Track,
 } from "../model";
-import { clusterColor } from "../lib/colors";
-import { CanvasView } from "./canvas-view";
+import {
+  clusterColor,
+  dirColor,
+  keyColor,
+  parseColor,
+  tempoColor,
+} from "../lib/colors";
+import { CanvasView, nearestInBlob, tabAt, type DotPosition } from "./canvas-view";
 
 function makeTrack(over: Partial<Track> = {}): Track {
   return {
@@ -22,37 +28,54 @@ function makeTrack(over: Partial<Track> = {}): Track {
 
 // ─── Cluster hover glow ───────────────────────────────────────
 
-/** Minimal 2-D context stand-in that records every fill colour. */
-function makeFakeCtx(): { ctx: CanvasRenderingContext2D; fills: string[] } {
-  const fills: string[] = [];
+/** Minimal 2-D context stand-in that records every alpha the dot pass sets. */
+function makeFakeCtx(): {
+  ctx: CanvasRenderingContext2D;
+  alphas: number[];
+  ellipses: { x: number; y: number; rx: number; ry: number }[];
+  rects: { x: number; y: number; w: number; h: number }[];
+} {
+  const alphas: number[] = [];
+  const ellipses: { x: number; y: number; rx: number; ry: number }[] = [];
+  const rects: { x: number; y: number; w: number; h: number }[] = [];
   const target: Record<string, unknown> = {
     measureText: () => ({ width: 10 }),
+    ellipse: (x: number, y: number, rx: number, ry: number) => {
+      ellipses.push({ x, y, rx, ry });
+    },
+    rect: (x: number, y: number, w: number, h: number) => {
+      rects.push({ x, y, w, h });
+    },
   };
   const ctx = new Proxy(target, {
     get(t, prop: string) {
-      if (prop === "fillStyle") return fills.at(-1) ?? "";
       if (prop in t) return t[prop];
       return () => undefined;
     },
     set(t, prop: string, value) {
-      if (prop === "fillStyle") fills.push(value as string);
+      if (prop === "globalAlpha") alphas.push(value as number);
       else t[prop] = value;
       return true;
     },
   });
-  return { ctx: ctx as unknown as CanvasRenderingContext2D, fills };
+  return {
+    ctx: ctx as unknown as CanvasRenderingContext2D,
+    alphas,
+    ellipses,
+    rects,
+  };
 }
 
 describe("CanvasView cluster hover glow", () => {
-  let fills: string[];
+  let alphas: number[];
   let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
 
   beforeEach(() => {
     vi.stubGlobal("devicePixelRatio", 1);
     document.body.innerHTML =
-      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
     const fake = makeFakeCtx();
-    fills = fake.fills;
+    alphas = fake.alphas;
     origGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = (() =>
       fake.ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
@@ -73,19 +96,21 @@ describe("CanvasView cluster hover glow", () => {
     return new CanvasView(m);
   }
 
-  it("glows a hovered cluster's members in its swatch colour", () => {
+  it("collects a halo for a hovered cluster's members in its swatch colour", () => {
     const cv = makeCanvas();
     cv.model.clusterAssignments = new Map([["a.mp3", 2]]);
     cv.hoverTarget = { kind: "cluster", id: 2 };
     cv.draw();
-    expect(fills).toContain(clusterColor(2));
+    const pts = cv.collectHoverGlowPoints(cv.model.tracks);
+    expect(pts).toHaveLength(1);
+    expect(pts[0].color).toEqual(parseColor(clusterColor(2)));
   });
 
-  it("does not glow a cluster colour when nothing is hovered", () => {
+  it("collects no halo when nothing is hovered", () => {
     const cv = makeCanvas();
     cv.model.clusterAssignments = new Map([["a.mp3", 2]]);
     cv.draw();
-    expect(fills).not.toContain(clusterColor(2));
+    expect(cv.collectHoverGlowPoints(cv.model.tracks)).toEqual([]);
   });
 
   it("sets and clears the hover target from a card element", () => {
@@ -119,37 +144,33 @@ describe("CanvasView cluster hover glow", () => {
     );
     expect(cv.hoverTarget).toEqual({ kind: "key", value: "Am" });
   });
+
+  it("fades tracks outside the active search result set", () => {
+    const cv = makeCanvas();
+    cv.searchResults = new Set(["a.mp3"]);
+    cv.draw();
+    // The non-match fades; the match does not.
+    expect(alphas).toContain(0.15);
+    expect(alphas.filter((a) => a === 0.15)).toHaveLength(1);
+  });
+
+  it("does not fade anything without an active search", () => {
+    const cv = makeCanvas();
+    cv.draw();
+    expect(alphas).not.toContain(0.15);
+  });
 });
 
 describe("CanvasView search field", () => {
-  let gradients: number;
   let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
 
   beforeEach(() => {
     vi.stubGlobal("devicePixelRatio", 1);
     document.body.innerHTML =
-      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
-    gradients = 0;
-    const target: Record<string, unknown> = {
-      measureText: () => ({ width: 10 }),
-      createRadialGradient: () => {
-        gradients += 1;
-        return { addColorStop: () => undefined };
-      },
-    };
-    const ctx = new Proxy(target, {
-      get(t, prop: string) {
-        if (prop in t) return t[prop];
-        return () => undefined;
-      },
-      set(t, prop: string, value) {
-        t[prop] = value;
-        return true;
-      },
-    });
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
     origGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = (() =>
-      ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+      makeFakeCtx().ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
   });
 
   afterEach(() => {
@@ -166,53 +187,58 @@ describe("CanvasView search field", () => {
     return new CanvasView(m);
   }
 
-  it("splats a landmark per sample point while the box is active", () => {
+  it("collects a glow point per landmark while the box is active", () => {
     const cv = makeCanvas();
     cv.searchField = [{ path: "a.mp3", score: 0.5 }];
     cv.searchActive = true;
     cv.draw();
-    expect(gradients).toBe(1);
+    expect(cv.collectSearchGlowPoints()).toHaveLength(1);
   });
 
-  it("hides the field while the search box is not active", () => {
+  it("collects no field while the search box is not active", () => {
     const cv = makeCanvas();
     cv.searchField = [{ path: "a.mp3", score: 0.5 }];
     cv.searchActive = false;
     cv.draw();
-    expect(gradients).toBe(0);
+    expect(cv.collectSearchGlowPoints()).toEqual([]);
   });
 
-  it("hides the field off the CLAP lens", () => {
+  it("collects no field off the CLAP lens", () => {
     const cv = makeCanvas();
     cv.searchField = [{ path: "a.mp3", score: 0.5 }];
     cv.searchActive = true;
     cv.model.lensId = "rhythm";
     cv.draw();
-    expect(gradients).toBe(0);
+    expect(cv.collectSearchGlowPoints()).toEqual([]);
   });
 
-  it("shows the field under a CLAP scope", () => {
+  it("collects the field under a CLAP scope", () => {
     const cv = makeCanvas();
     cv.searchField = [{ path: "a.mp3", score: 0.5 }];
     cv.searchActive = true;
     cv.model.lensId = "combined";
-    cv.model.scope = { cx: 0.5, cy: 0.5, r: 0.2, lensId: "clap" };
+    cv.model.scope = { shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "clap" };
     cv.model.scopePositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
     cv.draw();
-    expect(gradients).toBe(1);
+    expect(cv.collectSearchGlowPoints()).toHaveLength(1);
   });
 });
 
 describe("CanvasView scope positions", () => {
+  let ellipses: { x: number; y: number; rx: number; ry: number }[];
+  let rects: { x: number; y: number; w: number; h: number }[];
   let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
 
   beforeEach(() => {
     vi.stubGlobal("devicePixelRatio", 1);
     document.body.innerHTML =
-      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
+    const fake = makeFakeCtx();
+    ellipses = fake.ellipses;
+    rects = fake.rects;
     origGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = (() =>
-      makeFakeCtx().ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+      fake.ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
   });
 
   afterEach(() => {
@@ -229,7 +255,7 @@ describe("CanvasView scope positions", () => {
       makeTrack({ path: "c.mp3", folder: "Techno" }),
     ]);
     const cv = new CanvasView(m);
-    m.scope = { cx: 0.5, cy: 0.5, r: 0.2, lensId: "camelot" };
+    m.scope = { shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "camelot" };
     m.scopePositions = new Map([["a.mp3", { x: 0.4, y: 0.6 }]]);
     // c.mp3's outer position is outside the circle.
     m.embeddingPositions = new Map([
@@ -252,6 +278,64 @@ describe("CanvasView scope positions", () => {
       wy: 0.95,
     });
   });
+
+  it("draws the scope outline as the projected image of its world circle", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    const cv = new CanvasView(m);
+    // Non-square viewport: the world→screen transform scales x and y differently.
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    m.viewMode = "embeddings";
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    m.scope = { shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "camelot" };
+    m.scopePositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+
+    cv.draw();
+
+    // The scope outline must be the world circle's screen image — an ellipse
+    // whose axes are the world radius scaled by each axis — so nothing outside
+    // the world circle can render inside it.
+    const outline = ellipses.find((e) => e.rx > 1);
+    expect(outline).toBeDefined();
+    const iw = 800 - 2 * 40;
+    const ih = 400 - 2 * 40;
+    expect(outline!.rx).toBeCloseTo(0.2 * iw, 3);
+    expect(outline!.ry).toBeCloseTo(0.2 * ih, 3);
+    expect(outline!.rx / outline!.ry).toBeCloseTo(iw / ih, 3);
+  });
+
+  it("draws a box scope as a rectangle matching its world extent", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    const cv = new CanvasView(m);
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    m.viewMode = "embeddings";
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    m.scope = {
+      shape: "box",
+      cx: 0.5,
+      cy: 0.5,
+      r: 0.2,
+      rx: 0.2,
+      ry: 0.1,
+      lensId: "camelot",
+    };
+    m.scopePositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+
+    cv.draw();
+
+    // The box region's screen image is a rectangle: half-width rx scaled by the
+    // x axis, half-height ry by the y axis — no ellipse.
+    const iw = 800 - 2 * 40;
+    const ih = 400 - 2 * 40;
+    const box = rects.find((r) => r.w > 1);
+    expect(box).toBeDefined();
+    expect(box!.w).toBeCloseTo(2 * 0.2 * iw, 3);
+    expect(box!.h).toBeCloseTo(2 * 0.1 * ih, 3);
+    expect(ellipses.some((e) => e.rx > 1)).toBe(false);
+  });
 });
 
 // ─── Loading indicators (stacked) ─────────────────────────────
@@ -264,7 +348,7 @@ describe("CanvasView loading indicators", () => {
   beforeEach(() => {
     vi.stubGlobal("devicePixelRatio", 1);
     document.body.innerHTML =
-      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
     texts = [];
     arcs = [];
     const target: Record<string, unknown> = {
@@ -364,7 +448,7 @@ describe("CanvasView hovered-row info card", () => {
   beforeEach(() => {
     vi.stubGlobal("devicePixelRatio", 1);
     document.body.innerHTML =
-      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div>';
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
     origGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = (() =>
       makeFakeCtx().ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
@@ -396,5 +480,307 @@ describe("CanvasView hovered-row info card", () => {
     const cv = makeCanvas();
     cv.draw();
     expect(cv.$tip.classList.contains("hidden")).toBe(true);
+  });
+
+  it("routes an inspect-card tab click to onInspectAction", () => {
+    const cv = makeCanvas();
+    cv.inspect = {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: null,
+      results: [],
+      proximity: 100,
+      tab: "navigate",
+      describe: {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        results: [],
+        coordinates: [],
+      },
+    };
+    cv.onInspectAction = vi.fn();
+    const btn = document.createElement("button");
+    btn.dataset.inspectAction = "show-describe";
+    cv.$tip.appendChild(btn);
+
+    btn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(cv.onInspectAction).toHaveBeenCalledWith("show-describe", "a.mp3");
+  });
+
+  it("routes a Describe-term click to onSearchTerm", () => {
+    const cv = makeCanvas();
+    cv.onSearchTerm = vi.fn();
+    const row = document.createElement("div");
+    row.dataset.searchTerm = "a techno track";
+    // Term rows live in the folded-out panel, not the card.
+    cv.$coords.appendChild(row);
+
+    row.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    expect(cv.onSearchTerm).toHaveBeenCalledWith("a techno track");
+  });
+
+  it("folds the Describe content into a panel beside the card", () => {
+    const cv = makeCanvas();
+    cv.inspect = {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: null,
+      results: [],
+      proximity: 100,
+      tab: "describe",
+      describe: {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        results: [{ text: "a techno track", facet: "Genre", score: 0.31 }],
+        coordinates: [
+          {
+            axis: "dark <-> bright",
+            pos: "dark",
+            neg: "bright",
+            pole: "dark",
+            z: 2.1,
+            percentile: 0.98,
+            reliability: 2.58,
+          },
+        ],
+      },
+    };
+    cv.draw();
+    expect(cv.$coords.classList.contains("hidden")).toBe(false);
+    // One wide area, two columns: terms | coordinates.
+    const panel = cv.$coords.querySelector(".tt-desc-panel");
+    expect(panel?.querySelector(".tt-desc-col")).not.toBeNull();
+    expect(panel?.querySelector(".tt-coord-col")).not.toBeNull();
+    expect(cv.$coords.querySelector(".tt-describe-row")).not.toBeNull();
+    // The card itself carries none of it on this tab.
+    expect(cv.$tip.querySelector(".tt-describe-row")).toBeNull();
+    expect(cv.$tip.querySelector(".tt-coord")).toBeNull();
+  });
+
+  it("hides the Describe panel while the Navigate tab is active", () => {
+    const cv = makeCanvas();
+    cv.inspect = {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: null,
+      results: [],
+      proximity: 100,
+      tab: "navigate",
+      describe: {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        results: [{ text: "a techno track", facet: "Genre", score: 0.31 }],
+        coordinates: [],
+      },
+    };
+    cv.draw();
+    expect(cv.$coords.classList.contains("hidden")).toBe(true);
+  });
+
+  it("keeps the Describe panel DOM across an unchanged redraw", () => {
+    const cv = makeCanvas();
+    cv.inspect = {
+      path: "a.mp3",
+      busy: false,
+      message: null,
+      mode: null,
+      results: [],
+      proximity: 100,
+      tab: "describe",
+      describe: {
+        path: "a.mp3",
+        busy: false,
+        message: null,
+        results: [{ text: "a techno track", facet: "Genre", score: 0.31 }],
+        coordinates: [],
+      },
+    };
+    cv.draw();
+    const first = cv.$coords.querySelector(".tt-desc-panel");
+    expect(first).not.toBeNull();
+    // A pan/zoom frame redraws, but must not replace the rows under the pointer.
+    cv.draw();
+    expect(cv.$coords.querySelector(".tt-desc-panel")).toBe(first);
+  });
+});
+
+describe("nearestInBlob", () => {
+  const at = (idx: number, sx: number, sy: number): DotPosition => ({
+    idx,
+    sx,
+    sy,
+  });
+
+  function grid(points: DotPosition[]): Map<string, DotPosition[]> {
+    const g = new Map<string, DotPosition[]>();
+    for (const p of points) {
+      const key = `${Math.round(p.sx / 24)},${Math.round(p.sy / 24)}`;
+      const cell = g.get(key);
+      if (cell) cell.push(p);
+      else g.set(key, [p]);
+    }
+    return g;
+  }
+
+  it("picks the nearest member when the cursor sits in a blob", () => {
+    const g = grid([at(0, 100, 100), at(1, 110, 100), at(2, 100, 110)]);
+    // 30 px from the cluster, still inside the 3×3 cell reach.
+    expect(nearestInBlob(g, 130, 100)).toBe(1);
+  });
+
+  it("returns nothing for a lone dot's cell", () => {
+    const g = grid([at(0, 100, 100)]);
+    expect(nearestInBlob(g, 130, 100)).toBe(-1);
+  });
+
+  it("returns nothing when no cell is near the cursor", () => {
+    const g = grid([at(0, 100, 100), at(1, 110, 100)]);
+    expect(nearestInBlob(g, 400, 400)).toBe(-1);
+  });
+});
+
+describe("CanvasView track colour modes", () => {
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
+    const fake = makeFakeCtx();
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      fake.ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function view(track: Track): CanvasView {
+    const m = new Model();
+    m.setAllTracks([track]);
+    return new CanvasView(m);
+  }
+
+  it("colours by tempo and key from cached features", () => {
+    const t = makeTrack({
+      path: "a.mp3",
+      audio_features: {
+        tempo: 0.5,
+        key: 0.25,
+        mode: 1,
+        energy: 0.5,
+        danceability: 0.5,
+      },
+    });
+    const cv = view(t);
+    cv.model.colorMode = "tempo";
+    expect(cv.trackColor(t)).toBe(tempoColor(0.5));
+    cv.model.colorMode = "key";
+    expect(cv.trackColor(t)).toBe(keyColor(0.25, 1));
+  });
+
+  it("falls back to the folder colour when the feature is missing", () => {
+    const t = makeTrack({ path: "a.mp3", folder: "House" });
+    const cv = view(t);
+    cv.model.colorMode = "tempo";
+    expect(cv.trackColor(t)).toBe(dirColor("House"));
+    cv.model.colorMode = "key";
+    expect(cv.trackColor(t)).toBe(dirColor("House"));
+  });
+
+  it("colours by cluster when assignments exist", () => {
+    const t = makeTrack({ path: "a.mp3", folder: "House" });
+    const cv = view(t);
+    cv.model.colorMode = "cluster";
+    cv.model.clusterAssignments = new Map([["a.mp3", 4]]);
+    expect(cv.trackColor(t)).toBe(clusterColor(4));
+  });
+
+  it("colours by the head's predicted folder, gated by confidence", () => {
+    const t = makeTrack({ path: "a.mp3", folder: "House" });
+    const cv = view(t);
+    cv.model.colorMode = "head";
+    cv.model.folderPredictions = new Map([["a.mp3", "Root/Techno"]]);
+    // Confident (default): a weak match keeps its own folder colour.
+    cv.model.folderPredictionMatches = new Set();
+    expect(cv.trackColor(t)).toBe(dirColor("House"));
+    // A confident match takes the predicted folder's colour.
+    cv.model.folderPredictionMatches = new Set(["a.mp3"]);
+    expect(cv.trackColor(t)).toBe(dirColor("Root/Techno"));
+    // "All nearest" drops the gate, so the prediction wins regardless.
+    cv.model.headColorConfident = false;
+    cv.model.folderPredictionMatches = new Set();
+    expect(cv.trackColor(t)).toBe(dirColor("Root/Techno"));
+  });
+
+  it("falls back to the folder colour when there is no prediction", () => {
+    const t = makeTrack({ path: "a.mp3", folder: "House" });
+    const cv = view(t);
+    cv.model.colorMode = "head";
+    cv.model.folderPredictions = new Map();
+    cv.model.folderPredictionMatches = new Set();
+    expect(cv.trackColor(t)).toBe(dirColor("House"));
+  });
+});
+
+describe("CanvasView top tabbers", () => {
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
+    const fake = makeFakeCtx();
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      fake.ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("draws the lens and colour tabbers and hit-tests both", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    const cv = new CanvasView(m);
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+
+    cv.draw();
+
+    expect(cv.lensTabs.length).toBeGreaterThan(0);
+    expect(cv.colorTabs.length).toBeGreaterThan(0);
+    // The lens tabber is the top row, the colour tabber sits below it.
+    expect(cv.lensTabs[0].y1).toBeLessThan(cv.colorTabs[0].y0);
+    const lens = cv.lensTabs[0];
+    const lensCx = (lens.x0 + lens.x1) / 2;
+    expect(cv.topLensTabAt(lensCx, (lens.y0 + lens.y1) / 2)).toBe(lens.id);
+    const color = cv.colorTabs[2];
+    const colorCx = (color.x0 + color.x1) / 2;
+    expect(cv.topColorTabAt(colorCx, (color.y0 + color.y1) / 2)).toBe(color.id);
+    // The gap between the two rows belongs to neither.
+    const gap = (cv.lensTabs[0].y1 + cv.colorTabs[0].y0) / 2;
+    expect(cv.topLensTabAt(lensCx, gap)).toBeNull();
+    expect(cv.topColorTabAt(lensCx, gap)).toBeNull();
+  });
+});
+
+describe("tabAt", () => {
+  it("returns the id inside a rect and null outside", () => {
+    const tabs = [{ id: "x", x0: 10, y0: 10, x1: 20, y1: 20 }];
+    expect(tabAt(tabs, 15, 15)).toBe("x");
+    expect(tabAt(tabs, 25, 15)).toBeNull();
   });
 });

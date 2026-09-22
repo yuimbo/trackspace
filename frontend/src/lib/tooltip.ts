@@ -4,9 +4,10 @@
 // (collapsing to the filename when metadata is missing), a location stack of the
 // folder and cluster as icon-distinguished coloured tags, structure chips (the
 // audition sections), and two stat areas — user tags and audio features. BPM and key
-// appear only in Features: tempo as a bar and key as a chip, so they are not
-// duplicated near the title. `buildTooltip` is pure (unit-testable) and
-// `renderTooltip` is the only DOM code, so the canvas view stays free of layout.
+// appear only in Features, as chips filled with the same colours as the tempo/key
+// colour modes, so they are not duplicated near the title. `buildTooltip` is pure
+// (unit-testable) and `renderTooltip` is the only DOM code, so the canvas view
+// stays free of layout.
 
 import {
   type HoverTarget,
@@ -17,7 +18,14 @@ import {
   LIBROSA_FEATURE_AXIS_IDS,
   isAudioFeatureAxisId,
 } from "../model";
-import { clusterColor, dirTagColors } from "./colors";
+import {
+  clusterColor,
+  dirTagColors,
+  hslToRgb,
+  keyColor,
+  tempoColor,
+} from "./colors";
+import { trackTempoNorm } from "./lenses";
 import { displayFolderPath } from "./path-presenter";
 import { structureChips, type StructureChip } from "./structure";
 
@@ -28,6 +36,8 @@ export interface TooltipBar {
   readout: string;
   /** Categorical stat (key): render a chip, not a magnitude bar. */
   chip?: boolean;
+  /** Fill for a categorical chip (the feature-lens colour); omitted = neutral. */
+  color?: string;
   /** Navigation target when the row is a key/BPM stat (hover glows + S/H act on it). */
   target?: HoverTarget;
 }
@@ -40,6 +50,10 @@ export interface TooltipGenre {
   spanning: boolean;
   /** Hover target for the cluster name (``null`` when unassigned). */
   target: HoverTarget | null;
+  /** Folder head's predicted destination, when it differs from the track's folder. */
+  projectedFolder: string | null;
+  /** Whether that prediction clears its class's match floor. */
+  projectedConfident: boolean;
 }
 
 /** One ranked neighbour: the raw path plus the similarity score. */
@@ -47,6 +61,60 @@ export interface TooltipResult {
   path: string;
   score: number;
 }
+
+/** One zero-shot phrase CLAP ranked for the track (a phrase bank candidate). */
+export interface DescribeResult {
+  text: string;
+  /** Bank facet the phrase belongs to (Genre / Mood / …). */
+  facet: string;
+  score: number;
+}
+
+/** One semantic coordinate: where the track sits on a contrastive axis. */
+export interface CoordinateResult {
+  /** Axis label, e.g. ``dark <-> bright``. */
+  axis: string;
+  pos: string;
+  neg: string;
+  /** Pole the track leans to (percentile ≥ 50 % → ``pos``). */
+  pole: string;
+  z: number;
+  /** Reference-distribution percentile, 0–1. */
+  percentile: number;
+  /** Axis reliability (|Cohen's d| of the best genre contrast), used to weight it. */
+  reliability: number;
+}
+
+/** Describe-tab state, loaded lazily when the card is pinned. */
+export interface DescribeState {
+  /** Track the results belong to, so a stale fetch never shows on another card. */
+  path: string;
+  busy: boolean;
+  message: string | null;
+  results: DescribeResult[];
+  coordinates: CoordinateResult[];
+}
+
+/** An empty describe state for *path* (busy while the fetch is in flight). */
+export function emptyDescribe(path: string, busy = false): DescribeState {
+  return { path, busy, message: null, results: [], coordinates: [] };
+}
+
+/** Identity of the describe payload, so the panel rebuilds only when it changes. */
+export function describeKey(describe: DescribeState): string {
+  return [
+    describe.path,
+    describe.busy ? "busy" : "",
+    describe.message ?? "",
+    describe.results.map((r) => `${r.facet}:${r.text}:${r.score}`).join("|"),
+    describe.coordinates
+      .map((c) => `${c.axis}:${c.pole}:${c.percentile}`)
+      .join("|"),
+  ].join("\u0001");
+}
+
+/** The pinned card's two views: neighbour ranking, or zero-shot descriptions. */
+export type InspectTab = "navigate" | "describe";
 
 /** Interactive inspect state, present only while the card is pinned. */
 export interface InspectState {
@@ -64,6 +132,10 @@ export interface InspectState {
    * does not rebuild the slider under the pointer.
    */
   proximity: number;
+  /** Active tab: the neighbour ranking or the CLAP descriptions. */
+  tab: InspectTab;
+  /** Zero-shot descriptions, fetched when the Describe tab is first opened. */
+  describe: DescribeState;
 }
 
 export interface TooltipCard {
@@ -126,6 +198,7 @@ function audioFeatureRows(track: Track, m: Model): TooltipBar[] {
         value: 0,
         readout: track.musical_key,
         chip: true,
+        color: row ? keyColor(row.key, row.mode) : undefined,
         target: { kind: "key", value: track.musical_key },
       });
       continue;
@@ -134,11 +207,13 @@ function audioFeatureRows(track: Track, m: Model): TooltipBar[] {
     // standalone bar, so there is no bar fallback when BPM is unknown.
     if (k === "tempo") {
       if (track.bpm == null || !Number.isFinite(track.bpm)) continue;
+      const tnorm = trackTempoNorm(track);
       rows.push({
         label: m.axisDisplayName(k),
         value: 0,
         readout: `${Math.round(track.bpm)} BPM`,
         chip: true,
+        color: tnorm != null ? tempoColor(tnorm) : undefined,
         target: { kind: "bpm", value: track.bpm },
       });
       continue;
@@ -194,6 +269,12 @@ export function buildTooltip(
 
   const cid = m.clusterAssignments.get(track.path);
   const spanning = structure?.genre_spanning === true;
+  // The head's predicted destination, shown only when it would actually move the
+  // track (a prediction equal to the current folder says nothing new).
+  const predicted = m.folderPredictions.get(track.path);
+  const projectedFolder =
+    predicted && predicted !== folderPath ? displayFolderPath(predicted) : null;
+  const projectedConfident = m.folderPredictionMatches.has(track.path);
   const genre: TooltipGenre | null =
     cid === undefined && !spanning
       ? null
@@ -205,12 +286,20 @@ export function buildTooltip(
           color: cid === undefined ? null : clusterColor(cid),
           spanning,
           target: cid === undefined ? null : { kind: "cluster", id: cid },
+          projectedFolder,
+          projectedConfident,
         };
 
   const tags = tagRows(track);
   const features = audioFeatureRows(track, m);
-  const results = inspect
-    ? inspect.results.map((r) => resolveResult(r, m))
+  // Descriptions are fetched per track: if a response for another track lands
+  // after the card was re-pinned, drop it rather than label this track with it.
+  const effectiveInspect: InspectState | null =
+    inspect && inspect.describe.path !== track.path
+      ? { ...inspect, describe: emptyDescribe(track.path) }
+      : inspect;
+  const results = effectiveInspect
+    ? effectiveInspect.results.map((r) => resolveResult(r, m))
     : [];
 
   const key = [
@@ -225,8 +314,9 @@ export function buildTooltip(
     features.map((f) => `${f.label}:${f.readout}:${f.value}`).join("|"),
     activeSection ?? "",
     cid ?? "",
+    projectedFolder ?? "",
     m.clusterRevision ?? "",
-    inspect ? inspectKey(inspect) : "",
+    effectiveInspect ? inspectKey(effectiveInspect) : "",
   ].join("\u0001");
 
   return {
@@ -242,7 +332,7 @@ export function buildTooltip(
     tags,
     features,
     activeSection,
-    inspect,
+    inspect: effectiveInspect,
     results,
     // The hint only belongs on the plain card: once pinned it is interactive.
     hint: inspect ? null : HOLD_ALT_HINT,
@@ -274,6 +364,8 @@ function inspectKey(inspect: InspectState): string {
     inspect.message ?? "",
     inspect.mode ?? "",
     inspect.results.map((r) => `${r.path}:${r.score}`).join("|"),
+    inspect.tab,
+    describeKey(inspect.describe),
   ].join("\u0001");
 }
 
@@ -344,13 +436,10 @@ function tagFill(colors: string[]): string | null {
 
 /** Relative luminance of an `hsl(h,s%,l%)` colour, for contrast decisions. */
 function hslLuminance(h: number, s: number, l: number): number {
-  const a = (s / 100) * Math.min(l / 100, 1 - l / 100);
-  const channel = (n: number): number => {
-    const k = (n + h / 30) % 12;
-    const v = (l / 100) - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-    return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
-  };
-  return 0.2126 * channel(0) + 0.7152 * channel(8) + 0.0722 * channel(4);
+  const [r, g, b] = hslToRgb(h, s / 100, l / 100);
+  const linear = (v: number): number =>
+    v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
 }
 
 /** Icon/name colour with enough contrast for the tag's fill(s). */
@@ -401,7 +490,44 @@ function clusterTag(genre: TooltipGenre): HTMLElement {
     tag.appendChild(badge);
   }
   if (genre.target) markTarget(tag, genre.target);
+  // The chip truncates long names; hovering it shows the full one in a pop-over.
+  tag.dataset.genrePop = "";
   return tag;
+}
+
+/**
+ * Render the genre chip's hover pop-over: the chip's full (untruncated) name,
+ * plus the folder head's projected destination when it differs from the track's
+ * current folder. A fixed overlay, so it never reflows the card underneath.
+ */
+export function renderGenrePop(host: HTMLElement, genre: TooltipGenre): void {
+  const pop = el("div", "tt-pop-card");
+  const chip = el("span", "tt-pop-genre");
+  if (genre.color) {
+    chip.classList.add("tt-loc-filled");
+    chip.style.background = genre.color;
+    chip.style.color = tagTextColor([genre.color]);
+  }
+  chip.appendChild(locationIcon("tag"));
+  chip.appendChild(el("span", "tt-pop-name", genre.name ?? "No genre"));
+  pop.appendChild(chip);
+  if (genre.spanning)
+    pop.appendChild(el("div", "tt-pop-note", SPANNING_HINT));
+  if (genre.projectedFolder) {
+    const proj = el("div", "tt-pop-proj");
+    proj.appendChild(el("div", "tt-pop-proj-label", "Projected folder"));
+    const line = el("div", "tt-pop-proj-path");
+    line.appendChild(
+      locationIcon("folder"),
+    );
+    line.appendChild(el("span", "tt-pop-proj-name", genre.projectedFolder));
+    if (!genre.projectedConfident)
+      line.appendChild(el("span", "tt-pop-proj-low", "low confidence"));
+    proj.appendChild(line);
+    pop.appendChild(proj);
+  }
+  host.replaceChildren(pop);
+  host.classList.remove("hidden");
 }
 
 function statSection(
@@ -413,9 +539,15 @@ function statSection(
   section.appendChild(el("div", "tt-section-title", title));
   for (const r of rows) {
     if (r.chip) {
-      // Categorical stat (key): the value has no magnitude to bar, so show a
-      // chip in the same row style as the other stats.
+      // Categorical stat (key/BPM): the value has no magnitude to bar, so show a
+      // chip in the same row style as the other stats. A feature-lens colour fills
+      // it, so the card reads with the same palette as the map.
       const chip = el("span", "tt-stat-chip");
+      if (r.color) {
+        chip.classList.add("tt-stat-chip-filled");
+        chip.style.background = r.color;
+        chip.style.color = tagTextColor([r.color]);
+      }
       chip.appendChild(el("span", "tt-stat-chip-label", r.label));
       chip.appendChild(el("span", "tt-stat-chip-value", r.readout));
       if (r.target) markTarget(chip, r.target);
@@ -473,40 +605,69 @@ export function renderTooltip(host: HTMLElement, card: TooltipCard): void {
   host.replaceChildren(root);
 }
 
-/** Navigate buttons + the last ranking's rows (pinned card only). */
+/** Pinned card: a Navigate / Describe tab strip plus the active tab's body. */
 function inspectSection(
   inspect: InspectState,
   results: ResultRow[],
 ): HTMLElement {
   const section = el("div", "tt-section tt-inspect");
   const head = el("div", "tt-inspect-head");
-  head.appendChild(el("div", "tt-section-title", "Navigate"));
+  const tabs = el("div", "tt-tabs");
+  const defs: [InspectTab, string][] = [
+    ["navigate", "Navigate"],
+    ["describe", "Describe"],
+  ];
+  for (const [tab, label] of defs) {
+    const active = inspect.tab === tab;
+    const btn = el(
+      "button",
+      `tt-tab${active ? " active" : ""}`,
+      label,
+    ) as HTMLButtonElement;
+    btn.dataset.inspectAction = `show-${tab}`;
+    btn.setAttribute("role", "tab");
+    btn.setAttribute("aria-selected", String(active));
+    tabs.appendChild(btn);
+  }
+  head.appendChild(tabs);
   const close = el("button", "tt-close", "×");
   close.dataset.inspectClose = "";
   close.title = "Close inspect (Esc)";
   head.appendChild(close);
   section.appendChild(head);
 
-  const buttons = el("div", "tt-nav-buttons");
-  const actions: [string, string, string][] = [
-    ["anti", "Anti-track", "The track furthest away in the embedding space"],
-    ["near", "Nearest", "The closest tracks in the embedding space"],
-  ];
-  for (const [action, label, hint] of actions) {
-    const btn = el("button", "tt-nav-btn", label) as HTMLButtonElement;
-    btn.dataset.inspectAction = action;
-    btn.title = hint;
-    btn.disabled = inspect.busy;
-    buttons.appendChild(btn);
-  }
-  section.appendChild(buttons);
+  // On Describe the content folds out into the wide panel beside the card, so the
+  // card body stays empty there; Navigate keeps its controls in the card.
+  if (inspect.tab !== "describe")
+    section.appendChild(navigateBody(inspect, results));
+  return section;
+}
 
-  // Neighbourhood slider: 100 % = the whole library, narrower = the closest
-  // fraction of it. Replaces the old discrete "Solo" (top-N) jump; dragging the
-  // view re-homes gradually instead of snapping to ten neighbours.
+/** Navigate tab: the anti-track / nearest buttons, slider, and ranked rows. */
+function navigateBody(inspect: InspectState, results: ResultRow[]): HTMLElement {
+  const body = el("div", "tt-tab-body");
+  // One toggle flips the distance filter's direction: nearest keeps the closest
+  // tracks, anti-track keeps the furthest. The slider is the main affordance.
+  const mode = inspect.mode === "far" ? "far" : "near";
+  const toggle = el(
+    "button",
+    "tt-nav-btn",
+    mode === "far" ? "Anti-track" : "Nearest",
+  ) as HTMLButtonElement;
+  toggle.dataset.inspectAction = "toggle-rank-mode";
+  toggle.title =
+    mode === "far"
+      ? "Anti-track: the filter keeps the furthest tracks. Click for nearest."
+      : "Nearest: the filter keeps the closest tracks. Click for anti-track.";
+  toggle.disabled = inspect.busy;
+  body.appendChild(toggle);
+
+  // Distance-filter slider: 100 % = the whole library visible, narrower = keep
+  // the nearest (or, in anti-track mode, the furthest) fraction of it. It is the
+  // main affordance and does *not* re-home the view as it moves.
   const proximity = el("div", "tt-proximity");
   const proxHead = el("div", "tt-proximity-head");
-  proxHead.appendChild(el("span", "tt-proximity-label", "Neighbourhood"));
+  proxHead.appendChild(el("span", "tt-proximity-label", "Distance filter"));
   const proxValue = el(
     "span",
     "tt-proximity-value",
@@ -523,26 +684,93 @@ function inspectSection(
   range.step = "1";
   range.value = String(Math.round(inspect.proximity));
   range.dataset.inspectProximity = "";
-  range.title = "Drag to grow or shrink the neighbourhood around this track";
+  range.title =
+    mode === "far"
+      ? "Drag to keep only the furthest tracks (anti-track)"
+      : "Drag to keep only the closest tracks";
   range.disabled = inspect.busy;
   proximity.appendChild(range);
-  section.appendChild(proximity);
+  body.appendChild(proximity);
 
   if (inspect.busy) {
-    section.appendChild(el("div", "tt-note", "Searching the embedding space…"));
+    body.appendChild(el("div", "tt-note", "Searching the embedding space…"));
   } else if (inspect.message) {
-    section.appendChild(el("div", "tt-note tt-note-error", inspect.message));
+    body.appendChild(el("div", "tt-note tt-note-error", inspect.message));
   } else if (results.length) {
-    section.appendChild(
+    body.appendChild(
       el(
         "div",
         "tt-section-title",
         inspect.mode === "far" ? "Anti-track" : "Nearest",
       ),
     );
-    for (const r of results) section.appendChild(resultRow(r));
+    for (const r of results) body.appendChild(resultRow(r));
   }
-  return section;
+  return body;
+}
+
+/**
+ * The Describe panel: a wide two-column fold-out beside the pinned card.
+ *
+ * Left is the flat list of phrases CLAP ranks closest to the track; right is the
+ * semantic coordinates. Both live here rather than in the 300 px card, so the term
+ * list and the sliders get the width they need. There is no title: the tab already
+ * says Describe. *host* is hidden unless the Describe tab is active and something
+ * is loaded.
+ */
+export function renderDescribePanel(
+  host: HTMLElement,
+  describe: DescribeState,
+  active: boolean,
+): void {
+  if (!active) {
+    host.classList.add("hidden");
+    return;
+  }
+  const panel = el("div", "tt-desc-panel");
+  const terms = el("div", "tt-desc-col");
+  const coords = el("div", "tt-coord-col");
+  if (describe.busy) {
+    terms.appendChild(el("div", "tt-note", "Asking CLAP…"));
+  } else if (describe.message) {
+    terms.appendChild(el("div", "tt-note tt-note-error", describe.message));
+  } else if (!describe.results.length) {
+    terms.appendChild(
+      el("div", "tt-note", "No CLAP match for this track yet."),
+    );
+  } else {
+    for (const r of describe.results) {
+      const row = el("div", "tt-describe-row", r.text);
+      row.dataset.searchTerm = r.text;
+      row.title = "CLAP search for tracks like this";
+      terms.appendChild(row);
+    }
+  }
+  for (const c of describe.coordinates) coords.appendChild(coordinateRow(c));
+  panel.appendChild(terms);
+  panel.appendChild(coords);
+  host.replaceChildren(panel);
+  host.classList.remove("hidden");
+}
+
+/** One coordinate row: pos label, bipolar track with marker, neg label. */
+function coordinateRow(c: CoordinateResult): HTMLElement {
+  const pct = Math.round(c.percentile * 100);
+  const leansPos = c.pole === c.pos;
+  const row = el("div", "tt-coord");
+  row.title =
+    `${c.axis} · ${pct}% of the reference library is below this track ` +
+    `(axis reliability ${c.reliability.toFixed(2)})`;
+  const pos = el("span", `tt-coord-pole${leansPos ? " lean" : ""}`, c.pos);
+  const neg = el("span", `tt-coord-pole${leansPos ? "" : " lean"}`, c.neg);
+  const track = el("span", "tt-coord-track");
+  const marker = el("i", "tt-coord-marker");
+  marker.style.left = `${pct}%`;
+  track.appendChild(marker);
+  row.appendChild(pos);
+  row.appendChild(track);
+  row.appendChild(neg);
+  return row;
 }
 
 function resultRow(result: ResultRow): HTMLElement {

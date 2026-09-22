@@ -147,12 +147,6 @@ body { display: flex; }
   color: var(--fg-dim);
   flex-shrink: 0;
 }
-.folder-arrow.folder-arrow-add {
-  color: var(--accent);
-}
-.folder-arrow.folder-arrow-add:hover {
-  color: var(--accent-hi);
-}
 
 .folder-swatch {
   width: 7px;
@@ -215,52 +209,57 @@ body { display: flex; }
   text-shadow: 0 0 8px var(--accent-hi);
 }
 
-.folder-add-btn,
-.folder-reveal-btn,
-.folder-rename-btn {
+/* "New folder" row inside an expanded folder; the row's other actions live in
+   the hover popout (`#folder-actions`). */
+.folder-add-btn {
   font-size: 10px;
   color: var(--fg-dim);
   cursor: pointer;
   padding: 0 2px;
   flex-shrink: 0;
-  opacity: 0;
-  transition: opacity 0.15s;
 }
-.folder-row:hover .folder-reveal-btn,
-.folder-row:hover .folder-rename-btn { opacity: 1; }
-.folder-add-btn:hover,
-.folder-reveal-btn:hover,
-.folder-rename-btn:hover { color: var(--accent-hi); }
+.folder-add-btn:hover { color: var(--accent-hi); }
 
-.folder-role-btn {
-  font-size: 9px;
-  letter-spacing: 0.04em;
-  color: var(--fg-dim);
-  cursor: pointer;
-  padding: 0 2px;
-  flex-shrink: 0;
-  opacity: 0;
-  transition: opacity 0.15s;
+/* Action popout: a toolbar that floats to the right of the hovered folder row,
+   replacing the per-row inline icons. Hotkeyed actions carry a `<kbd>` badge. */
+.folder-actions {
+  position: fixed;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 168px;
+  padding: 4px;
+  background: #0d1219f2;
+  backdrop-filter: blur(8px);
+  border: 1px solid #ffffff3d;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px #0009;
 }
-.folder-row:hover .folder-role-btn { opacity: 0.7; }
-.folder-role-btn:hover { color: var(--accent-hi); opacity: 1; }
-.folder-row-external .folder-role-btn { opacity: 0.5; }
-
-.folder-imprint-btn,
-.folder-remove-btn {
-  font-size: 10px;
-  color: var(--fg-dim);
+.folder-action-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  padding: 3px 6px;
+  border-radius: 4px;
   cursor: pointer;
-  padding: 0 2px;
-  flex-shrink: 0;
-  opacity: 0;
-  transition: opacity 0.15s;
 }
-.folder-row:hover .folder-imprint-btn,
-.folder-row:hover .folder-remove-btn { opacity: 0.7; }
-.folder-imprint-btn:hover,
-.folder-remove-btn:hover { color: var(--accent-hi); opacity: 1; }
-.folder-row-external .folder-imprint-btn { opacity: 0.5; }
+.folder-action-btn:hover { background: #ffffff12; color: var(--accent-hi); }
+.folder-action-glyph {
+  width: 13px;
+  text-align: center;
+  color: var(--fg-dim);
+  flex-shrink: 0;
+}
+.folder-action-btn:hover .folder-action-glyph { color: var(--accent-hi); }
+.folder-action-label { flex: 1; white-space: nowrap; }
+.folder-action-hotkey { margin-left: auto; }
 
 #folder-controls label {
   display: flex;
@@ -505,44 +504,67 @@ body { display: flex; }
   color: var(--fg-dim);
 }
 
-/* ── Search section ───────────────────────────────────────── */
-#search-section {
-  padding: 6px 0;
+/* ── Search popup (⌘F) ───────────────────────────────────── */
+.search-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 260;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  background: rgba(6, 10, 24, 0.55);
+}
+.search-modal.hidden { display: none; }
+
+#search-modal-content {
+  width: min(560px, calc(100vw - 32px));
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  padding: 10px 12px;
+  border: 1px solid #ffffff22;
+  border-radius: 6px;
+  background: rgba(12, 18, 40, 0.96);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.55);
 }
 
 #search-input {
   width: 100%;
   box-sizing: border-box;
-  font-size: 11px;
-  padding: 3px 6px;
-  border: 1px solid #ffffff18;
-  border-radius: 3px;
-  background: #00000030;
+  font-size: 14px;
+  padding: 7px 10px;
+  border: 1px solid #ffffff22;
+  border-radius: 4px;
+  background: #00000040;
   color: var(--fg);
   outline: none;
 }
 #search-input:focus { border-color: var(--accent); }
 #search-input::placeholder { color: var(--fg-dim); }
-#search-section.searching #search-input { opacity: 0.6; }
+#search-modal.searching #search-input { opacity: 0.6; }
 
 #search-results {
-  max-height: 180px;
+  flex: 1;
+  min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
   padding-right: 2px;
-  margin-top: 4px;
+  margin-top: 6px;
 }
 #search-results::-webkit-scrollbar { width: 4px; }
 #search-results::-webkit-scrollbar-thumb { background: #ffffff18; border-radius: 3px; }
 
 .search-summary,
 .search-empty,
-.search-error {
+.search-error,
+.search-busy {
   font-size: 10px;
   color: var(--fg-dim);
   padding: 2px 0;
 }
 .search-error { color: var(--dot); }
+.search-busy { color: var(--accent); }
 
 .search-result-row {
   display: flex;
@@ -590,6 +612,67 @@ body { display: flex; }
   text-overflow: ellipsis;
   line-height: 1.2;
 }
+
+/* ── Active view modifiers (corner chip stack) ─────────────── */
+.view-modifiers {
+  position: absolute;
+  left: 8px;
+  bottom: 30px;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+  max-width: min(320px, 60vw);
+  pointer-events: none;
+}
+.view-modifiers.hidden { display: none; }
+
+.view-modifier {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 4px 3px 8px;
+  font-size: 11px;
+  color: var(--fg);
+  border: 1px solid #ffffff22;
+  border-radius: 4px;
+  background: rgba(12, 18, 40, 0.85);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.view-modifier .vm-label {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.view-modifier .vm-detail {
+  color: var(--fg-dim);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.view-modifier .vm-detail[hidden] { display: none; }
+.view-modifier .vm-range { width: 90px; margin: 0; flex-shrink: 0; }
+.view-modifier .vm-refit {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.view-modifier .vm-dismiss {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--fg-dim);
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 3px;
+  cursor: pointer;
+}
+.view-modifier .vm-dismiss:hover { color: var(--accent-hi); }
 
 /* ── Batch edit section ───────────────────────────────────── */
 #batch-section {
@@ -712,8 +795,33 @@ body { display: flex; }
 /* ── Right-panel spacer (pushes options+tags to bottom) ───── */
 .rp-spacer { flex: 1; min-height: 0; }
 
+/* ── View options panel (transparent, on the canvas edge) ──── */
+.view-options-panel {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 3;
+  width: 210px;
+  max-width: 45vw;
+  color: var(--fg);
+  border: 1px solid #ffffff22;
+  border-radius: 4px;
+  background: rgba(12, 18, 40, 0.55);
+  backdrop-filter: blur(3px);
+}
+.view-options-panel summary {
+  padding: 4px 8px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent);
+  cursor: pointer;
+  user-select: none;
+}
+.view-options-panel[open] summary { border-bottom: 1px solid #ffffff14; }
+
 /* ── Options section ──────────────────────────────────────── */
-#options-section { padding: 6px 0; }
+#options-section { padding: 4px 8px 8px; }
 #options-section label { margin-top: 4px; }
 
 .hover-preview-row {
@@ -1106,8 +1214,12 @@ kbd {
 #viewport {
   flex: 1;
   display: block;
-  background: var(--bg);
+  /* Transparent so the glow overlay stacked under it (z-index 0) shows through;
+     the page background behind both supplies the map's colour. */
+  background: transparent;
   cursor: crosshair;
+  position: relative;
+  z-index: 1;
 }
 
 #statusbar {
@@ -1320,6 +1432,89 @@ kbd {
   letter-spacing: 0.04em;
 }
 
+/* Genre-chip hover pop-over: the chip's full name (and the head's projected
+   folder), shown fixed above the chip so a long name never reflows the card. */
+.tt-pop {
+  position: fixed;
+  z-index: 120;
+  max-width: 320px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  background: #0d1219f2;
+  backdrop-filter: blur(8px);
+  border: 1px solid #ffffff1f;
+  box-shadow: 0 8px 24px #0009;
+  color: var(--fg);
+  font-size: 11px;
+  line-height: 1.35;
+  pointer-events: none;
+}
+
+.tt-pop-genre {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: #ffffff0f;
+  border: 1px solid #ffffff1a;
+  font-weight: 600;
+}
+
+.tt-pop-genre.tt-loc-filled {
+  color: #0d1219;
+  border-color: transparent;
+}
+
+.tt-pop-name { white-space: normal; word-break: break-word; }
+
+.tt-pop-note {
+  margin-top: 5px;
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+
+.tt-pop-proj {
+  margin-top: 6px;
+  padding-top: 5px;
+  border-top: 1px solid #ffffff14;
+}
+
+.tt-pop-proj-label {
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tt-pop-proj-path {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+.tt-pop-proj-low {
+  margin-left: 4px;
+  color: var(--fg-dim);
+  font-size: 9px;
+}
+
+/* Cursor-adjacent preview-volume readout while M + scroll is adjusting it. */
+.volume-hud {
+  position: fixed;
+  z-index: 130;
+  padding: 3px 7px;
+  border-radius: 6px;
+  background: #0d1219e6;
+  border: 1px solid #ffffff26;
+  color: var(--fg);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
 .tt-section {
   border-top: 1px solid #ffffff14;
   padding-top: 5px;
@@ -1403,6 +1598,14 @@ kbd {
 
 .tt-stat-chip-value { font-weight: 600; }
 
+/* Feature-lens fill (key/BPM): the chip takes the same colour as the map's
+   key/tempo mode, and its label inherits the contrast text so it stays legible. */
+.tt-stat-chip-filled { border-color: transparent; }
+.tt-stat-chip-filled .tt-stat-chip-label {
+  color: inherit;
+  opacity: 0.72;
+}
+
 /* Pinned inspect card: interactive (Alt over a dot). */
 .tooltip.pinned {
   pointer-events: auto;
@@ -1428,6 +1631,133 @@ kbd {
   align-items: center;
   justify-content: space-between;
 }
+
+/* Inspect card tabs (Navigate / Describe). */
+.tt-tabs {
+  display: flex;
+  gap: 2px;
+}
+
+.tt-tab {
+  border: none;
+  background: none;
+  color: var(--fg-dim);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+
+.tt-tab:hover { color: var(--fg); background: #ffffff12; }
+
+.tt-tab.active {
+  color: #7fc7ff;
+  background: #7fc7ff1f;
+}
+
+.tt-tab-body { padding-top: 4px; }
+
+/* Zero-shot CLAP descriptions: a flat list of clickable search terms. */
+.tt-describe-row {
+  padding: 3px 4px;
+  margin: 0 -4px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tt-describe-row:hover {
+  background: #ffffff1f;
+  color: #7fc7ff;
+}
+
+/* Semantic coordinates: a marker on a bipolar track, one row per axis. */
+.tt-coord {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 2px;
+}
+
+/* Fixed-width pole labels: a long name ellipsises instead of shrinking the
+   track, so every row's slider is the same length. */
+.tt-coord-pole {
+  flex: 0 0 72px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+
+.tt-coord-pole:last-child {
+  text-align: right;
+}
+
+.tt-coord-pole.lean {
+  color: #c99bff;
+  font-weight: 600;
+}
+
+.tt-coord-track {
+  position: relative;
+  flex: 1 1 auto;
+  height: 5px;
+  background: #ffffff14;
+  border-radius: 3px;
+}
+
+/* Centre tick, so a marker at the middle reads as "neutral". */
+.tt-coord-track::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: -2px;
+  bottom: -2px;
+  width: 1px;
+  background: #ffffff33;
+}
+
+.tt-coord-marker {
+  position: absolute;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50%;
+  background: #c99bff;
+}
+
+/* Describe panel: a wide two-column fold-out beside the pinned card. */
+.coords-panel {
+  position: fixed;
+  background: #0d1219f2;
+  backdrop-filter: blur(8px);
+  border: 1px solid #ffffff3d;
+  border-radius: 8px;
+  padding: 8px 10px;
+  z-index: 100;
+  box-shadow: 0 8px 24px #0009;
+}
+
+.tt-desc-panel {
+  display: flex;
+  gap: 14px;
+  width: 520px;
+}
+
+/* Terms | coordinates, equal halves of the wider area. */
+.tt-desc-col,
+.tt-coord-col {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.coords-panel .tt-coord-track { height: 6px; }
 
 .tt-close {
   border: none;

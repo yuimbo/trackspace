@@ -1,8 +1,49 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { Model, DEFAULT_CLUSTER_WEIGHTS, type Track } from "../model";
+import {
+  Model,
+  DEFAULT_CLUSTER_WEIGHTS,
+  type Track,
+  type ViewModifier,
+} from "../model";
 import { EmbeddingCoordinator } from "./embedding-coordinator";
+import type { ViewModifierSink } from "./view-modifier-coordinator";
 
 // ─── Fakes ───────────────────────────────────────────────────
+
+/** In-memory stand-in for the active-view-modifier stack. */
+function makeViewMods() {
+  let seq = 0;
+  const stack: ViewModifier[] = [];
+  const clearers = new Map<string, () => void>();
+  const sink: ViewModifierSink = {
+    push: (mod, clear) => {
+      const id = `vm-${++seq}`;
+      stack.push({ ...mod, id });
+      clearers.set(id, clear);
+      return id;
+    },
+    update: (id, patch) => {
+      const i = stack.findIndex((m) => m.id === id);
+      if (i >= 0) stack[i] = { ...stack[i], ...patch };
+    },
+    dismiss: (id) => {
+      const clear = clearers.get(id);
+      if (!clear) return;
+      clearers.delete(id);
+      const i = stack.findIndex((m) => m.id === id);
+      if (i >= 0) stack.splice(i, 1);
+      clear();
+    },
+    remove: (id) => {
+      if (!id) return;
+      clearers.delete(id);
+      const i = stack.findIndex((m) => m.id === id);
+      if (i >= 0) stack.splice(i, 1);
+    },
+    find: (kind) => stack.find((m) => m.kind === kind),
+  };
+  return { sink, stack };
+}
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -72,7 +113,14 @@ function pump(ms = 600): void {
 
 const HTML = `
   <div id="toast-container"></div>
-  <select id="lens-select"></select>
+  <select id="lens-select">
+    <option value="tags">Tags</option>
+    <option value="combined">Combined</option>
+  </select>
+  <select id="color-mode-select">
+    <option value="folder">Folder</option>
+    <option value="key">Key</option>
+  </select>
 `;
 
 interface Harness {
@@ -84,10 +132,10 @@ interface Harness {
     scheduleDraw: ReturnType<typeof vi.fn>;
     worldPosForTrack(t: Track): { wx: number; wy: number } | null;
     outerPosForTrack(t: Track): { wx: number; wy: number } | null;
-    flashLensHud: ReturnType<typeof vi.fn>;
   };
   coord: EmbeddingCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
+  viewMods: ReturnType<typeof makeViewMods>;
 }
 
 const STATUS_OK = {
@@ -117,18 +165,19 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     // need a stable outer position for scope membership and anchors.
     worldPosForTrack: (t: Track) => outerPos(model, t),
     outerPosForTrack: (t: Track) => outerPos(model, t),
-    flashLensHud: vi.fn(),
   };
+  const viewMods = makeViewMods();
   const coord = new EmbeddingCoordinator({
     model,
     status: { update },
     canvas,
+    viewMods: viewMods.sink,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
     Promise.resolve(jsonResponse(routes(String(input)))),
   );
   vi.stubGlobal("fetch", fetchSpy);
-  return { model, update, scheduleDraw, canvas, coord, fetchSpy };
+  return { model, update, scheduleDraw, canvas, coord, fetchSpy, viewMods };
 }
 
 const flush = () => new Promise((r) => setTimeout(r, 0));
@@ -202,6 +251,47 @@ describe("EmbeddingCoordinator projection fetch", () => {
     expect(String(call![0])).not.toContain("w=");
   });
 
+  it("includes externals whenever external roots exist, even when hidden", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    // Hidden on purpose: their positions must already ride along so the
+    // visibility toggle is a redraw rather than a refetch.
+    model.setExternalRoots(["ext"]);
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    const url = String(call![0]);
+    expect(url).toContain("include_external=1");
+    // The fit stays on the library; the server places externals onto it.
+    expect(url).not.toContain("fit_scope=all");
+  });
+
+  it("omits include_external when no external roots exist", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    expect(String(call![0])).not.toContain("include_external=1");
+  });
+
+  it("refits with externals only when opted in", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    model.setExternalRoots(["ext"]);
+    model.setShowExternal(true);
+    model.setExternalInProjection(true);
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    const url = String(call![0]);
+    expect(url).toContain("include_external=1");
+    expect(url).toContain("fit_scope=all");
+  });
+
   it("encodes non-default weights into the layout query", async () => {
     const { model, coord, fetchSpy } = makeHarness(projectionRoute);
     model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
@@ -212,6 +302,44 @@ describe("EmbeddingCoordinator projection fetch", () => {
     );
     const url = String(call![0]);
     expect(url).toContain("w=maest_logits:0.45,maest:0.25,rhythm:0.5");
+  });
+
+  it("clears the loading pill when a cached lens supersedes an in-flight fit", async () => {
+    let releaseClap: (() => void) | null = null;
+    const { model, coord } = makeHarness(projectionRoute);
+    const route = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes("sources=clap")) {
+          return new Promise<Response>((resolve) => {
+            releaseClap = () =>
+              resolve(
+                jsonResponse({
+                  positions: [{ path: "a.mp3", x: 0.9, y: 0.9 }],
+                  revision: "rev-1",
+                }),
+              );
+          });
+        }
+        return route(input, init);
+      }),
+    );
+
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject(); // caches the combined lens
+    expect(model.projectionPending).toBe(false);
+
+    const slow = coord.switchToLens("clap"); // uncached: fit left in flight
+    await flush();
+    expect(model.projectionPending).toBe(true);
+
+    await coord.switchToLens("combined"); // cache hit supersedes the fit
+    expect(model.projectionPending).toBe(false);
+
+    releaseClap!();
+    await slow;
+    expect(model.projectionPending).toBe(false);
   });
 
   it("refreshes the layout in place when weights change", async () => {
@@ -321,7 +449,7 @@ describe("EmbeddingCoordinator generation stream", () => {
 // ─── Lenses ────────────────────────────────────────────────
 
 describe("EmbeddingCoordinator lens switching", () => {
-  it("saves and restores the viewport across a lens switch", async () => {
+  it("keeps the camera still across a lens switch", async () => {
     const { model, coord } = makeHarness(projectionRoute);
     vi.spyOn(model, "saveLS").mockImplementation(() => {});
     model.viewMode = "tags";
@@ -330,7 +458,7 @@ describe("EmbeddingCoordinator lens switching", () => {
 
     await coord.switchToLens("combined");
     expect(model.viewMode).toBe("embeddings");
-    expect(model.vp).toEqual({ ox: 0, oy: 0, zoom: 1 });
+    expect(model.vp).toEqual({ ox: 0.1, oy: 0.2, zoom: 2 });
 
     await coord.switchToLens("tags");
     expect(model.viewMode).toBe("tags");
@@ -419,7 +547,7 @@ describe("EmbeddingCoordinator scopes", () => {
   it("lays out only the in-scope tracks with the scope lens", async () => {
     const { model, coord } = makeHarness();
     threeTracks(model);
-    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
     expect(model.scope?.lensId).toBe("camelot");
     expect(model.scopePositions.has("near.mp3")).toBe(true);
     expect(model.scopePositions.has("far.mp3")).toBe(true);
@@ -433,16 +561,57 @@ describe("EmbeddingCoordinator scopes", () => {
   it("closes the scope and clears its positions", async () => {
     const { model, coord } = makeHarness();
     threeTracks(model);
-    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
     coord.closeScope();
     expect(model.scope).toBeNull();
     expect(model.scopePositions.size).toBe(0);
   });
 
+  it("pushes a scope chip naming the lens on open", async () => {
+    const { model, coord, viewMods } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    expect(viewMods.stack).toHaveLength(1);
+    expect(viewMods.stack[0].kind).toBe("scope");
+    expect(viewMods.stack[0].label).toBe("Camelot wheel");
+  });
+
+  it("dismisses the scope chip on close", async () => {
+    const { model, coord, viewMods } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    coord.closeScope();
+    expect(viewMods.stack).toEqual([]);
+    expect(model.scope).toBeNull();
+  });
+
+  it("refreshes the scope chip's lens on a lens switch", async () => {
+    const { model, coord, viewMods } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    await coord.setScopeLens("tempo");
+    expect(viewMods.stack[0].label).toBe("Tempo spiral");
+  });
+
+  it("removes the scope chip when the outer lens switches", async () => {
+    const { model, coord, viewMods } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    await coord.switchToLens("combined");
+    expect(viewMods.stack).toEqual([]);
+  });
+
+  it("does not push a scope chip when the circle is empty", async () => {
+    const { model, coord, viewMods } = makeHarness();
+    threeTracks(model);
+    await coord.openScope({ shape: "circle", cx: 0.99, cy: 0.99, r: 0.01, lensId: "" }, "camelot");
+    expect(viewMods.stack).toEqual([]);
+  });
+
   it("warns and stays closed when the circle is empty", async () => {
     const { model, coord } = makeHarness();
     threeTracks(model);
-    await coord.openScope({ cx: 0.99, cy: 0.99, r: 0.01, lensId: "" }, "camelot");
+    await coord.openScope({ shape: "circle", cx: 0.99, cy: 0.99, r: 0.01, lensId: "" }, "camelot");
     expect(model.scope).toBeNull();
   });
 
@@ -452,7 +621,7 @@ describe("EmbeddingCoordinator scopes", () => {
       { path: "a.mp3", filename: "a.mp3", folder: "", tags: {}, artist: "", title: "" },
     ]);
     model.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
-    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.2, lensId: "" }, "clap");
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "" }, "clap");
     expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(1);
     expect(model.scopePositions.has("a.mp3")).toBe(true);
   });
@@ -460,7 +629,7 @@ describe("EmbeddingCoordinator scopes", () => {
   it("switches the open scope's lens and remembers it", async () => {
     const { model, coord } = makeHarness();
     threeTracks(model);
-    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
     const before = new Map(model.scopePositions);
     await coord.setScopeLens("tempo");
     expect(model.scope?.lensId).toBe("tempo");
@@ -471,17 +640,44 @@ describe("EmbeddingCoordinator scopes", () => {
     );
   });
 
-  it("resizes the open scope without a tween", async () => {
+  it("scales the open scope without a tween", async () => {
     const { model, coord, canvas } = makeHarness();
     threeTracks(model);
-    await coord.openScope({ cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
+    await coord.openScope({ shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" }, "camelot");
     pump(600); // let the open tween finish
-    const pending = coord.resizeScope(0.2);
-    // The radius updates synchronously so a rapid scroll accumulates.
+    const pending = coord.resizeScope(2);
+    // The region updates synchronously so a rapid scroll accumulates.
     expect(model.scope?.r).toBeCloseTo(0.2, 6);
     await pending;
     // A scroll resize is immediate, not animated through the overlay.
     expect(canvas.animPositions).toBeNull();
+  });
+
+  it("scales both half-extents of a box scope", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "box", cx: 0.5, cy: 0.5, r: 0.1, rx: 0.08, ry: 0.04, lensId: "" },
+      "camelot",
+    );
+    await coord.resizeScope(2);
+    expect(model.scope?.rx).toBeCloseTo(0.16, 6);
+    expect(model.scope?.ry).toBeCloseTo(0.08, 6);
+  });
+
+  it("lays out a box scope across its full width and height", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "box", cx: 0.5, cy: 0.5, r: 0.1, rx: 0.1, ry: 0.05, lensId: "" },
+      "camelot",
+    );
+    expect(model.scope?.shape).toBe("box");
+    // The lens layout fills the box, so dots stay within the region's extent.
+    for (const p of model.scopePositions.values()) {
+      expect(Math.abs(p.x - 0.5)).toBeLessThanOrEqual(0.1 + 1e-9);
+      expect(Math.abs(p.y - 0.5)).toBeLessThanOrEqual(0.05 + 1e-9);
+    }
   });
 
   it("opens an empty scope when allowEmpty is set", async () => {
@@ -490,7 +686,7 @@ describe("EmbeddingCoordinator scopes", () => {
     // A tiny circle in a corner: no tracks, but X + scroll must still open it so it
     // can grow in.
     await coord.openScope(
-      { cx: 0.99, cy: 0.99, r: 0.005, lensId: "" },
+      { shape: "circle", cx: 0.99, cy: 0.99, r: 0.005, lensId: "" },
       "camelot",
       true,
     );
@@ -506,11 +702,17 @@ describe("EmbeddingCoordinator scopes", () => {
     expect(model.lensId).toBe("tags");
   });
 
-  it("flashes the lens HUD on a switch", async () => {
-    const { model, coord, canvas } = makeHarness(projectionRoute);
+  it("mirrors the switched lens and colour mode into the View-tab selects", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
     vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.colorMode = "key";
     await coord.switchToLens("combined");
-    expect(canvas.flashLensHud).toHaveBeenCalled();
+    expect(
+      (document.getElementById("lens-select") as HTMLSelectElement).value,
+    ).toBe("combined");
+    expect(
+      (document.getElementById("color-mode-select") as HTMLSelectElement).value,
+    ).toBe("key");
   });
 });
 

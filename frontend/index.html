@@ -16,6 +16,9 @@
       <label id="show-external-label" class="hidden" title="External roots are analysed, but kept out of My library. When on, their tracks are drawn on the map too.">
         <input type="checkbox" id="show-external-toggle" /> Show external tracks
       </label>
+      <label id="external-projection-label" class="hidden" title="When off, external tracks are placed onto the library layout, so showing them never moves your library. When on, the layout is refit with external tracks included.">
+        <input type="checkbox" id="external-projection-toggle" /> Refit with external
+      </label>
       <button id="btn-add-root" type="button" title="Add root folder by path">+ Root</button>
     </div>
     <div id="root-drop-hint">Drop folders here to add roots. Drag a root row outside to remove.</div>
@@ -25,9 +28,68 @@
 
 <!-- component: main-viewport -->
 <main id="main">
-  <button type="button" id="viewport-clear-hides" class="viewport-clear-hides hidden" title="Show all tracks again (Alt+s)">Show all</button>
   <div id="selected-folders-overlay" class="selected-folders-overlay hidden"></div>
   <canvas id="viewport"></canvas>
+
+  <!-- Active view modifiers (search, proximity, scope, exclusions, filters,
+       external): one dismissible chip each, oldest → newest. Esc pops newest. -->
+  <div id="view-modifiers" class="view-modifiers hidden" role="list" aria-label="Active view modifiers"></div>
+
+  <!-- View options (lens, colour, hover preview) as a transparent panel on the
+       canvas edge rather than a sidebar tab. -->
+  <div id="view-options-panel" class="view-options-panel">
+    <details id="view-options-details" open>
+      <summary>View</summary>
+      <section id="options-section" x-data>
+        <div class="option-row hover-preview-row">
+          <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
+          <input
+            type="range"
+            id="hover-preview-volume"
+            min="0"
+            max="1"
+            step="0.01"
+            value="0.8"
+            title="Preview volume"
+            aria-label="Hover preview volume"
+          />
+          <span id="hover-preview-volume-value" class="option-value"></span>
+        </div>
+        <label class="folder-tune">
+          <span>Lens <kbd>E</kbd></span>
+          <select id="lens-select" title="What the canvas shows: tag axes, an embedding map, or a feature wheel"></select>
+        </label>
+        <label class="folder-tune">
+          <span>Colour <kbd>C</kbd></span>
+          <select id="color-mode-select" title="How dots are coloured: folder, predicted folder, microgenre cluster, tempo, or key"></select>
+        </label>
+        <label class="folder-tune">
+          <span>Predicted</span>
+          <select id="head-color-confident" title="Predicted folder colour: only tracks close enough to a learned folder, or every track's nearest">
+            <option value="1">Confident only</option>
+            <option value="0">All nearest</option>
+          </select>
+        </label>
+        <div class="cluster-weight-actions">
+          <button
+            id="lens-preset-save"
+            type="button"
+            title="Save the current lens and display options as a preset"
+          >
+            Save preset…
+          </button>
+          <button
+            id="lens-preset-delete"
+            type="button"
+            title="Delete the active preset"
+            disabled
+          >
+            Delete preset
+          </button>
+        </div>
+      </section>
+    </details>
+  </div>
 
   <footer id="statusbar">
     <span id="status-text">Select a folder to begin</span>
@@ -37,33 +99,18 @@
 
 <!-- component: right-panel -->
 <aside id="right-panel">
-  <!-- component: search-panel -->
-  <section id="search-section" x-data>
-    <h2>Search</h2>
-    <input
-      id="search-input"
-      type="search"
-      placeholder="Describe the sound…  /"
-      spellcheck="false"
-      autocomplete="off"
-      title="Semantic search over the cached CLAP embeddings"
-    />
-    <div id="search-results"></div>
-  </section>
-
   <section id="properties-section" x-data>
     <h2>Properties</h2>
     <div id="properties-list"></div>
   </section>
 
-  <!-- Tab strip: Search + Properties stay pinned above it; these four tabs own the
+  <!-- Tab strip: Properties stays pinned above it; these three tabs own the
        rest so the panel no longer scrolls to the brim. Sections are tagged with
        `data-rp-panel` in place (their cross-tab DOM order is irrelevant). -->
   <nav id="rp-tabs" role="tablist" aria-label="Right panel sections">
     <button type="button" class="rp-tab" data-rp-tab="analysis" role="tab" aria-selected="false">Analysis</button>
     <button type="button" class="rp-tab" data-rp-tab="organise" role="tab" aria-selected="false">Organise</button>
     <button type="button" class="rp-tab" data-rp-tab="tracks" role="tab" aria-selected="false">Tracks</button>
-    <button type="button" class="rp-tab" data-rp-tab="view" role="tab" aria-selected="false">View</button>
   </nav>
 
   <!-- component: analysis-panel (coverage + per-stage retrigger) -->
@@ -79,51 +126,8 @@
     <div id="batch-list"></div>
   </section>
 
-  <section id="options-section" data-rp-panel="view" x-data>
-    <h2>Options</h2>
-    <div class="option-row hover-preview-row">
-      <label><input type="checkbox" id="hover-preview-toggle" /> Hover preview <kbd>M</kbd></label>
-      <input
-        type="range"
-        id="hover-preview-volume"
-        min="0"
-        max="1"
-        step="0.01"
-        value="0.8"
-        title="Preview volume"
-        aria-label="Hover preview volume"
-      />
-      <span id="hover-preview-volume-value" class="option-value"></span>
-    </div>
-    <label class="folder-tune">
-      <span>Lens <kbd>E</kbd></span>
-      <select id="lens-select" title="What the canvas shows: tag axes, an embedding map, or a feature wheel"></select>
-    </label>
-    <div class="cluster-weight-actions">
-      <button
-        id="lens-preset-save"
-        type="button"
-        title="Save the current lens and display options as a preset"
-      >
-        Save preset…
-      </button>
-      <button
-        id="lens-preset-delete"
-        type="button"
-        title="Delete the active preset"
-        disabled
-      >
-        Delete preset
-      </button>
-    </div>
-  </section>
-
   <section id="cluster-section" data-rp-panel="analysis" x-data>
     <h2>Microgenres</h2>
-    <label>
-      <input type="checkbox" id="cluster-color-toggle" /> Colour by cluster
-      <kbd>C</kbd>
-    </label>
     <label class="folder-tune">
       <span>Granularity</span>
       <input
@@ -291,6 +295,21 @@
   </section>
 </aside>
 
+<!-- component: search-modal (⌘F): centered semantic query + ranked results -->
+<div id="search-modal" class="search-modal hidden">
+  <div id="search-modal-content">
+    <input
+      id="search-input"
+      type="search"
+      placeholder="Describe the sound…  ⌘F"
+      spellcheck="false"
+      autocomplete="off"
+      title="Semantic search over the cached CLAP embeddings"
+    />
+    <div id="search-results"></div>
+  </div>
+</div>
+
 <!-- component: shortcuts-modal (Alpine) -->
 <div
   id="shortcuts-modal"
@@ -322,6 +341,10 @@
 </div>
 
 <div id="tooltip" class="tooltip hidden"></div>
+<!-- Action popout for the hovered folder row: every row action plus its hotkey. -->
+<div id="folder-actions" class="folder-actions hidden" role="toolbar" aria-label="Folder actions"></div>
+<!-- Popped-out coordinate sliders, shown beside the pinned card on the Describe tab. -->
+<div id="coords-panel" class="coords-panel hidden"></div>
 <div id="toast-container"></div>
 <div id="loading-overlay" class="hidden">
   <div class="spinner"></div>

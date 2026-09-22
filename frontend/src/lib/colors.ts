@@ -1,3 +1,47 @@
+import {
+  CAMELOT_MAJOR_RADIUS,
+  CAMELOT_MINOR_RADIUS,
+  SPIRAL_R_MAX,
+  SPIRAL_R_MIN,
+  bpmSpiralPolar,
+  camelotPolar,
+} from "./lenses";
+
+// ─── CSS colour parsing ─────────────────────────────────────
+//
+// The canvas palettes emit `hsl()`, but the WebGL glow layer needs linear RGB
+// channels. One parser here keeps every colour consumer on the same conversion.
+
+/** `hsl(h, s, l)` with `s`/`l` in 0..1 to linear RGB channels, each 0..1. */
+export function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n: number) => {
+    const k = (n + h / 30) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+/** Parse the CSS colours the palette emits (`#rgb`, `#rrggbb`, `rgb()`, `hsl()`). */
+export function parseColor(css: string): [number, number, number] {
+  const s = css.trim().toLowerCase();
+  if (s.startsWith("#")) {
+    let hex = s.slice(1);
+    if (hex.length === 3)
+      hex = hex
+        .split("")
+        .map((c) => c + c)
+        .join("");
+    const n = parseInt(hex, 16);
+    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+  }
+  const nums = (s.match(/-?\d*\.?\d+/g) ?? []).map(Number);
+  if (s.startsWith("hsl")) {
+    return hslToRgb(nums[0] ?? 0, (nums[1] ?? 0) / 100, (nums[2] ?? 0) / 100);
+  }
+  return [(nums[0] ?? 0) / 255, (nums[1] ?? 0) / 255, (nums[2] ?? 0) / 255];
+}
+
 // ─── Folder coloring ─────────────────────────────────────────
 //
 // `dirColor` is a pure function of a virtual folder path (`rootId/sub/…`). Roots
@@ -74,4 +118,35 @@ export function clusterColor(id: number): string {
   // Alternate lightness so even a wrap-around hue collision stays separable.
   const light = id % 2 === 0 ? 62 : 52;
   return `hsl(${hue.toFixed(1)},68%,${light}%)`;
+}
+
+// ─── Feature-lens coloring ───────────────────────────────────
+//
+// The tempo and key lenses lay tracks out in polar coordinates. Their colouring
+// reuses that same geometry — angle → hue, radius from the centre → brightness —
+// so two tracks that sit close on the map also read as close in colour. Keeping one
+// polar source (the lens functions) is what makes "colour proximity = spatial
+// proximity" hold instead of drifting into a second, unrelated mapping.
+
+/** Polar colour: angle → hue, radius (normalised over `rLo`..`rHi`) → lightness. */
+function polarColor(angle: number, radius: number, rLo: number, rHi: number): string {
+  const hue = ((((angle / (2 * Math.PI)) % 1) + 1) % 1) * 360;
+  const t = rHi > rLo ? Math.max(0, Math.min(1, (radius - rLo) / (rHi - rLo))) : 0;
+  // 36%..72% keeps both rings legible on the dark canvas while still reading
+  // as "near = dark, far = bright".
+  return `hsl(${hue.toFixed(1)},72%,${(36 + t * 36).toFixed(1)}%)`;
+}
+
+/** Colour for a track's tempo: hue is its angle on the spiral, brightness its
+ *  log-BPM radius. Mirrors `bpmSpiralXY`. */
+export function tempoColor(tempoNorm: number): string {
+  const { angle, radius } = bpmSpiralPolar(tempoNorm);
+  return polarColor(angle, radius, SPIRAL_R_MIN, SPIRAL_R_MAX);
+}
+
+/** Colour for a track's key: hue is its Camelot angle, brightness the major
+ *  (outer, bright) vs minor (inner, dark) ring. Mirrors `camelotXY`. */
+export function keyColor(keyTurns: number, mode: number): string {
+  const { angle, radius } = camelotPolar(keyTurns, mode);
+  return polarColor(angle, radius, CAMELOT_MINOR_RADIUS, CAMELOT_MAJOR_RADIUS);
 }

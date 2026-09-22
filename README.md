@@ -35,14 +35,21 @@ cd frontend && npm run build && cd ..
 
 # Run server
 source .venv/bin/activate
-python -m backend.app /path/to/music
+python -m backend.app
 ```
+
+**`python -m backend.app` serves the prebuilt `frontend/dist`.** A change to any
+`frontend/src` file is not picked up until `npm run build` runs again — including a
+change to the shape of a wire payload the backend emits, which will break the served
+bundle until it is rebuilt. For frontend work use `npm run dev:all` above, which serves
+the source directly.
 
 Then open [http://127.0.0.1:5111](http://127.0.0.1:5111).
 
 **Options:**
 
 ```
+python -m backend.app /path/to/music # optional initial music root
 python -m backend.app -p 8080        # custom port
 python -m backend.app --host 0.0.0.0 # expose on LAN
 ```

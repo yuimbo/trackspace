@@ -7,12 +7,22 @@
 // canvas view stays free of API calls — same seam as `SearchCoordinator`.
 
 import { type Model } from "../model";
-import { type InspectState, type TooltipResult } from "../lib/tooltip";
+import {
+  type CoordinateResult,
+  type DescribeResult,
+  type InspectState,
+  type InspectTab,
+  type TooltipResult,
+  emptyDescribe,
+} from "../lib/tooltip";
+import type { ViewModifierSink } from "./view-modifier-coordinator";
 
 /** Neighbours requested for the "nearest" ranking. */
 export const NEAR_K = 5;
 /** The anti-track ranking: the most distant tracks, shown directly. */
 export const ANTI_K = 10;
+/** Phrases requested for the Describe tab (server max is 20). */
+export const DESCRIBE_K = 8;
 /** ``k`` sentinel for "the whole near ranking" (the server's ``all=1`` mode). */
 export const PROXIMITY_ALL = 0;
 /**
@@ -33,6 +43,14 @@ export interface SimilarResponse {
   ranking?: string[];
 }
 
+/** Shape of ``GET /api/tracks/describe``. */
+export interface DescribeResponse {
+  ok: boolean;
+  error?: string;
+  results?: DescribeResult[];
+  coordinates?: CoordinateResult[];
+}
+
 /** The parts of `CanvasView` this coordinator drives (structural for tests). */
 export interface InspectViewLike {
   setInspect(patch: Partial<InspectState>): void;
@@ -42,12 +60,16 @@ export interface InspectViewLike {
 export interface InspectCoordinatorDeps {
   model: Model;
   view: InspectViewLike;
+  /** The active-view-modifier stack: the proximity filter is one chip. */
+  viewMods: ViewModifierSink;
   /** Fetch a ranking (injectable so tests avoid `fetch`). */
   fetchSimilar(
     path: string,
     mode: "near" | "far",
     k: number,
   ): Promise<SimilarResponse>;
+  /** Fetch the zero-shot CLAP descriptions (injectable so tests avoid `fetch`). */
+  fetchDescribe(path: string, limit: number): Promise<DescribeResponse>;
   /** Fit the canvas viewport to the given paths. */
   fitToPaths(paths: Iterable<string>): void;
   /** Start the hover preview for a path (no-op when hover preview is off). */
@@ -72,6 +94,20 @@ export class InspectCoordinator {
   private _proximityLastRun = 0;
   /** Monotonic step id: a stale async apply must not overwrite a newer one. */
   private _proximitySeq = 0;
+  /** Path whose descriptions loaded successfully (avoids a refetch per tab switch). */
+  private _describePath: string | null = null;
+  /** Path with a describe fetch in flight, so a tab burst shares one request. */
+  private _describeInFlight: string | null = null;
+  /** Slider direction: keep the closest (near) or the furthest (anti-track). */
+  private _rankMode: "near" | "far" = "near";
+  /** Error from the last full-ranking fetch, shown when the slider has no data. */
+  private _rankingError: string | null = null;
+  /** Id of the active `proximity` modifier chip, or null when not filtering. */
+  private _proximityModifierId: string | null = null;
+  /** Path the proximity modifier filters around (the inspected track). */
+  private _proximityPath: string | null = null;
+  /** Last applied proximity percent, so a direction flip can refresh the chip. */
+  private _proximityPercent = 100;
 
   constructor(private deps: InspectCoordinatorDeps) {}
 
@@ -83,7 +119,42 @@ export class InspectCoordinator {
     if (action === "close") {
       // The card owns the preview once pinned, so closing it ends the audition.
       this.deps.stopPreview(path);
+      this._describePath = null;
+      this._describeInFlight = null;
+      // A proximity filter outlives the card as a view modifier, so its
+      // direction must survive; only an unfiltered card resets to nearest.
+      if (!this._proximityModifierId) this._rankMode = "near";
+      this._rankingError = null;
       this.deps.view.unpinInspect();
+      return;
+    }
+    if (action === "show-navigate" || action === "show-describe") {
+      this.setTab(path, action === "show-describe" ? "describe" : "navigate");
+      return;
+    }
+    if (action === "open") {
+      // The card was just pinned: default to nearest, load descriptions so the
+      // coordinates sit next to the audio features, list the nearest tracks, and
+      // pre-load the full ranking so the slider filters locally at once.
+      // A proximity filter belongs to the track it was narrowed around, so pinning
+      // another track drops the old neighbourhood.
+      if (this._proximityPath && this._proximityPath !== path) {
+        this._clearProximity();
+      }
+      this._rankMode = "near";
+      this.deps.view.setInspect({ mode: "near" });
+      void this.ensureDescribe(path);
+      void this.rankedFor(path);
+      void this.rank(path, "near");
+      return;
+    }
+    if (action === "toggle-rank-mode") {
+      // Invert the slider: nearest keeps the closest, anti-track the furthest.
+      this._rankMode = this._rankMode === "near" ? "far" : "near";
+      await this.rank(path, this._rankMode);
+      if (this._proximityModifierId && this._proximityPath === path) {
+        this._syncProximityModifier(path, this._proximityPercent);
+      }
       return;
     }
     if (action === "focus") {
@@ -104,10 +175,6 @@ export class InspectCoordinator {
     }
     if (action === "proximity") {
       await this._scheduleProximity(path, value ?? 100);
-      return;
-    }
-    if (action === "anti" || action === "near") {
-      await this.rank(path, action === "anti" ? "far" : "near");
     }
   }
 
@@ -117,6 +184,57 @@ export class InspectCoordinator {
     this.deps.model.replaceSelection([path]);
     this.deps.fitToPaths([path]);
     this.deps.preview(path);
+  }
+
+  /** Switch the pinned card's tab; the Describe tab loads its phrases on demand. */
+  private setTab(path: string, tab: InspectTab): void {
+    this.deps.view.setInspect({ tab });
+    if (tab === "describe") void this.ensureDescribe(path);
+  }
+
+  /**
+   * Load the zero-shot descriptions + coordinates for *path* once, lazily.
+   *
+   * Called when the card is pinned, so the coordinates show next to the audio
+   * features without waiting for the Describe tab, and again when the tab is opened.
+   * The result is cached per path, so a tab switch does not refetch. The state
+   * carries the path it belongs to, so a response that lands after the user pinned
+   * another track is never shown on the wrong card.
+   */
+  private async ensureDescribe(path: string): Promise<void> {
+    if (this._describePath === path) return;
+    if (this._describeInFlight === path) return;
+    this._describeInFlight = path;
+    this.deps.view.setInspect({ describe: emptyDescribe(path, true) });
+    let res: DescribeResponse;
+    try {
+      res = await this.deps.fetchDescribe(path, DESCRIBE_K);
+    } catch (err) {
+      res = {
+        ok: false,
+        error: err instanceof Error ? err.message : "Describe lookup failed",
+      };
+    }
+    if (this._describeInFlight === path) this._describeInFlight = null;
+    if (!res.ok) {
+      this.deps.view.setInspect({
+        describe: {
+          ...emptyDescribe(path, false),
+          message: res.error ?? "Describe lookup failed",
+        },
+      });
+      return;
+    }
+    this._describePath = path;
+    this.deps.view.setInspect({
+      describe: {
+        path,
+        busy: false,
+        message: null,
+        results: res.results ?? [],
+        coordinates: res.coordinates ?? [],
+      },
+    });
   }
 
   private async rank(path: string, mode: "near" | "far"): Promise<void> {
@@ -195,11 +313,12 @@ export class InspectCoordinator {
   }
 
   /**
-   * Neighbourhood slider: keep the closest *percent* of the ranked library and
-   * hide the rest, re-homing the view as it narrows. 100 % reveals everything
-   * (no isolation); because the visible set shrinks gradually the camera move is
-   * far less sudden than the old discrete top-N "solo" it replaces. *seq* guards
-   * the async ranking fetch: a superseded step must not apply its stale result.
+   * Distance-filter slider: keep the closest *percent* of the ranked library
+   * (nearest) or the furthest *percent* (anti-track), and hide the rest. 100 %
+   * reveals everything (no isolation). The filter deliberately does *not* re-home the
+   * view: the camera stays put while the visible set changes, so adjusting the
+   * filter never yanks the map. *seq* guards the async ranking fetch: a superseded
+   * step must not apply its stale result.
    */
   private async setProximity(
     path: string,
@@ -211,15 +330,85 @@ export class InspectCoordinator {
     if (p >= 100) {
       const all = new Set(m.allTracks.map((t) => t.path));
       this._proximityHidden = m.setProximityKeep(all, this._proximityHidden);
-      this.deps.fitToPaths(m.tracks.map((t) => t.path));
+      this._syncProximityModifier(path, p);
       return;
     }
     const ranked = await this.rankedFor(path);
-    if (ranked === null || seq !== this._proximitySeq) return;
+    if (ranked === null) {
+      if (seq === this._proximitySeq) {
+        this.deps.view.setInspect({
+          busy: false,
+          message: this._rankingError ?? "No ranking available",
+        });
+      }
+      return;
+    }
+    if (seq !== this._proximitySeq) return;
     const keepCount = Math.ceil((p / 100) * ranked.length);
-    const keep = new Set<string>([path, ...ranked.slice(0, keepCount)]);
+    const slice =
+      this._rankMode === "far"
+        ? ranked.slice(Math.max(0, ranked.length - keepCount))
+        : ranked.slice(0, keepCount);
+    const keep = new Set<string>([path, ...slice]);
     this._proximityHidden = m.setProximityKeep(keep, this._proximityHidden);
-    this.deps.fitToPaths(keep);
+    this._syncProximityModifier(path, p);
+  }
+
+  /**
+   * The proximity chip's slider moved. Applies the filter around the track the
+   * modifier belongs to, so it works after the inspect card has closed.
+   */
+  async setProximityFromChip(percent: number): Promise<void> {
+    const path = this._proximityPath;
+    if (!path) return;
+    await this._scheduleProximity(path, percent);
+  }
+
+  /**
+   * Mirror the proximity filter as one chip: pushed on the first narrowing,
+   * refreshed in place on each step, removed at 100 %. The chip's clear reveals
+   * every track the slider hid.
+   */
+  private _syncProximityModifier(path: string, percent: number): void {
+    const p = Math.max(0, Math.min(100, percent));
+    this._proximityPercent = p;
+    if (p >= 100) {
+      this._removeProximityModifier();
+      return;
+    }
+    const label = this.deps.model.trackByPath(path)?.filename ?? path;
+    const detail = `${this._rankMode === "far" ? "anti-track" : "nearest"} ${Math.round(p)}%`;
+    this._proximityPath = path;
+    if (this._proximityModifierId) {
+      this.deps.viewMods.update(this._proximityModifierId, {
+        label,
+        detail,
+        value: p,
+      });
+    } else {
+      this._proximityModifierId = this.deps.viewMods.push(
+        { kind: "proximity", label, detail, value: p },
+        () => this._clearProximity(),
+      );
+    }
+  }
+
+  /** Drop the proximity chip without re-applying the filter. */
+  private _removeProximityModifier(): void {
+    const id = this._proximityModifierId;
+    this._proximityModifierId = null;
+    this._proximityPath = null;
+    if (id) this.deps.viewMods.remove(id);
+  }
+
+  /** Reveal every track the proximity slider hid and drop its chip. */
+  private _clearProximity(): void {
+    this._removeProximityModifier();
+    const all = new Set(this.deps.model.allTracks.map((t) => t.path));
+    this._proximityHidden = this.deps.model.setProximityKeep(
+      all,
+      this._proximityHidden,
+    );
   }
 
   /**
@@ -241,15 +430,19 @@ export class InspectCoordinator {
 
   private async fetchRanking(path: string): Promise<string[] | null> {
     const res = await this.fetch(path, "near", PROXIMITY_ALL);
-    this._rankingPending = null;
-    this._rankingPendingPath = null;
+    // Only this request's own slot is cleared: a stale fetch for another path
+    // must not cancel the newer path's in-flight request.
+    if (this._rankingPendingPath === path) {
+      this._rankingPending = null;
+      this._rankingPendingPath = null;
+    }
+    // The pre-load is silent: the error is only surfaced when the slider
+    // actually needs the ranking (see `setProximity`).
     if (!res.ok || !res.ranking?.length) {
-      this.deps.view.setInspect({
-        busy: false,
-        message: res.error ?? "No ranking available",
-      });
+      this._rankingError = res.error ?? "No ranking available";
       return null;
     }
+    this._rankingError = null;
     this._rankingPath = path;
     this._ranking = res.ranking;
     return res.ranking;

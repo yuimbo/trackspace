@@ -44,6 +44,16 @@ describe("Model external-root view", () => {
     m2.loadLS();
     expect(m2.showExternal).toBe(true);
   });
+
+  it("keeps the projection library-only by default", () => {
+    const m = new Model();
+    expect(m.externalInProjection).toBe(false);
+    m.setExternalInProjection(true);
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.externalInProjection).toBe(true);
+  });
 });
 
 describe("Model proximity keep", () => {
@@ -73,6 +83,44 @@ describe("Model proximity keep", () => {
     m.setProximityKeep(new Set(["a.mp3", "b.mp3"]), hidden);
     expect(m.isTrackHidden(m.trackByPath("b.mp3")!)).toBe(false);
     expect(m.isTrackHidden(m.trackByPath("c.mp3")!)).toBe(true);
+  });
+});
+
+describe("Model visible tree prefixes", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("marks the root and every ancestor folder with a visible track", () => {
+    const m = new Model();
+    m.setAllTracks([track("a.mp3", "x/y/z"), track("b.mp3", "q")]);
+    const prefixes = m.visibleTreePrefixes();
+    expect(prefixes.has("")).toBe(true);
+    expect(prefixes.has("x")).toBe(true);
+    expect(prefixes.has("x/y")).toBe(true);
+    expect(prefixes.has("x/y/z")).toBe(true);
+    expect(prefixes.has("q")).toBe(true);
+    expect(prefixes.has("x/w")).toBe(false);
+    expect(m.hasVisibleTracksUnderTreePrefix("x/y")).toBe(true);
+    expect(m.hasVisibleTracksUnderTreePrefix("x/w")).toBe(false);
+  });
+
+  it("drops prefixes whose only tracks are excluded", () => {
+    const m = new Model();
+    m.setAllTracks([track("a.mp3", "x/y"), track("b.mp3", "q")]);
+    m.focusPaths(new Set(["a.mp3"]));
+    const prefixes = m.visibleTreePrefixes();
+    expect(prefixes.has("x/y")).toBe(true);
+    expect(prefixes.has("q")).toBe(false);
+    expect(m.hasVisibleTracksUnderTreePrefix("q")).toBe(false);
+  });
+
+  it("invalidates the cache when visibility changes", () => {
+    const m = new Model();
+    m.setAllTracks([track("a.mp3", "x"), track("b.mp3", "q")]);
+    expect(m.hasVisibleTracksUnderTreePrefix("q")).toBe(true);
+    m.focusPaths(new Set(["a.mp3"]));
+    expect(m.hasVisibleTracksUnderTreePrefix("q")).toBe(false);
+    m.clearExclusions();
+    expect(m.hasVisibleTracksUnderTreePrefix("q")).toBe(true);
   });
 });
 
@@ -142,18 +190,44 @@ describe("Model lens", () => {
     expect(m2.lensPresets[0].baseLens).toBe("clap");
   });
 
+  it("persists the colour mode and migrates the legacy cluster flag", () => {
+    localStorage.clear();
+    const m = new Model();
+    m.colorMode = "key";
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.colorMode).toBe("key");
+
+    localStorage.setItem("trackspace", JSON.stringify({ colorByCluster: true }));
+    const m3 = new Model();
+    m3.loadLS();
+    expect(m3.colorMode).toBe("cluster");
+  });
+
+  it("persists the predicted-folder confidence gate, defaulting to on", () => {
+    localStorage.clear();
+    const m = new Model();
+    expect(m.headColorConfident).toBe(true);
+    m.headColorConfident = false;
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.headColorConfident).toBe(false);
+  });
+
   it("applying a preset restores its display options", () => {
     const m = new Model();
     m.clusterWeights = { ...m.clusterWeights, rhythm: 0.5 };
-    m.colorByCluster = true;
+    m.colorMode = "tempo";
     m.clusterResolution = 3;
     const p = m.addLensPreset("loud");
     m.clusterWeights = { ...m.clusterWeights, rhythm: 0.1 };
-    m.colorByCluster = false;
+    m.colorMode = "folder";
     m.applyLensPreset(p);
     expect(m.lensId).toBe(p.id);
     expect(m.clusterWeights.rhythm).toBeCloseTo(0.5, 6);
-    expect(m.colorByCluster).toBe(true);
+    expect(m.colorMode).toBe("tempo");
     expect(m.clusterResolution).toBe(3);
   });
 

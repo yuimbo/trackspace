@@ -19,6 +19,8 @@ export interface HeadDeps {
   refreshProjection?(): Promise<void> | void;
   /** Refetch clusters after an import re-projects the library. */
   refreshClusters?(): void;
+  /** Refetch predicted folders after the head changes (train/import). */
+  refreshPredictions?(): void;
   /** Refresh the folder tree after an imprint root is added or removed. */
   onRootsChanged?(): Promise<void> | void;
   /** Reveal a right-panel tab (the imprint controls live in Organise). */
@@ -594,6 +596,7 @@ export class HeadCoordinator {
       // must be refetched (and the next cluster pass re-embeds).
       this.deps.refreshProjection?.();
       this.deps.refreshClusters?.();
+      this.deps.refreshPredictions?.();
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       if (!force && message.includes("different encoder versions")) {

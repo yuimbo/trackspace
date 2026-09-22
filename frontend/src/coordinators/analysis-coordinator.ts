@@ -19,6 +19,7 @@ import {
 } from "../model";
 import { toast } from "../lib/toast";
 import { clusterColor } from "../lib/colors";
+import { COLOR_MODES, colorModeTabs, type ColorMode } from "../lib/lenses";
 import { api, postJSON } from "../lib/api";
 
 const clamp = (v: number, lo = 0, hi = 1) => Math.max(lo, Math.min(hi, v));
@@ -32,8 +33,6 @@ export interface AnalysisDeps {
   /** Canvas hover state — hovering a cluster row glows its member points. */
   canvas: {
     hoverTarget: HoverTarget | null;
-    /** Flash the transient centre HUD (colour-mode feedback). */
-    flashHud(tabs: readonly { id: string; label: string }[], activeId: string): void;
   };
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): Promise<void> | void;
@@ -60,6 +59,15 @@ interface ClusterResponse {
   modularity?: number | null;
   /** Sources that actually contributed vectors (nonzero weight + cached rows). */
   sources_used?: string[];
+}
+
+/** Shape of ``GET /api/supervised/predictions``. */
+interface PredictionsResponse {
+  available: boolean;
+  /** path → the head's nearest learned folder (a virtual path). */
+  assignments?: Record<string, string>;
+  /** Paths whose winning similarity clears their class's match floor. */
+  matched?: string[];
 }
 
 /** Per-track coverage from ``GET /api/embeddings/status``. */
@@ -124,6 +132,9 @@ const RETRIGGER_STAGES: [string, string][] = [
 export class AnalysisCoordinator {
   private _jobsEventSource: EventSource | null = null;
   private _clusterFetchPending = false;
+  private _predictionsFetchPending = false;
+  /** Supervise jobs outstanding at the previous status poll, to spot a finish. */
+  private _prevSuperviseOutstanding: number | null = null;
 
   constructor(private deps: AnalysisDeps) {}
 
@@ -144,12 +155,35 @@ export class AnalysisCoordinator {
   bindPanel(): void {
     const m = this.deps.model;
 
-    const $cc = document.getElementById(
-      "cluster-color-toggle",
-    ) as HTMLInputElement | null;
-    if ($cc) {
-      $cc.checked = m.colorByCluster;
-      $cc.addEventListener("change", () => this._applyColorByCluster($cc.checked, false));
+    const $cm = document.getElementById(
+      "color-mode-select",
+    ) as HTMLSelectElement | null;
+    if ($cm) {
+      // The modes are the tabber's own list, so the two surfaces cannot drift.
+      $cm.replaceChildren(
+        ...colorModeTabs().map(({ id, label }) => {
+          const option = document.createElement("option");
+          option.value = id;
+          option.textContent = label;
+          return option;
+        }),
+      );
+      $cm.value = m.colorMode;
+      $cm.addEventListener("change", () =>
+        this.applyColorMode($cm.value as ColorMode, false),
+      );
+    }
+
+    const $hc = document.getElementById(
+      "head-color-confident",
+    ) as HTMLSelectElement | null;
+    if ($hc) {
+      $hc.value = m.headColorConfident ? "1" : "0";
+      $hc.addEventListener("change", () => {
+        m.headColorConfident = $hc.value === "1";
+        m.saveLS();
+        this.deps.scheduleDraw();
+      });
     }
 
     const $cr = document.getElementById(
@@ -229,7 +263,7 @@ export class AnalysisCoordinator {
 
     this._syncApplyEnabled();
     this._bindRetrigger();
-    this._syncClusterControls();
+    this._syncColorControls();
   }
 
   /* ── Analysis coverage + per-stage retrigger ─────────────── */
@@ -614,37 +648,67 @@ export class AnalysisCoordinator {
 
   /* ── Cluster panel ──────────────────────────────────────── */
 
-  /** Flip cluster colouring; shared by the panel checkbox and the hotkey. */
-  toggleColorByCluster(): void {
-    this._applyColorByCluster(!this.deps.model.colorByCluster, true);
+  /** Cycle the dot-colouring mode; shared by the panel select and the hotkeys. */
+  cycleColorMode(dir: 1 | -1 = 1): void {
+    const m = this.deps.model;
+    const idx = COLOR_MODES.indexOf(m.colorMode);
+    const n = COLOR_MODES.length;
+    this.applyColorMode(COLOR_MODES[(idx + dir + n) % n], true);
   }
 
-  private _applyColorByCluster(value: boolean, announce: boolean): void {
+  /**
+   * Set the dot-colouring mode; shared by the panel select, the top tabber and the
+   * hotkeys. *warn* explains when cluster colouring cannot apply (no clusters).
+   */
+  applyColorMode(mode: ColorMode, warn: boolean): void {
     const m = this.deps.model;
-    if (value && !m.clustersAvailable) {
-      // Never claim a colouring that cannot apply; say why and leave the toggle off.
-      if (announce) toast(this._clusterUnavailableReason(), "warn");
-      this._syncClusterControls();
+    if (mode === "cluster" && !m.clustersAvailable) {
+      // Never claim a colouring that cannot apply; say why and leave the mode be.
+      if (warn) toast(this._clusterUnavailableReason(), "warn");
+      this._syncColorControls();
       return;
     }
-    m.colorByCluster = value;
+    m.colorMode = mode;
     m.saveLS();
-    if (announce) {
-      // A transient HUD replaces the previous one, so repeated presses do not stack a
-      // history of "Colouring by …" toasts.
-      this.deps.canvas.flashHud(
-        [
-          { id: "folder", label: "Folder colour" },
-          { id: "cluster", label: "Cluster colour" },
-        ],
-        value ? "cluster" : "folder",
-      );
+    // Predicted folders are only needed for their colour mode, so they are
+    // fetched on first use rather than walking the library at every startup.
+    if (mode === "head" && !m.folderPredictionsLoaded) {
+      void this.fetchFolderPredictions();
     }
     this.deps.scheduleDraw();
-    this._syncClusterControls();
+    this._syncColorControls();
   }
 
-  /** Why cluster colouring cannot apply yet, for the disabled toggle's tooltip. */
+  /** Invalidate the cached predictions (the head changed) and refetch if in use. */
+  refreshFolderPredictions(): void {
+    const m = this.deps.model;
+    m.folderPredictionsLoaded = false;
+    if (m.colorMode === "head") void this.fetchFolderPredictions();
+  }
+
+  /** Fetch the head's nearest learned folder per track. */
+  async fetchFolderPredictions(): Promise<void> {
+    if (this._predictionsFetchPending) return;
+    this._predictionsFetchPending = true;
+    const m = this.deps.model;
+    try {
+      const d = await api<PredictionsResponse>("/api/supervised/predictions");
+      m.folderPredictionsAvailable = Boolean(d.available);
+      m.folderPredictions = new Map(Object.entries(d.assignments ?? {}));
+      m.folderPredictionMatches = new Set(d.matched ?? []);
+      m.folderPredictionsLoaded = true;
+      if (!d.available && m.colorMode === "head") {
+        toast("Train the folder head to colour by predicted folder", "warn");
+      }
+      this.deps.scheduleDraw();
+    } catch {
+      /* api() already toasted */
+    } finally {
+      this._predictionsFetchPending = false;
+    }
+  }
+
+  /** Why cluster colouring cannot apply yet, for the disabled option's tooltip. */
   private _clusterUnavailableReason(): string {
     const m = this.deps.model;
     if (m.queueStatus?.models?.maest_ready === false) {
@@ -656,24 +720,40 @@ export class AnalysisCoordinator {
   }
 
   /** Reflect cluster availability on the panel controls (disabled + explained). */
-  private _syncClusterControls(): void {
+  private _syncColorControls(): void {
     const m = this.deps.model;
     const available = m.clustersAvailable;
-    const reason = this._clusterUnavailableReason();
-    const $cc = document.getElementById(
-      "cluster-color-toggle",
-    ) as HTMLInputElement | null;
-    if ($cc) {
-      $cc.disabled = !available;
-      $cc.checked = available && m.colorByCluster;
-      $cc.title = available
-        ? "Colour tracks by their microgenre cluster"
-        : reason;
+    const $cm = document.getElementById(
+      "color-mode-select",
+    ) as HTMLSelectElement | null;
+    if ($cm) {
+      $cm.value = m.colorMode;
+      const $cluster = $cm.querySelector<HTMLOptionElement>(
+        'option[value="cluster"]',
+      );
+      if ($cluster) {
+        $cluster.disabled = !available;
+        $cluster.title = available
+          ? "Colour tracks by their microgenre cluster"
+          : this._clusterUnavailableReason();
+      }
+      const $head = $cm.querySelector<HTMLOptionElement>('option[value="head"]');
+      if ($head && m.folderPredictionsLoaded && !m.folderPredictionsAvailable) {
+        $head.title = "Train the folder head to colour by predicted folder";
+      }
     }
     const $cr = document.getElementById(
       "cluster-resolution-range",
     ) as HTMLInputElement | null;
     if ($cr) $cr.disabled = !available;
+    // The confidence gate only means anything for the predicted-folder colouring.
+    const $hc = document.getElementById(
+      "head-color-confident",
+    ) as HTMLSelectElement | null;
+    if ($hc) {
+      $hc.value = m.headColorConfident ? "1" : "0";
+      $hc.disabled = m.colorMode !== "head";
+    }
   }
 
   /** Subscribe to queue progress.
@@ -810,11 +890,22 @@ export class AnalysisCoordinator {
       this.deps.status.update(m);
       this.deps.scheduleDraw();
       this._syncApplyEnabled();
-      this._syncClusterControls();
+      this._syncColorControls();
       // Clustering finished or changed → refresh assignments.
       const rev = st.clusters?.revision ?? null;
       if (rev && rev !== prevRevision) {
         await this.fetchClusters();
+      }
+      // A supervise run just drained → a new head, so predictions are stale.
+      const superviseOutstanding = st.kinds?.supervise?.outstanding ?? 0;
+      const prevSupervise = this._prevSuperviseOutstanding;
+      this._prevSuperviseOutstanding = superviseOutstanding;
+      if (
+        prevSupervise !== null &&
+        prevSupervise > 0 &&
+        superviseOutstanding === 0
+      ) {
+        this.refreshFolderPredictions();
       }
     } catch {
       /* transient; next tick retries */
@@ -833,11 +924,14 @@ export class AnalysisCoordinator {
 
       if (!d.available) {
         m.clustersAvailable = false;
+        // A colouring that can no longer apply must not stay selected.
+        if (m.colorMode === "cluster") m.colorMode = "folder";
         m.clusterAssignments = new Map();
         m.clusterNames = new Map();
         m.clusterSizes = new Map();
         this._renderWeightsNote(null);
         this._renderClusterPanel();
+        this._syncColorControls();
         return;
       }
 
@@ -899,13 +993,13 @@ export class AnalysisCoordinator {
     if (!m.clustersAvailable) {
       $meta.textContent = this._clusterUnavailableReason();
       $list.replaceChildren();
-      this._syncClusterControls();
+      this._syncColorControls();
       return;
     }
 
     const n = m.clusterNames.size || m.clusterSizes.size;
     $meta.textContent = `${n} clusters at resolution ${m.clusterResolution}`;
-    this._syncClusterControls();
+    this._syncColorControls();
 
     const entries = [...m.clusterSizes.entries()].sort((a, b) => b[1] - a[1]);
     $list.replaceChildren();

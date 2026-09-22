@@ -60,17 +60,22 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
   `audio_pipeline.md` → *Embedding sources*.
 - [ ] **Landmark 2-D fidelity is unmeasured.** The landmark extension's derivative
   is exact (checked against central differences of the same `g`), but whether its 2-D
-  layout tracks the *real* t-SNE chart across the weight range is empirical. The naive
-  comparison is confounded — a refit is not a smooth function, so Procrustes cannot
-  align its cluster rearrangements — so measure against a *fixed* chart instead. Tune
-  `n_landmarks` (default 128) and `tau` (median of `D²`) on the real library.
-- [ ] **One fidelity harness for both.** Build the researcher's §8 evaluation once and
-  reuse it for the normalisation choice and the landmark fidelity: neighbourhood
-  recall / trustworthiness at k=10/30/100; weight hold-out generalization (hold out
-  *weight combinations*, not just tracks — a stationary map is perfectly smooth and
-  fails this); derivative correctness (`J·Δw` against the *same frozen mapping* at
-  decreasing step sizes, expecting a quadratic residual); and operational checks
-  (10k/20k, insertion batches, row permutations, old-coordinate byte-stability).
+  layout tracks the *real* t-SNE chart across the weight range is empirical. The harness
+  now exists (`backend/embeddings/layout_fidelity.py`); run it with the landmark model's
+  placed rows against the base chart. The naive comparison is confounded — a refit is not
+  a smooth function, so Procrustes cannot align its cluster rearrangements — so measure
+  against a *fixed* chart instead. Tune `n_landmarks` (default 128) and `tau` (median of
+  `D²`) on the real library.
+- [ ] **Fidelity harness: the researcher's §8 checks.** The neighbourhood-recall
+  half is built (`backend/embeddings/layout_fidelity.py`, bench entrypoint in
+  `tests/test_profiling_embeddings.py`, unit tests in `tests/test_layout_fidelity.py`)
+  and measured the incremental placement (0.313 vs the base layout's 0.360 at k=10) and
+  near-duplicate collapse (0.5% at 0.999). Still open: trustworthiness, weight
+  hold-out generalization (hold out *weight combinations*, not just tracks — a stationary
+  map is perfectly smooth and fails this), derivative correctness (`J·Δw` against the
+  *same frozen mapping* at decreasing step sizes, expecting a quadratic residual), and
+  operational checks (10k/20k, insertion batches, row permutations, old-coordinate
+  byte-stability).
 
 ## Lenses & scopes
 
@@ -79,13 +84,19 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
   it had in the full map. A t-SNE fit over just the in-scope tracks would show the
   local structure better; it is a per-scope fit, so it needs a progress indicator and
   a way to invalidate it when the scope moves. Files:
-  `frontend/src/coordinators/embedding-coordinator.ts` (`_scopeTargets`),
-  `backend/embeddings/layout.py`.
+  `frontend/src/coordinators/embedding-coordinator.ts` (`_computeScopeRaw` /
+  `_mapIntoScope`), `backend/embeddings/layout.py`.
 - [ ] **Multiple scopes.** Only one scope is open at a time; a second X + drag
   replaces it. Multiple non-overlapping scopes (and a per-scope close) would let a
   user compare two clusters in two lenses at once. `Model.scope` / `scopePositions`
   would become a list. Files: `frontend/src/model.ts`,
   `frontend/src/components/canvas-view.ts`, `canvas-interaction.ts`.
+- [ ] **Box scope resize is uniform.** X + scroll scales a box scope's half-width and
+  half-height by the same factor, so a wide box can only be grown proportionally.
+  Edge/corner drag handles on the box outline would resize each axis independently
+  (the way the tag-selection transform handles do). Files:
+  `frontend/src/coordinators/embedding-coordinator.ts` (`_scaleScope`),
+  `frontend/src/coordinators/canvas-interaction.ts`.
 - [ ] **Energy/dance semantic 2-space (experiment).** The re-encoded `features`
   block leaves energy and danceability linear. Test a more semantic encoding (e.g.
   polar around an energy×dance axis) against the §8 fidelity harness — only keep it
@@ -98,12 +109,24 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
   server (e.g. `--no-clap`) shows an empty map rather than an explanatory note.
   Files: `frontend/src/coordinators/embedding-coordinator.ts` (`ensureAndProject`).
 - [ ] **Prefetch scope.** The `layout` job warms only the library-only,
-  default-weights lens set. External-inclusive layouts and user weight presets are
-  still computed on demand, and every new analysis drain re-warms all five lenses
-  (cheap when the revision is unchanged, a full refit when it moved). Consider
-  warming the external variant too, or gating the sweep behind a size threshold.
-  Files: `backend/app.py` (`_prefetch_lens`),
+  default-weights lens set. The external-inclusive variant (`fit_scope=all`) and user
+  weight presets are still computed on demand, and every new analysis drain
+  re-warms all five lenses (cheap when the revision is unchanged, a full refit when
+  it moved). Consider warming `fit_scope=all` too, or gating the sweep behind a size
+  threshold. Files: `backend/app.py` (`_prefetch_lens`),
   `backend/embeddings/projection_config.py` (`PROJECTION_LENSES`).
+- [ ] **Placed-external jacobian fallback.** With `fit_scope=library` and externals
+  shown, the projection extends them by Nyström; but if the chart cannot be fit
+  (fewer than two library tracks) the weight-jacobian falls back to a fit-scope refit
+  and the external dots drop out until the drag is released. Extend the fallback too,
+  or accept the transient. Files: `backend/routes/api_embeddings.py`
+  (`_place_into_chart`), `frontend/src/lib/weight-jacobian.ts`.
+- [ ] **External placement fidelity is unmeasured.** The Nyström extension places
+  external roots onto the library chart, but whether they land where an
+  external-inclusive fit would put them is empirical. The harness now exists
+  (`backend/embeddings/layout_fidelity.py`); run it on the external tracks' placed
+  positions against the library chart. Files:
+  `backend/embeddings/landmark_projection.py` (`build_landmark_model`).
 - [ ] **Search field resolution.** The field splats the backend's fixed 128-point
   landmark sample, so zooming into a sparse region shows a few large blobs rather than
   detail. Consider a larger sample (or a screen-space grid) when zoomed in; the
@@ -120,6 +143,48 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Frontend
 
+- [ ] **Folder action popout is mouse-only.** `#folder-actions` opens on row hover and
+      closes on leave; it has no keyboard path (focus the row, open with a key, arrow
+      between buttons) and no focus-visible styling. Also the 6 px gap between row and
+      popout briefly clears `canvas.hoverTarget` when the pointer crosses it (restored on
+      popout `mouseenter`). Files: `frontend/src/coordinators/folder-tree-coordinator.ts`,
+      `frontend/src/trackspace.css`.
+
+- [ ] **Residual lens disagreement is real, not gauge noise.** After Procrustes
+      alignment the mean pairwise RMSE is still 0.305 (worst pair 0.40): lenses
+      genuinely disagree about where tracks belong, which is the point of having
+      them. If switching still feels jumpy, the remaining lever is *animating* the
+      transition (the shared `animPositions` overlay already does this) rather than
+      aligning harder. Do not chase RMSE → 0; that would mean the lenses stopped
+      differing. Files: `backend/embeddings/lens_gauge.py`,
+      `frontend/src/coordinators/embedding-coordinator.ts`.
+- [ ] **Pin the SSE progress contract with a test.** The backend's
+      `/api/library/stream` progress event carries a `tracks` batch; a stale
+      `frontend/dist` that still read `track` threw on every event (~15k console
+      errors, library never loaded) until rebuilt. Add a backend test asserting the
+      event shape and a vitest for the controller's handler so a wire change cannot
+      land without both sides updated. Files: `backend/services/library_scan.py`,
+      `frontend/src/controller.ts`.
+- [ ] **Metaball density tuning.** The scatter is one WebGL metaball pass
+      (`frontend/src/lib/point-layer.ts`); at far zoom a whole region coalesces into
+      one blob, which reads as density but can saturate. The kernel radius and iso
+      threshold are module constants (the edge ramp is screen-space derivative-based, so it
+      is already ~1 px at any density) — expose the constants (Options → View) if the
+      far-zoom look needs live fiddling, or add a density clamp so a very large stack
+      does not balloon without bound. A second note: colour is the kernel-weighted
+      *mean*, so where many different hues overlap the blob desaturates toward pale;
+      if that reads as washed out, switch the composite to a dominant-hue pick (or weight
+      the mean toward the densest kernel). Files: `frontend/src/lib/point-layer.ts`.
+- [ ] **Top tabbers overflow on a narrow canvas.** `CanvasView._drawTopTabs`
+      centres the lens and colour rows without clamping, so on a narrow window the
+      8 lens tabs can run off both edges. Wrap to two lines, scroll, or drop to
+      the labels' short forms when the row exceeds the canvas width. Files:
+      `frontend/src/components/canvas-view.ts` (`_drawTabs`).
+- [ ] **No legend for the tempo/key colour modes.** `tempoColor`/`keyColor`
+      (`frontend/src/lib/colors.ts`) reuse the lens polar geometry, but the canvas
+      gives no key for what a hue or a bright/dark shade means. Add a small legend
+      when the colour mode is tempo or key (hue = angle, brightness = radius), or
+      fade the mode back to folder when the matching guide is off screen.
 - [ ] **Optional sibling hue wiggle.** Family tints currently differ only in
       lightness/saturation (`frontend/src/lib/colors.ts` / `backend/services/dir_colors.py`).
       If same-depth siblings still read too alike on the canvas, add a small hue deviation
@@ -137,14 +202,41 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       may not fire and its glow/card can linger. Clear `canvas.hoveredPath` when the
       list rebuilds. Files: `frontend/src/components/search-view.ts`,
       `frontend/src/controller.ts`.
-- [ ] **Inspect card follow-ups.** The pinned card (Alt over a dot) has anti-track,
-      nearest, solo-neighbourhood and result focus, and its folder/cluster/key/BPM elements
+- [ ] **Inspect card follow-ups.** The pinned card (Alt over a dot) has Navigate
+      (a nearest/anti-track toggle + distance-filter slider + result focus) and Describe
+      (flat click-to-search CLAP terms) tabs, plus the semantic coordinates next
+      to the audio features; its folder/cluster/key/BPM elements
       are navigation targets (glow + S/H/F/Shift+S) — see `design-patterns.md`. Still open:
       "same cluster" / "same folder" jumps from the result rows, a `k` control instead of
-      the fixed `NEAR_K`/`SOLO_K`, and showing that the similarity score is a cosine, not a
-      probability. `_fetchSimilar` builds the whole-library matrix on first call — a warm-up
-      on library load would hide the first-click latency (cached for `CACHE_TTL_SECONDS`
-      after that).
+      the fixed `NEAR_K`/`DESCRIBE_K`, and showing that the similarity score is a cosine, not a
+      probability. The distance filter pre-loads the full ranking on pin, so
+      `_fetchSimilar` now builds the whole-library matrix on the first pin of a
+      session — a warm-up on library load would hide that latency (cached for
+      `CACHE_TTL_SECONDS` after that).
+- [ ] **M + scroll is canvas-scoped.** `CanvasInteractionController._onWheel` owns the
+      preview-volume gesture, so it only fires over the viewport; holding M and
+      scrolling over the sidebar instead falls through to the M tap toggle. Move the
+      listener to the document (capture) if the gesture should work anywhere.
+      Files: `frontend/src/coordinators/canvas-interaction.ts`.
+- [ ] **CLAP description bank is fixed and English-only.** `FACET_BANK`
+      (`backend/embeddings/clap_describe.py`) is a ~160-phrase curated
+      DJ/electronic list, so the Describe tab only surfaces phrases it contains
+      and never this library's own vocabulary. A user-extensible bank, or ranking
+      the library's tags/cluster names as candidates, would make it reflect the
+      collection.
+- [ ] **The semantic axes are hand-authored and reference-calibrated.** `AXES`
+      carries a mean/std/reliability measured on the development library (15 408
+      cached CLAP vectors), so a materially different collection drifts. Re-fit the
+      reference distribution from the live library (cached by CLAP write epoch) when
+      that drift shows. A validation harness — new axes must separate known folder
+      pairs (Techno vs Ambient, …) at |Cohen's d| ≥ 0.5 — would catch a junk axis
+      before it ships, since pole separation alone misleads (`dark <-> bright` has
+      near-identical poles yet d = 2.58).
+- [ ] **Coordinates use the pooled CLAP mean only.** A section-specific concept
+      (a talking-voice interlude, a breakbeat drop) is averaged away by the
+      3-segment mean. Scoring each axis against the per-segment vectors and keeping
+      the best, tagged with its section, would surface it — the search route
+      already does this (`/api/search` best-segment).
 - [ ] **Preview audio may need a user gesture.** The preview volume now tapers
       (`previewGain`) and defaults to a moderate 80 %, but a browser that blocks autoplay
       will silently drop the *first* hover's `play()` (`_startPreview` swallows the
@@ -190,10 +282,6 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       whether cluster assignments and cluster colouring should follow the projection
       scope or stay whole-library (the supervised head already learns from library
       folders only).
-- [ ] **mlx-vis point cap.** Above `TRACKSPACE_MLX_TSNE_MAX_POINTS` (default 10000)
-      the map silently falls back to the PCA-reduced sklearn path; the library is now
-      ~15.4k. Re-benchmark mlx-vis vs sklearn at that size and either raise the cap
-      or accept the fallback.
 - [ ] **`services/analysis_pipeline.py` — split if it grows again.** Handlers are
       already one factory function per stage; the cluster store and the enqueue helpers
       are the natural next seams.
@@ -201,6 +289,13 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       `clap.batch_ensure_embeddings` have no callers since the durable queue took
       over (the queue's `enqueue_library_work` filter supersedes them); remove them
       and their re-exports in `embeddings/__init__.py` / `layout.py`.
+- [ ] **Predicted folders are recomputed per fetch.** `GET /api/supervised/predictions`
+      walks the whole library and re-reads every cached `supervised` row on the first
+      selection of the *Predicted folder* colour mode (and again after each head
+      change). It is a pure function of the cached rows + the head's centroids, so
+      cache the payload server-side keyed on the head run id and serve it until the
+      head changes. Files: `backend/services/analysis_pipeline.py`
+      (`supervised_predictions`).
 - [ ] **Cheaper loudness envelope for `structure`.** `analyze_structure` decodes the
       whole file a second time, but the `scan` stage's `fpcalc` already decodes it
       and its raw fingerprint is discarded (only the hash is kept). If chromaprint can
@@ -262,24 +357,30 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       Measured: an `ffmpeg` subprocess is *not* faster (equal on whole tracks,
       ~2.7× slower per 15 s segment from process spawn), so the only win is
       dropping `_DECODE_LOCK` for the SIGBUS invariant.
-- [x] **MAEST `inference_mode`, and `torch.compile` rejected.** All inference
-      forwards (MAEST, CLAP audio/text, the supervised head) now use
-      `torch.inference_mode()`; measured neutral (0.96×/0.97× in an in-process,
-      interleaved A/B), kept for correctness of intent. `torch.compile` on the MAEST
-      transformer was measured twice, reproduced, and removed: ~2.3× slower per forward on
-      MPS and 1.78× end-to-end on real tracks, with `dynamic=True` no better (numbers
-      and method in `audio_pipeline.md` → *MAEST model management*). Only retry on CUDA,
-      with that same paired measurement.
 - [ ] **MAEST mel front end.** Already batched: `analyze_batch` stacks every
       excerpt of the claimed batch (up to `batch_size * MAEST_NUM_SEGMENTS`) into one
       `_mel(wave)` call, not three per track. The remaining CPU mel cost is the
       front end itself, which would need a different transform or device split.
-- [ ] **madmom tempo.** `TRACKSPACE_MADMOM_FAST=1` (one BLSTM) is ~4× faster but
-      opt-in. Benchmark the tempo error on a labelled sample and consider making it the
-      default (bump `FEATURES_VERSION` if the vector changes).
-- [ ] **Projection backends.** `TRACKSPACE_CUML` / `TRACKSPACE_MLX_VIS` are chosen by
-      import success; re-benchmark mlx-vis vs openTSNE vs sklearn after any
-      torch/librosa bump, and revisit `TRACKSPACE_OPENTSNE` being off by default.
+- [ ] **Re-validate the single-net tempo default.** `TRACKSPACE_MADMOM_FAST`
+      defaults to the single BLSTM (~4× faster; 26/29 tracks within 1 BPM), with
+      `reconcile_tempo_octave()` guarding the exact half/double lock against librosa;
+      `TRACKSPACE_MADMOM_FAST=0` restores the ensemble. `FEATURES_VERSION` was
+      bumped to 8 for the recipe change; validate against a labelled tempo set before
+      relying on it further.
+- [ ] **openTSNE fit cache is cold on the first request after a restart.**
+      The fitted embedding + PCA basis persist in `tsne_fit_cache` and the cache is on by
+      default, so a restart transforms rather than refits — but the blob is loaded lazily
+      on the first request. Preload it at startup, or accept the one cold request.
+      Files: `backend/embeddings/projection_backends.py`,
+      `backend/embeddings/feature_cache.py`.
+- [ ] **Projection backends: re-benchmark after a torch/librosa bump.** mlx-vis only
+      wins below ~7k tracks (n=7k: 10.4 s vs sklearn 12.8 s; n=10k: 24.6 vs 19.3;
+      n=14k: 45.6 vs 42.0), so the 10k `TRACKSPACE_MLX_TSNE_MAX_POINTS` cap is
+      conservative but correct — raising it would regress. Note mlx-vis raises
+      `UnboundLocalError` on a pre-reduced float32 matrix (its PCA branch expects the
+      raw input); `_project_tsne_fallback` passes the raw composite, so this is latent —
+      do not "optimise" by pre-reducing there. Files:
+      `backend/embeddings/projection_backends.py`.
 
 ### Dependencies
 

@@ -335,9 +335,11 @@ is steady state):
   the upper end matches madmom's `MAX_BPM`, so the estimator's whole range survives
   normalisation instead of saturating at a lower ceiling.
   Classical-feature excerpts stay at **22.05 kHz** for librosa; madmom receives a
-  **44.1 kHz** resample of that buffer only. Optional env
-  **`TRACKSPACE_MADMOM_FAST=1`** uses one BLSTM instead of the default
-  eight-network ensemble for a large speedup with slightly less robust tempo (pick one
+  **44.1 kHz** resample of that buffer only. The default is **one BLSTM**
+  (`_madmom_fast_enabled()`), measured ~4× faster than the 8-network ensemble
+  (1032 → 246 ms/track) and within 1 BPM on 26/29 real tracks; on an exact
+  half/double disagreement with the librosa estimate, `reconcile_tempo_octave()`
+  prefers librosa. Set **`TRACKSPACE_MADMOM_FAST=0`** for the ensemble (pick one
   setting per library and keep it stable, or bump `FEATURES_VERSION` / purge features
   when toggling). Profile locally: `.venv/bin/python tests/profile_madmom_tempo.py`.
 - Key: Krumhansl-Schmuckler algorithm on `librosa.feature.chroma_cqt()`
@@ -468,15 +470,24 @@ lens's `sources=` subset and optional `w=` weights; both are part of
 | `"tsne"` (default) | `_project_tsne` (openTSNE → cuML → mlx-vis → scikit-learn) | Best local cluster preservation; slower |
 | `"pca"` | `_project_pca` (numpy SVD) | Instant; used for live incremental updates during generation |
 
-**Incremental t-SNE (openTSNE, prototype).** With `TRACKSPACE_OPENTSNE=1`
-and `openTSNE` importable, `_project_tsne` routes to `_project_tsne_incremental`,
-which fits an embedding once per *vector config* and then places only newly added
-tracks into it via `TSNEEmbedding.transform` instead of refitting the library.
-Key facts:
+**Incremental t-SNE (openTSNE).** On by default (`TRACKSPACE_OPENTSNE=0`
+disables it), `_project_tsne` routes to `_project_tsne_incremental`, which fits
+an embedding once per *vector config* and then places only newly added tracks into
+it via `TSNEEmbedding.transform` instead of refitting the library. Measured on
+the real library (n=14,163, 50-D): a cold fit is 23.8 s, a `.transform` of 708 new
+tracks is **1.28 s (19× faster)**, and placed-point neighbourhood recall@10 is
+0.313 vs the base layout's own 0.360 — a ~9% fidelity cost. Its cold fit matches
+scikit-learn's and its full-fit recall is slightly *better* (0.360 vs 0.342), so it is
+also the better-quality backend. Key facts:
 
 - The fit cache keys on `_composite_config_token` (sources, mask, blend, weights,
-  versions) plus the semantic-basis params — **not** the track set, so adding tracks
+  versions) plus the semantic-basis params — **not the track set**, so adding tracks
   reuses the fit. Changing sources/mask/blend/weights/context refits.
+- The semantic-basis param key (`_semantic_basis_param_key`) keys on the folder
+  *set*, not the full path set, so a track added to an existing folder reuses the
+  chart (and is transformed into it) while a new *folder* is a new direction and
+  refits. The basis cache key deliberately uses `_composite_config_token`, never
+  `_composite_param_key`, or the full path set would leak back in.
 - Tracks already in the fit are sliced from the cached coordinates, so they never
   move between incremental updates. New tracks are PCA-reduced with the *fit's* PCA
   basis before `transform` (not the current matrix's basis).
@@ -486,10 +497,12 @@ Key facts:
 - `TSNEEmbedding.transform` recentres the fitted embedding in place, so the cached
   coords are re-read from the embedding after every transform.
 - CPU-only, so it does **not** take `inference_lock` (unlike mlx-vis).
-
-Off by default: the cold fit is slower than mlx-vis on Apple Silicon (~20.3 s vs
-~12.7 s at 9.5k × 50), while a +500 transform is ~0.93 s (~14× faster than a
-full refit). Flipping the default is a product decision.
+- The fitted embedding is **persisted** (`tsne_fit_cache` table, keyed by the same
+  config, capped at 8) so a restart transforms rather than refits. The blob is
+  magic-prefixed and unpickled defensively: an unreadable or older blob reads as a
+  miss and simply refits, so a library upgrade can never load an incompatible pickle.
+- The in-memory fit cache holds 8 entries, one per lens, so a full five-lens cycle
+  never evicts a fit it will need again.
 
 PCA is never shown in the UI toggle — it is only used internally for fast intermediate
 projections while embeddings are being generated.
@@ -502,17 +515,71 @@ stays on the PCA preview. The fallback therefore PCA-reduces to
 `TRACKSPACE_SKLEARN_TSNE_PCA_DIM` (default 50) first, mirroring the openTSNE path;
 set it to 0 to disable. cuML and mlx-vis reduce internally and are untouched.
 
+### Lens gauge (why a lens switch does not flip the map)
+
+t-SNE's objective is invariant to rotation, reflection and uniform scale, so two
+lenses over the same library land in arbitrary, unrelated frames — switching lens
+looked like the whole map flipped even though neighbourhoods were unchanged.
+Measured on the real library, **6 of 10 lens pairs differed by a reflection**.
+
+`embeddings/lens_gauge.py` fits a Procrustes (Kabsch) **similarity** transform —
+rotation, reflection, uniform scale, translation — from each new layout onto a
+reference layout, using the tracks the two share. `compute_projection` calls
+`gauge_layout()` just before `_normalise_coords`, so the gauged coordinates are what
+gets normalised, cached and persisted; a restart therefore replays already-gauged
+layouts and re-anchors consistently.
+
+Measured end-to-end on the five real cached lenses: **mean pairwise RMSE 0.518 →
+0.305 (−41%), every pair improved**, two reflections corrected. The transform is
+shape-preserving, so this changes only the gauge and never the structure —
+distance-ratio spread 2.8e-16 and 100% nearest-neighbour preservation.
+
+The family key is `source-versions | track_set_key(paths)`: layouts are only
+comparable over the same track set and cache generation. It deliberately excludes
+sources/mask/weights — keying on anything lens-varying would give every lens its own
+anchor and the alignment would silently never fire (`track_set_key` exists so that
+coupling is explicit rather than an accident of a hash slice, and
+`test_track_set_key_is_lens_independent` pins it).
+
+Two alternatives were measured and **rejected**:
+
+- **Anchor-free canonical gauge** (rotate each lens onto its own PCA axes with a
+  skew-based sign rule) reached only 0.479 and made 4 of 10 pairs *worse* — the
+  principal axes are unstable when the cloud is near-isotropic.
+- **Axis flip/swap only** (no rotation/scale) was worse than Procrustes on every
+  lens.
+
+The reference lens barely matters (mean RMSE 0.299–0.316 across all five choices),
+so it is not configurable: whichever layout is registered first for a family wins.
+Fitting is robust to partial overlap — a fit on 5% of the tracks scored 0.3756 vs
+0.3723 on all of them — so a lens with a smaller eligible set still aligns.
+
+This generalises the older `_pca_ref_cache` trick in `projection_backends.py`, which
+already did exactly this for the PCA preview so successive previews would not spin.
+
 ### Projection caching
 
-Projection results are cached at two levels:
+Projection results are cached at three levels:
 
-**Server-side (revision-keyed LRU):**
+**Server-side (revision-keyed LRU + disk):**
 `_revision_layout_cache` in `embeddings/layout.py` is an `OrderedDict[str, list[dict]]`
-(capped at 32 entries). The key is `layout_revision` — a deterministic SHA-256
-computed by `compute_layout_revision()` from sorted eligible paths, method,
-sources, feature mask/blend, folder/tag context, and cache version constants.
-Because the key is content-addressed, row order in the input data does not
-affect cache identity.
+(capped at 32 entries); on a miss it reads the persisted copy from the
+`layout_cache` table in `audio_features.db` (`FeatureCache.get_layout` /
+`put_layout`, capped at 32 revisions). The in-process LRU dies with the process, so
+without the disk tier every restart re-fits all five lenses (~20 s each); the disk
+tier turns that into a ~5 ms read (~356 KB for 14k tracks). The key is
+`layout_revision` — a deterministic SHA-256 computed by
+`compute_layout_revision()` from sorted eligible paths, method, sources, feature
+mask/blend, folder/tag context, and cache version constants. Because the key is
+content-addressed, row order in the input data does not affect cache identity, and it
+is stable across restarts.
+
+**Coverage and revision reads are presence-only.**
+`batch_fetch_maps` returns `{fingerprint: True}` sets from
+`FeatureCache.presence()` — one query with a boolean column per source — rather
+than decoding every blob (~328 MB per status request). Only
+`_gather_composite_vecs` reads the vectors themselves, through its own
+`_fetch_source_map`.
 
 **Client-side (query-string → {revision, positions} map):**
 `_layoutCache` in `coordinators/embedding-coordinator.ts` maps
@@ -523,13 +590,16 @@ whether a cached entry's `revision` matches the server's current `layout_revisio
 are applied directly — no projection round-trip. This handles A→B→A cycles
 (e.g. toggling TSNE↔UMAP↔TSNE) without redundant server work.
 
-**openTSNE fit cache (incremental path only):**
-`_tsne_fit_cache` in `embeddings/projection_backends.py` holds up to 4 fitted
-embeddings keyed by vector config (not track set). It sits *below* the
-revision-keyed LRU: the revision changes when tracks are added, so the LRU misses,
-and the fit cache turns that miss into a `transform` of only the new rows. The two
-caches answer different questions — revision = "same exact view?", fit config =
-"same vector space?".
+**openTSNE fit cache (incremental path):**
+`_tsne_fit_cache` in `embeddings/projection_backends.py` holds up to 8 fitted
+embeddings keyed by vector config (not track set), with a disk tier behind it
+(`tsne_fit_cache` table). It sits *below* the revision-keyed LRU: the revision
+changes when tracks are added, so the LRU misses, and the fit cache turns that miss
+into a `transform` of only the new rows. The two caches answer different
+questions — revision = "same exact view?", fit config = "same vector space?".
+The fit cache is guarded by `_fit_cache_lock` (it is mutated from request threads
+and the prefetch worker) and is only written for cached fits, so the Jacobian's
+throwaway perturbation fits never evict or persist the live fit.
 
 Both caches are invalidated when new embeddings are generated (server: implicitly
 via new revision; client: `invalidateLayoutCache()` on SSE `done`).
@@ -702,6 +772,14 @@ clears its class's floor; otherwise it is reported `unmatched` and left where it
 The floor is calibrated to how tightly the head packs each folder, so a diffuse folder
 gets a lower floor than a tight one, and an old head without floors (or a class with no
 training row) matches everything, preserving the previous behaviour.
+
+**The same prediction drives the canvas colouring.** `GET /api/supervised/predictions`
+returns the nearest learned folder per track (path → class name) plus the subset that clears
+its match floor, read straight from the cached `supervised` rows — no projection, no encoder
+work. The *Predicted folder* colour mode (`model.colorMode === "head"`) uses it so the map
+shows where the head *thinks* each track belongs; the client refetches it when the head changes
+(a drained supervise job or an import). The View tab's *Predicted* select chooses between
+*Confident only* (the floor-gated subset) and *All nearest*.
 
 **Unmatched tracks can still be filed by genre.** With the imprint's *Sort unmatched
 into Generic/…* toggle on, a track that clears no learned folder's floor is filed under

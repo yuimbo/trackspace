@@ -93,7 +93,7 @@ describe("OptionsPanelBinder", () => {
         name: "My view",
         baseLens: "combined",
         weights: model.clusterWeights,
-        colorByCluster: false,
+        colorMode: "folder",
         clusterResolution: 1.5,
       },
     ];
@@ -143,7 +143,7 @@ describe("OptionsPanelBinder", () => {
         name: "My view",
         baseLens: "combined",
         weights: model.clusterWeights,
-        colorByCluster: false,
+        colorMode: "folder",
         clusterResolution: 1.5,
       },
     ];
@@ -164,7 +164,7 @@ describe("OptionsPanelBinder", () => {
         name: "My view",
         baseLens: "combined",
         weights: model.clusterWeights,
-        colorByCluster: false,
+        colorMode: "folder",
         clusterResolution: 1.5,
       },
     ];

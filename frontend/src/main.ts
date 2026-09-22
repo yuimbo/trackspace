@@ -11,6 +11,7 @@ import {
   BatchView,
   StatusView,
   SearchView,
+  ViewModifierView,
 } from "./components";
 import { Controller } from "./controller";
 import { renderShortcutList } from "./hotkeys";
@@ -38,7 +39,10 @@ const status = new StatusView();
 status.update(model);
 const search = new SearchView(
   model,
-  document.getElementById("search-section")!,
+  document.getElementById("search-modal")!,
+);
+const viewModifiers = new ViewModifierView(
+  document.getElementById("view-modifiers")!,
 );
 
 const ctrl = new Controller(
@@ -50,6 +54,7 @@ const ctrl = new Controller(
   batch,
   status,
   search,
+  viewModifiers,
 );
 void ctrl.init();
 

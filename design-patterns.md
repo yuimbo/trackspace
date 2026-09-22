@@ -117,22 +117,24 @@ target kind, update its description — the modal follows automatically.
 
 ---
 
-## Pattern: transient canvas HUD
+## Pattern: persistent canvas tabbers
 
-A hotkey whose effect is a **mode** (which lens is active, how dots are coloured) needs
-feedback, but a toast is the wrong shape: pressing the key repeatedly stacks a history of
-"now X" / "now Y" messages on top of each other, and the newest is not obviously the
-truth. Instead flash a **single transient tab row** at the centre of the canvas:
+A hotkey whose effect is a **mode** (which lens is active, how dots are coloured)
+needs feedback. The feedback is the **tabber itself**, always visible at the top of
+the canvas: a lens row and a colour-mode row, with the active tab highlighted, so
+pressing **E** / **C** moves the highlight and a click switches directly. No
+transient flash, no toast — a toast stacks a history of "now X" / "now Y", and a
+flash disappears exactly when the user wants to confirm the state.
 
-- `CanvasView.flashHud(tabs, activeId, ms?)` draws the tabs with the active one
-  highlighted, exactly like the lens switcher and the scope tab bar (`_drawHudTabs`).
-- A new flash **replaces** the previous one (one `_hud` slot + one timer), so repeated
-  presses cannot stack; the last state is the only one shown.
-- It is view state: no model event, no persistence — just `scheduleDraw()`.
-- Reserve it for *mode* feedback (lens, colour-by). A one-off outcome ("Analysis
-  complete") is still a toast; an error/unavailable reason is still a warn toast.
-- The canvas owns the drawing; a coordinator calls it through a deps callback
-  (`EmbeddingDeps.canvas.flashLensHud`, `AnalysisDeps.canvas.flashHud`).
+- `CanvasView._drawTopTabs(w)` draws both rows with `_drawTabs` (the same
+  routine the scope tab bar uses) and stores their screen rects.
+- The tabbers are **chrome**, not data: clicking one is routed before any gesture
+  (`topLensTabAt` / `topColorTabAt` in `canvas-interaction.ts`) and only calls the
+  coordinator (`switchLens`, `setColorMode`).
+- It is view state: the rows read `model.activeBaseLensId()` and `model.colorMode`
+  each frame, so no model event or persistence is needed — just `scheduleDraw()`.
+- A mode that cannot apply is still explained with a warn toast; a one-off outcome
+  ("Analysis complete") is still a toast.
 
 ---
 

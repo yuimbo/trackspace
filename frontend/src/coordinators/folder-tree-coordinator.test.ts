@@ -50,6 +50,12 @@ const TREE_HTML = `
 const SHELL_HTML = `
   <div id="toast-container"></div>
   <div id="folder-section">
+    <label id="show-external-label" class="hidden">
+      <input type="checkbox" id="show-external-toggle" />
+    </label>
+    <label id="external-projection-label" class="hidden">
+      <input type="checkbox" id="external-projection-toggle" />
+    </label>
     <div id="folder-tree">${TREE_HTML}</div>
   </div>
   <div id="selected-folders-overlay" class="hidden"></div>
@@ -70,8 +76,10 @@ interface Harness {
   onRootsChanged: ReturnType<typeof vi.fn>;
   onImprintRoot: ReturnType<typeof vi.fn>;
   isPointerBusy: ReturnType<typeof vi.fn>;
+  runCanvasAction: ReturnType<typeof vi.fn>;
   coord: FolderTreeCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
+  refreshProjection: ReturnType<typeof vi.fn>;
 }
 
 function makeCanvas() {
@@ -91,6 +99,8 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const onRootsChanged = vi.fn(async () => {});
   const onImprintRoot = vi.fn();
   const isPointerBusy = vi.fn(() => false);
+  const refreshProjection = vi.fn();
+  const runCanvasAction = vi.fn();
   const coord = new FolderTreeCoordinator({
     model,
     canvas,
@@ -99,6 +109,8 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     renderTagPanels,
     onRootsChanged,
     onImprintRoot,
+    refreshProjection,
+    runCanvasAction,
   });
   coord.bind();
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
@@ -113,8 +125,10 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     onRootsChanged,
     onImprintRoot,
     isPointerBusy,
+    runCanvasAction,
     coord,
     fetchSpy,
+    refreshProjection,
   };
 }
 
@@ -465,6 +479,51 @@ describe("FolderTreeCoordinator hover", () => {
   });
 });
 
+// ─── Action popout ─────────────────────────────────────
+
+describe("FolderTreeCoordinator action popout", () => {
+  it("shows a toolbar with a hotkey badge for the hovered row", async () => {
+    const { coord } = makeHarness();
+    await coord.refresh();
+    mouseenter(row("House"));
+    const actions = document.getElementById("folder-actions")!;
+    expect(actions.classList.contains("hidden")).toBe(false);
+    const select = actions.querySelector(
+      "[data-folder-action='focus-folder']",
+    ) as HTMLElement;
+    expect(select.querySelector("kbd")!.textContent).toBe("F");
+    const isolate = actions.querySelector(
+      "[data-folder-action='isolate-selection']",
+    ) as HTMLElement;
+    expect(isolate.querySelector("kbd")!.textContent).toBe("s");
+  });
+
+  it("runs a canvas action from the popout", async () => {
+    const { coord, runCanvasAction } = makeHarness();
+    await coord.refresh();
+    mouseenter(row("House"));
+    (
+      document.querySelector(
+        "#folder-actions [data-folder-action='isolate-selection']",
+      ) as HTMLElement
+    ).click();
+    expect(runCanvasAction).toHaveBeenCalledWith("isolate-selection");
+  });
+
+  it("hides the popout when the pointer leaves the row", async () => {
+    vi.useFakeTimers();
+    const { coord } = makeHarness();
+    await coord.refresh();
+    mouseenter(row("House"));
+    mouseleave(row("House"));
+    vi.advanceTimersByTime(200);
+    expect(
+      document.getElementById("folder-actions")!.classList.contains("hidden"),
+    ).toBe(true);
+    vi.useRealTimers();
+  });
+});
+
 // ─── Roots ─────────────────────────────────────────────
 
 describe("FolderTreeCoordinator roots", () => {
@@ -534,32 +593,92 @@ describe("FolderTreeCoordinator roots", () => {
     expect(urls).toContain("/api/roots/remove");
   });
 
-  it("removes a root from its row's remove button", async () => {
+  it("removes a root from its row's action popout", async () => {
     vi.stubGlobal("confirm", vi.fn(() => true));
-    const { onRootsChanged, fetchSpy } = makeHarness(() => ({ ok: true }));
+    const { coord, onRootsChanged, fetchSpy } = makeHarness(() => ({ ok: true }));
     $tree().innerHTML = `
       <div class="folder-row" data-folder-path="r1" data-root-id="r1"
-           data-root-abs="/music/lib">
+           data-root-abs="/music/lib" data-root-role="library">
         <span class="folder-label" data-path="r1">lib</span>
-        <span class="folder-remove-btn" data-root-id="r1"
-              data-root-abs="/music/lib">✕</span>
       </div>`;
-    ($tree().querySelector(".folder-remove-btn") as HTMLElement).click();
+    await coord.refresh();
+    mouseenter(row("r1"));
+    const btn = document.querySelector(
+      "#folder-actions [data-folder-action='remove']",
+    ) as HTMLElement;
+    btn.click();
     await vi.waitFor(() => expect(onRootsChanged).toHaveBeenCalled());
     const urls = fetchSpy.mock.calls.map(([u]) => String(u));
     expect(urls).toContain("/api/roots/remove");
   });
 
-  it("prefills the imprint target from an external root's row", () => {
-    const { onImprintRoot } = makeHarness();
+  it("prefills the imprint target from an external root's action popout", async () => {
+    const { onImprintRoot, coord } = makeHarness();
     $tree().innerHTML = `
       <div class="folder-row folder-row-external" data-folder-path="r1"
-           data-root-id="r1" data-root-abs="/music/ext">
+           data-root-id="r1" data-root-abs="/music/ext" data-root-role="external">
         <span class="folder-label" data-path="r1">ext</span>
-        <span class="folder-imprint-btn" data-root-id="r1"
-              data-root-abs="/music/ext">⇥</span>
       </div>`;
-    ($tree().querySelector(".folder-imprint-btn") as HTMLElement).click();
+    await coord.refresh();
+    mouseenter(row("r1"));
+    const btn = document.querySelector(
+      "#folder-actions [data-folder-action='imprint']",
+    ) as HTMLElement;
+    btn.click();
     expect(onImprintRoot).toHaveBeenCalledWith("/music/ext");
+  });
+
+  it("redraws without refetching when externals are shown", () => {
+    const { model, canvas, refreshProjection } = makeHarness();
+    const $toggle = document.getElementById(
+      "show-external-toggle",
+    ) as HTMLInputElement;
+    $toggle.checked = true;
+    $toggle.dispatchEvent(new Event("change"));
+    expect(model.showExternal).toBe(true);
+    // External positions ride along with every chart, so this is a pure redraw.
+    expect(refreshProjection).not.toHaveBeenCalled();
+    expect(canvas.scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("heals a chart missing external positions after a tree swap", async () => {
+    const { model, coord, refreshProjection } = makeHarness();
+    model.embeddingsReady = true;
+    model.setAllTracks([makeTrack({ path: "ext/t.mp3", folder: "ext" })]);
+    // The tree reveals an external root the chart was fetched without.
+    $tree().innerHTML = `
+      <div class="folder-row" data-folder-path="ext"
+           data-root-role="external" data-root-id="ext">
+        <span class="folder-label" data-path="ext">ext</span>
+      </div>`;
+    await coord.refresh();
+    expect(model.externalRootIds.has("ext")).toBe(true);
+    expect(refreshProjection).toHaveBeenCalled();
+  });
+
+  it("does not heal when every external track already has a position", async () => {
+    const { model, coord, refreshProjection } = makeHarness();
+    model.embeddingsReady = true;
+    model.setAllTracks([makeTrack({ path: "ext/t.mp3", folder: "ext" })]);
+    model.embeddingPositions = new Map([["ext/t.mp3", { x: 0, y: 0 }]]);
+    $tree().innerHTML = `
+      <div class="folder-row" data-folder-path="ext"
+           data-root-role="external" data-root-id="ext">
+        <span class="folder-label" data-path="ext">ext</span>
+      </div>`;
+    await coord.refresh();
+    expect(model.externalRootIds.has("ext")).toBe(true);
+    expect(refreshProjection).not.toHaveBeenCalled();
+  });
+
+  it("refits the projection when the external fit scope is toggled", () => {
+    const { model, refreshProjection } = makeHarness();
+    const $toggle = document.getElementById(
+      "external-projection-toggle",
+    ) as HTMLInputElement;
+    $toggle.checked = true;
+    $toggle.dispatchEvent(new Event("change"));
+    expect(model.externalInProjection).toBe(true);
+    expect(refreshProjection).toHaveBeenCalled();
   });
 });

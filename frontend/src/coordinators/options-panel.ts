@@ -79,6 +79,13 @@ export class OptionsPanelBinder {
     if ($hov) $hov.checked = m.hoverPreview;
   }
 
+  /** Mirror the preview volume onto the slider + readout (live M + scroll). */
+  syncPreviewVolume(): void {
+    const $pv = document.getElementById("hover-preview-volume") as HTMLInputElement | null;
+    if ($pv) $pv.value = String(this.deps.model.previewVolume);
+    this._renderPreviewVolume();
+  }
+
   /** Rebuild the lens `<select>` from the built-ins plus the saved presets. */
   private _renderLensOptions(): void {
     const m = this.deps.model;

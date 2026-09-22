@@ -24,11 +24,45 @@ export const BPM_HI = 250;
 export const CAMELOT_MAJOR_RADIUS = 0.82;
 export const CAMELOT_MINOR_RADIUS = 0.45;
 const MINOR_FIFTHS_OFFSET = 3;
-const SPIRAL_R_MIN = 0.18;
-const SPIRAL_R_MAX = 0.86;
+export const SPIRAL_R_MIN = 0.18;
+export const SPIRAL_R_MAX = 0.86;
 const BPM_OCTAVES = Math.log2(BPM_HI / BPM_LO);
 
+/** A lens position in polar form: angle (radians) and radius from the centre. */
+export interface Polar {
+  angle: number;
+  radius: number;
+}
+
 export type LensKind = "tags" | "projection" | "deterministic";
+
+/** How dots are coloured; mirrors the folder/cluster palettes and the two feature
+ *  lenses (`camelot`, `tempo`), whose polar geometry drives the hue/brightness.
+ *  `head` colours by the folder head's nearest learned folder, not the track's own. */
+export type ColorMode = "folder" | "head" | "cluster" | "tempo" | "key";
+
+/** Colour modes in **C** cycle order. */
+export const COLOR_MODES: readonly ColorMode[] = [
+  "folder",
+  "head",
+  "cluster",
+  "tempo",
+  "key",
+];
+
+/** Tab labels for the colour-mode tabber, keyed by mode. */
+export const COLOR_MODE_LABELS: Record<ColorMode, string> = {
+  folder: "Folder colour",
+  head: "Predicted folder",
+  cluster: "Cluster colour",
+  tempo: "Tempo colour",
+  key: "Key colour",
+};
+
+/** Colour-mode tabs (id + label) for the top tabber and the View-tab select. */
+export function colorModeTabs(): { id: string; label: string }[] {
+  return COLOR_MODES.map((id) => ({ id, label: COLOR_MODE_LABELS[id] }));
+}
 
 /** A saved view: a base lens plus the display options the user tweaked. */
 export interface LensPreset {
@@ -36,7 +70,7 @@ export interface LensPreset {
   name: string;
   baseLens: string;
   weights: Record<string, number>;
-  colorByCluster: boolean;
+  colorMode: ColorMode;
   clusterResolution: number;
 }
 
@@ -73,22 +107,43 @@ function _jitter(t: Track, radius: number): { x: number; y: number } {
 }
 
 /** Camelot wheel: major outer ring, minor inner ring rotated 3 fifths (90°). */
-export function camelotXY(keyTurns: number, mode: number): { x: number; y: number } {
+export function camelotPolar(keyTurns: number, mode: number): Polar {
   const angle = 2 * Math.PI * (keyTurns - 0.5);
   const minor = mode < 0.5;
   const a = minor ? angle - MINOR_FIFTHS_OFFSET * ((2 * Math.PI) / 12) : angle;
   const r = minor ? CAMELOT_MINOR_RADIUS : CAMELOT_MAJOR_RADIUS;
-  return { x: 0.5 + 0.5 * r * Math.cos(a), y: 0.5 + 0.5 * r * Math.sin(a) };
+  return { angle: a, radius: r };
+}
+
+export function camelotXY(keyTurns: number, mode: number): { x: number; y: number } {
+  const { angle, radius } = camelotPolar(keyTurns, mode);
+  return { x: 0.5 + 0.5 * radius * Math.cos(angle), y: 0.5 + 0.5 * radius * Math.sin(angle) };
 }
 
 /** Tempo spiral: one turn per octave, radius grows with log-BPM. */
-export function bpmSpiralXY(tempoNorm: number): { x: number; y: number } {
+export function bpmSpiralPolar(tempoNorm: number): Polar {
   const bpm = Math.max(tempoNorm * (BPM_HI - BPM_LO) + BPM_LO, 1e-6);
   const octave = Math.log2(bpm / BPM_LO);
-  const a = 2 * Math.PI * (octave % 1);
+  const angle = 2 * Math.PI * (octave % 1);
   const tt = Math.min(1, Math.max(0, octave / BPM_OCTAVES));
-  const r = SPIRAL_R_MIN + tt * (SPIRAL_R_MAX - SPIRAL_R_MIN);
-  return { x: 0.5 + 0.5 * r * Math.cos(a), y: 0.5 + 0.5 * r * Math.sin(a) };
+  const radius = SPIRAL_R_MIN + tt * (SPIRAL_R_MAX - SPIRAL_R_MIN);
+  return { angle, radius };
+}
+
+export function bpmSpiralXY(tempoNorm: number): { x: number; y: number } {
+  const { angle, radius } = bpmSpiralPolar(tempoNorm);
+  return { x: 0.5 + 0.5 * radius * Math.cos(angle), y: 0.5 + 0.5 * radius * Math.sin(angle) };
+}
+
+/** [0,1] tempo for a track: cached features first, else its raw BPM chip. */
+export function trackTempoNorm(t: Track): number | null {
+  const af = t.audio_features;
+  const tnorm = af
+    ? af.tempo
+    : t.bpm != null
+      ? (t.bpm - BPM_LO) / (BPM_HI - BPM_LO)
+      : null;
+  return tnorm != null && Number.isFinite(tnorm) ? tnorm : null;
 }
 
 /** Camelot position for a track, or null when it has no cached features. */
@@ -102,13 +157,8 @@ export function camelotPosition(t: Track): { x: number; y: number } | null {
 
 /** Tempo-spiral position for a track, or null when it has no tempo. */
 export function tempoSpiralPosition(t: Track): { x: number; y: number } | null {
-  const af = t.audio_features;
-  const tnorm = af
-    ? af.tempo
-    : t.bpm != null
-      ? (t.bpm - BPM_LO) / (BPM_HI - BPM_LO)
-      : null;
-  if (tnorm == null || !Number.isFinite(tnorm)) return null;
+  const tnorm = trackTempoNorm(t);
+  if (tnorm == null) return null;
   const p = bpmSpiralXY(tnorm);
   const j = _jitter(t, 0.04);
   return { x: p.x + j.x, y: p.y + j.y };

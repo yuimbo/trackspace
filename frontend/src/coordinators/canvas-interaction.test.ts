@@ -26,6 +26,7 @@ interface FakeCanvas {
   hoveredIdx: number;
   hoveredSiblingFolder: string | null;
   hoverTarget: HoverTarget | null;
+  inspect: unknown;
   boxSel: { x0: number; y0: number; x1: number; y1: number } | null;
   lassoPoints: [number, number][];
   intersectMode: boolean;
@@ -41,9 +42,12 @@ interface FakeCanvas {
   clearHover: ReturnType<typeof vi.fn>;
   worldPosForTrack: ReturnType<typeof vi.fn>;
   scopeTabAt: ReturnType<typeof vi.fn>;
+  topLensTabAt: ReturnType<typeof vi.fn>;
+  topColorTabAt: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   unpinInspect: ReturnType<typeof vi.fn>;
   toggleInspect: ReturnType<typeof vi.fn>;
+  showVolumeHud: ReturnType<typeof vi.fn>;
 }
 
 function makeCanvas(): FakeCanvas {
@@ -53,6 +57,7 @@ function makeCanvas(): FakeCanvas {
     hoveredIdx: -1,
     hoveredSiblingFolder: null,
     hoverTarget: null,
+    inspect: null,
     boxSel: null,
     lassoPoints: [],
     intersectMode: false,
@@ -69,9 +74,12 @@ function makeCanvas(): FakeCanvas {
     clearHover: vi.fn(),
     worldPosForTrack: vi.fn(() => ({ wx: 0.5, wy: 0.5 })),
     scopeTabAt: vi.fn(() => null),
+    topLensTabAt: vi.fn(() => null),
+    topColorTabAt: vi.fn(() => null),
     scheduleDraw: vi.fn(),
     unpinInspect: vi.fn(() => false),
     toggleInspect: vi.fn(),
+    showVolumeHud: vi.fn(),
   };
 }
 
@@ -104,6 +112,11 @@ function makeHarness(): Harness {
     setScopeLens: vi.fn(),
     resizeScope: vi.fn(),
     closeScope: vi.fn(),
+    switchLens: vi.fn(),
+    setColorMode: vi.fn(),
+    togglePreview: vi.fn(),
+    adjustPreviewVolume: vi.fn(),
+    commitPreviewVolume: vi.fn(),
   } as CanvasInteractionDeps;
   const coord = new CanvasInteractionController(deps);
   coord.bind();
@@ -368,7 +381,7 @@ describe("CanvasInteractionController gesture state", () => {
     expect(canvas.scheduleDraw).toHaveBeenCalled();
   });
 
-  it("opens the scope immediately on an X + drag with the default lens", () => {
+  it("opens a box scope on an X + drag with the default lens", () => {
     const { model, canvas, deps } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
     canvas.hitTest.mockReturnValue(-1);
@@ -376,20 +389,25 @@ describe("CanvasInteractionController gesture state", () => {
       new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
     );
     down(canvas, 100, 100);
-    move(canvas, 140, 100);
-    up(canvas, 140, 100);
+    move(canvas, 140, 140);
+    up(canvas, 140, 140);
     expect(deps.openScope).toHaveBeenCalledTimes(1);
     const [scope, lensId] = (deps.openScope as ReturnType<typeof vi.fn>).mock
-      .calls[0] as [{ cx: number; cy: number; r: number }, string];
-    expect(scope.cx).toBeCloseTo(0.1, 5);
-    expect(scope.cy).toBeCloseTo(0.1, 5);
-    expect(scope.r).toBeCloseTo(0.04, 5);
+      .calls[0] as [
+      { shape: string; cx: number; cy: number; rx: number; ry: number },
+      string,
+    ];
+    expect(scope.shape).toBe("box");
+    expect(scope.cx).toBeCloseTo(0.12, 5);
+    expect(scope.cy).toBeCloseTo(0.12, 5);
+    expect(scope.rx).toBeCloseTo(0.02, 5);
+    expect(scope.ry).toBeCloseTo(0.02, 5);
     expect(lensId).toBe(model.scopeLensId);
   });
 
   it("closes an open scope on a bare X tap", () => {
     const { model, deps } = makeHarness();
-    model.scope = { cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
+    model.scope = { shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
     document.dispatchEvent(
       new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
     );
@@ -410,23 +428,25 @@ describe("CanvasInteractionController gesture state", () => {
     expect(deps.openScope).toHaveBeenCalledTimes(1);
     const [scope, lensId, allowEmpty] = (
       deps.openScope as ReturnType<typeof vi.fn>
-    ).mock.calls[0] as [{ r: number }, string, boolean];
-    // Starts small in *screen* space (14 px / the 0.001 world-per-px fake) and may
-    // be empty so the scroll can grow it in.
+    ).mock.calls[0] as [{ shape: string; r: number }, string, boolean];
+    // Starts small in *screen* space (14 px / the 0.001 world-per-px fake), round,
+    // and may be empty so the scroll can grow it in.
+    expect(scope.shape).toBe("circle");
     expect(scope.r).toBeCloseTo(0.014, 5);
     expect(lensId).toBe(model.scopeLensId);
     expect(allowEmpty).toBe(true);
 
-    model.scope = { cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
+    model.scope = { shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "camelot" };
     canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
     expect(deps.resizeScope).toHaveBeenCalledTimes(1);
-    expect((deps.resizeScope as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBeGreaterThan(0.1);
+    // A scroll up scales the scope up by a factor > 1.
+    expect((deps.resizeScope as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBeGreaterThan(1);
   });
 
   it("closes the scope when clicking outside it", () => {
     const { model, canvas, deps } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
-    model.scope = { cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    model.scope = { shape: "circle", cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
     canvas.hitTest.mockReturnValue(-1);
     canvas.scopeTabAt.mockReturnValue(null);
     down(canvas, 500, 500);
@@ -436,11 +456,58 @@ describe("CanvasInteractionController gesture state", () => {
   it("switches the scope lens from a tab click", () => {
     const { model, canvas, deps } = makeHarness();
     model.setAllTracks([makeTrack({ path: "a.mp3" })]);
-    model.scope = { cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
+    model.scope = { shape: "circle", cx: 0.1, cy: 0.1, r: 0.05, lensId: "camelot" };
     canvas.scopeTabAt.mockReturnValue("clap");
     down(canvas, 500, 500);
     expect(deps.setScopeLens).toHaveBeenCalledWith("clap");
     expect(deps.closeScope).not.toHaveBeenCalled();
+  });
+
+  it("switches the main lens from the top lens tabber", () => {
+    const { canvas, deps } = makeHarness();
+    canvas.topLensTabAt.mockReturnValue("clap");
+    down(canvas, 500, 20);
+    expect(deps.switchLens).toHaveBeenCalledWith("clap");
+    expect(deps.closeScope).not.toHaveBeenCalled();
+  });
+
+  it("sets the colour mode from the top colour tabber", () => {
+    const { canvas, deps } = makeHarness();
+    canvas.topColorTabAt.mockReturnValue("tempo");
+    down(canvas, 500, 40);
+    expect(deps.setColorMode).toHaveBeenCalledWith("tempo");
+  });
+
+  it("toggles the preview on a bare M tap", () => {
+    const { deps } = makeHarness();
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyM", bubbles: true }),
+    );
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyM", bubbles: true }),
+    );
+    expect(deps.togglePreview).toHaveBeenCalledTimes(1);
+  });
+
+  it("adjusts the preview volume on M + scroll and suppresses the toggle", () => {
+    const { canvas, deps } = makeHarness();
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyM", bubbles: true }),
+    );
+    canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
+    expect(deps.adjustPreviewVolume).toHaveBeenCalledTimes(1);
+    // A scroll up scales the volume up by a factor > 1.
+    expect(
+      (deps.adjustPreviewVolume as ReturnType<typeof vi.fn>).mock.calls[0][0],
+    ).toBeGreaterThan(1);
+    expect(canvas.showVolumeHud).toHaveBeenCalled();
+    document.dispatchEvent(
+      new KeyboardEvent("keyup", { code: "KeyM", bubbles: true }),
+    );
+    // The scroll marked the gesture used, so the tap does not toggle the preview.
+    expect(deps.togglePreview).not.toHaveBeenCalled();
+    expect(deps.commitPreviewVolume).toHaveBeenCalledTimes(1);
   });
 
   it("disarms the scope gesture on X keyup", () => {
@@ -488,6 +555,22 @@ describe("CanvasInteractionController gesture state", () => {
     canvas.hitTest.mockReturnValue(-1);
     down(canvas, 10, 10, { shiftKey: true });
     expect(canvas.unpinInspect).not.toHaveBeenCalled();
+  });
+
+  it("pauses canvas hover while the inspect card is pinned", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "pinned.mp3", folder: "A" }),
+      makeTrack({ path: "other.mp3", folder: "B" }),
+    ]);
+    // The pointer is over another track, but the pinned card keeps the hover.
+    canvas.hitTest.mockReturnValue(1);
+    canvas.inspect = { path: "pinned.mp3" };
+    move(canvas, 10, 10);
+    expect(canvas.hoveredIdx).toBe(0);
+    expect(canvas.hoveredSiblingFolder).toBe("A");
+    expect(deps.onHoverPreview).not.toHaveBeenCalled();
+    expect(deps.onHoverFolderChanged).not.toHaveBeenCalled();
   });
 });
 

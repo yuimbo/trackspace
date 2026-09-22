@@ -1,7 +1,9 @@
 import {
+  COLOR_MODES,
   getLens,
   nextLensId,
   prevLensId,
+  type ColorMode,
   type Lens,
   type LensPreset,
 } from "./lib/lenses";
@@ -192,6 +194,16 @@ export function isAudioFeatureAxisId(tag: string): boolean {
   return _LIBROSA_FEATURE_SET.has(tag);
 }
 
+const COLOR_MODES_LOOKUP = new Set<string>(COLOR_MODES);
+
+/** Read a persisted colour mode, falling back to the legacy cluster boolean. */
+function _migrateColorMode(raw: unknown, legacyCluster?: unknown): ColorMode {
+  if (typeof raw === "string" && COLOR_MODES_LOOKUP.has(raw)) {
+    return raw as ColorMode;
+  }
+  return Boolean(legacyCluster) ? "cluster" : "folder";
+}
+
 function _migrateLensPresets(raw: unknown): LensPreset[] {
   if (!Array.isArray(raw)) return [];
   const out: LensPreset[] = [];
@@ -204,7 +216,7 @@ function _migrateLensPresets(raw: unknown): LensPreset[] {
       name: p.name,
       baseLens: typeof p.baseLens === "string" ? p.baseLens : "combined",
       weights: _migrateClusterWeights(p.weights),
-      colorByCluster: Boolean(p.colorByCluster),
+      colorMode: _migrateColorMode(p.colorMode, p.colorByCluster),
       clusterResolution:
         typeof p.clusterResolution === "number" && p.clusterResolution > 0
           ? p.clusterResolution
@@ -217,11 +229,12 @@ function _migrateLensPresets(raw: unknown): LensPreset[] {
 export type ViewMode = "tags" | "embeddings";
 
 /**
- * Right-panel tab ids, in tab-strip order. Search and Properties stay pinned above
- * the strip; these four tabs own the lower sections so the panel no longer scrolls to
- * the brim. See `ui_conventions.md` → *Right panel*.
+ * Right-panel tab ids, in tab-strip order. Properties stays pinned above the
+ * strip; these three tabs own the lower sections so the panel no longer scrolls to
+ * the brim. The view options live on the canvas edge instead. See
+ * `ui_conventions.md` → *Right panel*.
  */
-export const RIGHT_PANEL_TABS = ["analysis", "organise", "tracks", "view"] as const;
+export const RIGHT_PANEL_TABS = ["analysis", "organise", "tracks"] as const;
 export type RightPanelTab = (typeof RIGHT_PANEL_TABS)[number];
 
 /** Hover-preview audition section; cycled with **D** and highlighted in the tooltip. */
@@ -243,21 +256,82 @@ export type HoverTarget =
 /** BPM window that counts as "the same tempo" for the BPM chip's hover target. */
 export const BPM_MATCH_TOLERANCE = 2;
 
+/**
+ * Kinds of **active view modifier**: a reversible change to what the canvas
+ * shows. Each kind is one chip in the corner stack; the chip's × and **Esc**
+ * undo it. See `design-patterns.md` → *Active view modifiers*.
+ */
+export const VIEW_MODIFIER_KINDS = [
+  "search",
+  "proximity",
+  "scope",
+  "exclusions",
+  "filters",
+  "external",
+] as const;
+export type ViewModifierKind = (typeof VIEW_MODIFIER_KINDS)[number];
+
+/**
+ * One active view modifier. Session-only: the stack resets on reload, like the
+ * exclusions and the scope it describes.
+ */
+export interface ViewModifier {
+  id: string;
+  kind: ViewModifierKind;
+  /** Chip title, e.g. the query, `"42 hidden"`, or `"3 filters"`. */
+  label: string;
+  /** Optional secondary readout, e.g. `"nearest 40%"`. */
+  detail?: string;
+  /** Slider position 0–100 for a `proximity` chip. */
+  value?: number;
+  /** Toggle state for an `external` chip (refit with external). */
+  checked?: boolean;
+}
+
 export interface Viewport {
   ox: number;
   oy: number;
   zoom: number;
 }
 
-/** A circle on the canvas whose tracks are re-laid-out by another lens. */
+/** A region on the canvas whose tracks are re-laid-out by another lens. */
 export interface Scope {
+  /** Region shape: a circle (X + scroll) or an axis-aligned box (X + drag). */
+  shape: "circle" | "box";
   /** Centre in world coordinates. */
   cx: number;
   cy: number;
-  /** Radius in world units. */
+  /** Circle radius in world units (a box uses ``rx``/``ry`` instead). */
   r: number;
+  /** Box half-width in world units (box only). */
+  rx?: number;
+  /** Box half-height in world units (box only). */
+  ry?: number;
   /** Lens the in-scope tracks are laid out by. */
   lensId: string;
+}
+
+/** Half-width / half-height of a scope's region, in world units. */
+export function scopeHalfExtents(scope: Scope): { hw: number; hh: number } {
+  if (scope.shape === "box")
+    return { hw: scope.rx ?? scope.r, hh: scope.ry ?? scope.r };
+  return { hw: scope.r, hh: scope.r };
+}
+
+/**
+ * True when a world position falls inside the scope's region.
+ *
+ * This is the single membership test: the coordinator uses it to pick the in-scope
+ * set and the canvas uses it to hide in-region tracks the scope lens cannot place.
+ * The region is a world-space circle or box, so the canvas must draw its
+ * (possibly non-circular) screen image — see ``CanvasView._drawScope``.
+ */
+export function scopeContains(scope: Scope, wx: number, wy: number): boolean {
+  if (scope.shape === "box") {
+    const { hw, hh } = scopeHalfExtents(scope);
+    return Math.abs(wx - scope.cx) <= hw && Math.abs(wy - scope.cy) <= hh;
+  }
+  return Math.hypot(wx - scope.cx, wy - scope.cy) <= scope.r;
 }
 
 const LS_KEY = "trackspace";
@@ -377,11 +451,17 @@ export class Model extends EventBus {
     return prevLensId(this._lensId, preset?.baseLens);
   }
 
+  /** Built-in lens the active view is based on: a preset's base, else the lens id. */
+  activeBaseLensId(): string {
+    const preset = this.lensPresets.find((p) => p.id === this._lensId);
+    return preset?.baseLens ?? this._lensId;
+  }
+
   /** Apply a saved preset: base lens plus its captured display options. */
   applyLensPreset(p: LensPreset): void {
     this._lensId = p.id;
     this.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, ...p.weights };
-    this.colorByCluster = p.colorByCluster;
+    this.colorMode = p.colorMode;
     this.clusterResolution = p.clusterResolution;
     this.emit("change");
   }
@@ -393,7 +473,7 @@ export class Model extends EventBus {
       name,
       baseLens: this.lens().id,
       weights: { ...this.clusterWeights },
-      colorByCluster: this.colorByCluster,
+      colorMode: this.colorMode,
       clusterResolution: this.clusterResolution,
     };
     this.lensPresets = [...this.lensPresets, preset];
@@ -434,8 +514,8 @@ export class Model extends EventBus {
   /** True while the required models are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
   /**
-   * Active scope: a circle (world coordinates) whose tracks are re-laid-out by
-   * ``lensId``. ``scopePositions`` holds only the in-scope tracks' scope-lens
+   * Active scope: a circle or box (world coordinates) whose tracks are re-laid-out
+   * by ``lensId``. ``scopePositions`` holds only the in-scope tracks' scope-lens
    * positions, so membership is "has a scope position".
    */
   scope: Scope | null = null;
@@ -458,8 +538,7 @@ export class Model extends EventBus {
 
   /* ── Clustering ─────────────────────────────────────────────
    * ``clusterAssignments`` maps track path → cluster id at the currently
-   * selected resolution; ``clusterNames`` labels those ids. Colouring by
-   * cluster is what makes the microgenre structure legible on the map.
+   * selected resolution; ``clusterNames`` labels those ids.
    */
   clusterAssignments: Map<string, number> = new Map();
   clusterNames: Map<number, string> = new Map();
@@ -468,8 +547,8 @@ export class Model extends EventBus {
   clusterResolutions: number[] = [];
   /** Currently displayed resolution; persisted. */
   clusterResolution = 1.5;
-  /** Colour dots by cluster instead of by folder; persisted. */
-  colorByCluster = false;
+  /** How dots are coloured (folder, cluster, tempo, key); persisted. */
+  colorMode: ColorMode = "folder";
   /**
    * Per-source weights for clustering and the layout; persisted. One vector drives
    * both pipelines so the map and cluster assignments describe the same space.
@@ -482,6 +561,19 @@ export class Model extends EventBus {
    * Empty means every root (the server's default).
    */
   trainFolders: string[] = [];
+
+  /* ── Predicted folders (folder head) ─────────────────────────
+   * ``folderPredictions`` maps track path → the folder head's nearest learned
+   * folder (a virtual path); ``folderPredictionMatches`` is the subset that also
+   * clears its class's match floor. Fetched lazily the first time the "Predicted
+   * folder" colour mode is selected, and invalidated when the head changes.
+   */
+  folderPredictions: Map<string, string> = new Map();
+  folderPredictionMatches: Set<string> = new Set();
+  folderPredictionsLoaded = false;
+  folderPredictionsAvailable = false;
+  /** Predicted-folder colour: confident matches only, or every nearest. Persisted. */
+  headColorConfident = true;
 
   /* ── Track structure ────────────────────────────────────────
    * Coarse intro/drop/break timestamps, fetched lazily per path (the structure
@@ -497,8 +589,21 @@ export class Model extends EventBus {
    */
   searchSections: Map<string, number> = new Map();
 
+  /* ── Active view modifiers ─────────────────────────────────
+   * The stack of reversible changes to what the canvas shows, oldest → newest.
+   * **Esc** dismisses the newest; a chip's × dismisses one. Session-only, like
+   * the exclusions and the scope a modifier may describe.
+   */
+  viewModifiers: ViewModifier[] = [];
+
   private _cache: Track[] | null = null;
   private _pathMap: Map<string, Track> | null = null;
+  /**
+   * Folder prefixes (and ``""``) that contain at least one visible track, derived
+   * from ``tracks``. Cached because the folder tree asks "is this row excluded?"
+   * once per row; scanning every track per row is O(rows × tracks) on each hover.
+   */
+  private _visibleTreePrefixes: Set<string> | null = null;
 
   /** Hidden by path (session-only). */
   hiddenPaths = new Set<string>();
@@ -508,6 +613,12 @@ export class Model extends EventBus {
   externalRootIds = new Set<string>();
   /** Include external-root tracks in the view (persisted, default off). */
   showExternal = false;
+  /**
+   * Fit the projection with external-root tracks included (persisted, default
+   * off). When off, showing externals keeps the library layout and places them
+   * onto it by Nyström extension, so toggling visibility never moves the map.
+   */
+  externalInProjection = false;
   /** Active right-panel tab (persisted); search + properties stay pinned. */
   rightPanelTab: RightPanelTab = "analysis";
 
@@ -547,13 +658,28 @@ export class Model extends EventBus {
 
   /** Visible tracks under ``prefix`` (``""`` or ``"a/b"``), respecting view union + hides. */
   hasVisibleTracksUnderTreePrefix(treePrefix: string): boolean {
+    return this.visibleTreePrefixes().has(treePrefix);
+  }
+
+  /**
+   * Every folder prefix (and ``""``) with at least one visible track under it, in one
+   * pass over the tracks. The folder tree tests each rendered row against this set
+   * rather than rescanning the library per row.
+   */
+  visibleTreePrefixes(): Set<string> {
+    if (this._visibleTreePrefixes) return this._visibleTreePrefixes;
+    const prefixes = new Set<string>();
     for (const t of this.allTracks) {
       if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) continue;
-      const tf = t.folder ?? "";
-      if (treePrefix === "" || tf === treePrefix || tf.startsWith(treePrefix + "/"))
-        return true;
+      prefixes.add("");
+      const folder = t.folder ?? "";
+      const parts = folder.split("/");
+      for (let i = 1; i <= parts.length; i++) {
+        prefixes.add(parts.slice(0, i).join("/"));
+      }
     }
-    return false;
+    this._visibleTreePrefixes = prefixes;
+    return prefixes;
   }
 
   get tracks(): Track[] {
@@ -637,8 +763,14 @@ export class Model extends EventBus {
   /* ── Internal ─────────────────────────────────────────────── */
 
   private _dirty(): void {
-    this._cache = null;
+    this._invalidateView();
     this._pathMap = null;
+  }
+
+  /** Drop the view-derived caches (visible track list + visible folder prefixes). */
+  private _invalidateView(): void {
+    this._cache = null;
+    this._visibleTreePrefixes = null;
   }
 
   private _hasAnyVisibleInViewUnion(): boolean {
@@ -673,21 +805,21 @@ export class Model extends EventBus {
 
   setRecursive(r: boolean): void {
     this.recursive = r;
-    this._cache = null;
+    this._invalidateView();
     this.selected.clear();
     this.emit("change");
   }
 
   hidePaths(paths: Iterable<string>): void {
     this.hiddenPaths = new Set([...this.hiddenPaths, ...paths]);
-    this._cache = null;
+    this._invalidateView();
     this._clearExclusionsIfNoneVisible();
     this.emit("change");
   }
 
   hideFolderTree(prefixNorm: string): void {
     this.hiddenFolderPrefixes.add(prefixNorm);
-    this._cache = null;
+    this._invalidateView();
     this._clearExclusionsIfNoneVisible();
     this.emit("change");
   }
@@ -701,7 +833,7 @@ export class Model extends EventBus {
     )
       return;
     this.externalRootIds = next;
-    this._cache = null;
+    this._invalidateView();
     this._clearExclusionsIfNoneVisible();
     this.emit("change");
   }
@@ -709,8 +841,14 @@ export class Model extends EventBus {
   setShowExternal(show: boolean): void {
     if (this.showExternal === show) return;
     this.showExternal = show;
-    this._cache = null;
+    this._invalidateView();
     this._clearExclusionsIfNoneVisible();
+    this.emit("change");
+  }
+
+  setExternalInProjection(included: boolean): void {
+    if (this.externalInProjection === included) return;
+    this.externalInProjection = included;
     this.emit("change");
   }
 
@@ -731,7 +869,7 @@ export class Model extends EventBus {
       add.push(t.path);
     }
     this.hiddenPaths = new Set([...this.hiddenPaths, ...add]);
-    this._cache = null;
+    this._invalidateView();
     this._clearExclusionsIfNoneVisible();
     this.emit("change");
   }
@@ -766,7 +904,7 @@ export class Model extends EventBus {
       newlyHidden.add(t.path);
     }
     this.hiddenPaths = next;
-    this._cache = null;
+    this._invalidateView();
     this._clearExclusionsIfNoneVisible();
     this.emit("change");
     return newlyHidden;
@@ -886,7 +1024,7 @@ export class Model extends EventBus {
    */
   revealFolderSubtree(prefixNorm: string): void {
     this._mutateRevealFolderSubtree(prefixNorm);
-    this._cache = null;
+    this._invalidateView();
     this.emit("change");
   }
 
@@ -894,7 +1032,7 @@ export class Model extends EventBus {
     if (!this.hasExclusions) return;
     this.hiddenPaths.clear();
     this.hiddenFolderPrefixes.clear();
-    this._cache = null;
+    this._invalidateView();
     this.emit("change");
   }
 
@@ -906,14 +1044,14 @@ export class Model extends EventBus {
   revealThenFocusPaths(paths: Iterable<string>): void {
     const keep = new Set(paths);
     this._mutateRevealPaths(keep);
-    this._cache = null;
+    this._invalidateView();
     this.focusPaths(keep);
   }
 
   /** Un-hide *paths* (and any folder prefix covering one) without changing the rest. */
   revealPaths(paths: Iterable<string>): void {
     this._mutateRevealPaths(paths);
-    this._cache = null;
+    this._invalidateView();
     this.emit("change");
   }
 
@@ -1134,10 +1272,12 @@ export class Model extends EventBus {
         lensPresets: this.lensPresets,
         scopeLensId: this.scopeLensId,
         clusterResolution: this.clusterResolution,
-        colorByCluster: this.colorByCluster,
+        colorMode: this.colorMode,
+        headColorConfident: this.headColorConfident,
         clusterWeights: this.clusterWeights,
         trainFolders: this.trainFolders,
         showExternal: this.showExternal,
+        externalInProjection: this.externalInProjection,
         rightPanelTab: this.rightPanelTab,
       }),
     );
@@ -1178,9 +1318,12 @@ export class Model extends EventBus {
         }
         const cr = Number((d as { clusterResolution?: number }).clusterResolution);
         this.clusterResolution = Number.isFinite(cr) && cr > 0 ? cr : 1.5;
-        this.colorByCluster = Boolean(
-          (d as { colorByCluster?: boolean }).colorByCluster,
+        this.colorMode = _migrateColorMode(
+          (d as { colorMode?: unknown }).colorMode,
+          (d as { colorByCluster?: unknown }).colorByCluster,
         );
+        this.headColorConfident =
+          (d as { headColorConfident?: unknown }).headColorConfident !== false;
         this.clusterWeights = _migrateClusterWeights(
           (d as { clusterWeights?: unknown }).clusterWeights,
         );
@@ -1190,6 +1333,9 @@ export class Model extends EventBus {
           : [];
         this.showExternal = Boolean(
           (d as { showExternal?: boolean }).showExternal,
+        );
+        this.externalInProjection = Boolean(
+          (d as { externalInProjection?: boolean }).externalInProjection,
         );
         const rpTab = (d as { rightPanelTab?: unknown }).rightPanelTab;
         this.rightPanelTab = RIGHT_PANEL_TABS.includes(rpTab as RightPanelTab)

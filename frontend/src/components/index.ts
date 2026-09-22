@@ -7,3 +7,4 @@ export type { SearchResult, SearchMeta } from "./search-view";
 export { SearchView } from "./search-view";
 export { BatchView } from "./batch-view";
 export { StatusView } from "./status-view";
+export { ViewModifierView } from "./view-modifier-view";

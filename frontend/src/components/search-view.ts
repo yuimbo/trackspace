@@ -37,8 +37,10 @@ export class SearchView {
   onFocusResult: ((path: string) => void) | null = null;
   onHoverTrack: ((path: string) => void) | null = null;
   onHoverEnd: (() => void) | null = null;
-  /** The box gained or lost focus — the canvas shows the search field only while active. */
+  /** The search became active (popup opened) or was cleared. */
   onActiveChange: ((active: boolean) => void) | null = null;
+  /** The popup should close (Enter, a result click, or a backdrop click). */
+  onCommit: (() => void) | null = null;
 
   /** Pending live-search timer, so a keystroke burst collapses into one query. */
   private _debounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -54,13 +56,11 @@ export class SearchView {
         e.preventDefault();
         clearTimeout(this._debounceTimer);
         this.onSearch?.(this.$input.value);
+        // Enter commits: the popup closes, the search stays live as a chip.
+        this.onCommit?.();
       } else if (e.key === "Escape") {
         e.preventDefault();
-        clearTimeout(this._debounceTimer);
-        this.$input.value = "";
-        this.clear();
-        // Esc leaves the input: the canvas search field hides with it.
-        this.$input.blur();
+        this._dismiss();
       }
     });
     // Search while typing: the box no longer waits for Enter.
@@ -76,14 +76,56 @@ export class SearchView {
         SEARCH_DEBOUNCE_MS,
       );
     });
-    this.$input.addEventListener("focus", () => this._emitActive());
-    this.$input.addEventListener("blur", () => this._emitActive());
+    // A click on the dimmed backdrop closes the popup without clearing.
+    this.$el.addEventListener("mousedown", (e) => {
+      if (e.target === this.$el) this.onCommit?.();
+    });
+  }
+
+  /** Open the centered popup and focus the query box (``/`` or ``⌘/Ctrl+F``). */
+  open(): void {
+    this.$el.classList.remove("hidden");
+    this.$input.focus();
+    this.$input.select();
+    this.onActiveChange?.(true);
+  }
+
+  /** Close the popup, leaving the live search active as a chip. */
+  close(): void {
+    this.$el.classList.add("hidden");
+    this.$input.blur();
+  }
+
+  /** True while the popup is shown (Esc closes it before it pops a modifier). */
+  isOpen(): boolean {
+    return !this.$el.classList.contains("hidden");
   }
 
   /** Focus the query box (``/`` or ``⌘/Ctrl+F`` hotkey). */
   focusInput(): void {
-    this.$input.focus();
-    this.$input.select();
+    this.open();
+  }
+
+  /** Esc in the box: clear the search and close the popup. */
+  private _dismiss(): void {
+    clearTimeout(this._debounceTimer);
+    this.$input.value = "";
+    this.onSearch?.("");
+    this.onActiveChange?.(false);
+    this.close();
+  }
+
+  /**
+   * Run a query that did not come from typing (a Describe-tab term click).
+   *
+   * The popup opens and the box is filled, so the applied query is visible and
+   * the canvas shows the search field.
+   */
+  setQuery(query: string): void {
+    clearTimeout(this._debounceTimer);
+    this.$input.value = query;
+    this.open();
+    this.onSearch?.(query);
   }
 
   setBusy(busy: boolean): void {
@@ -92,10 +134,17 @@ export class SearchView {
     // state (and hide the canvas field) mid-request. The coordinator drops a
     // response superseded by a newer query.
     this.$el.classList.toggle("searching", busy);
-  }
-
-  private _emitActive(): void {
-    this.onActiveChange?.(document.activeElement === this.$input);
+    // A visible "Searching…" row, so a click on a Describe term shows it is
+    // working even before the ranked list arrives.
+    const note = this.$results.querySelector(".search-busy");
+    if (busy && !note) {
+      const el = document.createElement("div");
+      el.className = "search-busy";
+      el.textContent = "Searching…";
+      this.$results.prepend(el);
+    } else if (!busy && note) {
+      note.remove();
+    }
   }
 
   clear(): void {
@@ -163,7 +212,11 @@ export class SearchView {
 
       row.addEventListener("mouseenter", () => this.onHoverTrack?.(r.path));
       row.addEventListener("mouseleave", () => this.onHoverEnd?.());
-      row.addEventListener("click", () => this.onFocusResult?.(r.path));
+      row.addEventListener("click", () => {
+        this.onFocusResult?.(r.path);
+        // A result click commits: close the popup, keep the search as a chip.
+        this.onCommit?.();
+      });
       this.$results.appendChild(row);
     }
   }

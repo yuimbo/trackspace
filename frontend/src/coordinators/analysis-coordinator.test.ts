@@ -80,7 +80,17 @@ const PANEL_HTML = `
   <div id="toast-container"></div>
   <div id="cluster-meta"></div>
   <ul id="cluster-list"></ul>
-  <input id="cluster-color-toggle" type="checkbox" />
+  <select id="color-mode-select">
+    <option value="folder">Folder</option>
+    <option value="head">Predicted folder</option>
+    <option value="cluster">Cluster</option>
+    <option value="tempo">Tempo</option>
+    <option value="key">Key</option>
+  </select>
+  <select id="head-color-confident">
+    <option value="1">Confident only</option>
+    <option value="0">All nearest</option>
+  </select>
   <input id="cluster-resolution-range" type="range" />
   <div id="cluster-weights"></div>
   <p id="cluster-weights-note"></p>
@@ -110,7 +120,6 @@ interface Harness {
   applyApproximateWeights: ReturnType<typeof vi.fn>;
   canvas: {
     hoverTarget: HoverTarget | null;
-    flashHud: ReturnType<typeof vi.fn>;
   };
   coord: AnalysisCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
@@ -125,7 +134,6 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const applyApproximateWeights = vi.fn(() => true);
   const canvas = {
     hoverTarget: null as HoverTarget | null,
-    flashHud: vi.fn(),
   };
   const coord = new AnalysisCoordinator({
     model,
@@ -363,6 +371,26 @@ describe("AnalysisCoordinator status polling", () => {
     );
     expect(clusterCalls).toHaveLength(0);
   });
+
+  it("invalidates predicted folders when a supervise run finishes", async () => {
+    let outstanding = 1;
+    const { coord } = makeHarness((url) => {
+      if (url.startsWith("/api/jobs/status")) {
+        return makeQueueStatus({
+          kinds: { supervise: makeKind({ outstanding }) },
+        });
+      }
+      return {};
+    });
+    const invalidate = vi.spyOn(coord, "refreshFolderPredictions");
+    // First poll records the outstanding run…
+    await coord.refreshQueueStatus();
+    expect(invalidate).not.toHaveBeenCalled();
+    // …the next poll sees it drain, so the cached head answer is stale.
+    outstanding = 0;
+    await coord.refreshQueueStatus();
+    expect(invalidate).toHaveBeenCalled();
+  });
 });
 
 // ─── Cluster fetch + panel ──────────────────────────────────
@@ -419,7 +447,7 @@ describe("AnalysisCoordinator cluster fetch", () => {
       model,
       status: { update: vi.fn() },
       scheduleDraw: vi.fn(),
-      canvas: { hoverTarget: null, flashHud: vi.fn() },
+      canvas: { hoverTarget: null },
     });
     const p1 = coord.fetchClusters();
     const p2 = coord.fetchClusters();
@@ -507,46 +535,64 @@ describe("AnalysisCoordinator cluster fetch", () => {
 // ─── Panel bindings ─────────────────────────────────────────
 
 describe("AnalysisCoordinator panel bindings", () => {
-  it("enables cluster colouring when clusters are available", () => {
-    const { model, coord, scheduleDraw, canvas } = makeHarness();
+  it("cycles colour modes and mirrors the active one in the panel select", () => {
+    const { model, coord, scheduleDraw } = makeHarness();
     model.clustersAvailable = true;
     coord.bindPanel();
+    vi.spyOn(coord, "fetchFolderPredictions").mockResolvedValue();
 
-    coord.toggleColorByCluster();
-
-    expect(model.colorByCluster).toBe(true);
+    coord.cycleColorMode();
+    expect(model.colorMode).toBe("head");
     expect(
-      (document.getElementById("cluster-color-toggle") as HTMLInputElement).checked,
-    ).toBe(true);
+      (document.getElementById("color-mode-select") as HTMLSelectElement).value,
+    ).toBe("head");
     expect(scheduleDraw).toHaveBeenCalled();
-    // A transient HUD replaces the old "Colouring by …" toast, so repeated presses
-    // never stack a history.
-    expect(canvas.flashHud).toHaveBeenLastCalledWith(
-      expect.arrayContaining([{ id: "cluster", label: "Cluster colour" }]),
-      "cluster",
-    );
-    coord.toggleColorByCluster();
-    expect(canvas.flashHud).toHaveBeenLastCalledWith(
-      expect.anything(),
-      "folder",
-    );
+
+    coord.cycleColorMode();
+    expect(model.colorMode).toBe("cluster");
+
+    coord.cycleColorMode();
+    expect(model.colorMode).toBe("tempo");
+
+    coord.cycleColorMode();
+    expect(model.colorMode).toBe("key");
+
+    coord.cycleColorMode();
+    expect(model.colorMode).toBe("folder");
+  });
+
+  it("cycles colour modes backward with shift", () => {
+    const { model, coord } = makeHarness();
+    model.clustersAvailable = true;
+    model.colorMode = "folder";
+    coord.bindPanel();
+    vi.spyOn(coord, "fetchFolderPredictions").mockResolvedValue();
+
+    coord.cycleColorMode(-1);
+    expect(model.colorMode).toBe("key");
+    coord.cycleColorMode(-1);
+    expect(model.colorMode).toBe("tempo");
+    coord.cycleColorMode(-1);
+    expect(model.colorMode).toBe("cluster");
   });
 
   it("refuses to colour by cluster when none are available, and says why", () => {
     const { model, coord, scheduleDraw } = makeHarness();
     model.clustersAvailable = false;
+    // Start one step before cluster so the refused cycle is the one under test.
+    model.colorMode = "head";
     coord.bindPanel();
     const fetchSpy = vi.spyOn(coord, "fetchClusters").mockResolvedValue();
     vi.mocked(toast).mockClear();
 
-    coord.toggleColorByCluster();
+    coord.cycleColorMode();
 
-    expect(model.colorByCluster).toBe(false);
-    const $cc = document.getElementById(
-      "cluster-color-toggle",
-    ) as HTMLInputElement;
-    expect($cc.checked).toBe(false);
-    expect($cc.disabled).toBe(true);
+    expect(model.colorMode).toBe("head");
+    expect(
+      document
+        .getElementById("color-mode-select")!
+        .querySelector<HTMLOptionElement>('option[value="cluster"]')!.disabled,
+    ).toBe(true);
     expect(toast).toHaveBeenCalledWith(
       expect.stringContaining("Rebuild clusters"),
       "warn",
@@ -556,14 +602,105 @@ describe("AnalysisCoordinator panel bindings", () => {
     expect(scheduleDraw).not.toHaveBeenCalled();
   });
 
-  it("does not refetch when toggling colouring off", () => {
+  it("applies a colour mode picked from the panel select", () => {
     const { model, coord } = makeHarness();
     model.clustersAvailable = true;
-    model.colorByCluster = true;
+    coord.bindPanel();
+
+    const $cm = document.getElementById("color-mode-select") as HTMLSelectElement;
+    $cm.value = "key";
+    $cm.dispatchEvent(new Event("change"));
+
+    expect(model.colorMode).toBe("key");
+  });
+
+  it("fetches predicted folders on first selection of that mode", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/supervised/predictions")
+        ? {
+            available: true,
+            assignments: { "a.mp3": "Root/Techno" },
+            matched: ["a.mp3"],
+          }
+        : {},
+    );
+    coord.bindPanel();
+    expect(model.folderPredictionsLoaded).toBe(false);
+
+    coord.cycleColorMode(); // folder → head
+    await flush();
+
+    expect(model.colorMode).toBe("head");
+    expect(model.folderPredictionsAvailable).toBe(true);
+    expect(model.folderPredictions.get("a.mp3")).toBe("Root/Techno");
+    expect(model.folderPredictionMatches.has("a.mp3")).toBe(true);
+    expect(model.folderPredictionsLoaded).toBe(true);
+  });
+
+  it("warns when no head is trained and falls back to folder colours", async () => {
+    const { model, coord } = makeHarness(() => ({
+      available: false,
+      assignments: {},
+      matched: [],
+    }));
+    coord.bindPanel();
+    vi.mocked(toast).mockClear();
+
+    coord.cycleColorMode(); // folder → head
+    await flush();
+
+    expect(model.colorMode).toBe("head");
+    expect(model.folderPredictionsAvailable).toBe(false);
+    expect(model.folderPredictions.size).toBe(0);
+    expect(toast).toHaveBeenCalledWith(
+      expect.stringContaining("Train the folder head"),
+      "warn",
+    );
+  });
+
+  it("persists the confidence gate and disables it outside head mode", () => {
+    const { model, coord } = makeHarness();
+    model.colorMode = "head";
+    coord.bindPanel();
+
+    const $hc = document.getElementById(
+      "head-color-confident",
+    ) as HTMLSelectElement;
+    expect($hc.disabled).toBe(false);
+    expect($hc.value).toBe("1");
+
+    $hc.value = "0";
+    $hc.dispatchEvent(new Event("change"));
+    expect(model.headColorConfident).toBe(false);
+
+    // Switching away disables the gate, which only affects predicted folders.
+    model.colorMode = "folder";
+    coord.applyColorMode("folder", false);
+    expect($hc.disabled).toBe(true);
+  });
+
+  it("invalidates and refetches predictions when the head changes", async () => {
+    const { model, coord } = makeHarness(() => ({ available: false }));
+    model.folderPredictionsLoaded = true;
+    model.colorMode = "head";
+    const fetchSpy = vi
+      .spyOn(coord, "fetchFolderPredictions")
+      .mockResolvedValue();
+
+    coord.refreshFolderPredictions();
+
+    expect(model.folderPredictionsLoaded).toBe(false);
+    expect(fetchSpy).toHaveBeenCalled();
+  });
+
+  it("does not refetch when cycling colouring", () => {
+    const { model, coord } = makeHarness();
+    model.clustersAvailable = true;
+    model.colorMode = "head";
     coord.bindPanel();
     const fetchSpy = vi.spyOn(coord, "fetchClusters").mockResolvedValue();
-    coord.toggleColorByCluster();
-    expect(model.colorByCluster).toBe(false);
+    coord.cycleColorMode();
+    expect(model.colorMode).toBe("cluster");
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 

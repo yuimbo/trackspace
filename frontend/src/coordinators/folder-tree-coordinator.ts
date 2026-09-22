@@ -14,7 +14,26 @@ import { toast } from "../lib/toast";
 import { dirColor } from "../lib/colors";
 import { postJSON } from "../lib/api";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
+import { HOTKEY_MAP } from "../hotkeys";
 import htmx from "htmx.org";
+
+/** Hotkey-driven canvas actions the folder popout can trigger. */
+export type FolderCanvasAction =
+  | "focus-folder"
+  | "isolate-selection"
+  | "fit-view"
+  | "exclude-selection";
+
+/** One button in the folder-row action popout. */
+interface FolderAction {
+  action: string;
+  glyph: string;
+  label: string;
+  hotkey?: string;
+}
+
+const hotkeyLabel = (action: string): string | undefined =>
+  HOTKEY_MAP.find((b) => b.action === action)?.label;
 
 export interface FolderTreeDeps {
   model: Model;
@@ -36,6 +55,8 @@ export interface FolderTreeDeps {
   refreshProjection?(): Promise<void> | void;
   /** Prefill the imprint target with a root's absolute path. */
   onImprintRoot?(absPath: string): void;
+  /** Run a hotkey-driven canvas action on the currently hovered folder. */
+  runCanvasAction?(action: FolderCanvasAction): void;
 }
 
 export class FolderTreeCoordinator {
@@ -54,6 +75,14 @@ export class FolderTreeCoordinator {
   private _rootDragId: string | null = null;
   private _rootDragRow: HTMLElement | null = null;
 
+  /** True while the one-off background heal of missing external positions runs. */
+  private _externalHealInFlight = false;
+
+  /** The row whose action popout is open, if any. */
+  private _actionsRow: HTMLElement | null = null;
+  private _actionsEl!: HTMLElement;
+  private _hideActionsTimer: number | null = null;
+
   constructor(private deps: FolderTreeDeps) {
     this.$folderTree = document.getElementById("folder-tree")!;
   }
@@ -61,10 +90,186 @@ export class FolderTreeCoordinator {
   /* ── Binding ────────────────────────────────────────────── */
 
   bind(): void {
+    this._bindFolderActions();
     this._bindFolderTree();
     this._bindRootImport();
     this._bindShowExternal();
+    this._bindExternalProjection();
     this._bindOverlay();
+  }
+
+  /* ── Row action popout ──────────────────────────────────── */
+
+  /**
+   * A single toolbar that floats to the right of whichever folder row is hovered,
+   * replacing the per-row inline icons. Every action the row supports becomes a
+   * button; actions that also have a global hotkey carry a `<kbd>` badge.
+   */
+  private _bindFolderActions(): void {
+    let el = document.getElementById("folder-actions");
+    if (!el) {
+      el = document.createElement("div");
+      el.id = "folder-actions";
+      el.className = "folder-actions hidden";
+      el.setAttribute("role", "toolbar");
+      el.setAttribute("aria-label", "Folder actions");
+      document.body.appendChild(el);
+    }
+    this._actionsEl = el;
+    el.addEventListener("mouseenter", () => {
+      this._cancelHideActions();
+      // Moving off the row onto the toolbar must keep its canvas hover alive.
+      this._setHoveredRow(this._actionsRow);
+    });
+    el.addEventListener("mouseleave", () => this._scheduleHideActions());
+    el.addEventListener("click", (e) => this._onFolderActionClick(e));
+    // The toolbar is pinned to a row's viewport position; scrolling or resizing
+    // would strand it, so hide rather than try to track the row.
+    window.addEventListener("scroll", () => this._hideActions(), true);
+    window.addEventListener("resize", () => this._hideActions());
+  }
+
+  private _showFolderActions(row: HTMLElement): void {
+    if (row.classList.contains("folder-row-create")) return;
+    if (row.dataset.folderPath == null) return;
+    this._cancelHideActions();
+    this._actionsRow = row;
+    this._renderFolderActions(row);
+    this._actionsEl.classList.remove("hidden");
+    this._positionFolderActions(row);
+  }
+
+  private _renderFolderActions(row: HTMLElement): void {
+    this._actionsEl.innerHTML = "";
+    for (const def of this._folderActionDefs(row)) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "folder-action-btn";
+      btn.dataset.folderAction = def.action;
+      btn.title = def.label;
+      btn.setAttribute("aria-label", def.label);
+      const glyph = document.createElement("span");
+      glyph.className = "folder-action-glyph";
+      glyph.textContent = def.glyph;
+      btn.appendChild(glyph);
+      const label = document.createElement("span");
+      label.className = "folder-action-label";
+      label.textContent = def.label;
+      btn.appendChild(label);
+      if (def.hotkey) {
+        const kbd = document.createElement("kbd");
+        kbd.className = "folder-action-hotkey";
+        kbd.textContent = def.hotkey;
+        btn.appendChild(kbd);
+      }
+      this._actionsEl.appendChild(btn);
+    }
+  }
+
+  /** Every action a row supports, in display order, with its hotkey badge. */
+  private _folderActionDefs(row: HTMLElement): FolderAction[] {
+    const path = row.dataset.folderPath ?? ".";
+    const isRoot = row.dataset.rootId != null;
+    const isExternal = row.dataset.rootRole === "external";
+    const isLeaf = row.querySelector("[data-folder-toggle]") == null;
+    const defs: FolderAction[] = [
+      { action: "focus-folder", glyph: "◆", label: "Select tracks", hotkey: hotkeyLabel("focus-folder") },
+      { action: "isolate-selection", glyph: "◉", label: "Isolate", hotkey: hotkeyLabel("isolate-selection") },
+      { action: "fit-view", glyph: "⤢", label: "Fit view", hotkey: hotkeyLabel("fit-view") },
+      { action: "exclude-selection", glyph: "⊘", label: "Exclude", hotkey: hotkeyLabel("exclude-selection") },
+      { action: "reveal", glyph: "↗", label: "Reveal in Finder" },
+    ];
+    if (path !== ".") defs.push({ action: "rename", glyph: "✎", label: "Rename" });
+    if (isLeaf) defs.push({ action: "add-subfolder", glyph: "+", label: "New subfolder" });
+    if (isRoot) {
+      defs.push({
+        action: "role",
+        glyph: isExternal ? "▤" : "◇",
+        label: isExternal ? "Move to My library" : "Mark as External",
+      });
+      if (isExternal)
+        defs.push({ action: "imprint", glyph: "⇥", label: "Imprint structure…" });
+      defs.push({ action: "remove", glyph: "✕", label: "Remove root" });
+    }
+    return defs;
+  }
+
+  private _positionFolderActions(row: HTMLElement): void {
+    const rect = row.getBoundingClientRect();
+    const el = this._actionsEl;
+    const top = Math.max(6, Math.min(rect.top, window.innerHeight - el.offsetHeight - 6));
+    el.style.top = `${top}px`;
+    el.style.left = `${rect.right + 6}px`;
+  }
+
+  private _onFolderActionClick(e: MouseEvent): void {
+    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-folder-action]");
+    if (!btn || !this._actionsRow) return;
+    e.stopPropagation();
+    const row = this._actionsRow;
+    const path = row.dataset.folderPath ?? ".";
+    switch (btn.dataset.folderAction) {
+      case "focus-folder":
+      case "isolate-selection":
+      case "fit-view":
+      case "exclude-selection":
+        this.deps.runCanvasAction?.(btn.dataset.folderAction as FolderCanvasAction);
+        break;
+      case "reveal":
+        void postJSON("/api/folders/reveal", { path: path === "." ? "" : path });
+        break;
+      case "rename": {
+        const label = row.querySelector(".folder-label") as HTMLElement | null;
+        if (label) this._beginFolderLabelRename(label);
+        break;
+      }
+      case "add-subfolder":
+        void this._createSubfolder(path === "." ? "" : path);
+        break;
+      case "role":
+        void this._setRootRole(
+          row.dataset.rootId ?? "",
+          row.dataset.rootRole === "external" ? "library" : "external",
+        );
+        break;
+      case "imprint":
+        this.deps.onImprintRoot?.(row.dataset.rootAbs ?? "");
+        break;
+      case "remove":
+        this._confirmRemoveRoot(row);
+        break;
+    }
+    this._hideActions();
+  }
+
+  private _scheduleHideActions(): void {
+    this._cancelHideActions();
+    this._hideActionsTimer = window.setTimeout(() => this._hideActions(), 150);
+  }
+
+  private _cancelHideActions(): void {
+    if (this._hideActionsTimer != null) {
+      window.clearTimeout(this._hideActionsTimer);
+      this._hideActionsTimer = null;
+    }
+  }
+
+  private _hideActions(): void {
+    this._cancelHideActions();
+    this._actionsRow = null;
+    this._actionsEl?.classList.add("hidden");
+  }
+
+  /** Point the canvas hover at a folder row (or clear it when *row* is null). */
+  private _setHoveredRow(row: HTMLElement | null): void {
+    const path = row?.dataset.folderPath;
+    if (row == null || path == null) return;
+    this.deps.canvas.hoveredSiblingFolder = null;
+    this.deps.canvas.hoverTarget = {
+      kind: "folder",
+      prefix: path === "." ? "" : path,
+    };
+    this.deps.canvas.scheduleDraw();
   }
 
   /** Toggle whether external-root tracks are drawn (persisted on the model). */
@@ -77,10 +282,41 @@ export class FolderTreeCoordinator {
     $toggle.addEventListener("change", () => {
       this.deps.model.setShowExternal($toggle.checked);
       this.deps.model.saveLS();
-      // The default layout fits library roots only; showing externals needs a
-      // layout that actually contains them.
+      // External positions ride along with every chart, so this is a pure redraw:
+      // no refetch, no wait. A chart fetched before the tree revealed the
+      // roots is healed once in the background by `_syncExternalRoots`.
+      this.deps.canvas.scheduleDraw();
+    });
+  }
+
+  /** Toggle whether the projection is refit with external roots (persisted). */
+  private _bindExternalProjection(): void {
+    const $toggle = document.getElementById(
+      "external-projection-toggle",
+    ) as HTMLInputElement | null;
+    if (!$toggle) return;
+    $toggle.checked = this.deps.model.externalInProjection;
+    $toggle.addEventListener("change", () => {
+      this.deps.model.setExternalInProjection($toggle.checked);
+      this.deps.model.saveLS();
       void this.deps.refreshProjection?.();
     });
+  }
+
+  /**
+   * Mirror the external visibility toggles onto the folder controls. The model can be
+   * changed from outside this panel (an active-view-modifier chip), so the checkboxes
+   * must follow every "change", not only their own input events.
+   */
+  syncExternalToggles(): void {
+    const $toggle = document.getElementById(
+      "show-external-toggle",
+    ) as HTMLInputElement | null;
+    if ($toggle) $toggle.checked = this.deps.model.showExternal;
+    const $projection = document.getElementById(
+      "external-projection-toggle",
+    ) as HTMLInputElement | null;
+    if ($projection) $projection.checked = this.deps.model.externalInProjection;
   }
 
   private _bindFolderTree(): void {
@@ -120,21 +356,23 @@ export class FolderTreeCoordinator {
   }
 
   private _afterFolderTreeSwap(): void {
+    this._hideActions();
     for (const row of this.$folderTree.querySelectorAll(".folder-row")) {
       row.addEventListener("mouseenter", () => {
-        const path = row.getAttribute("data-folder-path");
-        if (path == null) return;
-        this.deps.canvas.hoveredSiblingFolder = null;
-        this.deps.canvas.hoverTarget = {
-          kind: "folder",
-          prefix: path === "." ? "" : path,
-        };
-        this.deps.canvas.scheduleDraw();
+        this._setHoveredRow(row as HTMLElement);
+        this._showFolderActions(row as HTMLElement);
       });
-      row.addEventListener("mouseleave", () => {
+      row.addEventListener("mouseleave", (e) => {
         if (this.deps.isPointerBusy()) return;
+        const to = (e as MouseEvent).relatedTarget as Node | null;
+        if (to && this._actionsEl.contains(to)) {
+          // Moving onto the popout: keep the row's canvas hover alive.
+          this._cancelHideActions();
+          return;
+        }
         this.deps.canvas.hoverTarget = null;
         this.deps.canvas.scheduleDraw();
+        this._scheduleHideActions();
       });
     }
 
@@ -170,8 +408,34 @@ export class FolderTreeCoordinator {
       "show-external-toggle",
     ) as HTMLInputElement | null;
     if ($toggle) $toggle.checked = this.deps.model.showExternal;
-    const $label = document.getElementById("show-external-label");
-    $label?.classList.toggle("hidden", external.size === 0);
+    const $projection = document.getElementById(
+      "external-projection-toggle",
+    ) as HTMLInputElement | null;
+    if ($projection) $projection.checked = this.deps.model.externalInProjection;
+    for (const id of ["show-external-label", "external-projection-label"]) {
+      document.getElementById(id)?.classList.toggle("hidden", external.size === 0);
+    }
+    this._healExternalPositions();
+  }
+
+  /**
+   * Fetch the chart once more if it was built before the tree revealed the
+   * external roots: their positions ride along with every projection, so a chart
+   * fetched without them has none, and the visibility toggle must not be the thing
+   * that pays for them.
+   */
+  private _healExternalPositions(): void {
+    const m = this.deps.model;
+    if (this._externalHealInFlight || m.externalRootIds.size === 0) return;
+    if (!m.embeddingsReady) return;
+    for (const t of m.allTracks) {
+      if (!m.isExternalTrack(t) || m.embeddingPositions.has(t.path)) continue;
+      this._externalHealInFlight = true;
+      Promise.resolve(this.deps.refreshProjection?.()).finally(() => {
+        this._externalHealInFlight = false;
+      });
+      return;
+    }
   }
 
   /* ── Root import / removal ──────────────────────────────── */
@@ -329,6 +593,23 @@ export class FolderTreeCoordinator {
     toast("Root removed", "ok");
   }
 
+  /** Confirm and drop a root from trackspace (files and cache are kept). */
+  private _confirmRemoveRoot(row: HTMLElement): void {
+    const rootId = row.dataset.rootId ?? "";
+    if (!rootId) return;
+    const label = row.dataset.rootAbs || rootId;
+    if (
+      !window.confirm(
+        `Remove "${label}" from trackspace?\n\n` +
+          "Its files stay on disk and its cached analysis is kept, so " +
+          "re-adding the folder restores it instantly.",
+      )
+    ) {
+      return;
+    }
+    void this._removeRoot(rootId);
+  }
+
   /** Toggle a root between My library and External (analysed either way). */
   private async _setRootRole(rootId: string, role: string): Promise<void> {
     const res = await postJSON<{ ok: boolean; error?: string }>(
@@ -376,58 +657,6 @@ export class FolderTreeCoordinator {
       const btn = t.closest(".folder-add-btn") as HTMLElement;
       const parent = btn.dataset.parent ?? "";
       void this._createSubfolder(parent);
-      return;
-    }
-
-    if (t.closest(".folder-reveal-btn")) {
-      e.stopPropagation();
-      const btn = t.closest(".folder-reveal-btn") as HTMLElement;
-      const path = btn.dataset.path ?? ".";
-      void postJSON("/api/folders/reveal", { path: path === "." ? "" : path });
-      return;
-    }
-
-    if (t.closest(".folder-role-btn")) {
-      e.stopPropagation();
-      const btn = t.closest(".folder-role-btn") as HTMLElement;
-      const rootId = btn.dataset.rootId ?? "";
-      const role = btn.dataset.role === "external" ? "library" : "external";
-      void this._setRootRole(rootId, role);
-      return;
-    }
-
-    if (t.closest(".folder-imprint-btn")) {
-      e.stopPropagation();
-      const btn = t.closest(".folder-imprint-btn") as HTMLElement;
-      const absPath = btn.dataset.rootAbs ?? "";
-      if (absPath) this.deps.onImprintRoot?.(absPath);
-      return;
-    }
-
-    if (t.closest(".folder-remove-btn")) {
-      e.stopPropagation();
-      const btn = t.closest(".folder-remove-btn") as HTMLElement;
-      const rootId = btn.dataset.rootId ?? "";
-      if (!rootId) return;
-      const label = btn.dataset.rootAbs || rootId;
-      if (
-        !window.confirm(
-          `Remove "${label}" from trackspace?\n\n` +
-            "Its files stay on disk and its cached analysis is kept, so " +
-            "re-adding the folder restores it instantly.",
-        )
-      ) {
-        return;
-      }
-      void this._removeRoot(rootId);
-      return;
-    }
-
-    if (t.closest(".folder-rename-btn")) {
-      e.stopPropagation();
-      const row = t.closest(".folder-row") as HTMLElement;
-      const label = row.querySelector(".folder-label") as HTMLElement | null;
-      if (label) this._beginFolderLabelRename(label);
       return;
     }
 
@@ -749,15 +978,20 @@ export class FolderTreeCoordinator {
       row.dataset.folderPath = folder === "" ? "." : folder;
       row.addEventListener("mouseenter", () => {
         row.classList.add("folder-hover");
-        this.deps.canvas.hoveredSiblingFolder = null;
-        this.deps.canvas.hoverTarget = { kind: "folder", prefix: folder };
-        this.deps.canvas.scheduleDraw();
+        this._setHoveredRow(row);
+        this._showFolderActions(row);
       });
-      row.addEventListener("mouseleave", () => {
+      row.addEventListener("mouseleave", (e) => {
         row.classList.remove("folder-hover");
         if (this.deps.isPointerBusy()) return;
+        const to = (e as MouseEvent).relatedTarget as Node | null;
+        if (to && this._actionsEl.contains(to)) {
+          this._cancelHideActions();
+          return;
+        }
         this.deps.canvas.hoverTarget = null;
         this.deps.canvas.scheduleDraw();
+        this._scheduleHideActions();
       });
       const arrow = document.createElement("span");
       arrow.className = "folder-arrow";

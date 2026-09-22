@@ -13,6 +13,7 @@ import type {
   BatchView,
   StatusView,
   SearchView,
+  ViewModifierView,
 } from "./components";
 import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
@@ -27,10 +28,14 @@ import { HotkeyManager } from "./hotkeys";
 import { AnalysisCoordinator } from "./coordinators/analysis-coordinator";
 import { HeadCoordinator } from "./coordinators/head-coordinator";
 import { EmbeddingCoordinator } from "./coordinators/embedding-coordinator";
-import { FolderTreeCoordinator } from "./coordinators/folder-tree-coordinator";
+import {
+  FolderTreeCoordinator,
+  type FolderCanvasAction,
+} from "./coordinators/folder-tree-coordinator";
 import { CanvasInteractionController } from "./coordinators/canvas-interaction";
 import { OptionsPanelBinder } from "./coordinators/options-panel";
 import { RightPanelBinder } from "./coordinators/right-panel";
+import { ViewModifierCoordinator } from "./coordinators/view-modifier-coordinator";
 import {
   SearchCoordinator,
   type SearchResponse,
@@ -38,6 +43,7 @@ import {
 import {
   InspectCoordinator,
   PROXIMITY_ALL,
+  type DescribeResponse,
   type SimilarResponse,
 } from "./coordinators/inspect-coordinator";
 
@@ -75,10 +81,16 @@ export class Controller {
   private batch: BatchView;
   private status: StatusView;
   private searchView: SearchView;
+  /** Corner stack of active view modifiers (search, proximity, scope, …). */
+  private viewModifiers: ViewModifierView;
 
   private previewPath: string | null = null;
   /** Paths with an in-flight structure fetch, so a hover burst fetches once. */
   private structurePending = new Set<string>();
+  /** Filter-tag → its chip id, so each active range filter has one chip. */
+  private filterModifierIds = new Map<string, string>();
+  /** Signature of the last exclusion set, so its hidden count recomputes only on change. */
+  private _exclusionKey = "";
   private $audio: HTMLAudioElement;
   private pending = new Map<string, PendingUpdate>();
   private cmdMgr: CommandManager;
@@ -108,6 +120,9 @@ export class Controller {
   /** Semantic search: query fetch, result selection, result panel. */
   private search: SearchCoordinator;
 
+  /** The stack of active view modifiers, shown as corner chips. */
+  private viewMods: ViewModifierCoordinator;
+
   /** Pinned inspect card: anti-track / nearest / solo-neighbourhood. */
   private inspect: InspectCoordinator;
 
@@ -120,6 +135,7 @@ export class Controller {
     batchView: BatchView,
     statusView: StatusView,
     searchView: SearchView,
+    viewModifierView: ViewModifierView,
   ) {
     this.model = model;
     this.canvas = canvasView;
@@ -129,6 +145,12 @@ export class Controller {
     this.batch = batchView;
     this.status = statusView;
     this.searchView = searchView;
+    this.viewModifiers = viewModifierView;
+
+    this.viewMods = new ViewModifierCoordinator({
+      model,
+      view: viewModifierView,
+    });
 
     this.cmdMgr = new CommandManager((effect) => {
       if (effect === "tags-dirty") {
@@ -150,6 +172,7 @@ export class Controller {
       // training run, an import, or a fan-out that moves tracks between folders.
       refreshProjection: () => this.embedding.refreshProjection(),
       refreshClusters: () => void this.analysis.fetchClusters(),
+      refreshPredictions: () => this.analysis.refreshFolderPredictions(),
       // An imprint registers/removes a root, so the library and tree must
       // follow: the root set and the visible track set stay in step.
       onRootsChanged: () => this._reloadLibraryAndTree(),
@@ -185,6 +208,7 @@ export class Controller {
       model,
       status: statusView,
       canvas: canvasView,
+      viewMods: this.viewMods,
     });
 
     this.interaction = new CanvasInteractionController({
@@ -205,19 +229,26 @@ export class Controller {
       onHoverFolderChanged: () => this.folders.updateHighlights(),
       onHoverPreview: () => this._handlePreview(),
       stopPreview: () => this._stopPreview(),
+      togglePreview: () => this._togglePreview(),
+      adjustPreviewVolume: (factor) => this._adjustPreviewVolume(factor),
+      commitPreviewVolume: () => this.model.saveLS(),
       // Viewport moves (focus/homing) tween on the shared canvas frame.
       tweenViewport: (target) => this.embedding.tweenViewport(target),
       // The scope's lens is switched from its on-canvas tab bar.
       openScope: (scope, lensId, allowEmpty) =>
         void this.embedding.openScope(scope, lensId, allowEmpty),
       setScopeLens: (lensId) => void this.embedding.setScopeLens(lensId),
-      resizeScope: (r) => void this.embedding.resizeScope(r),
+      resizeScope: (factor) => void this.embedding.resizeScope(factor),
       closeScope: () => this.embedding.closeScope(),
+      // The persistent top tabbers switch the main lens / colour mode.
+      switchLens: (lensId) => void this.embedding.switchToLens(lensId),
+      setColorMode: (mode) => this.analysis.applyColorMode(mode, true),
     });
 
     this.search = new SearchCoordinator({
       model,
       view: searchView,
+      viewMods: this.viewMods,
       fetchResults: (query, limit) =>
         api<SearchResponse>(
           `/api/search?q=${encodeURIComponent(query)}&limit=${limit}&field=1`,
@@ -230,6 +261,11 @@ export class Controller {
         this.canvas.searchField = field;
         this.canvas.scheduleDraw();
       },
+      // The matched paths drive the fade; purely visual, so on the canvas.
+      setResults: (paths) => {
+        this.canvas.searchResults = paths ? new Set(paths) : null;
+        this.canvas.scheduleDraw();
+      },
     });
 
     this.inspect = new InspectCoordinator({
@@ -238,10 +274,17 @@ export class Controller {
         setInspect: (patch) => canvasView.setInspect(patch),
         unpinInspect: () => canvasView.unpinInspect(),
       },
+      viewMods: this.viewMods,
       fetchSimilar: (path, mode, k) =>
         api<SimilarResponse>(
           `/api/tracks/similar?path=${encodeURIComponent(path)}&mode=${mode}` +
             (k === PROXIMITY_ALL ? "&all=1" : `&k=${k}`),
+          undefined,
+          true,
+        ),
+      fetchDescribe: (path, limit) =>
+        api<DescribeResponse>(
+          `/api/tracks/describe?path=${encodeURIComponent(path)}&limit=${limit}`,
           undefined,
           true,
         ),
@@ -253,8 +296,15 @@ export class Controller {
       },
       stopPreview: () => this._stopPreview(),
     });
-    canvasView.onInspectAction = (action, path, value) =>
+    canvasView.onInspectAction = (action, path, value) => {
+      // The card shows the head's projected folder, so load the predictions the
+      // first time a card is pinned rather than waiting for that colour mode.
+      if (action === "open" && !model.folderPredictionsLoaded)
+        void this.analysis.fetchFolderPredictions();
       void this.inspect.action(action, path, value);
+    };
+    // A Describe-tab term is a semantic search: run it like a typed query.
+    canvasView.onSearchTerm = (term) => this.searchView.setQuery(term);
 
     this.folders = new FolderTreeCoordinator({
       model,
@@ -268,11 +318,19 @@ export class Controller {
       refreshProjection: () => this.embedding.refreshProjection(),
       // "Imprint this root" on an external row prefills the head panel's target.
       onImprintRoot: (absPath) => this.head.prefillImprint(absPath),
+      // The hover popout's buttons run the same canvas actions as the hotkeys.
+      runCanvasAction: (action) => this._runCanvasAction(action),
     });
 
     this.options = new OptionsPanelBinder({
       model,
-      selectLens: (id) => void this.embedding.switchToLens(id),
+      selectLens: (id) => {
+        void this.embedding.switchToLens(id);
+        // A preset carries its colour mode. `switchToLens` applies it
+        // synchronously before its first await, so re-applying it here syncs the
+        // colour controls and fetches predicted folders if that mode needs them.
+        this.analysis.applyColorMode(model.colorMode, false);
+      },
       saveLensPreset: () => {
         const name = window.prompt("Preset name");
         if (!name || !name.trim()) return;
@@ -306,9 +364,9 @@ export class Controller {
     this.head.bindPanel();
     this._bindKeyboard();
     this._bindResize();
-    this._bindViewportChrome();
     this.options.sync();
     this.embedding.syncLensChrome();
+    this._syncViewModifierChips();
   }
 
   private _renderTagPanels(): void {
@@ -328,7 +386,8 @@ export class Controller {
       this.options.sync();
       this.folders.updateHighlights();
       this.folders.syncActiveLabels();
-      this._updateClearHidesButton();
+      this.folders.syncExternalToggles();
+      this._syncViewModifierChips();
       // ``m.tracks`` is rebuilt when hides/filters change; ``hoveredIdx`` must be
       // re-derived from the pointer after the next paint or hotkeys see a stale index.
       requestAnimationFrame(() => this.interaction.resyncHoverFromLastPointer());
@@ -405,10 +464,24 @@ export class Controller {
       void this.search.search(query);
     };
     this.searchView.onFocusResult = (path) => this.search.focusResult(path);
-    // The canvas shows the search field only while the search box is focused.
+    // Enter or a result click commits: the popup closes, the search stays live
+    // as a chip. The canvas field follows the search's active state.
+    this.searchView.onCommit = () => this.searchView.close();
     this.searchView.onActiveChange = (active) => {
       this.canvas.searchActive = active;
       this.canvas.scheduleDraw();
+    };
+
+    // Active-view-modifier chips: × dismisses one (the coordinator runs its
+    // clear callback), the inline controls drive the same model state the panels do.
+    this.viewModifiers.onDismiss = (id) => this.viewMods.dismiss(id);
+    this.viewModifiers.onProximityInput = (_id, percent) => {
+      void this.inspect.setProximityFromChip(percent);
+    };
+    this.viewModifiers.onExternalRefit = (_id, checked) => {
+      m.setExternalInProjection(checked);
+      m.saveLS();
+      void this.embedding.refreshProjection();
     };
 
     this.batch.onApply = (tag, updates) => {
@@ -432,10 +505,88 @@ export class Controller {
     };
   }
 
-  private _updateClearHidesButton(): void {
-    const btn = document.getElementById("viewport-clear-hides");
-    if (!btn) return;
-    btn.classList.toggle("hidden", !this.model.hasExclusions);
+  /**
+   * Mirror the visibility-filtering model state into the modifier chip stack:
+   * exclusions, per-tag range filters, and shown external tracks.
+   */
+  private _syncViewModifierChips(): void {
+    this._syncExclusionsModifier();
+    this._syncFilterModifiers();
+    this._syncExternalModifier();
+  }
+
+  private _syncExclusionsModifier(): void {
+    const m = this.model;
+    const active = this.viewMods.find("exclusions");
+    if (!m.hasExclusions) {
+      if (active) this.viewMods.remove(active.id);
+      this._exclusionKey = "";
+      return;
+    }
+    const key = `${m.hiddenPaths.size}|${[...m.hiddenFolderPrefixes].sort().join(",")}`;
+    let detail = active?.detail ?? "";
+    if (key !== this._exclusionKey) {
+      this._exclusionKey = key;
+      let n = 0;
+      for (const t of m.allTracks) if (m.isTrackHidden(t)) n++;
+      detail = `${n} hidden`;
+    }
+    if (active) this.viewMods.update(active.id, { detail });
+    else
+      this.viewMods.push({ kind: "exclusions", label: "Excluded", detail }, () =>
+        m.clearExclusions(),
+      );
+  }
+
+  private _syncFilterModifiers(): void {
+    const m = this.model;
+    const tags = Object.keys(m.filterRanges);
+    for (const [tag, id] of [...this.filterModifierIds]) {
+      if (tags.includes(tag)) continue;
+      this.filterModifierIds.delete(tag);
+      this.viewMods.remove(id);
+    }
+    for (const tag of tags) {
+      const [lo, hi] = m.filterRanges[tag];
+      const detail = `${Math.round(lo * 100)}–${Math.round(hi * 100)}%`;
+      const id = this.filterModifierIds.get(tag);
+      if (id) {
+        this.viewMods.update(id, { detail });
+      } else {
+        this.filterModifierIds.set(
+          tag,
+          this.viewMods.push(
+            { kind: "filters", label: m.axisDisplayName(tag), detail },
+            () => {
+              delete m.filterRanges[tag];
+              m.emit("change");
+            },
+          ),
+        );
+      }
+    }
+  }
+
+  private _syncExternalModifier(): void {
+    const m = this.model;
+    const active = this.viewMods.find("external");
+    if (!m.showExternal) {
+      if (active) this.viewMods.remove(active.id);
+      return;
+    }
+    const patch = {
+      label: "External tracks",
+      detail: m.externalInProjection ? "refit" : "library layout",
+      checked: m.externalInProjection,
+    };
+    if (active) {
+      this.viewMods.update(active.id, patch);
+    } else {
+      this.viewMods.push({ kind: "external", ...patch }, () => {
+        m.setShowExternal(false);
+        m.saveLS();
+      });
+    }
   }
 
   /* ── Data loading ───────────────────────────────────────── */
@@ -491,15 +642,19 @@ export class Controller {
         const data = JSON.parse(e.data) as {
           done: number;
           total: number;
-          track: Track;
+          track?: Track;
+          tracks?: Track[];
         };
-        this._libPending.push(data.track);
-        const tr = data.track;
+        // The server chunks progress into batches of tracks; accept a single
+        // `track` too so an older server still works.
+        const batch = data.tracks ?? (data.track ? [data.track] : []);
+        for (const t of batch) this._libPending.push(t);
+        const tr = batch.length ? batch[batch.length - 1] : undefined;
         m.libraryLoadProgress = {
           done: data.done,
           total: data.total,
-          lastPath: tr.path,
-          lastTitle: tr.title?.trim() || undefined,
+          lastPath: tr?.path,
+          lastTitle: tr?.title?.trim() || undefined,
         };
         if ($progress) {
           $progress.textContent = `Loading library… ${data.done} / ${data.total}`;
@@ -616,6 +771,23 @@ export class Controller {
   }, FLUSH_MS);
 
   /* ── Hover preview ──────────────────────────────────────── */
+
+  /** Bare **M** tap: toggle hover preview, ending any audition when turned off. */
+  private _togglePreview(): void {
+    const m = this.model;
+    m.hoverPreview = !m.hoverPreview;
+    if (!m.hoverPreview) this._stopPreview();
+    this.options.sync();
+    m.saveLS();
+  }
+
+  /** **M + scroll**: scale the preview volume and mirror it on the slider. */
+  private _adjustPreviewVolume(factor: number): void {
+    const m = this.model;
+    m.previewVolume = Math.max(0, Math.min(1, m.previewVolume * factor));
+    this.$audio.volume = previewGain(m.previewVolume);
+    this.options.syncPreviewVolume();
+  }
 
   private _handlePreview(): void {
     const m = this.model;
@@ -762,55 +934,62 @@ export class Controller {
 
   /* ── Keyboard shortcuts ─────────────────────────────────── */
 
+  /**
+   * Canvas actions shared by the global hotkeys and the folder-row popout.
+   * Each acts on the *effective hover target* — the pinned card's navigation
+   * element wins over the pointer, exactly as the hotkeys always did.
+   */
+  private _runCanvasAction(action: FolderCanvasAction): void {
+    const m = this.model;
+    if (action === "fit-view") {
+      this.interaction.fitView();
+      return;
+    }
+    if (action === "isolate-selection") {
+      this.interaction.solo();
+      return;
+    }
+    const target = this.interaction.effectiveHoverTarget();
+    if (!target) return;
+    if (action === "focus-folder") {
+      m.selectOnlyHoverTarget(target);
+      m.saveLS();
+      return;
+    }
+    // exclude-selection
+    // A folder keeps its prefix-based exclusion so newly discovered files
+    // under it are hidden too; the other kinds are path sets.
+    if (target.kind === "folder") {
+      if (m.folderSubtreeFullyExcluded(target.prefix)) {
+        m.revealFolderSubtree(target.prefix);
+      } else {
+        m.hideFolderTree(target.prefix);
+      }
+    } else {
+      const paths = m.hoverTargetPaths(target);
+      if (paths.size === 0) return;
+      if (m.pathsFullyHidden(paths)) m.revealPaths(paths);
+      else m.hidePaths(paths);
+    }
+    m.saveLS();
+  }
+
   private _bindKeyboard(): void {
     const m = this.model;
     const hk = this.hotkeyMgr;
 
     hk.on("focus-search", () => this.searchView.focusInput());
 
-    hk.on("toggle-preview", () => {
-      m.hoverPreview = !m.hoverPreview;
-      if (!m.hoverPreview) this._stopPreview();
-      this.options.sync();
-      m.saveLS();
-    });
+    // M is owned by CanvasInteractionController (bare tap toggles, hold + scroll
+    // adjusts the volume), so HotkeyManager lists it but does not dispatch it.
 
-    hk.on("fit-view", () => this.interaction.fitView());
+    hk.on("fit-view", () => this._runCanvasAction("fit-view"));
 
-    hk.on("focus-folder", () => {
-      const target = this.interaction.effectiveHoverTarget();
-      if (!target) return;
-      m.selectOnlyHoverTarget(target);
-      m.saveLS();
-    });
+    hk.on("focus-folder", () => this._runCanvasAction("focus-folder"));
 
-    hk.on("exclude-selection", () => {
-      const target = this.interaction.effectiveHoverTarget();
-      if (target) {
-        // A folder keeps its prefix-based exclusion so newly discovered files
-        // under it are hidden too; the other kinds are path sets.
-        if (target.kind === "folder") {
-          if (m.folderSubtreeFullyExcluded(target.prefix)) {
-            m.revealFolderSubtree(target.prefix);
-          } else {
-            m.hideFolderTree(target.prefix);
-          }
-        } else {
-          const paths = m.hoverTargetPaths(target);
-          if (paths.size === 0) return;
-          if (m.pathsFullyHidden(paths)) m.revealPaths(paths);
-          else m.hidePaths(paths);
-        }
-        m.saveLS();
-        return;
-      }
-      if (m.selected.size) {
-        m.hidePaths([...m.selected]);
-        m.saveLS();
-      }
-    });
+    hk.on("exclude-selection", () => this._runCanvasAction("exclude-selection"));
 
-    hk.on("isolate-selection", () => this.interaction.solo());
+    hk.on("isolate-selection", () => this._runCanvasAction("isolate-selection"));
 
     hk.on("show-all-tracks", () => {
       m.clearExclusions();
@@ -827,15 +1006,20 @@ export class Controller {
 
     hk.on("toggle-view-prev", () => void this.embedding.cycleLens(-1));
 
-    hk.on("toggle-clusters", () => this.analysis.toggleColorByCluster());
+    hk.on("toggle-clusters", () => this.analysis.cycleColorMode());
+
+    hk.on("toggle-clusters-prev", () => this.analysis.cycleColorMode(-1));
 
     hk.on("deselect", () => {
-      if (this.canvas.unpinInspect()) return;
-      if (this.interaction.cancelActiveGesture()) return;
-      if (m.scope) {
-        this.embedding.closeScope();
+      // Transient surfaces first, then the newest view modifier, then selection.
+      // (Esc inside the search box is handled by the box itself.)
+      if (this.searchView.isOpen()) {
+        this.searchView.close();
         return;
       }
+      if (this.canvas.unpinInspect()) return;
+      if (this.interaction.cancelActiveGesture()) return;
+      if (this.viewMods.popNewest()) return;
       m.clearSelection();
     });
   }
@@ -846,13 +1030,6 @@ export class Controller {
     window.addEventListener("resize", () => {
       this.canvas.resize();
       this.canvas.scheduleDraw();
-    });
-  }
-
-  private _bindViewportChrome(): void {
-    document.getElementById("viewport-clear-hides")?.addEventListener("click", () => {
-      this.model.clearExclusions();
-      this.model.saveLS();
     });
   }
 }

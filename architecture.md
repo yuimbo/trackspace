@@ -13,7 +13,7 @@ backend/
   app.py                  CLI entry + wiring (helpers, ANALYSIS_DEPS, worker registration)
   factory.py              create_app() + blueprint registration
   trackspace_state.py     TrackspaceState: caches, roots, queue, workers, clusters
-  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, supervised, imprint, static_audio)
+  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, describe, supervised, imprint, static_audio)
   tags.py                 ID3 tag read/write via mutagen
   cache.py                TrackCache (path+mtime → metadata, LRU + SQLite)
   fingerprint.py          Chromaprint audio fingerprinting (fpcalc)
@@ -32,6 +32,7 @@ backend/
     supervised.py         folder-supervised 128-D projection head (weak supervision)
     rhythm_features.py    14-D rhythm/DSP descriptors
     clap.py               CLAP audio + text encoder
+    clap_describe.py      zero-shot phrase bank + contrastive semantic coordinates
     feature_cache.py      content-addressed SQLite cache (versioned sources)
     ...                   audio_decode, librosa features, coverage, revision
   templates/partials/     Jinja templates served by Flask (HTMX)
@@ -75,6 +76,7 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
 | Feature cache | `backend/embeddings/feature_cache.py` | ~560 | One generic `_SOURCES` registry + fan-out journal + origin memory |
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
+| Layout fidelity (bench) | `backend/embeddings/layout_fidelity.py` | ~60 | Neighbourhood recall; imported only by tests, not production |
 | Frontend orchestration | `frontend/src/controller.ts` | ~840 | Wiring, data loading, tag-write queue, preview, keyboard |
 | Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~575 | Queue SSE + cluster panel + source weights |
 | Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | ~610 | Train/export/import/compare, imprint, fan-out undo |
@@ -96,7 +98,9 @@ The frontend uses **Vite + TypeScript**, **Alpine.js**, and **HTMX**.
 
 - **UI modules:** `frontend/src/components/` — one file per view (`canvas-view.ts`,
   `tag-panel-view.ts`, …). Shared DOM helpers (toast, loading overlay) live in
-  `frontend/src/lib/toast.ts`; folder/cluster colours live in `frontend/src/lib/colors.ts`.
+  `frontend/src/lib/toast.ts`; folder/cluster/tempo/key colours live in `frontend/src/lib/colors.ts`;
+  the max-blended glow overlay is `frontend/src/lib/glow-layer.ts`; the metaball
+  scatter pass is `frontend/src/lib/point-layer.ts`.
 - **Alpine.js:** Declarative islands in `frontend/index.html` (e.g. shortcuts modal
   `x-data`, `x-cloak`). Heavier logic stays in TypeScript (controller, coordinators, canvas).
 - **HTMX:** The folder sidebar list is HTML from Flask (`GET /partials/folder-tree`) loaded
@@ -211,6 +215,12 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
   `RLIMIT_NOFILE` and SQLite began failing with "unable to open database file". Each
   cache's `_conn()` wraps the raw connection; do not construct a bare `sqlite3.connect`
   in a `with`.
+- **Batch reads before fanning out, and read presence not blobs.** `TrackCache.get_many`
+  and `FeatureCache.get_all`/`presence` replace one SQLite connect per track (measured
+  ~730 us each, ~10 s per library scan). Layouts persist by `layout_revision` in the
+  `layout_cache` table, and coverage/revision tests use `FeatureCache.presence()` (one
+  boolean-per-source query) instead of decoding every blob. See `audio_pipeline.md` →
+  *Projection caching*.
 
 ---
 
@@ -226,8 +236,14 @@ recomputed on load (`services/roots_registry.py`). Each root carries a role:
   `FeatureCache` never cares where a file lives), but they stay out of the default
   projection: `/api/embeddings/projection` walks the library roots only unless the
   request carries `include_external=1`, which the frontend sends when the "External"
-  toggle is on. The toggle also gates their visibility (`Model.trackInViewUnion`), and
-  the head does not learn from their folder labels by default.
+  toggle is on. Showing externals does **not** refit the map: the fit scope is
+  controlled separately by `fit_scope=library|all` (default `library`), so with the
+  default the server fits the library chart and places the external tracks onto it by
+  Nyström extension (`landmark_projection.build_landmark_model(..., place_infos=…)`).
+  The "Refit with external" checkbox sends `fit_scope=all` to opt into the old
+  external-inclusive refit. The visibility toggle also gates their drawing
+  (`Model.trackInViewUnion`), and the head does not learn from their folder labels by
+  default.
   Because analysis is content-addressed, marking a root external — or removing it —
   never discards its cached embeddings; re-adding restores it instantly.
 
@@ -235,7 +251,7 @@ Persistence stores only the *paths* whose role is external (`external_roots` in
 `roots.json`); library is the default so old files stay valid. The folder-tree partial
 renders a muted "External" section, root rows carry `data-root-role` and `data-root-abs`,
 and `POST /api/roots/role` flips a root between the two. `POST /api/roots/remove` drops a
-root (the row's `.folder-remove-btn`, or dragging the row out of the sidebar); the files and
+root (from the row's hover action popout, or dragging the row out of the sidebar); the files and
 their content-addressed embeddings stay, so re-adding restores it. Ephemeral imprint roots
 (`temp_roots`) are a separate, shorter-lived concept — they are marked external while alive
 and removed when the imprint finishes.
@@ -262,12 +278,20 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   `postJSON` read `error` from the JSON body into the toast, so messages must stay
   client-safe (never include a traceback or absolute paths).
 - **Analysis reads are read-only over `FeatureCache`.** `/api/search` (CLAP text
-  ranking), `/api/tracks/structure` (cached intro/drop/break + genre-spanning
-  flag) and `/api/tracks/similar` (nearest/anti-track over the composite vectors)
-  never run an encoder or decode on a request thread; expensive analysis goes
-  through the queue. `/api/tracks/similar` is the one exception to "reads are
-  cheap": it rebuilds the weighted matrix that clustering/layout use, cached by
-  `(clustering revision, weights, library mtime)` with a TTL — see
+  ranking), `/api/tracks/describe` (zero-shot phrase ranking + semantic
+  coordinates against one track's cached CLAP audio vector),
+  `/api/tracks/structure` (cached intro/drop/break + genre-spanning flag) and
+  `/api/tracks/similar` (nearest/anti-track over the composite vectors) never
+  re-encode a track's *audio* on a request thread; expensive analysis goes
+  through the queue. `/api/search` and `/api/tracks/describe` run only the CLAP
+  text tower, under `clap.inference_lock`; describe's phrase bank and axis
+  directions are encoded once per process and cached
+  (`embeddings/clap_describe.PromptBank` / `AxisDirections`), it drops phrases
+  below `MIN_SIMILARITY` so the list is not padded with noise, and its
+  coordinates are z-scored against a reference distribution baked into `AXES`, so no
+  library scan is needed on a request. `/api/tracks/similar` is the one exception
+  to "reads are cheap": it rebuilds the weighted matrix that clustering/layout use,
+  cached by `(clustering revision, weights, library mtime)` with a TTL — see
   `services/similarity.py`.
 - **`/api/analysis/problems` is the actionable counterpart to the coverage counts.**
   It lists tracks fpcalc cannot fingerprint at all plus per-path terminal job failures

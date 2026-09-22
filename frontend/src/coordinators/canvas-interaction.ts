@@ -15,8 +15,11 @@ import {
   type Scope,
   type Track,
   isAudioFeatureAxisId,
+  scopeContains,
 } from "../model";
 import type { CanvasView, TxHandle } from "../components";
+import { isTextEntryTarget } from "../hotkeys";
+import type { ColorMode } from "../lib/lenses";
 
 const DRAG_THRESH = 4;
 const ZOOM_FACTOR = 1.12;
@@ -122,10 +125,20 @@ export interface CanvasInteractionDeps {
   openScope(scope: Scope, lensId: string, allowEmpty?: boolean): void;
   /** Switch the open scope to a different lens. */
   setScopeLens(lensId: string): void;
-  /** Resize the open scope (X + scroll). */
-  resizeScope(r: number): void;
+  /** Scale the open scope by *factor* (X + scroll). */
+  resizeScope(factor: number): void;
   /** Close the active scope, animating its tracks back out. */
   closeScope(): void;
+  /** Switch the main lens from the persistent top tabber. */
+  switchLens(lensId: string): void;
+  /** Set the dot colour mode from the persistent top tabber. */
+  setColorMode(mode: ColorMode): void;
+  /** Toggle hover preview on/off (a bare **M** tap). */
+  togglePreview(): void;
+  /** Scale the preview volume by *factor* (**M + scroll**). */
+  adjustPreviewVolume(factor: number): void;
+  /** Persist the volume after an M + scroll gesture ends. */
+  commitPreviewVolume(): void;
 }
 
 export class CanvasInteractionController {
@@ -136,6 +149,10 @@ export class CanvasInteractionController {
   private _scopeArmed = false;
   /** Whether the current X hold produced a drag/scroll (vs a bare tap to close). */
   private _scopeGestureUsed = false;
+  /** True while **M** is held: a scroll adjusts preview volume, a tap toggles. */
+  private _previewArmed = false;
+  /** Whether the current M hold produced a scroll (vs a bare tap to toggle). */
+  private _previewGestureUsed = false;
 
   constructor(private deps: CanvasInteractionDeps) {
     this.mouse = {
@@ -157,10 +174,11 @@ export class CanvasInteractionController {
     };
   }
 
-  /** Wire canvas pointer events and the scope key. */
+  /** Wire canvas pointer events, the scope key and the preview key. */
   bind(): void {
     this._bindCanvas();
     this._bindScopeKeys();
+    this._bindPreviewKeys();
     this._bindInspectKey();
   }
 
@@ -210,12 +228,25 @@ export class CanvasInteractionController {
     }
     if (e.button !== 0) return;
 
-    // X + drag draws a scope circle; it takes priority over dot selection so a
+    // The persistent top tabbers are chrome: a click switches lens / colour mode
+    // and never starts a gesture.
+    const lensTab = cv.topLensTabAt(sx, sy);
+    if (lensTab) {
+      this.deps.switchLens(lensTab);
+      return;
+    }
+    const colorTab = cv.topColorTabAt(sx, sy);
+    if (colorTab) {
+      this.deps.setColorMode(colorTab as ColorMode);
+      return;
+    }
+
+    // X + drag draws a scope box; it takes priority over dot selection so a
     // scope can be opened anywhere, including over a dense cluster.
     if (this._scopeArmed) {
       this._scopeGestureUsed = true;
       mouse.mode = "scope";
-      cv.scopeDrag = { cx: sx, cy: sy, r: 0 };
+      cv.scopeDrag = { x0: sx, y0: sy, x1: sx, y1: sy };
       cv.scheduleDraw();
       return;
     }
@@ -229,7 +260,7 @@ export class CanvasInteractionController {
         return;
       }
       const [wx, wy] = cv.s2w(sx, sy);
-      if (Math.hypot(wx - m.scope.cx, wy - m.scope.cy) > m.scope.r) {
+      if (!scopeContains(m.scope, wx, wy)) {
         this.deps.closeScope();
         return;
       }
@@ -449,12 +480,24 @@ export class CanvasInteractionController {
   private _updateCanvasHoverAt(sx: number, sy: number): void {
     const m = this.deps.model;
     const cv = this.deps.canvas;
-    const prevIdx = cv.hoveredIdx;
-    const prevPath =
-      prevIdx >= 0 ? (m.tracks[prevIdx]?.path ?? null) : null;
 
     this.mouse.lx = sx;
     this.mouse.ly = sy;
+
+    // While the Alt-pinned inspect card is open it owns the pointer's attention:
+    // moving across the map must not retarget hover, audition, or the sibling glow
+    // to another track. Keep the hover on the card's own track so hotkeys still
+    // target it, and resume free hover on the next move after the card closes.
+    if (cv.inspect) {
+      cv.hoveredIdx = m.tracks.findIndex((t) => t.path === cv.inspect!.path);
+      cv.hoveredSiblingFolder =
+        cv.hoveredIdx >= 0 ? (m.tracks[cv.hoveredIdx].folder ?? null) : null;
+      return;
+    }
+
+    const prevIdx = cv.hoveredIdx;
+    const prevPath =
+      prevIdx >= 0 ? (m.tracks[prevIdx]?.path ?? null) : null;
 
     cv.hoveredIdx = cv.hitTest(sx, sy);
     const newPath =
@@ -516,7 +559,12 @@ export class CanvasInteractionController {
 
     if (mouse.mode === "scope") {
       const d = cv.scopeDrag;
-      if (d) d.r = Math.hypot(sx - d.cx, sy - d.cy);
+      if (d) {
+        // The live preview is the exact screen rectangle the release will open;
+        // the box is a world region whose screen image is that rectangle.
+        d.x1 = sx;
+        d.y1 = sy;
+      }
       cv.scheduleDraw();
       return;
     }
@@ -585,18 +633,30 @@ export class CanvasInteractionController {
       cv.scopeDrag = null;
       mouse.mode = "idle";
       cv.scheduleDraw();
-      if (d && d.r >= 6) {
-        const [wx, wy] = cv.s2w(d.cx, d.cy);
-        const [wxr] = cv.s2w(d.cx + d.r, d.cy);
-        this.deps.openScope(
-          {
-            cx: wx,
-            cy: wy,
-            r: Math.abs(wxr - wx),
-            lensId: m.scopeLensId,
-          },
-          m.scopeLensId,
-        );
+      if (d) {
+        const bL = Math.min(d.x0, d.x1),
+          bR = Math.max(d.x0, d.x1);
+        const bT = Math.min(d.y0, d.y1),
+          bB = Math.max(d.y0, d.y1);
+        // A tiny drag is a mis-click, not a region.
+        if (bR - bL >= 6 && bB - bT >= 6) {
+          const [wx0, wy0] = cv.s2w(bL, bB);
+          const [wx1, wy1] = cv.s2w(bR, bT);
+          const rx = Math.abs(wx1 - wx0) / 2;
+          const ry = Math.abs(wy1 - wy0) / 2;
+          this.deps.openScope(
+            {
+              shape: "box",
+              cx: (wx0 + wx1) / 2,
+              cy: (wy0 + wy1) / 2,
+              r: Math.max(rx, ry),
+              rx,
+              ry,
+              lensId: m.scopeLensId,
+            },
+            m.scopeLensId,
+          );
+        }
       }
       return;
     }
@@ -757,18 +817,34 @@ export class CanvasInteractionController {
       this._scopeGestureUsed = true;
       const factor = Math.exp(clamp(-dy / 600, -0.4, 0.4));
       if (m.scope) {
-        this.deps.resizeScope(m.scope.r * factor);
+        this.deps.resizeScope(factor);
       } else {
         const [wx, wy] = cv.s2w(sx, sy);
         // Start small *on screen* and grow outwards, so the opening circle looks
         // the same at any zoom instead of appearing already huge.
         const [wxr] = cv.s2w(sx + SCOPE_SCROLL_START_PX, sy);
         this.deps.openScope(
-          { cx: wx, cy: wy, r: Math.abs(wxr - wx), lensId: m.scopeLensId },
+          {
+            shape: "circle",
+            cx: wx,
+            cy: wy,
+            r: Math.abs(wxr - wx),
+            lensId: m.scopeLensId,
+          },
           m.scopeLensId,
           true,
         );
       }
+      return;
+    }
+
+    // M + scroll adjusts the preview volume at the cursor. A scroll marks the
+    // gesture as used, so the M keyup does not also toggle the preview.
+    if (this._previewArmed) {
+      this._previewGestureUsed = true;
+      const factor = Math.exp(clamp(-dy / 600, -0.4, 0.4));
+      this.deps.adjustPreviewVolume(factor);
+      cv.showVolumeHud(e.clientX, e.clientY);
       return;
     }
 
@@ -1186,40 +1262,20 @@ export class CanvasInteractionController {
     return false;
   }
 
-  /** False while typing in a text field, so X/Alt do not fire shortcuts there. */
-  private _scopeKeysAllowed(target: EventTarget | null): boolean {
-    const el = target as HTMLElement | null;
-    if (!el) return true;
-    if (el.tagName === "TEXTAREA") return false;
-    if (el.tagName === "INPUT") {
-      const type = (el as HTMLInputElement).type.toLowerCase();
-      const isTextEntry =
-        type === "" ||
-        type === "text" ||
-        type === "password" ||
-        type === "email" ||
-        type === "search" ||
-        type === "url" ||
-        type === "tel" ||
-        type === "number" ||
-        type === "date" ||
-        type === "time" ||
-        type === "datetime-local" ||
-        type === "month" ||
-        type === "week";
-      if (isTextEntry) return false;
-    }
-    return true;
+  /** False while typing in a text field, so X/M/Alt do not fire shortcuts there. */
+  private _keysAllowed(target: EventTarget | null): boolean {
+    return !isTextEntryTarget(target);
   }
 
   /**
-   * **X** arms the scope gesture: **X + drag** draws a circle, **X + scroll**
-   * opens or resizes one at the cursor, and a bare **X** tap closes an open scope.
+   * **X** arms the scope gesture: **X + drag** draws a box, **X + scroll**
+   * opens a circle or resizes the open scope, and a bare **X** tap closes an open
+   * scope (**Esc** does too).
    */
   private _bindScopeKeys(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.code !== "KeyX" || e.repeat) return;
-      if (!this._scopeKeysAllowed(e.target)) return;
+      if (!this._keysAllowed(e.target)) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       this._scopeArmed = true;
       this._scopeGestureUsed = false;
@@ -1239,13 +1295,39 @@ export class CanvasInteractionController {
   }
 
   /**
+   * **M** toggles the hover preview on a bare tap, but **M + scroll** adjusts
+   * the preview volume instead: a scroll during the hold marks the gesture used, so
+   * the keyup does not also toggle the preview off.
+   */
+  private _bindPreviewKeys(): void {
+    document.addEventListener("keydown", (e: KeyboardEvent) => {
+      if (e.code !== "KeyM" || e.repeat) return;
+      if (!this._keysAllowed(e.target)) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      this._previewArmed = true;
+      this._previewGestureUsed = false;
+    });
+    document.addEventListener("keyup", (e: KeyboardEvent) => {
+      if (e.code !== "KeyM" || !this._previewArmed) return;
+      this._previewArmed = false;
+      // A scroll already adjusted the volume; a bare tap toggles the preview.
+      if (this._previewGestureUsed) this.deps.commitPreviewVolume();
+      else this.deps.togglePreview();
+    });
+    window.addEventListener("blur", () => {
+      this._previewArmed = false;
+      this._previewGestureUsed = false;
+    });
+  }
+
+  /**
    * **Alt** over a hovered dot pins its inspect card open (and again closes it).
    * The card then survives leaving the canvas so it can be clicked.
    */
   private _bindInspectKey(): void {
     document.addEventListener("keydown", (e: KeyboardEvent) => {
       if (e.key !== "Alt" || e.repeat) return;
-      if (!this._scopeKeysAllowed(e.target)) return;
+      if (!this._keysAllowed(e.target)) return;
       // Unpinning ends the audition the card owned.
       if (this.deps.canvas.toggleInspect()) this.deps.stopPreview();
     });

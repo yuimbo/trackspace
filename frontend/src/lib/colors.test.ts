@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import vectors from "./dir-color-vectors.json";
-import { dirColor, dirTagColors } from "./colors";
+import {
+  dirColor,
+  dirTagColors,
+  keyColor,
+  parseColor,
+  tempoColor,
+} from "./colors";
 
 /** The pre-family algorithm, kept to prove depth <= 1 is byte-identical. */
 function legacyDirColor(folderPath: string): string {
@@ -15,6 +21,32 @@ function legacyDirColor(folderPath: string): string {
 function lightness(color: string): number {
   return parseInt(color.split(",")[2], 10);
 }
+
+/** Hue component (float) of an `hsl(h,s%,l%)` string. */
+function hue(color: string): number {
+  return parseFloat(color.slice(4));
+}
+
+describe("parseColor", () => {
+  it("parses 6-digit hex", () => {
+    expect(parseColor("#8e9bff")).toEqual([142 / 255, 155 / 255, 1]);
+  });
+
+  it("parses 3-digit hex", () => {
+    expect(parseColor("#fff")).toEqual([1, 1, 1]);
+  });
+
+  it("parses rgb()", () => {
+    expect(parseColor("rgb(142,155,255)")).toEqual([142 / 255, 155 / 255, 1]);
+  });
+
+  it("parses hsl() into linear rgb", () => {
+    const [r, g, b] = parseColor("hsl(0,100%,50%)");
+    expect(r).toBeCloseTo(1);
+    expect(g).toBeCloseTo(0);
+    expect(b).toBeCloseTo(0);
+  });
+});
 
 describe("dirColor", () => {
   it("matches the shared golden vectors (keep in sync with dir_colors.py)", () => {
@@ -84,5 +116,25 @@ describe("dirTagColors", () => {
       dirColor("abc12345/GENRES"),
       dirColor("abc12345/GENRES/Rock"),
     ]);
+  });
+});
+
+describe("feature-lens colors", () => {
+  it("gives one octave the same tempo hue, and higher BPM a brighter shade", () => {
+    const lo = (60 - 60) / (250 - 60);
+    const hi = (120 - 60) / (250 - 60);
+    expect(hue(tempoColor(lo))).toBeCloseTo(hue(tempoColor(hi)), 0);
+    expect(lightness(tempoColor(hi))).toBeGreaterThan(lightness(tempoColor(lo)));
+  });
+
+  it("brightens a key as its Camelot radius grows: major over minor", () => {
+    expect(lightness(keyColor(0, 1))).toBeGreaterThan(lightness(keyColor(0, 0)));
+  });
+
+  it("spaces adjacent keys on the circle of fifths 30° apart", () => {
+    const a = hue(keyColor(0, 1));
+    const b = hue(keyColor(1 / 12, 1));
+    const diff = ((b - a) % 360 + 360) % 360;
+    expect(diff).toBeCloseTo(30, 0);
   });
 });

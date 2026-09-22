@@ -1,16 +1,39 @@
 import type { HoverTarget, Model, Track } from "../model";
-import { isAudioFeatureAxisId } from "../model";
-import { clusterColor, dirColor } from "../lib/colors";
+import { isAudioFeatureAxisId, scopeContains, scopeHalfExtents } from "../model";
+import {
+  clusterColor,
+  dirColor,
+  keyColor,
+  parseColor,
+  tempoColor,
+} from "../lib/colors";
 import {
   BUILTIN_LENSES,
   CAMELOT_MAJOR_RADIUS,
   CAMELOT_MINOR_RADIUS,
   camelotGuide,
+  colorModeTabs,
   scopeLenses,
   spiralGuide,
+  trackTempoNorm,
 } from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
-import { buildTooltip, renderTooltip, type InspectState } from "../lib/tooltip";
+import { GlowLayer, type GlowPoint } from "../lib/glow-layer";
+import {
+  MetaballLayer,
+  POINT_SPLAT_R,
+  type PointSpec,
+} from "../lib/point-layer";
+import {
+  buildTooltip,
+  describeKey,
+  emptyDescribe,
+  renderDescribePanel,
+  renderGenrePop,
+  renderTooltip,
+  type InspectState,
+  type TooltipCard,
+} from "../lib/tooltip";
 
 
 // ─── Types ───────────────────────────────────────────────────
@@ -26,19 +49,13 @@ export interface SearchFieldPoint {
   score: number;
 }
 
-/** A clickable lens tab drawn on the canvas. */
-export interface LensTabHit {
-  lensId: string;
+/** A clickable tab drawn on the canvas (a lens or colour-mode id). */
+export interface TabHit {
+  id: string;
   x0: number;
   y0: number;
   x1: number;
   y1: number;
-}
-
-/** One tab in a transient canvas HUD (id + label; the active one is highlighted). */
-export interface HudTab {
-  id: string;
-  label: string;
 }
 
 export interface TxHandle {
@@ -71,24 +88,81 @@ interface TxWorld {
 
 // ─── Constants ───────────────────────────────────────────────
 const PAD = 40;
+/** Bottom of the persistent top tabbers (lens row + colour row); status pills dock below. */
+const TOP_TABS_BOTTOM = 50;
 const DOT_R = 4;
 const DOT_R_SEL = 6;
 const HIT_RADIUS = 10;
-const CLUSTER_CELL = 16;
+/** Screen-grid cell for the blob-aware hit fallback; ~3×3 cells ≈ 72 px reach. */
+const HIT_CELL = 24;
+/** Extra screen pixels kept around the viewport before a dot is culled. */
+const CULL_MARGIN = 64;
 const TX_PAD = 14;
 const TX_KNOB_HIT = 9;
 
 /** Halo colour for a key/BPM hover target (folders/clusters use their own colours). */
 const TARGET_GLOW_COLOR = "#8e9bff";
 /** Search-field glow: accent RGB (matches `TARGET_GLOW_COLOR`) and splat radius in px. */
-const FIELD_GLOW_RGB = "142,155,255";
+const FIELD_GLOW_RGB: [number, number, number] = [142 / 255, 155 / 255, 1];
 const FIELD_GLOW_R = 64;
+/** Hover halo: a dot-sized disc plus a soft edge, sized to match the old blur pass. */
+const HOVER_GLOW_R = DOT_R + 20;
+const HOVER_GLOW_CORE = 0.42;
+const HOVER_GLOW_ALPHA = 0.64;
+
+/**
+ * Nearest track when the cursor sits inside a merged blob rather than on a single
+ * dot. Returns ``-1`` unless the 3×3 screen-grid neighbourhood around the
+ * cursor holds at least two points — a lone dot's cell is not a blob, so a far
+ * isolated point is never grabbed. Pure, so the rule is unit-tested directly.
+ */
+export function nearestInBlob(
+  grid: Map<string, DotPosition[]>,
+  sx: number,
+  sy: number,
+  cell = HIT_CELL,
+): number {
+  const gx = Math.round(sx / cell);
+  const gy = Math.round(sy / cell);
+  let best = -1;
+  let bestD = Infinity;
+  let count = 0;
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      const arr = grid.get(`${gx + dx},${gy + dy}`);
+      if (!arr) continue;
+      count += arr.length;
+      for (const p of arr) {
+        const d = Math.hypot(p.sx - sx, p.sy - sy);
+        if (d < bestD) {
+          bestD = d;
+          best = p.idx;
+        }
+      }
+    }
+  }
+  return count >= 2 ? best : -1;
+}
+
+/** Id of the tab under *sx,sy*, else null. Pure, so it is unit-tested directly. */
+export function tabAt(
+  tabs: readonly TabHit[],
+  sx: number,
+  sy: number,
+): string | null {
+  for (const t of tabs) {
+    if (sx >= t.x0 && sx <= t.x1 && sy >= t.y0 && sy <= t.y1) return t.id;
+  }
+  return null;
+}
 
 export class CanvasView {
   model: Model;
   $canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   $tip: HTMLElement;
+  /** Popped-out coordinate panel, shown beside the pinned card on Describe. */
+  $coords: HTMLElement;
 
   positions: DotPosition[] = [];
   hoveredIdx = -1;
@@ -108,6 +182,11 @@ export class CanvasView {
   /** Landmark query scores the backend returns for the CLAP-lens field. */
   searchField: SearchFieldPoint[] | null = null;
   /**
+   * Paths the active search matched. Non-members are drawn faded while it is
+   * set, so the results read against the rest of the map. ``null`` = no search.
+   */
+  searchResults: Set<string> | null = null;
+  /**
    * Hovered navigation element — a folder row, cluster row, or card chip (key/BPM).
    * Owned by whichever list renders it (sidebar tree, cluster panel, inspect card);
    * the canvas only reads it to glow matching dots. Purely visual, so it lives here
@@ -120,6 +199,10 @@ export class CanvasView {
   tipTimer = 0;
   /** Identity of the rendered tooltip card, so pan/zoom frames do not rebuild it. */
   private _tipKey = "";
+  /** The currently rendered card, for the genre chip's hover pop-over. */
+  private _tipCard: TooltipCard | null = null;
+  /** Identity of the rendered Describe panel (``""`` while hidden). */
+  private _describeKey = "";
   /**
    * Pinned inspect card state (Alt over a track). ``null`` = the plain hover
    * tooltip; while set, the card is interactive and ignores hover changes.
@@ -132,22 +215,21 @@ export class CanvasView {
   /** Inspect-card action clicked (``anti``/``near``/``proximity``/``focus``/``close``). */
   onInspectAction: ((action: string, path: string, value?: number) => void) | null =
     null;
+  /** A Describe-tab term clicked: run it as a CLAP search for similar tracks. */
+  onSearchTerm: ((term: string) => void) | null = null;
   lassoPoints: [number, number][] = [];
   boxSel: BoxSel | null = null;
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
   intersectMode = false;
   dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null = null;
-  /** In-progress scope circle in screen coordinates (centre + radius px). */
-  scopeDrag: { cx: number; cy: number; r: number } | null = null;
+  /** In-progress scope box in screen coordinates (drag corners). */
+  scopeDrag: { x0: number; y0: number; x1: number; y1: number } | null = null;
   /** Clickable lens tabs drawn around the open scope (screen rects). */
-  scopeTabs: LensTabHit[] = [];
-  /**
-   * Transient centre-screen HUD: a tab row with the active tab highlighted. A new
-   * flash **replaces** the previous one, so repeated hotkeys never stack a history.
-   */
-  private _hud: { tabs: readonly HudTab[]; activeId: string; until: number } | null =
-    null;
-  private _hudTimer = 0;
+  scopeTabs: TabHit[] = [];
+  /** Clickable lens tabs in the persistent top tabber. */
+  lensTabs: TabHit[] = [];
+  /** Clickable colour-mode tabs in the persistent top tabber. */
+  colorTabs: TabHit[] = [];
   private _waitTimer = 0;
   _rafId = 0;
 
@@ -160,19 +242,40 @@ export class CanvasView {
   /** Transient per-track positions used during animated mode transitions. */
   animPositions: Map<string, { x: number; y: number }> | null = null;
 
-  // Offscreen canvas used as render texture for the glow screen-pass
-  private _glowCanvas: HTMLCanvasElement | null = null;
-  private _glowCtx: CanvasRenderingContext2D | null = null;
+  /** Transparent WebGL overlay under the scatter: every glow is one additive SDF pass. */
+  glow: GlowLayer;
+
+  /**
+   * Transparent WebGL layer that merges the scatter points into gooey blobs. Its
+   * canvas is blitted between the grid and the overlays; when unsupported the
+   * scatter falls back to plain 2-D dots.
+   */
+  points: MetaballLayer;
+  /** This frame's splats (all points except the crisp hover/selected ones). */
+  private _pointSpecs: PointSpec[] = [];
+  /** Hover/selected dots, excluded from the merge so they read as single tracks. */
+  private _crispDots: { sx: number; sy: number; idx: number }[] = [];
+  /** Screen grid over the visible dots, for the blob-aware hit fallback. */
+  private _hitGrid = new Map<string, DotPosition[]>();
 
   constructor(model: Model) {
     this.model = model;
     this.$canvas = document.getElementById("viewport") as HTMLCanvasElement;
     this.ctx = this.$canvas.getContext("2d")!;
+    this.glow = new GlowLayer(
+      this.$canvas.parentElement as HTMLElement,
+      this.$canvas,
+    );
+    this.points = new MetaballLayer();
     this.$tip = document.getElementById("tooltip")!;
+    this.$coords = document.getElementById("coords-panel")!;
     this.$tip.addEventListener("click", (e) => this._onTipClick(e));
     this.$tip.addEventListener("input", (e) => this._onTipInput(e));
     this.$tip.addEventListener("mouseover", (e) => this._onTipOver(e));
     this.$tip.addEventListener("mouseout", (e) => this._onTipOut(e));
+    // The Describe panel is a sibling of the card, so its term rows (a CLAP
+    // search on click) need the same click routing as the card's own controls.
+    this.$coords.addEventListener("click", (e) => this._onTipClick(e));
     // Leaving the open card ends the audition it owns (the card is
     // `pointer-events: none` until pinned, so this only fires while open).
     this.$tip.addEventListener("mouseleave", () =>
@@ -220,6 +323,8 @@ export class CanvasView {
     this.$canvas.width = this.$canvas.clientWidth * dpr;
     this.$canvas.height = this.$canvas.clientHeight * dpr;
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.glow.sync();
+    this.points.sync(this.$canvas);
   }
 
   scheduleDraw(): void {
@@ -253,6 +358,11 @@ export class CanvasView {
         bestD = d;
         best = p.idx;
       }
+    }
+    // A merged blob is wider than a single dot's hit radius, so a click inside
+    // one falls through to the nearest member of its neighbourhood.
+    if (best < 0 && this.points.supported) {
+      best = nearestInBlob(this._hitGrid, sx, sy);
     }
     return best;
   }
@@ -291,6 +401,8 @@ export class CanvasView {
     this.positions = [];
     this.txHandles = [];
     this.scopeTabs = [];
+    this.lensTabs = [];
+    this.colorTabs = [];
     this._txBox = null;
     this._txWorld = null;
     this._txAllowBoxDrag = false;
@@ -302,22 +414,26 @@ export class CanvasView {
       ctx.fillText("No tracks loaded", w / 2, h / 2);
       ctx.textAlign = "start";
       this._drawLasso();
+      this._drawTopTabs(w);
+      this.points.render([]);
+      this.glow.render([]);
       return;
     }
 
     this._drawGrid(w, h);
     this._drawLensGuide();
-    this._drawSearchField();
     this._drawDragGhosts();
     this._drawScatter(tracks);
-    this._drawFolderGlow(tracks);
+    this._renderPoints(tracks);
+    this._renderGlow(tracks);
     this._drawTransformBox();
-    this._drawClusters();
     this._drawBoxSel();
     this._drawLasso();
     this._drawScope();
-    this._drawHud(w);
-    this._drawModeBadge(w, h);
+    this._drawTopTabs(w);
+    // Docked status pills start below the tabbers, so a running analysis never
+    // covers the persistent E/C feedback.
+    this._drawModeBadge(w, h, TOP_TABS_BOTTOM + 8);
     this._updateTooltip(tracks);
   }
 
@@ -366,59 +482,84 @@ export class CanvasView {
     ctx.restore();
   }
 
-  /* ── Search field (where the active query matches) ───────── */
+  /* ── Glow points (search field + hover halo) ────────────── */
 
   /**
-   * The "where does my query match" glow, drawn under the dots while the search
-   * box is focused and the CLAP lens is shown.
+   * The "where does my query match" glow points, shown while the search box is
+   * focused and the CLAP lens is on screen.
    *
    * Built from the backend's landmark sample: each landmark is splatted at its
    * *current* map position (scope/animation included), sized and weighted by its
-   * query cosine, additively blended so the samples read as one smooth field.
-   * t-SNE only preserves local neighbourhoods, so this shows where matching
-   * tracks live — not a calibrated similarity contour.
+   * query cosine, so the samples read as one smooth additive field. t-SNE only
+   * preserves local neighbourhoods, so this shows where matching tracks live —
+   * not a calibrated similarity contour.
    */
-  private _drawSearchField(): void {
+  collectSearchGlowPoints(): GlowPoint[] {
     const m = this.model;
     // The lens actually on screen: the scope's when one is open, else the map's.
     const lensId = m.scope ? m.scope.lensId : m.lensId;
     if (!this.searchActive || m.viewMode !== "embeddings" || lensId !== "clap") {
-      return;
+      return [];
     }
     const field = this.searchField;
-    if (!field || !field.length) return;
+    if (!field || !field.length) return [];
 
     let lo = Infinity,
       hi = -Infinity;
-    const pts: { sx: number; sy: number; s: number }[] = [];
+    const placed: { x: number; y: number; score: number }[] = [];
     for (const p of field) {
       const t = m.trackByPath(p.path);
       if (!t) continue;
       const pos = this._resolveTrackWPos(t);
       if (!pos) continue;
-      const [sx, sy] = this.w2s(pos.wx, pos.wy);
-      pts.push({ sx, sy, s: p.score });
+      const [x, y] = this.w2s(pos.wx, pos.wy);
+      placed.push({ x, y, score: p.score });
       if (p.score < lo) lo = p.score;
       if (p.score > hi) hi = p.score;
     }
-    if (!pts.length) return;
+    if (!placed.length) return [];
     const span = Math.max(hi - lo, 1e-6);
 
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.globalCompositeOperation = "lighter";
-    for (const p of pts) {
-      const w = (p.s - lo) / span;
-      const r = FIELD_GLOW_R * (0.55 + 0.45 * w);
-      const grad = ctx.createRadialGradient(p.sx, p.sy, 0, p.sx, p.sy, r);
-      grad.addColorStop(0, `rgba(${FIELD_GLOW_RGB},${(0.05 + 0.35 * w * w).toFixed(3)})`);
-      grad.addColorStop(1, `rgba(${FIELD_GLOW_RGB},0)`);
-      ctx.fillStyle = grad;
-      ctx.beginPath();
-      ctx.arc(p.sx, p.sy, r, 0, Math.PI * 2);
-      ctx.fill();
+    return placed.map((p) => {
+      const w = (p.score - lo) / span;
+      return {
+        x: p.x,
+        y: p.y,
+        radius: FIELD_GLOW_R * (0.55 + 0.45 * w),
+        core: 0,
+        color: FIELD_GLOW_RGB,
+        alpha: 0.05 + 0.35 * w * w,
+      };
+    });
+  }
+
+  /** Glow points for the hovered navigation target / sibling folder. */
+  collectHoverGlowPoints(tracks: Track[]): GlowPoint[] {
+    if (this.hoverTarget === null && this.hoveredSiblingFolder === null) {
+      return [];
     }
-    ctx.restore();
+    const points: GlowPoint[] = [];
+    for (const pos of this.positions) {
+      const track = tracks[pos.idx];
+      if (!this._inHoverGlow(track)) continue;
+      points.push({
+        x: pos.sx,
+        y: pos.sy,
+        radius: HOVER_GLOW_R,
+        core: HOVER_GLOW_CORE,
+        color: parseColor(this._hoverGlowColor(track)),
+        alpha: HOVER_GLOW_ALPHA,
+      });
+    }
+    return points;
+  }
+
+  /** Splat every glow for this frame in one additive overlay pass. */
+  private _renderGlow(tracks: Track[]): void {
+    this.glow.render([
+      ...this.collectSearchGlowPoints(),
+      ...this.collectHoverGlowPoints(tracks),
+    ]);
   }
 
   /* ── Grid + tick labels (adaptive to zoom) ──────────────── */
@@ -632,28 +773,19 @@ export class CanvasView {
     return this._outerTrackWPos(t);
   }
 
-  /** Flash a transient tab row at the centre of the canvas. */
-  flashHud(tabs: readonly HudTab[], activeId: string, ms = 1400): void {
-    this._hud = { tabs, activeId, until: performance.now() + ms };
-    clearTimeout(this._hudTimer);
-    this._hudTimer = setTimeout(
-      () => this.scheduleDraw(),
-      ms + 30,
-    ) as unknown as number;
-    this.scheduleDraw();
-  }
-
-  /** Lens-switch feedback: the built-in lenses with the active one highlighted. */
-  flashLensHud(ms = 1400): void {
-    this.flashHud(BUILTIN_LENSES, this.model.lensId, ms);
-  }
-
   /** Lens id under *sx,sy* when a scope tab is there, else null. */
   scopeTabAt(sx: number, sy: number): string | null {
-    for (const t of this.scopeTabs) {
-      if (sx >= t.x0 && sx <= t.x1 && sy >= t.y0 && sy <= t.y1) return t.lensId;
-    }
-    return null;
+    return tabAt(this.scopeTabs, sx, sy);
+  }
+
+  /** Lens id under *sx,sy* in the top tabber, else null. */
+  topLensTabAt(sx: number, sy: number): string | null {
+    return tabAt(this.lensTabs, sx, sy);
+  }
+
+  /** Colour-mode id under *sx,sy* in the top tabber, else null. */
+  topColorTabAt(sx: number, sy: number): string | null {
+    return tabAt(this.colorTabs, sx, sy);
   }
 
   private _resolveTrackWPos(t: Track): { wx: number; wy: number } | null {
@@ -672,10 +804,7 @@ export class CanvasView {
       if (sp) return { wx: sp.x, wy: sp.y };
       // A track the scope lens could not place but whose outer position falls
       // inside the circle would clutter the re-layout; hide it.
-      if (
-        outer &&
-        Math.hypot(outer.wx - m.scope.cx, outer.wy - m.scope.cy) <= m.scope.r
-      ) {
+      if (outer && scopeContains(m.scope, outer.wx, outer.wy)) {
         return null;
       }
     }
@@ -697,6 +826,14 @@ export class CanvasView {
 
   private _drawScatter(tracks: Track[]): void {
     const m = this.model;
+    const supported = this.points.supported;
+    // Reuse the per-frame buffers: allocating three fresh containers for ~14k
+    // tracks on every animation frame is pure GC pressure.
+    this._pointSpecs.length = 0;
+    this._crispDots.length = 0;
+    this._hitGrid.clear();
+    const w = this.$canvas.clientWidth;
+    const h = this.$canvas.clientHeight;
     let anyFiltered = false;
     tracks.forEach((t, i) => {
       if (m.viewMode === "tags" && !m.passesFilter(t)) {
@@ -706,13 +843,32 @@ export class CanvasView {
       const pos = this._resolveTrackWPos(t);
       if (!pos) return;
       const [sx, sy] = this.w2s(pos.wx, pos.wy);
+      // An off-screen dot cannot be seen or hit, so skip it entirely; while
+      // zoomed in this is most of the library.
+      if (
+        sx < -CULL_MARGIN ||
+        sx > w + CULL_MARGIN ||
+        sy < -CULL_MARGIN ||
+        sy > h + CULL_MARGIN
+      )
+        return;
       this.positions.push({ idx: i, sx, sy });
-      this._dot(sx, sy, t, i);
+      if (!supported) {
+        this._dot(sx, sy, t, i);
+        return;
+      }
+      const key = `${Math.round(sx / HIT_CELL)},${Math.round(sy / HIT_CELL)}`;
+      const cell = this._hitGrid.get(key);
+      if (cell) cell.push({ idx: i, sx, sy });
+      else this._hitGrid.set(key, [{ idx: i, sx, sy }]);
+      if (m.selected.has(t.path) || this.hoveredIdx === i) {
+        this._crispDots.push({ sx, sy, idx: i });
+      } else {
+        this._pointSpecs.push(this._pointSpec(sx, sy, t));
+      }
     });
     if (anyFiltered) {
       const ctx = this.ctx;
-      const w = this.$canvas.clientWidth,
-        h = this.$canvas.clientHeight;
       ctx.save();
       ctx.fillStyle = "rgba(255,170,50,0.55)";
       ctx.font = "10px monospace";
@@ -720,6 +876,34 @@ export class CanvasView {
       ctx.fillText("filtered", w - 6, h - 6);
       ctx.restore();
     }
+  }
+
+  /** One splat for a track, with its colour and search/external fade. */
+  private _pointSpec(sx: number, sy: number, track: Track): PointSpec {
+    const faded =
+      this.searchResults !== null && !this.searchResults.has(track.path);
+    return {
+      x: sx,
+      y: sy,
+      radius: POINT_SPLAT_R,
+      color: parseColor(this.trackColor(track)),
+      alpha: faded ? 0.15 : this.model.isExternalTrack(track) ? 0.5 : 1,
+    };
+  }
+
+  /**
+   * Blit the merged field over the grid, then draw the crisp hover/selected dots
+   * on top — they are excluded from the field so a single track never dissolves
+   * into a blob. Falls through to nothing when the layer is unsupported, since
+   * `_drawScatter` already drew every dot.
+   */
+  private _renderPoints(tracks: Track[]): void {
+    if (!this.points.supported) return;
+    this.points.render(this._pointSpecs);
+    const w = this.$canvas.clientWidth,
+      h = this.$canvas.clientHeight;
+    this.ctx.drawImage(this.points.canvas, 0, 0, w, h);
+    for (const c of this._crispDots) this._dot(c.sx, c.sy, tracks[c.idx], c.idx);
   }
 
   /* ── Hover glow pass (navigation targets + sibling folder) ── */
@@ -740,66 +924,6 @@ export class CanvasView {
     if (t?.kind === "key" || t?.kind === "bpm" || t?.kind === "track")
       return TARGET_GLOW_COLOR;
     return this.trackColor(track);
-  }
-
-  /**
-   * Lazily creates / resizes the offscreen glow render-texture so it always
-   * matches the main canvas in physical pixels and shares the same DPR
-   * coordinate transform.
-   */
-  private _ensureGlowCanvas(w: number, h: number): void {
-    const dpr = devicePixelRatio || 1;
-    const pw = Math.round(w * dpr);
-    const ph = Math.round(h * dpr);
-    if (!this._glowCanvas) {
-      this._glowCanvas = document.createElement("canvas");
-      this._glowCtx = this._glowCanvas.getContext("2d")!;
-    }
-    if (this._glowCanvas.width !== pw || this._glowCanvas.height !== ph) {
-      this._glowCanvas.width = pw;
-      this._glowCanvas.height = ph;
-      // Setting canvas dimensions resets the context transform
-      this._glowCtx!.setTransform(dpr, 0, 0, dpr, 0, 0);
-    }
-  }
-
-  /**
-   * Renders the hover glow (navigation-target matches, or a hovered dot's sibling
-   * folder) as a single screen-pass blur instead of N individual
-   * ctx.shadowBlur draws.
-   *
-   * All glowing dots are painted (without shadow) onto an offscreen render
-   * texture, then the texture is blitted to the main canvas with a single
-   * ctx.filter = 'blur()' — one GPU compositing pass for all dots.
-   */
-  private _drawFolderGlow(tracks: Track[]): void {
-    if (this.hoverTarget === null && this.hoveredSiblingFolder === null) return;
-
-    const w = this.$canvas.clientWidth;
-    const h = this.$canvas.clientHeight;
-    this._ensureGlowCanvas(w, h);
-    const gc = this._glowCtx!;
-
-    // Render all halo circles to the offscreen texture (no shadow)
-    gc.clearRect(0, 0, w, h);
-    gc.globalAlpha = 0.85;
-    for (const pos of this.positions) {
-      const track = tracks[pos.idx];
-      if (!this._inHoverGlow(track)) continue;
-      gc.beginPath();
-      gc.arc(pos.sx, pos.sy, DOT_R + 6, 0, Math.PI * 2);
-      gc.fillStyle = this._hoverGlowColor(track);
-      gc.fill();
-    }
-    gc.globalAlpha = 1;
-
-    // Single screen-pass blur: blit render texture with one filter operation
-    const ctx = this.ctx;
-    ctx.save();
-    ctx.filter = "blur(14px)";
-    ctx.globalAlpha = 0.75;
-    ctx.drawImage(this._glowCanvas!, 0, 0, w, h);
-    ctx.restore();
   }
 
   /* ── Drag ghosts (original positions while dragging) ────── */
@@ -826,17 +950,43 @@ export class CanvasView {
     ctx.restore();
   }
 
-  /** Base colour for a track: cluster hue when enabled, else folder hue.
+  /** Base colour for a track, from the active colour mode.
    *
-   * Falls back to the folder colour whenever the track has no cluster yet
-   * (still being analysed), so partially analysed libraries never render as a
+   * Feature modes (tempo, key) reuse the matching lens's polar geometry, so a
+   * track's colour tracks its position on that map. Falls back to the folder
+   * colour whenever the chosen mode has nothing to say about the track — no cluster
+   * yet, or no cached features — so partially analysed libraries never render as a
    * field of grey dots.
    */
   trackColor(track: Track): string {
     const m = this.model;
-    if (m.colorByCluster && m.clusterAssignments.size > 0) {
-      const cid = m.clusterAssignments.get(track.path);
-      if (cid !== undefined) return clusterColor(cid);
+    switch (m.colorMode) {
+      case "head": {
+        const predicted = m.folderPredictions.get(track.path);
+        // "Confident only" leaves a weak match on its real folder, so a novel
+        // track never reads as a folder it merely resembles.
+        const ok =
+          predicted !== undefined &&
+          (!m.headColorConfident ||
+            m.folderPredictionMatches.has(track.path));
+        if (ok) return dirColor(predicted);
+        break;
+      }
+      case "cluster": {
+        const cid = m.clusterAssignments.get(track.path);
+        if (cid !== undefined) return clusterColor(cid);
+        break;
+      }
+      case "tempo": {
+        const tnorm = trackTempoNorm(track);
+        if (tnorm != null) return tempoColor(tnorm);
+        break;
+      }
+      case "key": {
+        const af = track.audio_features;
+        if (af) return keyColor(af.key, af.mode);
+        break;
+      }
     }
     return dirColor(track.folder ?? "");
   }
@@ -851,21 +1001,29 @@ export class CanvasView {
 
     let color: string;
     if (sel) color = "#ffdd57";
-    else if (hov) color = "#ff7eb3";
     else color = this.trackColor(track);
 
     // External-root tracks (shown via the sidebar toggle) read as secondary.
     const external = !sel && !hov && this.model.isExternalTrack(track);
-    if (external) ctx.globalAlpha = 0.5;
+    // While a search is active, tracks it did not match fade into the map so the
+    // results stand out. The selected set *is* the result set, so `!sel` covers it.
+    const faded =
+      this.searchResults !== null &&
+      !sel &&
+      !hov &&
+      !this.searchResults.has(track.path);
+    ctx.globalAlpha = faded ? 0.15 : external ? 0.5 : 1;
 
     ctx.beginPath();
     ctx.arc(sx, sy, r, 0, Math.PI * 2);
     ctx.fillStyle = color;
     ctx.fill();
 
-    if (external) ctx.globalAlpha = 1;
+    ctx.globalAlpha = 1;
 
-    if (sel) {
+    // Selected and hovered dots get a white outline, so a track stays legible
+    // against a merged blob without changing its own colour.
+    if (sel || hov) {
       ctx.strokeStyle = "#ffffffaa";
       ctx.lineWidth = 1.5;
       ctx.stroke();
@@ -963,47 +1121,6 @@ export class CanvasView {
       ctx.strokeRect(h.sx - 4, h.sy - 4, 8, 8);
     }
     ctx.restore();
-  }
-
-  /* ── Cluster badges ─────────────────────────────────────── */
-
-  private _drawClusters(): void {
-    if (this.positions.length < 2) return;
-    const grid = new Map<string, DotPosition[]>();
-    for (const p of this.positions) {
-      const key = `${Math.round(p.sx / CLUSTER_CELL)},${Math.round(p.sy / CLUSTER_CELL)}`;
-      if (!grid.has(key)) grid.set(key, []);
-      grid.get(key)!.push(p);
-    }
-
-    const ctx = this.ctx;
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-
-    for (const cluster of grid.values()) {
-      if (cluster.length < 2) continue;
-      const cx = cluster.reduce((s, p) => s + p.sx, 0) / cluster.length;
-      const cy = cluster.reduce((s, p) => s + p.sy, 0) / cluster.length;
-      const n = cluster.length;
-      const br = n > 9 ? 9 : 7;
-      const bx = cx + DOT_R + 1;
-      const by = cy - DOT_R - 1;
-
-      ctx.beginPath();
-      ctx.arc(bx, by, br, 0, Math.PI * 2);
-      ctx.fillStyle = "rgba(15,15,30,0.88)";
-      ctx.fill();
-      ctx.strokeStyle = "rgba(255,255,255,0.28)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-
-      ctx.fillStyle = "#fff";
-      ctx.font = `bold ${n > 9 ? 7 : 8}px monospace`;
-      ctx.fillText(String(n), bx, by);
-    }
-
-    ctx.textAlign = "start";
-    ctx.textBaseline = "alphabetic";
   }
 
   /* ── Mode badge ─────────────────────────────────────────── */
@@ -1211,7 +1328,8 @@ export class CanvasView {
     ctx.restore();
   }
 
-  private _drawModeBadge(w: number, h: number): void {
+  /** Top-right badge and the docked status pills, starting at *top*. */
+  private _drawModeBadge(w: number, h: number, top: number): void {
     const m = this.model;
     if (m.viewMode !== "embeddings") return;
     const ctx = this.ctx;
@@ -1237,7 +1355,6 @@ export class CanvasView {
     // top strip, so neither indicator covers the points.
     const docked = m.embeddingPositions.size > 0 || layoutWait;
 
-    let top = 34;
     if (showProg && prog) {
       top = this._drawPipelinePill(w, h, prog, top, docked) + 8;
     }
@@ -1310,7 +1427,7 @@ export class CanvasView {
 
   /* ── Scope overlay ─────────────────────────────────────── */
 
-  /** The open scope's circle, its lens tab switcher, and the in-progress drag. */
+  /** The open scope region, its lens tab switcher, and the in-progress drag. */
   private _drawScope(): void {
     const ctx = this.ctx;
     const scope = this.model.scope;
@@ -1322,24 +1439,35 @@ export class CanvasView {
     ctx.strokeStyle = "rgba(120,220,255,0.85)";
     ctx.fillStyle = "rgba(120,220,255,0.05)";
     if (drag) {
+      // The drag is a screen-space box; draw it as-is.
+      const x = Math.min(drag.x0, drag.x1);
+      const y = Math.min(drag.y0, drag.y1);
       ctx.beginPath();
-      ctx.arc(drag.cx, drag.cy, Math.max(1, drag.r), 0, Math.PI * 2);
+      ctx.rect(x, y, Math.max(1, Math.abs(drag.x1 - drag.x0)), Math.max(1, Math.abs(drag.y1 - drag.y0)));
       ctx.fill();
       ctx.stroke();
     }
     if (scope) {
+      // The region is world-space and w2s is non-uniform: it stretches the unit
+      // square to the viewport, so a circle's screen image is an ellipse and a
+      // box's is a rectangle. Draw the exact membership region so an
+      // out-of-scope track can never sit inside the outline.
+      const { hw, hh } = scopeHalfExtents(scope);
       const [cx, cy] = this.w2s(scope.cx, scope.cy);
-      const [ex] = this.w2s(scope.cx + scope.r, scope.cy);
-      const rpx = Math.abs(ex - cx);
+      const [ex] = this.w2s(scope.cx + hw, scope.cy);
+      const [, ey] = this.w2s(scope.cx, scope.cy + hh);
+      const rx = Math.abs(ex - cx);
+      const ry = Math.abs(ey - cy);
       ctx.beginPath();
-      ctx.arc(cx, cy, rpx, 0, Math.PI * 2);
+      if (scope.shape === "box") ctx.rect(cx - rx, cy - ry, rx * 2, ry * 2);
+      else ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
       ctx.fill();
       ctx.stroke();
       ctx.setLineDash([]);
-      // The lens tabs sit just outside the circle, above unless it is near the top.
-      const above = cy - rpx - 16 > 26;
-      const tabCy = above ? cy - rpx - 16 : cy + rpx + 16;
-      this.scopeTabs = this._drawHudTabs(
+      // The lens tabs sit just outside the region, above unless it is near the top.
+      const above = cy - ry - 16 > 26;
+      const tabCy = above ? cy - ry - 16 : cy + ry + 16;
+      this.scopeTabs = this._drawTabs(
         scopeLenses(),
         scope.lensId,
         cx,
@@ -1350,23 +1478,32 @@ export class CanvasView {
     ctx.restore();
   }
 
-  /** The transient centre-screen HUD, while its flash window is open. */
-  private _drawHud(w: number): void {
-    const hud = this._hud;
-    if (!hud || performance.now() >= hud.until) return;
-    this._drawHudTabs(hud.tabs, hud.activeId, w / 2, 30);
+  /**
+   * The persistent top tabbers: a lens row and a colour-mode row, both centred
+   * at the top of the canvas. Their active tab tracks the model, so they are the
+   * always-visible feedback for **E** / **C** (and a click switches directly).
+   */
+  private _drawTopTabs(w: number): void {
+    const m = this.model;
+    this.lensTabs = this._drawTabs(
+      BUILTIN_LENSES,
+      m.activeBaseLensId(),
+      w / 2,
+      16,
+    );
+    this.colorTabs = this._drawTabs(colorModeTabs(), m.colorMode, w / 2, 40);
   }
 
   /**
    * Draw a horizontal row of tabs centred at *(cx, cy)* and return their screen rects
    * so a click can be routed back to the coordinator.
    */
-  private _drawHudTabs(
-    tabs: readonly HudTab[],
+  private _drawTabs(
+    tabs: readonly { id: string; label: string }[],
     activeId: string,
     cx: number,
     cy: number,
-  ): LensTabHit[] {
+  ): TabHit[] {
     const ctx = this.ctx;
     const padX = 9;
     const gap = 6;
@@ -1380,7 +1517,7 @@ export class CanvasView {
       widths.reduce((a, b) => a + b, 0) + gap * (tabs.length - 1);
     let x = cx - total / 2;
     const y = cy - h / 2;
-    const hits: LensTabHit[] = [];
+    const hits: TabHit[] = [];
     tabs.forEach((tab, i) => {
       const w = widths[i];
       const active = tab.id === activeId;
@@ -1396,7 +1533,7 @@ export class CanvasView {
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
       ctx.fillText(tab.label, x + w / 2, y + h / 2 + 0.5);
-      hits.push({ lensId: tab.id, x0: x, y0: y, x1: x + w, y1: y + h });
+      hits.push({ id: tab.id, x0: x, y0: y, x1: x + w, y1: y + h });
       x += w + gap;
     });
     ctx.restore();
@@ -1461,16 +1598,35 @@ export class CanvasView {
 
     if (!track || !anchor) {
       this.$tip.classList.add("hidden");
+      this.$coords.classList.add("hidden");
+      this._describeKey = "";
+      this._tipCard = null;
+      this._hideGenrePop();
       return;
     }
 
     const card = buildTooltip(track, this.model, this.inspect);
+    // On the Describe tab the content folds out into a wide two-column panel
+    // beside the card (terms | coordinates), where it gets room the 300 px card
+    // cannot give. `card.inspect` is the path-guarded effective state.
+    const showPanel = pinned && this.inspect?.tab === "describe";
+    const describe = card.inspect?.describe ?? emptyDescribe("");
     if (card.key !== this._tipKey) {
       this._tipKey = card.key;
       renderTooltip(this.$tip, card);
-      // The old target elements are gone; a stale hover would keep glowing.
+      // The old target elements are gone; a stale hover would keep glowing, and
+      // a rebuilt chip cannot keep the old pop-over.
       this.hoverTarget = null;
       this._previewRow = null;
+      this._hideGenrePop();
+    }
+    this._tipCard = card;
+    // The panel is a sibling of the card, so it needs its own identity gate: a
+    // pan/zoom frame must not replace the term rows under the pointer.
+    const panelKey = showPanel ? describeKey(describe) : "";
+    if (panelKey !== this._describeKey) {
+      this._describeKey = panelKey;
+      renderDescribePanel(this.$coords, describe, showPanel);
     }
     this.$tip.classList.toggle("pinned", pinned);
     this.$tip.classList.remove("hidden");
@@ -1484,6 +1640,19 @@ export class CanvasView {
     ty = Math.max(4, Math.min(ty, window.innerHeight - this.$tip.offsetHeight - 4));
     this.$tip.style.left = tx + "px";
     this.$tip.style.top = ty + "px";
+
+    if (showPanel) {
+      let px = tx + this.$tip.offsetWidth + 8;
+      if (px + this.$coords.offsetWidth > window.innerWidth)
+        px = tx - this.$coords.offsetWidth - 8;
+      px = Math.max(4, Math.min(px, window.innerWidth - this.$coords.offsetWidth - 4));
+      const py = Math.max(
+        4,
+        Math.min(ty, window.innerHeight - this.$coords.offsetHeight - 4),
+      );
+      this.$coords.style.left = px + "px";
+      this.$coords.style.top = py + "px";
+    }
   }
 
   /* ── Inspect card (pinned, interactive) ──────────────────── */
@@ -1503,9 +1672,14 @@ export class CanvasView {
       mode: null,
       results: [],
       proximity: 100,
+      tab: "navigate",
+      describe: emptyDescribe(track.path),
     };
     this._tipKey = "";
     this.scheduleDraw();
+    // Load the zero-shot descriptions so the coordinates show next to the stats
+    // while the card is pinned, before the Describe tab is opened.
+    this.onInspectAction?.("open", track.path);
   }
 
   /** Close the inspect card; returns whether one was open. */
@@ -1515,8 +1689,11 @@ export class CanvasView {
     this._pinPos = null;
     this._previewRow = null;
     this._tipKey = "";
+    this._tipCard = null;
+    this._hideGenrePop();
     this.hoverTarget = null;
     this.$tip.classList.remove("pinned");
+    this.$coords.classList.add("hidden");
     this.scheduleDraw();
     return true;
   }
@@ -1539,6 +1716,12 @@ export class CanvasView {
   /** Delegated click handling for the inspect card's buttons and result rows. */
   private _onTipClick(e: MouseEvent): void {
     const t = e.target as HTMLElement;
+    // A Describe-tab term is a search: clicking it runs the semantic query.
+    const term = t.closest<HTMLElement>("[data-search-term]");
+    if (term) {
+      this.onSearchTerm?.(term.dataset.searchTerm!);
+      return;
+    }
     if (t.closest("[data-inspect-close]")) {
       this.onInspectAction?.("close", this.inspect?.path ?? "");
       return;
@@ -1588,6 +1771,10 @@ export class CanvasView {
       this._previewRow = preview;
       this.onInspectAction?.("hover", preview.dataset.preview!);
     }
+    // Hovering the genre chip opens a pop-over with the full name, so a truncated
+    // one can be read without the fixed-width card reflowing.
+    const genre = t.closest<HTMLElement>("[data-genre-pop]");
+    if (genre) this._showGenrePop(genre);
     const el = t.closest<HTMLElement>("[data-hover-target]");
     const raw = el?.dataset.hoverTarget;
     if (!raw) return;
@@ -1608,6 +1795,11 @@ export class CanvasView {
       "[data-preview]",
     );
     if (preview && previewTo !== preview) this._previewRow = null;
+    const genre = t.closest<HTMLElement>("[data-genre-pop]");
+    const genreTo = (e.relatedTarget as HTMLElement | null)?.closest?.(
+      "[data-genre-pop]",
+    );
+    if (genre && genreTo !== genre) this._hideGenrePop();
     const el = t.closest<HTMLElement>("[data-hover-target]");
     if (!el) return;
     const to = (e.relatedTarget as HTMLElement | null)?.closest?.(
@@ -1618,6 +1810,71 @@ export class CanvasView {
     this.scheduleDraw();
   }
 
+  /**
+   * The genre chip's hover pop-over. It is a body-level fixed element, not a
+   * child of the card, so expanding a truncated name never reflows the card.
+   */
+  private _genrePop: HTMLElement | null = null;
+
+  private _ensureGenrePop(): HTMLElement {
+    if (!this._genrePop) {
+      const pop = document.createElement("div");
+      pop.id = "tt-pop";
+      pop.className = "tt-pop hidden";
+      document.body.appendChild(pop);
+      this._genrePop = pop;
+    }
+    return this._genrePop;
+  }
+
+  /** Show the full genre name (and projected folder) above the chip. */
+  private _showGenrePop(anchor: HTMLElement): void {
+    const genre = this._tipCard?.genre;
+    if (!genre) return;
+    const pop = this._ensureGenrePop();
+    renderGenrePop(pop, genre);
+    const r = anchor.getBoundingClientRect();
+    const pw = pop.offsetWidth,
+      ph = pop.offsetHeight;
+    let top = r.top - ph - 6;
+    if (top < 4) top = r.bottom + 6;
+    const left = Math.max(4, Math.min(r.left, window.innerWidth - pw - 4));
+    pop.style.left = `${left}px`;
+    pop.style.top = `${Math.max(4, Math.min(top, window.innerHeight - ph - 4))}px`;
+  }
+
+  private _hideGenrePop(): void {
+    this._genrePop?.classList.add("hidden");
+  }
+
+  /**
+   * Cursor-adjacent readout while **M + scroll** adjusts the preview volume. A
+   * body-level fixed element, so it follows the pointer without touching layout,
+   * and it fades after a short pause so it never lingers.
+   */
+  private _volumeHud: HTMLElement | null = null;
+  private _volumeHudTimer = 0;
+
+  showVolumeHud(clientX: number, clientY: number): void {
+    if (!this._volumeHud) {
+      const hud = document.createElement("div");
+      hud.id = "volume-hud";
+      hud.className = "volume-hud hidden";
+      document.body.appendChild(hud);
+      this._volumeHud = hud;
+    }
+    const hud = this._volumeHud;
+    hud.textContent = `${Math.round(this.model.previewVolume * 100)}%`;
+    hud.classList.remove("hidden");
+    hud.style.left = `${clientX + 14}px`;
+    hud.style.top = `${clientY + 14}px`;
+    clearTimeout(this._volumeHudTimer);
+    this._volumeHudTimer = setTimeout(
+      () => hud.classList.add("hidden"),
+      700,
+    ) as unknown as number;
+  }
+
   clearHover(): void {
     clearTimeout(this.tipTimer);
     this.tipReady = false;
@@ -1625,6 +1882,10 @@ export class CanvasView {
     this.hoveredPath = null;
     this.hoveredSiblingFolder = null;
     // The pinned inspect card outlives the pointer leaving the canvas.
-    if (!this.inspect) this.$tip.classList.add("hidden");
+    if (!this.inspect) {
+      this.$tip.classList.add("hidden");
+      this.$coords.classList.add("hidden");
+      this._hideGenrePop();
+    }
   }
 }

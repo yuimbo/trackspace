@@ -6,6 +6,40 @@ export interface HotkeyBinding {
   alt?: boolean;
   label: string;
   description: string;
+  /**
+   * When ``false`` the entry is listed in F1 but not dispatched by
+   * `HotkeyManager` — the controller owns its keydown/keyup (e.g. **M**, which
+   * toggles on a bare tap but adjusts the preview volume when held + scrolled).
+   */
+  dispatch?: boolean;
+}
+
+/**
+ * True while *target* is a text-entry field, so a shortcut must not fire there.
+ * One source of truth for the hotkey manager, the canvas gestures and the
+ * controller's own key handlers.
+ */
+export function isTextEntryTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  if (el.tagName === "TEXTAREA") return true;
+  if (el.tagName !== "INPUT") return false;
+  const type = (el as HTMLInputElement).type.toLowerCase();
+  return (
+    type === "" ||
+    type === "text" ||
+    type === "password" ||
+    type === "email" ||
+    type === "search" ||
+    type === "url" ||
+    type === "tel" ||
+    type === "number" ||
+    type === "date" ||
+    type === "time" ||
+    type === "datetime-local" ||
+    type === "month" ||
+    type === "week"
+  );
 }
 
 const IS_MAC =
@@ -15,7 +49,7 @@ const MOD_SYMBOL = IS_MAC ? "⌘" : "Ctrl+";
 export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "focus-search",   key: "/",      mod: false, shift: false, alt: false, label: "/",                      description: "Focus semantic search" },
   { action: "focus-search",   key: "f",      mod: true,  shift: false, alt: false, label: `${MOD_SYMBOL}F`,         description: "Focus semantic search" },
-  { action: "toggle-preview",  key: "m",      mod: false, shift: false, alt: false, label: "M",                      description: "Toggle hover preview" },
+  { action: "toggle-preview",  key: "m",      mod: false, shift: false, alt: false, label: "M",                      description: "Toggle hover preview (hold + scroll adjusts its volume)", dispatch: false },
   { action: "fit-view",        key: "h",      mod: false, shift: false, alt: false, label: "H",                      description: "Fit view to the hovered element (cluster/folder/key/BPM) or track's folder (80% radius), else full view" },
   { action: "focus-folder",    key: "f",      mod: false, shift: false, alt: false, label: "F",                      description: "Select all tracks of the hovered element or the track's folder (and subfolders)" },
   { action: "isolate-selection", key: "s",  mod: false, shift: false, alt: false, label: "s",                      description: "Isolate to the hovered element or selection; again when isolated: show all; hovering nothing: show all" },
@@ -27,7 +61,8 @@ export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "deselect",        key: "Escape", mod: false, shift: false, alt: false, label: "Esc",                    description: "Deselect / cancel" },
   { action: "toggle-view",     key: "e",      mod: false, shift: false, alt: false, label: "E",                      description: "Cycle lenses forward (tags → combined → per-source maps → feature wheels)" },
   { action: "toggle-view-prev", key: "e",      mod: false, shift: true,  alt: false, label: "Shift+E",              description: "Cycle lenses backward" },
-  { action: "toggle-clusters", key: "c",      mod: false, shift: false, alt: false, label: "C",                      description: "Colour dots by microgenre cluster" },
+  { action: "toggle-clusters", key: "c",      mod: false, shift: false, alt: false, label: "C",                      description: "Cycle dot colour forward: folder → predicted folder → cluster → tempo → key" },
+  { action: "toggle-clusters-prev", key: "c", mod: false, shift: true,  alt: false, label: "Shift+C",              description: "Cycle dot colour backward" },
 ];
 
 export type HotkeyAction = (typeof HOTKEY_MAP)[number]["action"];
@@ -40,9 +75,12 @@ export const MOUSE_HINTS: { label: string; description: string }[] = [
   { label: "Click folder",    description: "Select all tracks in this folder (and subfolders)" },
   { label: "⌘/Ctrl+click",    description: "Add this folder’s tracks to the selection" },
   { label: "Shift+click",     description: "Add tracks from each folder between anchor and this row (set anchor with a normal click)" },
-  { label: "X + drag / scroll", description: "Scope: draw or resize a circle, then pick a lens from its tab bar" },
+  { label: "X + drag",   description: "Scope: box-select a region, then pick a lens from its tab bar" },
+  { label: "X + scroll", description: "Scope: draw or resize a circle at the cursor" },
   { label: "X",          description: "Close the active scope" },
+  { label: "Esc",        description: "Close the active scope" },
   { label: "Click away", description: "Close the active scope" },
+  { label: "M + scroll", description: "Adjust preview volume (a scroll suppresses the M tap toggle)" },
   { label: "Alt+click folder", description: "Exclude folder from the view" },
   { label: "Alt + hover dot",  description: "Pin the inspect card (anti-track, nearest, solo)" },
   { label: "Hover cluster + s / H", description: "Isolate to the cluster / fit the view to it" },
@@ -95,19 +133,12 @@ export class HotkeyManager {
 
   private _dispatch(e: KeyboardEvent): void {
     if (!this._enabled) return;
-    const el = e.target as HTMLElement;
-    if (el.tagName === "TEXTAREA") return;
-    if (el.tagName === "INPUT") {
-      // Only suppress hotkeys for text-entry inputs; range/checkbox/radio/etc. should not block global shortcuts
-      const type = (el as HTMLInputElement).type.toLowerCase();
-      const isTextEntry = type === "" || type === "text" || type === "password" ||
-        type === "email" || type === "search" || type === "url" ||
-        type === "tel" || type === "number" || type === "date" ||
-        type === "time" || type === "datetime-local" || type === "month" || type === "week";
-      if (isTextEntry) return;
-    }
+    // Only suppress hotkeys for text-entry fields; range/checkbox/radio/etc. must
+    // not block global shortcuts.
+    if (isTextEntryTarget(e.target)) return;
 
     for (const b of this.bindings) {
+      if (b.dispatch === false) continue;
       if (!this._matches(e, b)) continue;
       e.preventDefault();
       const handlers = this._handlers.get(b.action);
