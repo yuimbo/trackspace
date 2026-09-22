@@ -19,7 +19,7 @@ from backend.tuning import BPM_HI, BPM_LO
 
 log = logging.getLogger(__name__)
 
-FEATURES_VERSION = 7
+FEATURES_VERSION = 8
 AUDIO_FEATURE_DIM = 6
 
 _KEY_TO_FIFTHS: dict[str, int] = {
@@ -164,7 +164,9 @@ def extract_audio_features_and_warning(
             tempo = float(tempo[0])
         madmom_bpm = madmom_tempo.estimate_tempo_bpm(audio, sr)
         if madmom_bpm is not None:
-            tempo = madmom_bpm
+            # Guard the single-network tracker's half/double lock against the
+            # librosa estimate already computed above.
+            tempo = madmom_tempo.reconcile_tempo_octave(madmom_bpm, float(tempo))
         tempo_norm = float(np.clip((tempo - BPM_LO) / (BPM_HI - BPM_LO), 0.0, 1.0))
 
         key_str, scale_str = detect_key(audio, sr)

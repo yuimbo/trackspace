@@ -282,6 +282,75 @@ def test_pca_ref_aligns_revisited_view():
     assert pb.pca_ref_stats()["hit"] == 1
 
 
+def _two_folder_library(seed: int = 11):
+    """A CLAP-only library with two well-populated folders."""
+    rng = np.random.default_rng(seed)
+    clap: dict[str, np.ndarray] = {}
+    infos: list[dict] = []
+    for folder in ("lib/Techno", "lib/House"):
+        for i in range(10):
+            fp = f"{folder}-{i}"
+            clap[fp] = rng.standard_normal(8).astype(np.float32)
+            infos.append({"path": f"{folder}/t{i}.mp3", "fingerprint": fp})
+    return _StubFeatureCache(clap=clap), clap, infos
+
+
+def test_fit_reuses_chart_when_a_track_joins_an_existing_folder(monkeypatch):
+    """Adding a track to an existing folder must transform, not refit.
+
+    The fit is keyed on the folder *set*, so the chart frame is stable and the
+    new track is placed into it. This is the "growing library" case that used to
+    refit every lens because the key carried the full path set.
+    """
+    from backend.embeddings import projection_backends as pb
+
+    monkeypatch.setattr(layout, "is_model_ready", lambda: True)
+    pb.reset_tsne_fit_cache()
+    cache, clap, infos = _two_folder_library()
+
+    def project(rows: list[dict]):
+        return compute_projection(
+            rows, cache, method="tsne", scale_folders=True, sources=("clap",),
+        )
+
+    project(infos)
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+    extra_fp = "lib/Techno-extra"
+    clap[extra_fp] = np.random.default_rng(3).standard_normal(8).astype(np.float32)
+    project(infos + [{"path": "lib/Techno/extra.mp3", "fingerprint": extra_fp}])
+
+    stats = pb.tsne_fit_stats()
+    assert stats["transform"] == 1
+    assert stats["fit"] == 1
+
+
+def test_fit_refits_when_a_new_folder_appears(monkeypatch):
+    """A new folder is a genuinely new direction, so the chart refits."""
+    from backend.embeddings import projection_backends as pb
+
+    monkeypatch.setattr(layout, "is_model_ready", lambda: True)
+    pb.reset_tsne_fit_cache()
+    cache, clap, infos = _two_folder_library(seed=12)
+
+    def project(rows: list[dict]):
+        return compute_projection(
+            rows, cache, method="tsne", scale_folders=True, sources=("clap",),
+        )
+
+    project(infos)
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+    rng = np.random.default_rng(4)
+    for i in range(10):
+        fp = f"lib/Ambient-{i}"
+        clap[fp] = rng.standard_normal(8).astype(np.float32)
+        infos.append({"path": f"lib/Ambient/t{i}.mp3", "fingerprint": fp})
+    project(infos)
+
+    assert pb.tsne_fit_stats()["fit"] == 2
+
+
 def test_weight_jacobian_predicts_small_weight_steps():
     """The Jacobian is a first-order fit: a small step must point its way.
 

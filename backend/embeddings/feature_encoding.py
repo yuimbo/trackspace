@@ -1,7 +1,7 @@
 """Perceptual re-encodings of the cached 6-D audio-feature vector.
 
 The cache stores ``[tempo_norm, key_cos, key_sin, mode, energy_norm,
-danceability]`` (``FEATURES_VERSION`` 6, ``librosa_audio_features``).  Two of those
+danceability]`` (``librosa_audio_features``).  Two of those
 dimensions are not perceptually uniform:
 
 - ``tempo_norm`` is linear in BPM, so a 90 BPM track and its double-time 180 BPM

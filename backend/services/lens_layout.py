@@ -63,7 +63,7 @@ def compute_lens_projection(
     if proj.method == "tsne":
         from backend.embeddings.layout import revision_layout_cached
 
-        hit = revision_layout_cached(revision)
+        hit = revision_layout_cached(revision, feature_cache)
         if hit is not None:
             return hit, revision
     slot = user_projection() if user else prefetch_projection()

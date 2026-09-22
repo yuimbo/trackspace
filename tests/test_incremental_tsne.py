@@ -132,3 +132,82 @@ def test_no_paths_or_key_uses_fallback():
     out = pb._project_tsne(mat)
     assert out.shape == (60, 2)
     assert len(pb._tsne_fit_cache) == 0
+
+
+class _FakeFitStore:
+    """Minimal stand-in for FeatureCache's fit-blob sidecar."""
+
+    def __init__(self) -> None:
+        self.blobs: dict[str, bytes] = {}
+
+    def get_tsne_fit(self, key: str) -> bytes | None:
+        return self.blobs.get(key)
+
+    def put_tsne_fit(self, key: str, blob: bytes) -> None:
+        self.blobs[key] = blob
+
+
+def test_fit_survives_a_restart_via_disk():
+    """A restart must transform, not refit, when the blob is on disk."""
+    store = _FakeFitStore()
+    mat = _matrix(120)
+    pb._project_tsne(
+        mat, paths=_paths(120), config_key="cfg", feature_cache=store
+    )
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+    # Simulate a restart: the in-process cache is empty, the disk is not.
+    pb.reset_tsne_fit_cache()
+    out = pb._project_tsne(
+        mat, paths=_paths(120), config_key="cfg", feature_cache=store
+    )
+    assert out.shape == (120, 2)
+    stats = pb.tsne_fit_stats()
+    assert stats["fit"] == 0
+    assert stats["reuse"] == 1
+
+
+def test_persisted_fit_transforms_new_tracks_after_restart():
+    store = _FakeFitStore()
+    mat = _matrix(120)
+    pb._project_tsne(
+        mat, paths=_paths(120), config_key="cfg", feature_cache=store
+    )
+
+    pb.reset_tsne_fit_cache()
+    added = _matrix(10, seed=7)
+    sup_paths = _paths(120) + _paths(10, offset=1000)
+    out = pb._project_tsne(
+        np.vstack([mat, added]),
+        paths=sup_paths,
+        config_key="cfg",
+        feature_cache=store,
+    )
+    assert out.shape == (130, 2)
+    assert pb.tsne_fit_stats()["transform"] == 1
+    assert pb.tsne_fit_stats()["fit"] == 0
+
+
+def test_unreadable_persisted_fit_refits():
+    store = _FakeFitStore()
+    store.blobs["cfg"] = b"not a fit"
+    mat = _matrix(120)
+    out = pb._project_tsne(
+        mat, paths=_paths(120), config_key="cfg", feature_cache=store
+    )
+    assert out.shape == (120, 2)
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+
+def test_disk_fit_not_written_for_jacobian_fits():
+    """The Jacobian's throwaway fits must not touch the persisted blob."""
+    store = _FakeFitStore()
+    mat = _matrix(60)
+    pb._project_tsne(
+        mat,
+        paths=_paths(60),
+        config_key="pert",
+        cache_fit=False,
+        feature_cache=store,
+    )
+    assert store.blobs == {}

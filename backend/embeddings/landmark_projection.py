@@ -199,21 +199,37 @@ def _select_landmarks(mat_u: np.ndarray, n_landmarks: int, seed: int) -> np.ndar
     return out
 
 
-def _source_deltas(
+def _landmark_rows(
     mat_u: np.ndarray,
     spans: dict[str, tuple[int, int]],
     landmark_idx: np.ndarray,
 ) -> dict[str, np.ndarray]:
-    """``source -> (N, M)`` squared distances to the landmarks, in float32."""
+    """``source -> (M, D_s)`` unweighted blocks for the landmark tracks.
+
+    Fixed once per chart: the same rows serve both the fit and the out-of-sample
+    extension, so an inserted track's distances are measured against the chart's own
+    landmarks rather than its own rows.
+    """
+    return {
+        s: mat_u[landmark_idx, lo:hi].astype(np.float64)
+        for s, (lo, hi) in spans.items()
+    }
+
+
+def _deltas_to_landmark_rows(
+    mat_u: np.ndarray,
+    spans: dict[str, tuple[int, int]],
+    landmark_rows: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """``source -> (N, M)`` squared distances from *mat_u* to fixed landmark rows."""
     out: dict[str, np.ndarray] = {}
     for s, (lo, hi) in spans.items():
         block = mat_u[:, lo:hi].astype(np.float64)
+        lm = landmark_rows[s]
         sq = (block**2).sum(axis=1)
-        lm = block[landmark_idx]
+        sq_l = (lm**2).sum(axis=1)
         gram = block @ lm.T
-        out[s] = (sq[:, None] + sq[landmark_idx][None, :] - 2.0 * gram).astype(
-            np.float32
-        )
+        out[s] = (sq[:, None] + sq_l[None, :] - 2.0 * gram).astype(np.float32)
     return out
 
 
@@ -260,12 +276,20 @@ def build_landmark_model(
     n_landmarks: int = DEFAULT_LANDMARKS,
     tau_quantile: float = DEFAULT_TAU_QUANTILE,
     seed: int = 42,
+    place_infos: list[dict] | None = None,
 ) -> LandmarkModel | None:
     """Fit the landmark extension against the existing base 2-D layout.
 
     Returns ``None`` when there is nothing to fit (fewer than two eligible tracks).
     The caller caches the result per chart revision: refitting ``c`` per drag would
     be the "recompute the fitted quantity" mistake the derivative must avoid.
+
+    *place_infos* are extra tracks the chart *places* but does not fit: the
+    landmarks, bandwidth and coefficients stay fixed by the base layout, and the
+    extra tracks get a Nyström-style out-of-sample extension in the same frame.
+    That is how external roots are drawn on a library-only chart without a refit:
+    the fitted rows keep their true base positions and the extra rows are placed
+    by the same frozen ``g``.
     """
     w0 = {s: float((weights0 or {}).get(s, 1.0)) for s in sources}
     paths, mat_u, spans = _unweighted_composite(
@@ -283,16 +307,21 @@ def build_landmark_model(
     keep = [i for i, p in enumerate(paths) if p in by_path]
     if len(keep) < 2:
         return None
-    paths = [paths[i] for i in keep]
-    mat_u = mat_u[keep]
+    fit_paths = [paths[i] for i in keep]
+    fit_mat = mat_u[keep]
 
-    landmark_idx = _select_landmarks(mat_u, int(n_landmarks), int(seed))
-    delta = _source_deltas(mat_u, spans, landmark_idx)
-    tau = _tau_from(delta, tau_quantile)
+    landmark_idx = _select_landmarks(fit_mat, int(n_landmarks), int(seed))
+    landmark_rows = _landmark_rows(fit_mat, spans, landmark_idx)
+    fit_delta = _deltas_to_landmark_rows(fit_mat, spans, landmark_rows)
+    tau = _tau_from(fit_delta, tau_quantile)
+    # A source with no cached rows for any track contributes no span; keep only
+    # the sources that actually have a block, or the affinity sum would index a
+    # missing key (e.g. ``supervised`` before a head is trained).
+    active_sources = tuple(s for s in sources if s in fit_delta)
 
-    a0 = _affinities_at(delta, sources, w0, tau)
+    a0 = _affinities_at(fit_delta, active_sources, w0, tau)
     y0 = np.array(
-        [[by_path[p]["x"], by_path[p]["y"]] for p in paths], dtype=np.float64
+        [[by_path[p]["x"], by_path[p]["y"]] for p in fit_paths], dtype=np.float64
     )
     gram = a0.T @ a0 + FIT_RIDGE * np.eye(a0.shape[1])
     try:
@@ -300,18 +329,49 @@ def build_landmark_model(
     except np.linalg.LinAlgError:
         return None
 
+    placed_paths: list[str] = []
+    placed_delta: dict[str, np.ndarray] | None = None
+    if place_infos:
+        candidate_paths, candidate_mat, candidate_spans = _unweighted_composite(
+            place_infos,
+            feature_cache,
+            sources=sources,
+            feature_mask=feature_mask,
+            features_blend=features_blend,
+            required_sources=required_sources,
+        )
+        # A source block missing from the extra tracks would shift every later
+        # column; drop the extension rather than measure the wrong blocks.
+        if candidate_mat.shape[0] and candidate_spans == spans:
+            placed_paths = candidate_paths
+            placed_delta = _deltas_to_landmark_rows(
+                candidate_mat, spans, landmark_rows
+            )
+
+    if placed_delta is not None:
+        a_placed = _affinities_at(placed_delta, active_sources, w0, tau)
+        g_placed = a_placed @ coeffs
+        all_paths = fit_paths + placed_paths
+        delta = {
+            s: np.vstack([fit_delta[s], placed_delta[s]]) for s in active_sources
+        }
+        base = np.vstack([y0, g_placed])
+    else:
+        all_paths, delta, base = fit_paths, fit_delta, y0
+
     model = LandmarkModel(
-        paths=paths,
-        sources=tuple(sources),
+        paths=all_paths,
+        sources=active_sources,
         delta=delta,
         coeffs=coeffs,
-        base=y0,
+        base=base,
         tau=tau,
         weights0=w0,
     )
     log.info(
-        "Landmark extension: %d tracks, %d landmarks, tau=%.4g",
-        len(paths),
+        "Landmark extension: %d fitted, %d placed, %d landmarks, tau=%.4g",
+        len(fit_paths),
+        len(all_paths) - len(fit_paths),
         int(landmark_idx.size),
         tau,
     )
@@ -357,16 +417,26 @@ def landmark_model_for(
     required_sources: tuple[str, ...] | None = None,
     weights0: dict[str, float] | None = None,
     n_landmarks: int = DEFAULT_LANDMARKS,
+    place_infos: list[dict] | None = None,
 ) -> LandmarkModel | None:
     """Fit (or reuse) the chart for *layout_revision*; ``None`` when unfittable.
 
     Cached per chart revision, which already includes the weights, so a drag reuses
-    the fit and only the ``O(N*M*S)`` evaluation runs.
+    the fit and only the ``O(N*M*S)`` evaluation runs. When *place_infos* is
+    given, the cache key also carries their path set: the same chart extends a
+    different set of external tracks, and serving one set's coordinates for another
+    would be wrong.
     """
-    if layout_revision:
-        hit = _model_cache.get(layout_revision)
+    cache_key = layout_revision
+    if layout_revision and place_infos:
+        from .layout import track_set_key  # local: layout imports this module
+
+        sig = track_set_key([t["path"] for t in place_infos], sort=True)
+        cache_key = f"{layout_revision}|place:{sig}"
+    if cache_key:
+        hit = _model_cache.get(cache_key)
         if hit is not None:
-            _model_cache.move_to_end(layout_revision)
+            _model_cache.move_to_end(cache_key)
             return hit
     model = build_landmark_model(
         track_infos,
@@ -378,10 +448,11 @@ def landmark_model_for(
         required_sources=required_sources,
         weights0=weights0,
         n_landmarks=n_landmarks,
+        place_infos=place_infos,
     )
-    if model is not None and layout_revision:
-        _model_cache[layout_revision] = model
-        _model_cache.move_to_end(layout_revision)
+    if model is not None and cache_key:
+        _model_cache[cache_key] = model
+        _model_cache.move_to_end(cache_key)
         while len(_model_cache) > _MODEL_CACHE_MAX:
             _model_cache.popitem(last=False)
     return model

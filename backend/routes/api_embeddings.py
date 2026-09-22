@@ -39,6 +39,12 @@ RETRIGGER_STAGES: tuple[str, ...] = (
     KIND_CLAP,
 )
 
+#: Projection fit scopes. ``library`` fits "my library" roots only and places any
+#: visible external roots onto that chart by Nyström extension; ``all`` fits every
+#: visible track (the old external-inclusive behaviour). The default is ``library``,
+#: so toggling "Show external" never moves the library layout.
+FIT_SCOPES: tuple[str, ...] = ("library", "all")
+
 
 class _Broadcaster(Protocol):
     def subscribe(self, *, maxsize: int = 2000) -> queue.Queue[dict[str, Any]]: ...
@@ -75,6 +81,69 @@ def create_api_embeddings_blueprint(
     structure_version: int,
 ) -> Blueprint:
     bp = Blueprint("api_embeddings", __name__)
+
+    def _fit_scope(req: Any) -> str:
+        raw = (req.args.get("fit_scope") or "library").strip().lower()
+        one_of(raw, FIT_SCOPES, field="fit_scope")
+        return raw
+
+    def _split_fit_scope(
+        infos: list[dict[str, Any]],
+        *,
+        rel: str,
+        include_external: bool,
+        fit_scope: str,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split *infos* into the fitted chart and the Nyström-placed extra tracks.
+
+        The library scope keeps the chart on "my library" roots: when external
+        tracks are visible they are *placed* onto it rather than refitting the map
+        (which would move every library dot). A specific folder is always its own
+        scope, and ``fit_scope=all`` keeps the old external-inclusive fit.
+        """
+        if fit_scope == "all" or not include_external or rel:
+            return infos, []
+        library_ids = set(library_root_ids())
+        fit = [t for t in infos if t["path"].split("/", 1)[0] in library_ids]
+        fit_paths = {t["path"] for t in fit}
+        place = [t for t in infos if t["path"] not in fit_paths]
+        return fit, place
+
+    def _place_into_chart(
+        *,
+        base_infos: list[dict[str, Any]],
+        place_infos: list[dict[str, Any]],
+        base_positions: list[dict[str, Any]],
+        proj: Any,
+        revision: str | None,
+        weights0: dict[str, float],
+    ) -> list[dict[str, Any]]:
+        """Nyström-extend *place_infos* into the chart fitted for *base_infos*.
+
+        The fitted chart is cached per revision, so a repeat request only pays the
+        ``O(N*M*S)`` evaluation. ``evaluate`` reproduces the base positions at
+        ``w0`` and extends the extra tracks in the same frame.
+        """
+        model = landmark_mod.landmark_model_for(
+            revision,
+            base_infos,
+            feature_cache,
+            base_positions,
+            sources=proj.sources,
+            feature_mask=proj.feature_mask,
+            features_blend=proj.features_blend,
+            required_sources=proj.required_sources,
+            weights0=weights0,
+            place_infos=place_infos,
+        )
+        if model is None:
+            return []
+        g = model.evaluate(weights0)
+        first_placed = len(base_positions)
+        return [
+            {"path": model.paths[i], "x": float(g[i, 0]), "y": float(g[i, 1])}
+            for i in range(first_placed, len(model.paths))
+        ]
 
     @bp.route("/api/embeddings/stream")
     def api_embeddings_stream():
@@ -196,13 +265,17 @@ def create_api_embeddings_blueprint(
         running, progress = _analysis_progress()
 
         def _scope_infos(all_infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            """Infos in the default projection scope.
+            """Infos in the projection *fit* scope.
 
-            External roots are analysed (and covered) like library roots, but stay
-            out of the layout unless the client asks for them explicitly, so the
-            revision must match the projection's track set.
+            External roots are analysed (and covered) like library roots. By
+            default they are placed onto the library chart rather than fitted into
+            it, so the revision must match the fitted track set — otherwise the
+            client would treat the library layout as stale and refetch it on every
+            external toggle.
             """
-            if request.args.get("include_external") == "1":
+            if request.args.get("include_external") == "1" and _fit_scope(
+                request
+            ) == "all":
                 return all_infos
             ids = set(library_root_ids())
             return [t for t in all_infos if t["path"].split("/", 1)[0] in ids]
@@ -325,11 +398,19 @@ def create_api_embeddings_blueprint(
     def api_embeddings_projection():
         rel = request.args.get("folder", "")
         recursive = request.args.get("recursive", "1") == "1"
-        # External roots stay out of the default layout; the External toggle
-        # requests them explicitly with include_external=1.
+        # External roots stay out of the default fit; the External toggle
+        # requests them explicitly with include_external=1. fit_scope decides
+        # whether they join the fit or are Nyström-placed onto the library chart.
         include_external = request.args.get("include_external") == "1"
+        fit_scope = _fit_scope(request)
         infos = build_track_infos_fn(
             rel, recursive, include_external=include_external
+        )
+        fit_infos, place_infos = _split_fit_scope(
+            infos,
+            rel=rel,
+            include_external=include_external,
+            fit_scope=fit_scope,
         )
 
         proj = parse_projection_params_fn(request, default_when_no_method=True)
@@ -353,8 +434,8 @@ def create_api_embeddings_blueprint(
 
         pversions = _versions()
         weights0 = dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS)
-        positions, revision = compute_lens_projection(
-            infos,
+        fit_positions, revision = compute_lens_projection(
+            fit_infos,
             feature_cache,
             proj,
             embeddings_mod=embeddings_mod,
@@ -364,6 +445,19 @@ def create_api_embeddings_blueprint(
             embedding_version=embedding_version,
             on_progress=_layout_progress,
         )
+        placed_positions = (
+            _place_into_chart(
+                base_infos=fit_infos,
+                place_infos=place_infos,
+                base_positions=fit_positions,
+                proj=proj,
+                revision=revision,
+                weights0=weights0,
+            )
+            if place_infos
+            else []
+        )
+        positions = fit_positions + placed_positions
 
         if not with_jacobian:
             return jsonify({"positions": positions, "revision": revision})
@@ -372,23 +466,26 @@ def create_api_embeddings_blueprint(
         # separate, slower pass. The landmark extension differentiates a *fixed*,
         # smooth function of the weights, so its derivative is exact rather than
         # refit noise (an independent refit lands in a different local optimum).
+        # It also carries the placed tracks, so a weight drag moves them with the
+        # chart instead of dropping them until release.
         _layout_progress("chart", 0, 0)
         model = landmark_mod.landmark_model_for(
             revision,
-            infos,
+            fit_infos,
             feature_cache,
-            positions,
+            fit_positions,
             sources=proj.sources,
             feature_mask=proj.feature_mask,
             features_blend=proj.features_blend,
             required_sources=proj.required_sources,
             weights0=weights0,
+            place_infos=place_infos,
         )
         if model is None:
             # Too few tracks to fit a chart: fall back to the refit finite
             # difference (correct for PCA, noisy for t-SNE).
             _positions, jacobian = embeddings_mod.compute_projection(
-                infos,
+                fit_infos,
                 feature_cache,
                 version=embedding_version,
                 method=proj.method,

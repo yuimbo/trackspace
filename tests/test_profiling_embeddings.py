@@ -305,3 +305,75 @@ def test_profile_incremental_tsne(monkeypatch):
     stats = tsne_fit_stats()
     assert stats["fit"] == 1
     assert stats["transform"] == 1
+
+
+def test_profile_layout_fidelity():
+    """Neighbourhood recall of the incremental placement vs a full fit.
+
+    Reports the fidelity cost of the incremental path on synthetic data: the base
+    layout's own recall@k, the placed points' recall, and (for reference) a
+    subsample-and-interpolate baseline. Run with ``-s`` and raise ``N`` toward the
+    real library for a representative measurement::
+
+      TRACKSPACE_PROFILE_FIDELITY_N=8000 \\
+      .venv/bin/python -m pytest tests/test_profiling_embeddings.py -v -s \\
+        -k layout_fidelity
+    """
+    pytest.importorskip("openTSNE")
+    from backend.embeddings.layout_fidelity import neighbourhood_recall
+    from backend.embeddings.projection_backends import (
+        _opentsne_pca_dim,
+        _pca_reduce,
+        _tsne_perplexity,
+    )
+
+    n = int(os.environ.get("TRACKSPACE_PROFILE_FIDELITY_N", "2000"))
+    d = int(os.environ.get("TRACKSPACE_PROFILE_FIDELITY_D", "50"))
+    k = int(os.environ.get("TRACKSPACE_PROFILE_FIDELITY_K", "10"))
+
+    from sklearn.manifold import TSNE as SklearnTSNE
+    from openTSNE import TSNE as OpenTSNE
+
+    rng = np.random.default_rng(0)
+    hi = rng.standard_normal((n, d)).astype(np.float32)
+
+    base = np.asarray(
+        SklearnTSNE(
+            n_components=2,
+            perplexity=_tsne_perplexity(n),
+            learning_rate="auto",
+            init="pca",
+            random_state=42,
+        ).fit_transform(hi),
+        dtype=np.float32,
+    )
+    print(
+        f"recall@{k}_full_fit          "
+        f"{neighbourhood_recall(hi, base, k=k, sample=2000):.3f}"
+    )
+
+    # Fit on 95% and place the remaining 5% with openTSNE's .transform — the
+    # incremental path the map takes when a few tracks are added.
+    hold = rng.choice(n, max(1, n // 20), replace=False)
+    mask = np.ones(n, bool)
+    mask[hold] = False
+    reduced, pca = _pca_reduce(hi[mask], _opentsne_pca_dim(d))
+    emb = OpenTSNE(
+        n_components=2,
+        perplexity=_tsne_perplexity(int(mask.sum())),
+        random_state=42,
+        n_jobs=-1,
+        verbose=False,
+    ).fit(reduced)
+    placed = np.empty((n, 2), dtype=np.float32)
+    placed[mask] = np.asarray(emb, dtype=np.float32)
+    placed[hold] = np.asarray(
+        emb.transform(pca.transform(hi[hold])), dtype=np.float32
+    )
+    print(
+        f"recall@{k}_placed            "
+        f"{neighbourhood_recall(hi, placed, k=k, sample=2000):.3f}"
+    )
+
+    assert placed.shape == (n, 2)
+    assert np.isfinite(placed).all()

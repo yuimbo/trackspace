@@ -21,10 +21,12 @@ from .clap import (
     generate_embedding,
     generate_text_embeddings,
     is_model_ready,
+    load_error,
     load_model,
     _load_audio_segments,
 )
 from .feature_encoding import FEATURE_ENCODING_VERSION, encode_feature_vector
+from .lens_gauge import gauge_layout
 from .projection_backends import (
     _project_pca,
     _project_tsne,
@@ -41,6 +43,9 @@ log = logging.getLogger(__name__)
 
 # Tiered projection LRU (composite gather → semantic direction basis → t-SNE).
 _COMPOSITE_CACHE_MAX = 24
+#: Byte budget for the composite matrices. A combined-lens matrix is ~101 MB at
+#: 14k tracks, so 24 entries could reach ~2.4 GB; evict by total bytes too.
+_COMPOSITE_CACHE_BYTES_MAX = 512 * 1024 * 1024
 _SEMANTIC_BASIS_CACHE_MAX = 16
 _REVISION_LAYOUT_CACHE_MAX = 32
 _composite_cache: OrderedDict[str, tuple[list[str], np.ndarray, int, int]] = (
@@ -50,6 +55,7 @@ _semantic_basis_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
     OrderedDict()
 )
 _revision_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
+_composite_cache_bytes = 0
 
 _SOURCE_ROW_CACHE_MAX = 24_000
 _source_row_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
@@ -92,15 +98,52 @@ def _tier_cache_put(cache: OrderedDict, key: str, value, max_size: int) -> None:
             cache.popitem(last=False)
 
 
-def revision_layout_cached(revision: str | None) -> list[dict] | None:
+def _composite_cache_put(key: str, value) -> None:
+    """Byte-budgeted put for the composite matrix tier cache."""
+    global _composite_cache_bytes
+    with _cache_lock:
+        old = _composite_cache.get(key)
+        if old is not None:
+            _composite_cache_bytes -= int(old[1].nbytes)
+        _composite_cache[key] = value
+        _composite_cache.move_to_end(key)
+        _composite_cache_bytes += int(value[1].nbytes)
+        while (
+            len(_composite_cache) > _COMPOSITE_CACHE_MAX
+            or (
+                _composite_cache_bytes > _COMPOSITE_CACHE_BYTES_MAX
+                and len(_composite_cache) > 1
+            )
+        ):
+            _k, old_v = _composite_cache.popitem(last=False)
+            _composite_cache_bytes -= int(old_v[1].nbytes)
+
+
+def revision_layout_cached(
+    revision: str | None, feature_cache=None
+) -> list[dict] | None:
     """The cached t-SNE layout for *revision*, or ``None``.
 
-    Lets a caller short-circuit before taking the projection slot: an already-warmed
-    lens must not wait behind a background fit for another lens.
+    In-process LRU first, then the persisted copy: the LRU dies with the process,
+    so without the disk tier a restart re-fits every lens (~20 s each). Lets a
+    caller short-circuit before taking the projection slot: an already-warmed lens
+    must not wait behind a background fit for another lens.
     """
     if not revision:
         return None
-    return _tier_cache_get(_revision_layout_cache, revision)
+    hit = _tier_cache_get(_revision_layout_cache, revision)
+    if hit is not None:
+        return hit
+    getter = getattr(feature_cache, "get_layout", None)
+    if getter is None:
+        return None
+    disk = getter(revision)
+    if not disk:
+        return None
+    _tier_cache_put(
+        _revision_layout_cache, revision, disk, _REVISION_LAYOUT_CACHE_MAX
+    )
+    return disk
 
 
 def _supervised_cache_version(feature_cache) -> int:
@@ -152,6 +195,18 @@ def _composite_config_token(
     )
 
 
+def track_set_key(paths: list[str], *, sort: bool = False) -> str:
+    """Digest of the *track set* alone, independent of any lens configuration.
+
+    Shared by the composite cache key, the lens gauge, and the landmark placement
+    cache: they must key on the tracks alone, never on anything that varies per lens
+    (sources, mask, weights) or per call (the order the paths arrive in).
+    """
+    if sort:
+        paths = sorted(paths)
+    return hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
+
+
 def _composite_param_key(
     paths: list[str],
     sources: tuple[str, ...],
@@ -160,7 +215,7 @@ def _composite_param_key(
     weights: dict[str, float] | None = None,
     versions_token: str = "",
 ) -> str:
-    ph = hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
+    ph = track_set_key(paths)
     return f"{ph}|{_composite_config_token(sources, mask, blend, weights, versions_token)}"
 
 
@@ -395,11 +450,8 @@ def _gather_composite_vecs(
         return paths, np.empty((0, 0), dtype=np.float32), 0, 0, "", comp_config, {}
 
     mat = np.concatenate(blocks, axis=1).astype(np.float32)
-    _tier_cache_put(
-        _composite_cache,
-        comp_key,
-        (list(paths), mat, clap_dim, clap_col_lo, spans),
-        _COMPOSITE_CACHE_MAX,
+    _composite_cache_put(
+        comp_key, (list(paths), mat, clap_dim, clap_col_lo, spans)
     )
     return paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans
 
@@ -524,7 +576,7 @@ def compute_projection(
     on_progress: Callable[[str, int, int], None] | None = None,
 ) -> list[dict] | tuple[list[dict], dict[str, np.ndarray]]:
     if layout_revision and method == "tsne":
-        hit = _tier_cache_get(_revision_layout_cache, layout_revision)
+        hit = revision_layout_cached(layout_revision, feature_cache)
         if hit is not None:
             log.debug("projection: revision cache hit (tsne)")
             return hit
@@ -568,8 +620,14 @@ def compute_projection(
         mat_proj = mat
         basis_key = ""
         if needs_weight:
+            # Key the semantic basis on the vector *config* and the folder *set*,
+            # never the full path set: the frame is defined by the folders, so a
+            # track added to an existing folder must reuse the fitted chart (and
+            # be transformed into it) rather than refit the whole map. A new
+            # folder is a genuinely new direction, so it does refit.
             basis_key = (
-                f"{comp_key}|{_semantic_basis_param_key(context_tags, folder_seeds)}"
+                f"{comp_config}"
+                f"|{_semantic_basis_param_key(context_tags, folder_seeds)}"
             )
             basis = _tier_cache_get(_semantic_basis_cache, basis_key)
             if basis is None:
@@ -603,9 +661,24 @@ def compute_projection(
                     f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
                 )
             coords = _project_tsne(
-                mat_proj, paths=paths, config_key=tsne_config, cache_fit=cache_fit
+                mat_proj,
+                paths=paths,
+                config_key=tsne_config,
+                cache_fit=cache_fit,
+                feature_cache=feature_cache,
             )
 
+        # Put every lens in one shared gauge before normalising, so switching lens
+        # is not an apparent rotation/flip of the whole map (see `lens_gauge`).
+        # Keyed by the track set + cache generations, not the lens: layouts are only
+        # comparable within one such family. The Jacobian's perturbation fits are
+        # excluded — they must stay in their own frame to difference correctly.
+        if cache_fit:
+            coords = gauge_layout(
+                f"{_source_versions_token(feature_cache)}|{track_set_key(paths)}",
+                paths,
+                coords,
+            )
         normed = _normalise_coords(coords)
         result = [
             {"path": paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
@@ -624,6 +697,9 @@ def compute_projection(
         _tier_cache_put(
             _revision_layout_cache, layout_revision, result, _REVISION_LAYOUT_CACHE_MAX,
         )
+        putter = getattr(feature_cache, "put_layout", None)
+        if putter is not None:
+            putter(layout_revision, result)
 
     if with_jacobian:
         jacobian = _weight_jacobian(

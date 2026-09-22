@@ -7,19 +7,20 @@ incremental refreshes.
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import logging
 import os
+import pickle
 import platform
 import sys
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 
 import numpy as np
 
 from .clap import inference_lock as _inference_lock
-from .linalg_utils import svd_singular
+from .linalg_utils import apply_procrustes, procrustes, svd_singular
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ _pca_ref_stats = {"hit": 0, "miss": 0, "evict": 0}
 
 
 def _pca_ref_key(paths: list[str]) -> str:
-    return hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest()[:24]
+    """Track-set digest for the PCA reference cache (shared with the layout cache)."""
+    from .layout import track_set_key  # local: layout imports this module
+
+    return track_set_key(paths)
 
 
 def pca_ref_stats() -> dict[str, int]:
@@ -87,12 +91,12 @@ def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
                         idx_new.append(i)
                         idx_ref.append(ref_map[p])
                 if len(idx_new) >= 2:
-                    A = coords[idx_new]
-                    B = ref[idx_ref]
-                    A_mu, B_mu = A.mean(axis=0), B.mean(axis=0)
-                    U, _, Vt2 = svd_singular((A - A_mu).T @ (B - B_mu))
-                    R = U @ Vt2
-                    coords = (coords - A_mu) @ R + B_mu
+                    # Rotation only: a PCA layout's scale is its own, so the fit
+                    # aligns orientation and ignores the similarity's scale.
+                    rot, _scale, a_mu, b_mu = procrustes(
+                        coords[idx_new], ref[idx_ref]
+                    )
+                    coords = apply_procrustes(coords, rot, 1.0, a_mu, b_mu)
         _pca_ref_store(paths, coords)
     return coords
 
@@ -233,6 +237,9 @@ def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
                     pca_dim=pca_dim,
                     normalize=False,
                 )
+                # Pass the *raw* composite: mlx-vis runs its own PCA and its
+                # branch raises `UnboundLocalError` on an already-reduced float32
+                # matrix, so pre-reducing here would break the fallback.
                 x = np.asarray(mat, dtype=np.float32)
                 with _inference_lock:
                     y = reducer.fit_transform(x)
@@ -261,14 +268,23 @@ def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
 # makes the common update — a generation batch finishes and only a few dozen
 # tracks are new — cost seconds rather than a full refit.
 #
-# Opt-in via ``TRACKSPACE_OPENTSNE=1`` (default off) so existing behaviour is
-# unchanged until the prototype has been benchmarked. Falls back to the
-# cuML / mlx-vis / sklearn chain when unavailable, above the point cap, or on
-# any error. CPU-only, so it needs no ``inference_lock`` (unlike mlx-vis).
+# On by default: it is the only backend that can *place* new tracks into an
+# already-fitted chart, and measured on the real library its cold fit is equal to
+# sklearn's while its neighbourhood recall is slightly better (0.360 vs 0.342 at
+# k=10, n=14k). Falls back to the cuML / mlx-vis / sklearn chain when
+# unavailable, above the point cap, or on any error. CPU-only, so it needs no
+# ``inference_lock`` (unlike mlx-vis).
 
-_OPENTSNE_FIT_CACHE_MAX = 4
+#: Fitted embeddings kept in memory, one per vector config. Five projection
+#: lenses share one config per lens, so the cap must exceed the lens count
+#: (``projection_config.PROJECTION_LENSES``) or a full lens cycle evicts the
+#: oldest fit and refits it on the next pass.
+_OPENTSNE_FIT_CACHE_MAX = 8
 _tsne_fit_cache: OrderedDict[str, "_TsneFit"] = OrderedDict()
 _tsne_fit_stats = {"fit": 0, "transform": 0, "reuse": 0, "evict": 0}
+#: The fit cache is mutated from Flask request threads and the layout-prefetch
+#: worker, so an unguarded `move_to_end` / eviction could corrupt it.
+_fit_cache_lock = threading.RLock()
 
 
 @dataclass
@@ -283,7 +299,8 @@ class _TsneFit:
 
 def reset_tsne_fit_cache() -> None:
     """Drop fitted embeddings and zero the counters (tests, config changes)."""
-    _tsne_fit_cache.clear()
+    with _fit_cache_lock:
+        _tsne_fit_cache.clear()
     for key in _tsne_fit_stats:
         _tsne_fit_stats[key] = 0
 
@@ -291,6 +308,39 @@ def reset_tsne_fit_cache() -> None:
 def tsne_fit_stats() -> dict[str, int]:
     """Fit / transform / reuse / eviction counters for the openTSNE cache."""
     return dict(_tsne_fit_stats)
+
+
+def _load_persisted_fit(feature_cache: object, key: str) -> "_TsneFit | None":
+    """Read the fitted embedding persisted for *key*, or ``None``.
+
+    The in-process fit cache dies with the process, so without this a restart
+    refits every lens (~20 s each) even though the layout coordinates are
+    already cached. An unreadable or older blob reads as a miss: a library
+    upgrade simply refits rather than loading an incompatible pickle.
+    """
+    getter = getattr(feature_cache, "get_tsne_fit", None)
+    if getter is None:
+        return None
+    blob = getter(key)
+    if not blob:
+        return None
+    try:
+        fit = pickle.loads(blob)
+    except Exception:
+        log.warning("openTSNE fit: unreadable persisted fit for %s", key)
+        return None
+    return fit if isinstance(fit, _TsneFit) else None
+
+
+def _store_persisted_fit(feature_cache: object, key: str, fit: "_TsneFit") -> None:
+    """Persist *fit* under *key* (best-effort; the blob is opaque to the cache)."""
+    putter = getattr(feature_cache, "put_tsne_fit", None)
+    if putter is None:
+        return
+    try:
+        putter(key, pickle.dumps(fit, protocol=pickle.HIGHEST_PROTOCOL))
+    except Exception:
+        log.debug("openTSNE fit: could not persist", exc_info=True)
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -301,7 +351,7 @@ def _use_opentsne() -> bool:
     global _opentsne_projection_enabled
     if _opentsne_projection_enabled is not None:
         return _opentsne_projection_enabled
-    if not _env_flag("TRACKSPACE_OPENTSNE", "0"):
+    if not _env_flag("TRACKSPACE_OPENTSNE", "1"):
         _opentsne_projection_enabled = False
         return False
     if importlib.util.find_spec("openTSNE") is None:
@@ -366,18 +416,20 @@ def _fit_tsne(reduced: np.ndarray) -> tuple[object, np.ndarray]:
 
 
 def _fit_cache_get(key: str) -> "_TsneFit | None":
-    entry = _tsne_fit_cache.get(key)
-    if entry is not None:
-        _tsne_fit_cache.move_to_end(key)
-    return entry
+    with _fit_cache_lock:
+        entry = _tsne_fit_cache.get(key)
+        if entry is not None:
+            _tsne_fit_cache.move_to_end(key)
+        return entry
 
 
 def _fit_cache_put(key: str, fit: "_TsneFit") -> None:
-    _tsne_fit_cache[key] = fit
-    _tsne_fit_cache.move_to_end(key)
-    while len(_tsne_fit_cache) > _OPENTSNE_FIT_CACHE_MAX:
-        _tsne_fit_cache.popitem(last=False)
-        _tsne_fit_stats["evict"] += 1
+    with _fit_cache_lock:
+        _tsne_fit_cache[key] = fit
+        _tsne_fit_cache.move_to_end(key)
+        while len(_tsne_fit_cache) > _OPENTSNE_FIT_CACHE_MAX:
+            _tsne_fit_cache.popitem(last=False)
+            _tsne_fit_stats["evict"] += 1
 
 
 def _project_tsne_incremental(
@@ -386,13 +438,21 @@ def _project_tsne_incremental(
     config_key: str,
     *,
     cache_fit: bool = True,
+    feature_cache: object = None,
 ) -> np.ndarray:
     """Fit once per vector config, then transform only newly added tracks.
 
     *cache_fit* is False for the throwaway fits of the weight Jacobian, whose
-    one-off configs would otherwise evict the live fit the map needs.
+    one-off configs would otherwise evict the live fit the map needs. The fit is
+    also persisted under *config_key* (via *feature_cache*) so a restart can
+    transform rather than refit; only the config decides that key, so adding tracks
+    still reuses it.
     """
     fit = _fit_cache_get(config_key)
+    if fit is None and cache_fit:
+        fit = _load_persisted_fit(feature_cache, config_key)
+        if fit is not None:
+            _fit_cache_put(config_key, fit)
     if fit is not None:
         index = {p: i for i, p in enumerate(fit.paths)}
         new_rows = [i for i, p in enumerate(paths) if p not in index]
@@ -419,7 +479,9 @@ def _project_tsne_incremental(
     reduced, pca = _pca_reduce(mat, _opentsne_pca_dim(mat.shape[1]))
     embedding, coords = _fit_tsne(reduced)
     if cache_fit:
-        _fit_cache_put(config_key, _TsneFit(list(paths), coords, pca, embedding))
+        fit = _TsneFit(list(paths), coords, pca, embedding)
+        _fit_cache_put(config_key, fit)
+        _store_persisted_fit(feature_cache, config_key, fit)
     _tsne_fit_stats["fit"] += 1
     return coords
 
@@ -430,13 +492,18 @@ def _project_tsne(
     config_key: str | None = None,
     *,
     cache_fit: bool = True,
+    feature_cache: object = None,
 ) -> np.ndarray:
     if paths and config_key and _use_opentsne():
         cap = _opentsne_max_points()
         if cap <= 0 or len(mat) <= cap:
             try:
                 return _project_tsne_incremental(
-                    mat, paths, config_key, cache_fit=cache_fit
+                    mat,
+                    paths,
+                    config_key,
+                    cache_fit=cache_fit,
+                    feature_cache=feature_cache,
                 )
             except Exception as e:
                 log.warning("openTSNE failed; using fitted-backend chain: %s", e)

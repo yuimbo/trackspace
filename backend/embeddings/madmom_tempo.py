@@ -10,9 +10,11 @@ we patch those before importing the package where needed.
 at 22.05 kHz; we resample that buffer to 44.1 kHz here only (cheap vs. running all
 librosa features at 44.1 kHz).
 
-The default beat tracker loads an **8× BLSTM** ensemble; set env
-``TRACKSPACE_MADMOM_FAST=1`` to use a single network (~4× faster per excerpt,
-slightly less robust).
+The default beat tracker is a **single** BLSTM network (~4× faster per excerpt,
+measured 1032 -> 246 ms/track; agreed within 1 BPM on 26/29 real tracks, the
+remaining disagreement an exact half-tempo that
+:func:`reconcile_tempo_octave` corrects). Set env
+``TRACKSPACE_MADMOM_FAST=0`` for the 8× ensemble.
 
 **Threading:** the BLSTM layers are stateful, so processors are *per thread* — see
 :data:`_local`. Never share one processor instance between analysis workers.
@@ -43,8 +45,32 @@ _madmom_checked: bool | None = None
 _madmom_ok = False
 
 
-def _env_truthy(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+def _madmom_fast_enabled() -> bool:
+    """Single-network beat tracker unless explicitly disabled.
+
+    The 8-network ensemble is ~4x slower per excerpt; the single net agreed
+    within 1 BPM on 26/29 real tracks (the rest an exact half-tempo handled by
+    :func:`reconcile_tempo_octave`).
+    """
+    raw = os.environ.get("TRACKSPACE_MADMOM_FAST", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def reconcile_tempo_octave(
+    bpm: float, reference: float, tol: float = 0.03
+) -> float:
+    """Pull *bpm* back to *reference* when it is an exact half/double of it.
+
+    The single-network beat tracker occasionally locks to the half-tempo (measured
+    once in 29 tracks: 130.4 -> 65.2). *reference* is the librosa estimate the
+    caller already computed; on an exact octave disagreement prefer it.
+    """
+    if not (reference and np.isfinite(reference) and reference > 0):
+        return bpm
+    for factor in (2.0, 0.5):
+        if abs(bpm - reference * factor) <= tol * abs(reference):
+            return float(reference)
+    return bpm
 
 
 def _apply_madmom_runtime_shims() -> None:
@@ -96,7 +122,7 @@ def _get_processors():
         from madmom.models import BEATS_BLSTM
 
         nn_kw = {}
-        if _env_truthy("TRACKSPACE_MADMOM_FAST"):
+        if _madmom_fast_enabled():
             nn_kw["nn_files"] = [BEATS_BLSTM[0]]
         procs = (RNNBeatProcessor(**nn_kw), TempoEstimationProcessor(fps=100))
         _local.processors = procs

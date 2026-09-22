@@ -32,7 +32,7 @@ from typing import Any
 
 import numpy as np
 
-from .linalg_utils import svd_singular
+from .linalg_utils import l2_normalize, svd_singular
 
 log = logging.getLogger(__name__)
 
@@ -153,12 +153,6 @@ class ClusterResult:
 # ──────────────────────────────────────────────────────────────
 
 
-def _l2_normalize_rows(mat: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms < 1e-9] = 1.0
-    return (mat / norms).astype(np.float32)
-
-
 def _standardize(mat: np.ndarray) -> np.ndarray:
     """Zero-mean / unit-variance per column, tolerant of constant columns."""
     mu = mat.mean(axis=0, keepdims=True)
@@ -194,7 +188,7 @@ def build_weighted_matrix(
             continue
         # Standardize first so a block with wild scale (raw logits) cannot
         # dominate purely through magnitude before normalisation.
-        norm = _l2_normalize_rows(_standardize(arr))
+        norm = l2_normalize(_standardize(arr))
         blocks.append(norm * float(np.sqrt(weight)))
         used.append(name)
         effective[name] = weight
@@ -251,7 +245,7 @@ def build_knn_graph(
         return [], []
 
     k = int(max(1, min(k, n - 1)))
-    x = _l2_normalize_rows(mat)
+    x = l2_normalize(mat)
     sim = (x @ x.T).astype(np.float32)
     np.fill_diagonal(sim, -np.inf)
 
@@ -393,7 +387,7 @@ def _fallback_cluster(mat: np.ndarray, resolution: float) -> tuple[np.ndarray, N
     n = int(mat.shape[0])
     n_clusters = int(np.clip(round(resolution * 12), 2, max(2, n // 4)))
     model = AgglomerativeClustering(n_clusters=n_clusters, metric="cosine", linkage="average")
-    return model.fit_predict(_l2_normalize_rows(mat)).astype(np.int32), None
+    return model.fit_predict(l2_normalize(mat)).astype(np.int32), None
 
 
 # ──────────────────────────────────────────────────────────────

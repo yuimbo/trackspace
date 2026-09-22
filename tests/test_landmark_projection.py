@@ -187,6 +187,106 @@ def test_build_fits_against_the_base_layout():
     assert np.abs(g0 - y0).mean() < 0.5 * baseline
 
 
+def test_build_tolerates_a_source_without_rows():
+    """A source with no cached rows (e.g. an untrained head) must not break it."""
+    cache, infos = _infos(n=40)
+    del cache._maps["features"]
+    clap = np.array([cache._maps["clap"][t["fingerprint"]] for t in infos])
+    clap = clap / (np.linalg.norm(clap, axis=1, keepdims=True) + 1e-9)
+    base = [
+        {"path": t["path"], "x": float(clap[i, 0]), "y": float(clap[i, 1])}
+        for i, t in enumerate(infos)
+    ]
+
+    model = build_landmark_model(
+        infos,
+        cache,
+        base,
+        sources=("clap", "features"),
+        feature_mask=np.ones(6, dtype=np.float32),
+        features_blend=0.37,
+        required_sources=("clap",),
+        n_landmarks=20,
+    )
+    assert model is not None
+    assert set(model.sources) == {"clap"}
+    assert set(model.delta) == {"clap"}
+    assert set(model.raw_jacobian(model.weights0)) == {"clap"}
+
+
+def test_place_infos_do_not_move_the_base_chart():
+    """Placing extra tracks must leave the fitted base chart bit-identical.
+
+    This is the invariant behind "showing external roots never moves my library":
+    the landmarks, bandwidth and coefficients come from the base layout, and the
+    extra rows are only evaluated through the same frozen ``g``.
+    """
+    cache, infos = _infos(n=40)
+    clap = np.array([cache._maps["clap"][t["fingerprint"]] for t in infos])
+    clap = clap / (np.linalg.norm(clap, axis=1, keepdims=True) + 1e-9)
+    base = [
+        {"path": t["path"], "x": float(clap[i, 0]), "y": float(clap[i, 1])}
+        for i, t in enumerate(infos)
+    ]
+    extra = [{"path": f"x/ext/t{i}.mp3", "fingerprint": f"xfp{i}"} for i in range(6)]
+    rng = np.random.default_rng(11)
+    for t in extra:
+        cache._maps["clap"][t["fingerprint"]] = rng.standard_normal(6).astype(
+            np.float32
+        )
+        cache._maps["features"][t["fingerprint"]] = rng.standard_normal(6).astype(
+            np.float32
+        )
+
+    kwargs = {
+        "sources": ("clap", "features"),
+        "feature_mask": np.ones(6, dtype=np.float32),
+        "features_blend": 0.5,
+        "n_landmarks": 20,
+    }
+    plain = build_landmark_model(infos, cache, base, **kwargs)
+    extended = build_landmark_model(infos, cache, base, place_infos=extra, **kwargs)
+    assert plain is not None and extended is not None
+    assert len(plain.paths) == len(infos)
+    assert len(extended.paths) == len(infos) + len(extra)
+
+    g_plain = plain.evaluate(plain.weights0)
+    g_ext = extended.evaluate(extended.weights0)
+    np.testing.assert_array_equal(g_ext[: len(infos)], g_plain)
+    # The extra rows land in the chart's own frame (a convex combination of the
+    # landmark coordinates), not at a fixed preview corner.
+    placed = g_ext[len(infos):]
+    assert np.isfinite(placed).all()
+    assert ((placed >= -0.5) & (placed <= 1.5)).all()
+
+
+def test_place_infos_without_the_required_source_are_dropped():
+    """A placed set missing a source block cannot be measured; skip it whole."""
+    cache, infos = _infos(n=40)
+    clap = np.array([cache._maps["clap"][t["fingerprint"]] for t in infos])
+    clap = clap / (np.linalg.norm(clap, axis=1, keepdims=True) + 1e-9)
+    base = [
+        {"path": t["path"], "x": float(clap[i, 0]), "y": float(clap[i, 1])}
+        for i, t in enumerate(infos)
+    ]
+    # Only the clap row is present, so the features column would shift.
+    extra = [{"path": "x/ext/t0.mp3", "fingerprint": "xfp0"}]
+    cache._maps["clap"]["xfp0"] = np.ones(6, dtype=np.float32)
+
+    model = build_landmark_model(
+        infos,
+        cache,
+        base,
+        sources=("clap", "features"),
+        feature_mask=np.ones(6, dtype=np.float32),
+        features_blend=0.5,
+        n_landmarks=20,
+        place_infos=extra,
+    )
+    assert model is not None
+    assert len(model.paths) == len(infos)
+
+
 def test_chart_is_reused_per_layout_revision():
     """Refitting the chart per drag would recompute a fitted quantity."""
     from backend.embeddings.landmark_projection import (
