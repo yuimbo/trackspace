@@ -12,6 +12,7 @@
 
 import type { ViewModifier } from "../model";
 import { hotkeyLabel } from "../hotkeys";
+import { createKbd } from "../lib/dom";
 
 export class ViewModifierView {
   private $el: HTMLElement;
@@ -154,10 +155,7 @@ export class ViewModifierView {
 
   /** A `<kbd>` hotkey badge on a chip. */
   private _hotkey(label: string): HTMLElement {
-    const kbd = document.createElement("kbd");
-    kbd.className = "vm-hotkey";
-    kbd.textContent = label;
-    return kbd;
+    return createKbd(label, "vm-hotkey");
   }
 
   private _updateChip(chip: HTMLElement, mod: ViewModifier): void {

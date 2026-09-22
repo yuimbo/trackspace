@@ -14,6 +14,7 @@ import { toast } from "../lib/toast";
 import { api, apiBlob, postJSON, postForm } from "../lib/api";
 import { confirmAction } from "../lib/util";
 import { Poller } from "../lib/async";
+import { Modal } from "../lib/dom";
 
 export interface HeadDeps {
   model: Model;
@@ -83,6 +84,8 @@ export class HeadCoordinator {
   private _imprintFolder: string | null = null;
   /** Analysis-status poll for the imprint target. */
   private _imprintPoll = new Poller(2000, () => void this._pollImprint());
+  /** The imprint dialog, with one backdrop + Esc dismissal wiring. */
+  private _modal = new Modal("head-modal");
 
   constructor(private deps: HeadDeps) {
     this._trainFolders = new Set(deps.model.trainFolders);
@@ -286,7 +289,6 @@ export class HeadCoordinator {
 
   /** Open the head modal (the only home for head tools + Train folder view). */
   openModal(absPath = ""): void {
-    const $modal = document.getElementById("head-modal");
     const $path = document.getElementById(
       "head-imprint-path",
     ) as HTMLInputElement | null;
@@ -297,36 +299,20 @@ export class HeadCoordinator {
         ? `Projecting onto ${absPath}`
         : "Project the folder head onto a destination folder.";
     }
-    $modal?.classList.remove("hidden");
+    this._modal.open();
     this._refreshUndo();
     if (absPath) $path?.focus();
   }
 
   closeModal(): void {
-    document.getElementById("head-modal")?.classList.add("hidden");
+    this._modal.close();
   }
 
   private _bindHeadModal(): void {
-    const $modal = document.getElementById("head-modal");
-    if (!$modal) return;
     document
       .getElementById("head-modal-close")
       ?.addEventListener("click", () => this.closeModal());
-    $modal.addEventListener("click", (e) => {
-      if (e.target === $modal) this.closeModal();
-    });
-    // Capture phase + stopImmediatePropagation, so Esc closes the modal without
-    // also reaching the global Esc handler (which would clear the selection).
-    document.addEventListener(
-      "keydown",
-      (e) => {
-        if (e.key === "Escape" && !$modal.classList.contains("hidden")) {
-          e.stopImmediatePropagation();
-          this.closeModal();
-        }
-      },
-      true,
-    );
+    this._modal.bind(() => this.closeModal());
   }
 
   private _setImprintNote(text: string): void {

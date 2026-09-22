@@ -29,6 +29,7 @@ import {
 import { trackTempoNorm } from "./lenses";
 import { clamp, clamp01 } from "./util";
 import { displayFolderPath } from "./path-presenter";
+import { buildTabStrip, el } from "./dom";
 import { hotkeyBinding, hotkeyLabel } from "../hotkeys";
 import {
   formatTimestamp,
@@ -441,13 +442,6 @@ function inspectKey(inspect: InspectState): string {
 
 /* ── DOM rendering ─────────────────────────────────────────── */
 
-function el(tag: string, className?: string, text?: string): HTMLElement {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text != null) node.textContent = text;
-  return node;
-}
-
 /** Hint shown on every navigation-target element in the card. */
 const TARGET_HINT = "Highlight matches · S solo · H fit";
 
@@ -828,24 +822,16 @@ function inspectSection(
 ): HTMLElement {
   const section = el("div", "tt-section tt-inspect");
   const head = el("div", "tt-inspect-head");
-  const tabs = el("div", "tt-tabs");
-  const defs: [InspectTab, string][] = [
-    ["navigate", "Navigate"],
-    ["describe", "Describe"],
-  ];
-  for (const [tab, label] of defs) {
-    const active = inspect.tab === tab;
-    const btn = el(
-      "button",
-      `tt-tab${active ? " active" : ""}`,
-      label,
-    ) as HTMLButtonElement;
-    btn.dataset.inspectAction = `show-${tab}`;
-    btn.setAttribute("role", "tab");
-    btn.setAttribute("aria-selected", String(active));
-    tabs.appendChild(btn);
-  }
-  head.appendChild(tabs);
+  const tabs = buildTabStrip(
+    "tt-tabs",
+    [
+      { id: "navigate", label: "Navigate", data: "show-navigate" },
+      { id: "describe", label: "Describe", data: "show-describe" },
+    ],
+    inspect.tab,
+    { dataKey: "inspectAction", buttonClass: "tt-tab" },
+  );
+  head.appendChild(tabs.el);
   const close = el("button", "tt-close", "×");
   close.dataset.inspectClose = "";
   close.title = "Close inspect (Esc)";

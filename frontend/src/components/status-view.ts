@@ -2,6 +2,7 @@ import type { Model, QueueStatus } from "../model";
 import { pipelineProgress, phaseLabel, stageDetail } from "../lib/pipeline";
 import { escapeHtml as esc } from "../lib/util";
 import { clearOnNewTimer } from "../lib/async";
+import { placeAt } from "../lib/dom";
 
 const PANEL_HIDE_MS = 140;
 
@@ -122,13 +123,7 @@ export class StatusView {
       : null;
     if (!anchor || this._panel.hidden) return;
     const r = anchor.getBoundingClientRect();
-    const pw = this._panel.offsetWidth;
-    const ph = this._panel.offsetHeight;
-    let left = r.left + r.width / 2 - pw / 2;
-    left = Math.max(8, Math.min(left, window.innerWidth - pw - 8));
-    const top = Math.max(8, r.top - ph - 8);
-    this._panel.style.left = `${left}px`;
-    this._panel.style.top = `${top}px`;
+    placeAt(this._panel, r, { side: "above", gap: 8, margin: 8 });
   }
 
   private _showPanel(

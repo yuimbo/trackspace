@@ -1,3 +1,5 @@
+import { createKbd, el } from "./lib/dom";
+
 export interface HotkeyBinding {
   action: string;
   /** `KeyboardEvent.key` the binding matches; a bare letter matches either case. */
@@ -125,13 +127,15 @@ export function renderShortcutList(container: HTMLElement): void {
   for (const b of HOTKEY_MAP) {
     const row = document.createElement("div");
     row.className = "shortcut-row";
-    row.innerHTML = `<kbd>${b.label}</kbd><span>${b.description}</span>`;
+    row.appendChild(createKbd(b.label));
+    row.appendChild(el("span", undefined, b.description));
     container.appendChild(row);
   }
   for (const h of MOUSE_HINTS) {
     const row = document.createElement("div");
     row.className = "shortcut-row";
-    row.innerHTML = `<kbd>${h.label}</kbd><span>${h.description}</span>`;
+    row.appendChild(createKbd(h.label));
+    row.appendChild(el("span", undefined, h.description));
     container.appendChild(row);
   }
 }

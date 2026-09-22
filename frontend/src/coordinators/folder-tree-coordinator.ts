@@ -21,6 +21,7 @@ import {
 import { postJSON } from "../lib/api";
 import { confirmAction } from "../lib/util";
 import { clearOnNewTimer } from "../lib/async";
+import { Modal, buildTabStrip, createKbd, placeAt } from "../lib/dom";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
 import { hotkeyLabel } from "../hotkeys";
 import htmx from "htmx.org";
@@ -238,10 +239,7 @@ export class FolderTreeCoordinator {
       label.textContent = def.label;
       btn.appendChild(label);
       if (def.hotkey) {
-        const kbd = document.createElement("kbd");
-        kbd.className = "folder-action-hotkey";
-        kbd.textContent = def.hotkey;
-        btn.appendChild(kbd);
+        btn.appendChild(createKbd(def.hotkey, "folder-action-hotkey"));
       }
       this._actionsEl.appendChild(btn);
     }
@@ -302,11 +300,7 @@ export class FolderTreeCoordinator {
   }
 
   private _positionFolderActions(row: HTMLElement): void {
-    const rect = row.getBoundingClientRect();
-    const el = this._actionsEl;
-    const top = Math.max(6, Math.min(rect.top, window.innerHeight - el.offsetHeight - 6));
-    el.style.top = `${top}px`;
-    el.style.left = `${rect.right + 6}px`;
+    placeAt(this._actionsEl, row.getBoundingClientRect(), { side: "right" });
   }
 
   private _onFolderActionClick(e: MouseEvent): void {
@@ -516,20 +510,18 @@ export class FolderTreeCoordinator {
   private _bindRootImport(): void {
     const $section = document.getElementById("folder-section");
     const $addRoot = document.getElementById("btn-add-root");
-    const $modal = document.getElementById("root-add-modal");
+    const $modal = new Modal("root-add-modal");
     const $input = document.getElementById("root-add-input") as HTMLInputElement | null;
     const $external = document.getElementById("root-add-external") as HTMLInputElement | null;
     const $ok = document.getElementById("root-add-ok");
     const $cancel = document.getElementById("root-add-cancel");
 
     const closeModal = () => {
-      if (!$modal) return;
-      $modal.classList.add("hidden");
+      $modal.close();
     };
     /** Open the modal; *prefill* (a Finder drop) skips the clipboard guess. */
     const openModal = async (prefill?: string) => {
-      if (!$modal) return;
-      $modal.classList.remove("hidden");
+      $modal.open();
       if ($external) $external.checked = false;
       if ($input) {
         $input.value = prefill ?? "";
@@ -564,19 +556,14 @@ export class FolderTreeCoordinator {
     if ($addRoot) $addRoot.addEventListener("click", () => void openModal());
     if ($ok) $ok.addEventListener("click", submitModal);
     if ($cancel) $cancel.addEventListener("click", closeModal);
-    if ($modal) {
-      $modal.addEventListener("click", (e) => {
-        if (e.target === $modal) closeModal();
-      });
-    }
+    // Backdrop click-self and a document-capture Esc, so the modal always
+    // closes on Esc (not only while its input holds focus).
+    $modal.bind(closeModal);
     if ($input) {
       $input.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
           e.preventDefault();
           submitModal();
-        } else if (e.key === "Escape") {
-          e.preventDefault();
-          closeModal();
         }
       });
     }
@@ -1230,22 +1217,12 @@ export class FolderTreeCoordinator {
   }
 
   private _buildOverlayTabs(classes: OverlayClass[]): HTMLElement {
-    const strip = document.createElement("div");
-    strip.className = "overlay-tabs";
-    strip.setAttribute("role", "tablist");
-    for (const c of classes) {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.className = "overlay-tab";
-      btn.dataset.overlayTab = c.id;
-      btn.setAttribute("role", "tab");
-      const selected = c.id === this._overlayTab;
-      btn.setAttribute("aria-selected", selected ? "true" : "false");
-      btn.classList.toggle("active", selected);
-      btn.textContent = c.label;
-      strip.appendChild(btn);
-    }
-    return strip;
+    return buildTabStrip(
+      "overlay-tabs",
+      classes.map((c) => ({ id: c.id, label: c.label })),
+      this._overlayTab,
+      { dataKey: "overlayTab", buttonClass: "overlay-tab" },
+    ).el;
   }
 
   /**
