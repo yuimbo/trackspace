@@ -42,6 +42,7 @@ from collections.abc import Callable, Sequence
 
 import numpy as np
 
+from .linalg_utils import l2_normalize
 from .maest import MAEST_EMBED_DIM
 from .projection_config import FROZEN_SOURCE_WEIGHTS, FROZEN_SOURCES
 
@@ -156,12 +157,6 @@ def derive_folder_labels(
 # ──────────────────────────────────────────────────────────────
 
 
-def _l2_normalize_rows(mat: np.ndarray) -> np.ndarray:
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    norms[norms < 1e-9] = 1.0
-    return (mat / norms).astype(np.float32)
-
-
 def build_input_matrix(
     source_blocks: dict[str, np.ndarray],
     weights: dict[str, float] | None = None,
@@ -184,7 +179,7 @@ def build_input_matrix(
         arr = np.asarray(block, dtype=np.float32)
         if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
             continue
-        scaled = _l2_normalize_rows(arr) * float(np.sqrt(weight))
+        scaled = l2_normalize(arr) * float(np.sqrt(weight))
         blocks.append(scaled.astype(np.float32))
         used.append(name)
     if not blocks:
@@ -234,7 +229,7 @@ def excerpt_dispersion(excerpts: np.ndarray | None) -> float | None:
     arr = np.asarray(excerpts, dtype=np.float32)
     if arr.ndim != 2 or arr.shape[0] < 2:
         return None
-    norm = _l2_normalize_rows(arr)
+    norm = l2_normalize(arr)
     sim = norm @ norm.T
     m = int(sim.shape[0])
     iu = np.triu_indices(m, k=1)
@@ -279,7 +274,7 @@ def mine_hard_negatives(
         return np.empty((0, 2), dtype=np.int64)
 
     k = int(max(1, min(k, n - 1)))
-    xn = _l2_normalize_rows(x)
+    xn = l2_normalize(x)
     pairs: set[tuple[int, int]] = set()
     step = int(max(1, chunk))
     for start in range(0, n, step):
@@ -655,9 +650,13 @@ def load_head(data_dir: str) -> dict | None:
     return {"payload": payload, "meta": meta}
 
 
-def head_centroids(data_dir: str) -> np.ndarray | None:
-    """Per-folder centroids of the installed head, or ``None`` when absent."""
-    head = load_head(data_dir)
+def head_centroids(data_dir: str, head: dict | None = None) -> np.ndarray | None:
+    """Per-folder centroids of the installed head, or ``None`` when absent.
+
+    Pass *head* to reuse an already-loaded head instead of re-reading it.
+    """
+    if head is None:
+        head = load_head(data_dir)
     if head is None:
         return None
     raw = head["payload"].get("centroids")
@@ -800,7 +799,7 @@ def predict_folders(
             np.full(m.shape[0] if m.ndim == 2 else 0, -1, dtype=np.int64),
             np.zeros(m.shape[0] if m.ndim == 2 else 0, dtype=np.float32),
         )
-    mn = _l2_normalize_rows(m)
+    mn = l2_normalize(m)
     idx = np.empty(m.shape[0], dtype=np.int64)
     sim = np.empty(m.shape[0], dtype=np.float32)
     step = int(max(1, chunk))
@@ -842,7 +841,7 @@ def compute_match_thresholds(
         or c.shape[0] != n
     ):
         return out
-    xn = _l2_normalize_rows(x)
+    xn = l2_normalize(x)
     for cls in range(n):
         rows = xn[y == cls]
         if rows.shape[0] == 0:

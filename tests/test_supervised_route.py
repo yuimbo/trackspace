@@ -183,6 +183,32 @@ def test_compare_against_itself_is_perfectly_compatible(tmp_path):
     assert body["compare"]["mean_cosine"] == pytest.approx(1.0, abs=1e-4)
 
 
+def test_predictions_require_a_head(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    body = client.get("/api/supervised/predictions").get_json()
+    assert body["available"] is False
+    assert body["assignments"] == {}
+
+
+def test_predictions_map_each_track_to_its_nearest_folder(tmp_path):
+    fc, infos, _ = _library(tmp_path)
+    client, _ = _app(tmp_path, fc, infos)
+    train_supervised(_deps(tmp_path, fc), build_track_infos=lambda _f, _r: infos)
+
+    body = client.get("/api/supervised/predictions").get_json()
+    assert body["available"] is True
+    # Every training track has a cached row and its own folder is the nearest.
+    assert len(body["assignments"]) == len(infos)
+    for info in infos:
+        assert body["assignments"][info["path"]] == os.path.dirname(info["path"])
+    # The match floor is a 5th percentile, so some rows may fall below it, but a
+    # healthy majority clears it and every match is a known track.
+    matched = set(body["matched"])
+    assert 0 < len(matched) <= len(body["assignments"])
+    assert matched <= set(body["assignments"])
+
+
 def test_fanout_requires_a_folder(tmp_path):
     fc, infos, _ = _library(tmp_path)
     client, _ = _app(tmp_path, fc, infos)

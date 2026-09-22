@@ -1322,6 +1322,99 @@ def import_supervised_head(
     return meta
 
 
+@dataclass(frozen=True)
+class _HeadParts:
+    """The installed head and the pieces its consumers match tracks against."""
+
+    head: dict[str, Any] | None
+    meta: dict[str, Any]
+    class_names: list[str]
+    centroids: np.ndarray | None
+    thresholds: np.ndarray | None
+
+
+def _load_head_parts(deps: AnalysisDeps) -> _HeadParts:
+    """Load the installed head, its class names, centroids, and match thresholds.
+
+    A missing head or centroids comes back as ``None`` rather than an error: each
+    caller has its own message and availability semantics.
+    """
+    head = supervised_mod.load_head(deps.data_dir)
+    if head is None:
+        return _HeadParts(None, {}, [], None, None)
+    meta = head["meta"]
+    class_names = list(meta.get("class_names", []))
+    raw_thresholds = meta.get("class_match_thresholds")
+    thresholds = (
+        np.asarray(raw_thresholds, dtype=np.float32)
+        if isinstance(raw_thresholds, (list, tuple)) and raw_thresholds
+        else None
+    )
+    return _HeadParts(
+        head,
+        meta,
+        class_names,
+        supervised_mod.head_centroids(deps.data_dir, head),
+        thresholds,
+    )
+
+
+def supervised_predictions(
+    deps: AnalysisDeps,
+    *,
+    build_track_infos: Callable[[str, bool], list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Nearest learned folder per track, from the installed head's centroids.
+
+    Reads the cached ``supervised`` rows (no projection, no encoder work) and
+    matches each against the head's per-folder centroids. ``assignments`` maps every
+    track that has a row to its nearest folder; ``matched`` is the subset that also
+    clears its class's training-distance floor — the same rule a fan-out uses to
+    decide whether a track is close enough to a learned folder to be placed in it.
+    """
+    parts = _load_head_parts(deps)
+    if parts.head is None or parts.centroids is None:
+        return {"available": False, "assignments": {}, "matched": []}
+    if not parts.class_names or parts.centroids.shape[0] != len(parts.class_names):
+        return {"available": False, "assignments": {}, "matched": []}
+    run_id = int(parts.meta.get("run_id", 0))
+
+    infos = build_track_infos("", True)
+    rows = deps.feature_cache.get_all(
+        "supervised",
+        [str(t["fingerprint"]) for t in infos if t.get("fingerprint")],
+        version=run_id,
+    )
+    paths: list[str] = []
+    vecs: list[np.ndarray] = []
+    for t in infos:
+        fp = t.get("fingerprint")
+        vec = rows.get(str(fp)) if fp else None
+        if vec is None:
+            continue
+        paths.append(str(t["path"]))
+        vecs.append(vec)
+    if not paths:
+        return {"available": True, "assignments": {}, "matched": []}
+
+    idx, sim = supervised_mod.predict_folders(parts.centroids, np.stack(vecs))
+    matched = supervised_mod.matches_thresholds(idx, sim, parts.thresholds)
+    assignments: dict[str, str] = {}
+    matched_paths: list[str] = []
+    for i, path in enumerate(paths):
+        c = int(idx[i])
+        if c < 0 or c >= len(parts.class_names):
+            continue
+        assignments[path] = parts.class_names[c]
+        if bool(matched[i]):
+            matched_paths.append(path)
+    return {
+        "available": True,
+        "assignments": assignments,
+        "matched": matched_paths,
+    }
+
+
 def _unique_target(path: str) -> str:
     """A path that does not clobber an existing file, ``" (n)"``-suffixed."""
     if not os.path.exists(path):
@@ -1386,22 +1479,15 @@ def fanout_supervised(
     every move is journalled before it happens so
     :func:`undo_fanout_supervised` can restore the previous layout.
     """
-    head = supervised_mod.load_head(deps.data_dir)
-    if head is None:
+    parts = _load_head_parts(deps)
+    if parts.head is None:
         return {"ok": False, "error": "no trained head to fan out with"}
-    centroids = supervised_mod.head_centroids(deps.data_dir)
-    if centroids is None:
+    if parts.centroids is None:
         return {"ok": False, "error": "head has no folder centroids; retrain it"}
-    meta = head["meta"]
-    class_names = list(meta.get("class_names", []))
-    if centroids.shape[0] != len(class_names):
+    if parts.centroids.shape[0] != len(parts.class_names):
         return {"ok": False, "error": "head centroids do not match its folders"}
-    raw_thresholds = meta.get("class_match_thresholds")
-    thresholds = (
-        np.asarray(raw_thresholds, dtype=np.float32)
-        if isinstance(raw_thresholds, (list, tuple)) and raw_thresholds
-        else None
-    )
+    head, meta, class_names = parts.head, parts.meta, parts.class_names
+    centroids, thresholds = parts.centroids, parts.thresholds
 
     infos = build_track_infos(folder_vpath, recursive)
     if not infos:

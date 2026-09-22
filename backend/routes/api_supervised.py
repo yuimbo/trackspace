@@ -71,6 +71,19 @@ def create_api_supervised_blueprint(
         """Metadata for the installed head, or ``{"available": false}``."""
         return jsonify(pipeline.supervised_head_info(analysis_deps))
 
+    @bp.route("/api/supervised/predictions")
+    def api_supervised_predictions():
+        """Nearest learned folder per track, for the predicted-folder colour mode.
+
+        Read-only: the canvas colours each dot by the folder its cached
+        ``supervised`` row is closest to, so the mode never touches disk.
+        """
+        return jsonify(
+            pipeline.supervised_predictions(
+                analysis_deps, build_track_infos=build_track_infos_fn
+            )
+        )
+
     @bp.route("/api/supervised/export")
     def api_supervised_export():
         """Download the installed head as a portable bundle."""

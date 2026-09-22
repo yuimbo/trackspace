@@ -16,6 +16,7 @@ import pytest
 
 from backend.embeddings import supervised as sup
 from backend.embeddings.feature_cache import FeatureCache
+from backend.embeddings.linalg_utils import l2_normalize
 from backend.embeddings.layout import _source_versions_token
 from backend.jobs import KIND_MAEST, Job, JobQueue
 from backend.services.analysis_pipeline import (
@@ -622,7 +623,10 @@ def test_compute_match_thresholds_is_per_class_percentile():
     # Class 0 is tight (similarities near 1); class 1 is diffuse.
     tight = np.tile(np.array([1.0, 0.0], np.float32), (10, 1))
     diffuse = np.stack(
-        [sup._l2_normalize_rows(np.array([[1.0, s]], np.float32))[0] for s in np.linspace(0.0, 1.0, 10)]
+        [
+            l2_normalize(np.array([[1.0, s]], np.float32))[0]
+            for s in np.linspace(0.0, 1.0, 10)
+        ]
     )
     z = np.vstack([tight, diffuse])
     y = np.array([0] * 10 + [1] * 10, dtype=np.int64)
