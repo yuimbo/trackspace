@@ -20,6 +20,7 @@ import {
   type BloomRangeKey,
 } from "./lib/bloom";
 import { clamp01 } from "./lib/util";
+import clusterWeights from "./lib/cluster-weights.json";
 
 /** Cached librosa descriptors ([0,1]) when the fingerprint has a features row. */
 export interface TrackAudioFeatures {
@@ -147,19 +148,12 @@ const _LIBROSA_AXIS_DISPLAY: Record<string, string> = {
 };
 
 /**
- * Default per-source weights for clustering **and** the 2-D layout. Mirrors the
- * server's ``clustering.DEFAULT_WEIGHTS`` / ``projection_config.FROZEN_SOURCE_WEIGHTS``
- * — the map and the clusters must describe the same space, so one user-controlled
- * vector drives both. Persisted; "Reset" restores these values.
+ * Default per-source weights for clustering **and** the 2-D layout. The values
+ * live in ``cluster-weights.json`` (shared with the server) — the map and the
+ * clusters must describe the same space, so one user-controlled vector drives
+ * both. Persisted; "Reset" restores these values.
  */
-export const DEFAULT_CLUSTER_WEIGHTS: Record<string, number> = {
-  maest_logits: 0.45,
-  maest: 0.25,
-  rhythm: 0.15,
-  clap: 0.1,
-  supervised: 0.15,
-  features: 0,
-};
+export const DEFAULT_CLUSTER_WEIGHTS: Record<string, number> = clusterWeights;
 
 /** Slider labels, keyed by source name (insertion order = display order). */
 export const CLUSTER_WEIGHT_LABELS: Record<string, string> = {

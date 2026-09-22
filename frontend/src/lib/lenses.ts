@@ -16,17 +16,18 @@
 
 import type { Track } from "../model";
 import { clamp } from "./util";
+import featureGeometry from "./feature-geometry.json";
 
-// Mirrors ``backend/tuning.py`` BPM_LO / BPM_HI; keep in sync.
-export const BPM_LO = 60;
-export const BPM_HI = 250;
+// Feature geometry constants live in ``feature-geometry.json`` (shared with the
+// server) so the deterministic lenses cannot silently drift from the backend.
+export const BPM_LO = featureGeometry.bpm_lo;
+export const BPM_HI = featureGeometry.bpm_hi;
 
-// Mirrors ``backend/embeddings/feature_encoding.py``; keep in sync.
-export const CAMELOT_MAJOR_RADIUS = 0.82;
-export const CAMELOT_MINOR_RADIUS = 0.45;
-const MINOR_FIFTHS_OFFSET = 3;
-export const SPIRAL_R_MIN = 0.18;
-export const SPIRAL_R_MAX = 0.86;
+export const CAMELOT_MAJOR_RADIUS = featureGeometry.camelot_major_radius;
+export const CAMELOT_MINOR_RADIUS = featureGeometry.camelot_minor_radius;
+const MINOR_FIFTHS_OFFSET = featureGeometry.minor_fifths_offset;
+export const SPIRAL_R_MIN = featureGeometry.spiral_r_min;
+export const SPIRAL_R_MAX = featureGeometry.spiral_r_max;
 const BPM_OCTAVES = Math.log2(BPM_HI / BPM_LO);
 
 /** A lens position in polar form: angle (radians) and radius from the centre. */

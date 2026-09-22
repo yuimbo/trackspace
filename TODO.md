@@ -311,12 +311,37 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 - [ ] **Structure preview follow-up.** `_fetchStructure` (`controller.ts`) fetches one
       path per hover — a batched request for the visible tracks would cut the
       round-trips.
-- [ ] **Frontend duplicates backend tuning constants.** `frontend/src/lib/lenses.ts`
-      mirrors `BPM_LO`/`BPM_HI` (`backend/tuning.py`) and the Camelot/spiral radii
-      (`backend/embeddings/feature_encoding.py`) by hand, so a retune needs an edit in
-      both languages (the tempo-window change did). Expose them to the frontend — an
-      `/api/tuning` payload or a build-time generated module — so the deterministic
-      lenses cannot silently drift from the backend.
+- [ ] **Shared lens registry.** `frontend/src/lib/lenses.ts` (`BUILTIN_LENSES`) and
+      `backend/embeddings/projection_config.py` (`PROJECTION_LENSES`) mirror the
+      projection lens ids and source sets, and `tests/test_layout_prefetch.py` pins
+      the ids by hand with a "keep in sync" comment. The cluster weights and the
+      feature geometry are now shared JSON (`frontend/src/lib/cluster-weights.json`,
+      `feature-geometry.json`); do the same for the lens registry, or have the
+      backend test parse `lenses.ts`. Files: `backend/embeddings/projection_config.py`,
+      `frontend/src/lib/lenses.ts`, `tests/test_layout_prefetch.py`.
+- [ ] **CSS base classes.** `trackspace.css` repeats a glass popover shell (~6
+      surfaces), a modal backdrop/card (~5), a progress bar (~7), a slider knob (2),
+      a scrollbar rule (~12), a truncation triplet (~20) and a list-row hover.
+      Extract `.glass`, `.overlay`/`.overlay-card`, `.progress`, `.scroll-thin`,
+      `.truncate`, `.list-row`, plus `.tab`/`.chip` base + modifier classes.
+      Needs a visual pass (a human verifies taste), so it was deferred.
+- [ ] **Tree/row builders.** The head training-folders tree
+      (`head-coordinator.ts` `_folderNodeEl`) and the HTMX folder tree share no
+      code, and the selected-tracks overlay row and the cluster rows re-build the
+      same swatch+label+count row. A shared `buildRow`/`buildTree` would unify
+      them; deferred as the smallest payoff of the DOM pass.
+- [ ] **Preferences registry.** `model.ts` `saveLS`/`loadLS` list the same ~21
+      fields twice with a hand-cast per field, and the four `_migrate*` helpers are
+      bespoke. A `PREFERENCES` registry of typed `{key, default, parse, serialize}`
+      entries would make both loops; deferred as roughly line-neutral and it risks a
+      god-registry if the fields are not truly uniform.
+- [ ] **Variable registry.** `COLOR_MODES`/`COLOR_MODE_LABELS` (`lib/lenses.ts`),
+      the bloom range keys and max constants (`lib/bloom.ts`) and
+      `CLUSTER_WEIGHT_LABELS`/`_DESCRIPTIONS` (`model.ts`) are three parallel
+      maps over related ids. One `VARIABLES` table keyed by colour mode would
+      remove the risk that a new mode silently misses a bloom slot or label;
+      deferred as the three domains (colour by, bloom range, clustering weight) may
+      not share enough to justify one registry.
 
 ### Backend
 

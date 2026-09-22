@@ -55,7 +55,10 @@ frontend/src/
   lib/api.ts              shared fetch / postJSON
   lib/util.ts             shared clamp / escape / confirm / cycle helpers
   lib/async.ts            shared debounce / throttle / seq / in-flight / SSE helpers
+  lib/dom.ts              shared el / modal / popover / tab-strip / kbd seams
   lib/lenses.ts           lens registry + deterministic feature geometry
+  lib/cluster-weights.json  shared FE/BE clustering + layout weights
+  lib/feature-geometry.json shared FE/BE BPM / Camelot / spiral geometry
 tests/                    pytest suite (backend); vitest lives beside frontend sources
 data/                     SQLite caches (gitignored, created at runtime)
 ```
@@ -357,6 +360,24 @@ with vitest coverage:
 - ✅ `ViewModifierCoordinator` — the active-view-modifier stack (search, proximity, scope,
   exclusions, filters, external) with `push`/`update`/`dismiss`/`remove`/`popNewest`, plus
   the corner chip view. See `design-patterns.md` → *Active view modifiers*.
+
+**Cross-cutting unification** — the recurring UI/async/data shapes were pulled into shared
+modules so a concept has one definition:
+
+- ✅ `lib/util.ts` — `clamp`/`clamp01` (eight copies), `escapeHtml`, `confirmAction`
+  (four sites) and `cycle`.
+- ✅ `lib/async.ts` — `debounce`, `throttle`, `clearOnNewTimer`, `latestSeq`,
+  `keyedInFlight`, `CoalescedTask`, `Poller`, `SseSubscription`, replacing fifteen
+  hand-rolled race guards, eleven timer wrappers and three SSE wirings.
+- ✅ `lib/dom.ts` — `el`, `createKbd`, `Modal` (one backdrop + document-capture Esc),
+  `placeAt` and `buildTabStrip`.
+- ✅ `ViewRule` — `Model.viewRules` is the single ordered stack; a rule with a
+  `matches(track)` predicate also filters, and `Model.isVisible` is the one predicate the
+  canvas and the fit/select paths share (the chip stack and the visible set agree).
+- ✅ `coverage_payload` emits one `sources[]` row per source; the frontend renders it
+  directly, so adding a source is a one-place backend change.
+- ✅ `cluster-weights.json` / `feature-geometry.json` — the clustering weights and the
+  BPM/Camelot/spiral geometry are shared JSON, guarded from both languages.
 
 ---
 

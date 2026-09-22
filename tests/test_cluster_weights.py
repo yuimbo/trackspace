@@ -128,3 +128,26 @@ def test_map_and_cluster_weights_stay_in_sync():
     # The head's input must not include its own output.
     assert "supervised" not in SUPERVISED_INPUT_WEIGHTS
     assert SUPERVISED_INPUT_WEIGHTS.get("maest_logits") == FROZEN_SOURCE_WEIGHTS["maest_logits"]
+
+
+def test_frontend_weights_match_the_shared_json():
+    """The frontend reads the same weights from ``cluster-weights.json``.
+
+    The Python copies are guarded against each other above; without this the
+    frontend could drift and lay the map out in a different space than the
+    clusters describe.
+    """
+    import json
+    from pathlib import Path
+
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "frontend"
+        / "src"
+        / "lib"
+        / "cluster-weights.json"
+    )
+    shared = json.loads(path.read_text(encoding="utf-8"))
+    assert shared == DEFAULT_WEIGHTS

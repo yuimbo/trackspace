@@ -1,0 +1,9 @@
+{
+  "bpm_lo": 60,
+  "bpm_hi": 250,
+  "camelot_major_radius": 0.82,
+  "camelot_minor_radius": 0.45,
+  "minor_fifths_offset": 3,
+  "spiral_r_min": 0.18,
+  "spiral_r_max": 0.86
+}

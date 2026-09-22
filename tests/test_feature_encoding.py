@@ -160,3 +160,32 @@ def test_features_block_uses_the_perceptual_encoding():
         return float(np.dot(x, y) / (np.linalg.norm(x) * np.linalg.norm(y) + 1e-9))
 
     assert cos(c_major, a_minor) > cos(c_major, fs_major)
+
+
+def test_frontend_geometry_matches_the_shared_json():
+    """The frontend lenses read the same geometry from ``feature-geometry.json``.
+
+    The lens radii were hand-mirrored in ``lenses.ts``; a retune that edits only
+    one side would move the deterministic lenses off the backend's encoding.
+    """
+    import json
+    from pathlib import Path
+
+    from backend.embeddings import feature_encoding as fe
+    from backend.tuning import BPM_HI, BPM_LO
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "frontend"
+        / "src"
+        / "lib"
+        / "feature-geometry.json"
+    )
+    shared = json.loads(path.read_text(encoding="utf-8"))
+    assert shared["bpm_lo"] == BPM_LO
+    assert shared["bpm_hi"] == BPM_HI
+    assert shared["camelot_major_radius"] == fe.CAMELOT_MAJOR_RADIUS
+    assert shared["camelot_minor_radius"] == fe.CAMELOT_MINOR_RADIUS
+    assert shared["minor_fifths_offset"] == fe._MINOR_FIFTHS_OFFSET
+    assert shared["spiral_r_min"] == fe.BPM_SPIRAL_R_MIN
+    assert shared["spiral_r_max"] == fe.BPM_SPIRAL_R_MAX

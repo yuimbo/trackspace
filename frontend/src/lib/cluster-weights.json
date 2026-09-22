@@ -1,0 +1,8 @@
+{
+  "maest_logits": 0.45,
+  "maest": 0.25,
+  "rhythm": 0.15,
+  "clap": 0.1,
+  "supervised": 0.15,
+  "features": 0
+}
