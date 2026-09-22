@@ -12,6 +12,7 @@ from typing import Any
 from flask import Flask, jsonify, request
 from werkzeug.exceptions import HTTPException
 
+from backend.routes.api_describe import create_api_describe_blueprint
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_folders import create_api_folders_blueprint
 from backend.routes.api_imprint import create_api_imprint_blueprint
@@ -165,6 +166,15 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
         )
     )
     app.register_blueprint(
+        create_api_describe_blueprint(
+            clap_mod=deps.embeddings_mod,
+            feature_cache=deps.feature_cache,
+            embedding_version=deps.embedding_version,
+            resolve_virtual_path=deps.resolve_virtual_path,
+            cached_read_all=deps.cached_read_all,
+        )
+    )
+    app.register_blueprint(
         create_api_similar_blueprint(
             analysis_deps=deps.analysis_deps,
             index=deps.similarity_index,
@@ -189,6 +199,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             executor=deps.executor,
             feature_cache=deps.feature_cache,
             features_version=deps.features_version,
+            track_cache=deps.track_cache,
             audio_features_mod=deps.audio_features_mod,
             read_paths_parallel=deps.read_paths_parallel,
             iter_parallel_reads=deps.iter_parallel_reads,

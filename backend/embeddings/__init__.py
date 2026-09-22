@@ -15,6 +15,7 @@ _PUBLIC = frozenset({
     "generate_embedding",
     "generate_text_embeddings",
     "is_model_ready",
+    "load_error",
     "load_model",
     "parse_audio_feature_mask",
     "parse_features_blend",
