@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 
 from backend.embeddings.clustering import build_weighted_matrix
+from backend.embeddings.linalg_utils import l2_normalize
 
 log = logging.getLogger(__name__)
 
@@ -30,13 +31,6 @@ CACHE_TTL_SECONDS = 120.0
 
 #: Refuse to hold a matrix larger than this (float32 elements ≈ 4 bytes each).
 MAX_CACHED_ELEMENTS = 120_000_000  # ~480 MB
-
-
-def _l2_normalize_rows(mat: np.ndarray) -> np.ndarray:
-    """Row-wise L2 normalisation with a floor, so a zero row cannot divide by zero."""
-    norms = np.linalg.norm(mat, axis=1, keepdims=True)
-    np.maximum(norms, 1e-9, out=norms)
-    return mat / norms
 
 
 class SimilarityIndex:
@@ -88,7 +82,7 @@ class SimilarityIndex:
         if matrix.size > MAX_CACHED_ELEMENTS:
             log.info("Similarity index: too large to cache (%d elements)", matrix.size)
             return None
-        norm = _l2_normalize_rows(matrix)
+        norm = l2_normalize(matrix, axis=1)
         row = {p: i for i, p in enumerate(paths)}
         with self._lock:
             self._key = key

@@ -32,6 +32,7 @@ from typing import Any
 import numpy as np
 from flask import Blueprint, jsonify, request
 
+from backend.embeddings.linalg_utils import l2_normalize
 from backend.services.request_validation import opt_int, require_str
 
 log = logging.getLogger(__name__)
@@ -43,13 +44,6 @@ MAX_QUERY_LEN = 200
 #: Landmark sample size for the search field. 128 matches the layout's own
 #: landmark count (`landmark_projection.DEFAULT_LANDMARKS`).
 FIELD_LANDMARKS = 128
-
-
-def _l2_normalize(mat: np.ndarray) -> np.ndarray:
-    """Row-wise L2 normalisation with a floor, so a zero row cannot divide by zero."""
-    norms = np.linalg.norm(mat, axis=-1, keepdims=True)
-    np.maximum(norms, 1e-9, out=norms)
-    return mat / norms
 
 
 def _score_entries(
@@ -72,13 +66,13 @@ def _score_entries(
     """
     if not tracks:
         return []
-    q = _l2_normalize(np.asarray(query_vec, dtype=np.float32).reshape(1, -1))[0]
+    q = l2_normalize(np.asarray(query_vec, dtype=np.float32).reshape(1, -1))[0]
     scored: list[tuple[float, int, str, float | None]] = []
     for idx, (path, vectors, positions) in enumerate(tracks):
         m = np.asarray(vectors, dtype=np.float32)
         if m.ndim == 1:
             m = m.reshape(1, -1)
-        sims = _l2_normalize(m) @ q
+        sims = l2_normalize(m) @ q
         pos: np.ndarray | None = None
         if positions is not None:
             p = np.asarray(positions, dtype=np.float32).reshape(-1)
@@ -155,7 +149,7 @@ def _landmark_paths(
             for t in ordered
         ]
     )
-    mat = _l2_normalize(mat)
+    mat = l2_normalize(mat)
     # Lazy import: the layout's landmark selection owns the k-means heuristic.
     from backend.embeddings.landmark_projection import _select_landmarks
 

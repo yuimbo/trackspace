@@ -70,7 +70,11 @@ class TrackspaceState:
             thread_pool=ThreadPoolExecutor(
                 max_workers=min(32, (os.cpu_count() or 4) * 4),
             ),
-            track_cache=TrackCache(os.path.join(data_dir, "track_cache.db")),
+            # Sized to hold the whole library in memory: a smaller LRU thrashes on
+            # a library-wide scan and every page load re-hits SQLite per track.
+            track_cache=TrackCache(
+                os.path.join(data_dir, "track_cache.db"), max_memory=20000
+            ),
             feature_cache=FeatureCache(os.path.join(data_dir, "audio_features.db")),
             embed_broadcaster=EmbeddingBroadcaster(),
             status_cache=EmbeddingStatusCache(

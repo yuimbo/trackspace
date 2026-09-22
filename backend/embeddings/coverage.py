@@ -29,7 +29,11 @@ class SourceVersions:
 
 @dataclass(frozen=True)
 class CachedSourceMaps:
-    """Fingerprint → row maps from one batch read per source."""
+    """Fingerprint → presence sets from one batch read per source.
+
+    Values are ``{fingerprint: True}`` placeholders, not decoded rows: every
+    consumer only tests membership.
+    """
 
     clap: Mapping[str, object]
     features: Mapping[str, object]
@@ -56,20 +60,32 @@ def batch_fetch_maps(
     fingerprints: list[str],
     versions: SourceVersions,
 ) -> CachedSourceMaps:
+    """Presence-only per-source maps: ``{fingerprint: True}``.
+
+    Coverage and layout revision only ever test ``fp in map``; decoding the blobs
+    to answer that moved ~328 MB per status request. The composite gather reads
+    the vectors it needs through its own path.
+    """
+    presence = feature_cache.presence(
+        {
+            "clap": versions.clap,
+            "features": versions.features,
+            "maest": versions.maest,
+            "maest_logits": versions.maest,
+            "rhythm": versions.rhythm,
+            "supervised": versions.supervised,
+            "structure": versions.structure,
+        },
+        list(fingerprints),
+    )
     return CachedSourceMaps(
-        clap=feature_cache.get_all("clap", fingerprints, version=versions.clap),
-        features=feature_cache.get_all("features", fingerprints, version=versions.features),
-        maest=feature_cache.get_all("maest", fingerprints, version=versions.maest),
-        maest_logits=feature_cache.get_all(
-            "maest_logits", fingerprints, version=versions.maest
-        ),
-        rhythm=feature_cache.get_all("rhythm", fingerprints, version=versions.rhythm),
-        supervised=feature_cache.get_all(
-            "supervised", fingerprints, version=versions.supervised
-        ),
-        structure=feature_cache.get_all(
-            "structure", fingerprints, version=versions.structure
-        ),
+        clap=presence.get("clap", {}),
+        features=presence.get("features", {}),
+        maest=presence.get("maest", {}),
+        maest_logits=presence.get("maest_logits", {}),
+        rhythm=presence.get("rhythm", {}),
+        supervised=presence.get("supervised", {}),
+        structure=presence.get("structure", {}),
     )
 
 

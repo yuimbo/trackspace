@@ -20,7 +20,7 @@ import sqlite3
 import threading
 from collections import OrderedDict
 
-from backend.sqlite_conn import ClosingConnection
+from backend.sqlite_conn import ClosingConnection, chunked
 
 
 class TrackCache:
@@ -92,6 +92,47 @@ class TrackCache:
         with self._lock:
             self._lru_put(key, data)
         return data
+
+    def get_many(
+        self, pairs: list[tuple[str, float]]
+    ) -> dict[tuple[str, float], dict]:
+        """Batch-read many *(path, mtime)* keys, warming the memory LRU.
+
+        ``get`` opens a fresh SQLite connection (and re-runs ``PRAGMA
+        journal_mode=WAL``, a write to the DB header) on every miss — measured at
+        ~730 us/track, which is ~10 s for a 14k-track library scan. One chunked
+        query per call removes that, and the per-track ``get`` then hits the LRU.
+        """
+        out: dict[tuple[str, float], dict] = {}
+        missing: list[tuple[str, float]] = []
+        with self._lock:
+            for key in pairs:
+                hit = self._mem.get(key)
+                if hit is not None:
+                    self._mem.move_to_end(key)
+                    out[key] = hit
+                else:
+                    missing.append(key)
+        if not missing:
+            return out
+        try:
+            with self._conn() as conn:
+                for batch, placeholders in chunked(missing, unit="(?,?)"):
+                    flat = [value for pair in batch for value in pair]
+                    rows = conn.execute(
+                        "SELECT path, mtime, data FROM track_cache "
+                        f"WHERE (path, mtime) IN ({placeholders})",
+                        flat,
+                    ).fetchall()
+                    for path, mtime, blob in rows:
+                        data = json.loads(blob)
+                        key = (path, mtime)
+                        out[key] = data
+                        with self._lock:
+                            self._lru_put(key, data)
+        except Exception:
+            return out
+        return out
 
     def put(self, path: str, mtime: float, data: dict) -> None:
         """Store *data* under *(path, mtime)* in both layers."""

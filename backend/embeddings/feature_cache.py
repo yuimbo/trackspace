@@ -28,6 +28,7 @@ because a single model pass produces the pooled embedding, the logits and the
 excerpts together, and the reader owns the dimension (the blob carries no header).
 """
 
+import json
 import logging
 import os
 import sqlite3
@@ -38,12 +39,21 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from backend.sqlite_conn import ClosingConnection
+from backend.sqlite_conn import ClosingConnection, chunked
 
 log = logging.getLogger(__name__)
 
-#: ``WHERE ... IN (...)`` chunk size, safely below SQLite's variable limit.
-_IN_CHUNK = 500
+#: Persisted 2-D layouts kept on disk, keyed by layout revision.
+_LAYOUT_KEEP = 32
+
+#: Persisted fitted t-SNE embeddings kept on disk, keyed by vector config. The
+#: in-process fit cache dies with the process, so without this a restart refits
+#: every lens (~20 s each) even though the layout coordinates are already cached.
+_TSNE_FIT_KEEP = 8
+
+#: Blob magic + format version. An unreadable or older blob reads as a miss, so a
+#: library upgrade simply refits instead of loading an incompatible pickle.
+_TSNE_FIT_MAGIC = b"TSF1"
 
 
 @dataclass(frozen=True)
@@ -186,6 +196,25 @@ class FeatureCache:
                     fingerprint TEXT PRIMARY KEY,
                     origin TEXT NOT NULL,
                     recorded_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS layout_cache (
+                    revision   TEXT PRIMARY KEY,
+                    paths      TEXT NOT NULL,
+                    xy         BLOB NOT NULL,
+                    created_at REAL NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS tsne_fit_cache (
+                    config_key TEXT PRIMARY KEY,
+                    blob       BLOB NOT NULL,
+                    created_at REAL NOT NULL
                 )
                 """
             )
@@ -362,19 +391,135 @@ class FeatureCache:
         out: dict[str, str] = {}
         try:
             with self._conn() as conn:
-                for start in range(0, len(fps), _IN_CHUNK):
-                    chunk = fps[start : start + _IN_CHUNK]
-                    placeholders = ",".join("?" * len(chunk))
+                for batch, placeholders in chunked(fps):
                     rows = conn.execute(
                         "SELECT fingerprint, origin FROM origin_folders "
                         f"WHERE fingerprint IN ({placeholders})",
-                        chunk,
+                        batch,
                     ).fetchall()
                     for fp, origin in rows:
                         out[str(fp)] = str(origin)
         except Exception:
             return {}
         return out
+
+    # ── Revision-keyed layout persistence ────────────────────────
+    # 2-D layouts live only in an in-process LRU, so a server restart re-fits
+    # every lens (~20 s each). The layout revision is a deterministic digest of
+    # the exact configuration, so it is a stable key across restarts.
+
+    def get_layout(self, revision: str) -> list[dict] | None:
+        """Persisted 2-D positions for *revision*, or ``None``."""
+        if not revision:
+            return None
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT paths, xy FROM layout_cache WHERE revision=?",
+                    (revision,),
+                ).fetchone()
+        except Exception:
+            return None
+        if row is None:
+            return None
+        try:
+            paths = json.loads(row[0])
+            xy = np.frombuffer(row[1], dtype=np.float32).reshape(-1, 2)
+        except Exception:
+            return None
+        if not isinstance(paths, list) or len(paths) != xy.shape[0]:
+            return None
+        return [
+            {"path": str(p), "x": float(xy[i, 0]), "y": float(xy[i, 1])}
+            for i, p in enumerate(paths)
+        ]
+
+    def _put_keyed(
+        self,
+        table: str,
+        key_col: str,
+        key: str,
+        cols: tuple[str, ...],
+        values: tuple,
+        keep: int,
+    ) -> None:
+        """Upsert one keyed cache row and prune *table* to the newest *keep* rows.
+
+        Best-effort: a cache write must never fail the request that produced it.
+        """
+        assignments = ", ".join(f"{c}=excluded.{c}" for c in cols)
+        placeholders = ",".join("?" for _ in cols)
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    f"INSERT INTO {table} ({key_col},{','.join(cols)},created_at) "
+                    f"VALUES (?,{placeholders},?) "
+                    f"ON CONFLICT({key_col}) DO UPDATE SET "
+                    f"{assignments}, created_at=excluded.created_at",
+                    (key, *values, time.time()),
+                )
+                conn.execute(
+                    f"DELETE FROM {table} WHERE {key_col} NOT IN ("
+                    f"SELECT {key_col} FROM {table} "
+                    f"ORDER BY created_at DESC LIMIT ?)",
+                    (keep,),
+                )
+        except Exception:
+            return
+
+    def put_layout(self, revision: str, positions: list[dict]) -> None:
+        """Persist *positions* under *revision* (best-effort)."""
+        if not revision or not positions:
+            return
+        paths = [str(p["path"]) for p in positions]
+        xy = np.asarray(
+            [[float(p["x"]), float(p["y"])] for p in positions], dtype=np.float32
+        )
+        self._put_keyed(
+            "layout_cache",
+            "revision",
+            revision,
+            ("paths", "xy"),
+            (json.dumps(paths), xy.tobytes()),
+            _LAYOUT_KEEP,
+        )
+
+    # ── Vector-config-keyed fitted t-SNE persistence ─────────────
+    # The fitted embedding is a pure function of the vector config (sources /
+    # mask / blend / weights), not the track set, so it is keyed by that config
+    # and a growing library can transform only its new tracks.
+
+    def get_tsne_fit(self, config_key: str) -> bytes | None:
+        """Persisted fitted t-SNE blob for *config_key*, or ``None``."""
+        if not config_key:
+            return None
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT blob FROM tsne_fit_cache WHERE config_key=?",
+                    (config_key,),
+                ).fetchone()
+        except Exception:
+            return None
+        if row is None or not row[0]:
+            return None
+        blob = bytes(row[0])
+        if not blob.startswith(_TSNE_FIT_MAGIC):
+            return None
+        return blob[len(_TSNE_FIT_MAGIC) :]
+
+    def put_tsne_fit(self, config_key: str, blob: bytes) -> None:
+        """Persist a fitted t-SNE *blob* under *config_key* (best-effort)."""
+        if not config_key or not blob:
+            return
+        self._put_keyed(
+            "tsne_fit_cache",
+            "config_key",
+            config_key,
+            ("blob",),
+            (_TSNE_FIT_MAGIC + bytes(blob),),
+            _TSNE_FIT_KEEP,
+        )
 
     @staticmethod
     def _spec(source: str) -> _SourceSpec:
@@ -488,9 +633,7 @@ class FeatureCache:
         if missing:
             try:
                 with self._conn() as conn:
-                    for i in range(0, len(missing), _IN_CHUNK):
-                        batch = missing[i : i + _IN_CHUNK]
-                        placeholders = ",".join("?" for _ in batch)
+                    for batch, placeholders in chunked(missing):
                         rows = conn.execute(
                             f"SELECT fingerprint, {spec.blob_col} FROM audio_features "
                             f"WHERE fingerprint IN ({placeholders}) AND "
@@ -507,6 +650,43 @@ class FeatureCache:
             except Exception:
                 pass
         return result
+
+    def presence(
+        self, source_versions: dict[str, int], fingerprints: list[str]
+    ) -> dict[str, dict[str, bool]]:
+        """Which *fingerprints* have a non-empty row per source: ``{fp: True}``.
+
+        One query with a boolean column per source. Coverage and layout revision
+        only ever test ``fp in map``; decoding the blobs to answer that moved
+        ~328 MB per status request. The composite gather still reads the vectors
+        it needs through its own path.
+        """
+        out: dict[str, dict[str, bool]] = {s: {} for s in source_versions}
+        if not source_versions or not fingerprints:
+            return out
+        specs = list(source_versions.items())
+        cols = ", ".join(
+            f"(length({self._spec(s).blob_col}) > 0 AND "
+            f"{self._spec(s).version_col}=?)"
+            for s, _v in specs
+        )
+        params = [int(v) for _s, v in specs]
+        try:
+            with self._conn() as conn:
+                for batch, placeholders in chunked(fingerprints):
+                    rows = conn.execute(
+                        f"SELECT fingerprint, {cols} FROM audio_features "
+                        f"WHERE fingerprint IN ({placeholders})",
+                        [*params, *batch],
+                    ).fetchall()
+                    for row in rows:
+                        fp = row[0]
+                        for j, (s, _v) in enumerate(specs):
+                            if row[j + 1]:
+                                out[s][fp] = True
+        except Exception:
+            return out
+        return out
 
     def count(self, source: str, version: int | None = None) -> int:
         spec = self._spec(source)
