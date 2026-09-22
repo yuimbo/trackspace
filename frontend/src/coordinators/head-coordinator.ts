@@ -13,6 +13,7 @@ import { type Model } from "../model";
 import { toast } from "../lib/toast";
 import { api, postJSON, postForm } from "../lib/api";
 import { confirmAction } from "../lib/util";
+import { Poller } from "../lib/async";
 
 export interface HeadDeps {
   model: Model;
@@ -81,7 +82,7 @@ export class HeadCoordinator {
   /** Virtual folder of the current imprint target, for status/plan/apply. */
   private _imprintFolder: string | null = null;
   /** Analysis-status poll for the imprint target. */
-  private _imprintTimer: number | null = null;
+  private _imprintPoll = new Poller(2000, () => void this._pollImprint());
 
   constructor(private deps: HeadDeps) {
     this._trainFolders = new Set(deps.model.trainFolders);
@@ -375,18 +376,11 @@ export class HeadCoordinator {
   }
 
   private _startImprintPoll(): void {
-    this._stopImprintPoll();
-    this._imprintTimer = window.setInterval(
-      () => void this._pollImprint(),
-      2000,
-    );
+    this._imprintPoll.start();
   }
 
   private _stopImprintPoll(): void {
-    if (this._imprintTimer != null) {
-      window.clearInterval(this._imprintTimer);
-      this._imprintTimer = null;
-    }
+    this._imprintPoll.stop();
   }
 
   /** Poll analysis readiness until the imprint target is fully analysed. */

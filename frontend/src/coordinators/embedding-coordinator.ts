@@ -20,6 +20,7 @@ import { type Lens, getLens, lensWaitSources, lensWeights } from "../lib/lenses"
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 import { clamp } from "../lib/util";
+import { SseSubscription, latestSeq } from "../lib/async";
 import type { ViewModifierSink } from "./view-modifier-coordinator";
 import {
   approximatePositions,
@@ -119,7 +120,7 @@ const SCOPE_MAX_R = 0.75;
 
 export class EmbeddingCoordinator {
   private _embedPollTimer = 0;
-  private _embedEventSource: EventSource | null = null;
+  private _embedStream = new SseSubscription();
   private _embedBatchCount = 0;
   private _projectionFetchPending = false;
   /** Query-string → {revision, positions} map so A→B→A revisits are instant. */
@@ -132,9 +133,9 @@ export class EmbeddingCoordinator {
 
   private _animFrame = 0;
   /** Monotonic request id; a slow projection must not overwrite a newer one. */
-  private _projectionReqSeq = 0;
+  private _projectionSeq = latestSeq();
   /** Monotonic request id for scope recomputes (lens switch / resize). */
-  private _scopeReqSeq = 0;
+  private _scopeSeq = latestSeq();
   /** Id of the active `scope` modifier chip, or null when no scope is open. */
   private _scopeModifierId: string | null = null;
 
@@ -407,11 +408,9 @@ export class EmbeddingCoordinator {
 
   /** Open an SSE connection to stream embedding generation progress. */
   private _listenEmbeddingStream(): void {
-    this._closeEmbeddingStream();
     this._embedBatchCount = 0;
 
-    const es = new EventSource("/api/embeddings/stream");
-    this._embedEventSource = es;
+    const es = this._embedStream.open("/api/embeddings/stream");
 
     es.addEventListener("decode_warning", ((e: MessageEvent) => {
       const data = JSON.parse(e.data) as { path: string; message: string };
@@ -477,10 +476,7 @@ export class EmbeddingCoordinator {
   }
 
   private _closeEmbeddingStream(): void {
-    if (this._embedEventSource) {
-      this._embedEventSource.close();
-      this._embedEventSource = null;
-    }
+    this._embedStream.close();
   }
 
   private _projectionQueryString(
@@ -619,7 +615,7 @@ export class EmbeddingCoordinator {
   }): Promise<void> {
     const m = this.deps.model;
     const qs = this._projectionQueryString();
-    const reqSeq = ++this._projectionReqSeq;
+    const reqSeq = this._projectionSeq.next();
 
     // --- Client-side cache check ---
     const cached = this._layoutCache.get(qs);
@@ -643,7 +639,7 @@ export class EmbeddingCoordinator {
         }
       }
       if (rev != null && rev === cached.revision) {
-        if (reqSeq === this._projectionReqSeq) {
+        if (this._projectionSeq.isCurrent(reqSeq)) {
           this._applyPositions(cached.positions);
           this._settleProjection(reqSeq);
         }
@@ -663,7 +659,7 @@ export class EmbeddingCoordinator {
       );
       // A newer projection was requested while this one was in flight (a refit
       // takes seconds); its response must win, not this stale one.
-      if (reqSeq !== this._projectionReqSeq) return;
+      if (!this._projectionSeq.isCurrent(reqSeq)) return;
       const { positions, revision } = parseProjectionResponse(raw);
       const newPositions = new Map<string, { x: number; y: number }>();
       for (const p of positions) {
@@ -687,7 +683,7 @@ export class EmbeddingCoordinator {
    *  can apply the final positions while an older, slower fit is still in flight,
    *  and that stale fit must not leave the pill up (nor take it down twice). */
   private _settleProjection(reqSeq: number): void {
-    if (reqSeq !== this._projectionReqSeq) return;
+    if (!this._projectionSeq.isCurrent(reqSeq)) return;
     const m = this.deps.model;
     m.projectionPending = false;
     m.pendingProjectionQuery = null;
@@ -956,7 +952,7 @@ export class EmbeddingCoordinator {
   ): Promise<void> {
     const m = this.deps.model;
     const active = { ...scope, lensId };
-    const seq = ++this._scopeReqSeq;
+    const seq = this._scopeSeq.next();
     // Show the circle immediately so X + scroll can resize it while the layout
     // loads; the no-tracks case reverts below.
     m.scopeLensId = lensId;
@@ -965,7 +961,7 @@ export class EmbeddingCoordinator {
     this.deps.canvas.scheduleDraw();
 
     const { raw, inScope } = await this._computeScopeRaw(active);
-    if (seq !== this._scopeReqSeq) return;
+    if (!this._scopeSeq.isCurrent(seq)) return;
     if (inScope.length === 0 && !allowEmpty) {
       m.scope = null;
       toast("No tracks inside the scope", "warn");
@@ -1010,9 +1006,9 @@ export class EmbeddingCoordinator {
     if (!scope || scope.lensId === lensId) return;
     m.scopeLensId = lensId;
     const next = { ...scope, lensId };
-    const seq = ++this._scopeReqSeq;
+    const seq = this._scopeSeq.next();
     const { raw } = await this._computeScopeRaw(next);
-    if (seq !== this._scopeReqSeq) return;
+    if (!this._scopeSeq.isCurrent(seq)) return;
     const targets = this._mapIntoScope(raw, next);
     const start = new Map(m.scopePositions);
     m.scope = next;
@@ -1038,9 +1034,9 @@ export class EmbeddingCoordinator {
     if (!scope) return Promise.resolve();
     const next = this._scaleScope(scope, factor);
     m.scope = next;
-    const seq = ++this._scopeReqSeq;
+    const seq = this._scopeSeq.next();
     return this._computeScopeRaw(next).then(({ raw }) => {
-      if (seq !== this._scopeReqSeq) return;
+      if (!this._scopeSeq.isCurrent(seq)) return;
       m.scopePositions = this._mapIntoScope(raw, next);
       this.deps.canvas.scheduleDraw();
     });

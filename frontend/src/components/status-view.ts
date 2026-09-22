@@ -1,13 +1,14 @@
 import type { Model, QueueStatus } from "../model";
 import { pipelineProgress, phaseLabel, stageDetail } from "../lib/pipeline";
 import { escapeHtml as esc } from "../lib/util";
+import { clearOnNewTimer } from "../lib/async";
 
 const PANEL_HIDE_MS = 140;
 
 export class StatusView {
   $el: HTMLElement;
   private _panel: HTMLElement;
-  private _hideTimer = 0;
+  private _hide = clearOnNewTimer();
   private _boundPosition: () => void;
   private _model!: Model;
   private _hoverAnchor: HTMLElement | null = null;
@@ -103,16 +104,11 @@ export class StatusView {
   }
 
   private _clearHideTimer(): void {
-    if (this._hideTimer) {
-      clearTimeout(this._hideTimer);
-      this._hideTimer = 0;
-    }
+    this._hide.cancel();
   }
 
   private _scheduleHide(): void {
-    this._clearHideTimer();
-    this._hideTimer = window.setTimeout(() => {
-      this._hideTimer = 0;
+    this._hide.set(() => {
       this._hoverAnchor = null;
       this._panel.hidden = true;
       delete this._panel.dataset.openKind;

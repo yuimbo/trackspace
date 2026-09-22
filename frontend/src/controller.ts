@@ -20,6 +20,7 @@ import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast
 import { api, postJSON } from "./lib/api";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
 import { cycle, clamp01 } from "./lib/util";
+import { debounce, keyedInFlight } from "./lib/async";
 import { bloomRangeLabel } from "./lib/bloom";
 import {
   CommandManager,
@@ -55,18 +56,6 @@ const FLUSH_MS = 500;
 /** Range added per D + scroll step, at the gesture's clamped max (±0.4 → ±0.2). */
 const BLOOM_RANGE_SCROLL_STEP = 0.5;
 
-// ─── Utilities ───────────────────────────────────────────────
-function debounce<Args extends unknown[]>(
-  fn: (...args: Args) => void,
-  ms: number,
-): (...args: Args) => void {
-  let t: ReturnType<typeof setTimeout>;
-  return (...a) => {
-    clearTimeout(t);
-    t = setTimeout(() => fn(...a), ms);
-  };
-}
-
 // ─── Internal types ──────────────────────────────────────────
 interface PendingUpdate {
   path: string;
@@ -93,7 +82,7 @@ export class Controller {
   /** Fraction to seek to once a freshly-started preview's metadata lands. */
   private pendingSeekFraction: number | null = null;
   /** Paths with an in-flight structure fetch, so a hover burst fetches once. */
-  private structurePending = new Set<string>();
+  private structurePending = keyedInFlight<string, void>();
   /** Filter-tag → its chip id, so each active range filter has one chip. */
   private filterModifierIds = new Map<string, string>();
   private $audio: HTMLAudioElement;
@@ -924,8 +913,7 @@ export class Controller {
     if (this.model.trackStructure.has(path) || this.structurePending.has(path)) {
       return;
     }
-    this.structurePending.add(path);
-    try {
+    await this.structurePending.run(path, async () => {
       const res = await api<{
         tracks?: (TrackStructure & { path: string })[];
       }>(
@@ -950,11 +938,9 @@ export class Controller {
       }
       // Chips appear as soon as the structure lands, without moving the mouse.
       this.canvas.scheduleDraw();
-    } catch {
+    }).catch(() => {
       /* A missing row is the normal "not analysed yet" case; keep the fallback. */
-    } finally {
-      this.structurePending.delete(path);
-    }
+    });
   }
 
   private _stopPreview(): void {

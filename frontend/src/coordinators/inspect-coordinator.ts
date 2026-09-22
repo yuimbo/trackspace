@@ -17,6 +17,7 @@ import {
 } from "../lib/tooltip";
 import type { ViewModifierSink } from "./view-modifier-coordinator";
 import { clamp } from "../lib/util";
+import { keyedInFlight, latestSeq, throttle } from "../lib/async";
 
 /** Neighbours requested for the "nearest" ranking. */
 export const NEAR_K = 5;
@@ -85,20 +86,19 @@ export class InspectCoordinator {
   /** Cached full near ranking for the inspected path (one fetch per pin). */
   private _rankingPath: string | null = null;
   private _ranking: string[] = [];
-  /** In-flight ranking fetch, so a drag burst shares one request. */
-  private _rankingPending: Promise<string[] | null> | null = null;
-  private _rankingPendingPath: string | null = null;
-  /** Proximity throttle: the latest requested step and its callers. */
-  private _proximityPending: { path: string; percent: number } | null = null;
-  private _proximityWaiters: Array<() => void> = [];
-  private _proximityTimer: ReturnType<typeof setTimeout> | null = null;
-  private _proximityLastRun = 0;
+  /** One shared ranking fetch per path, so a drag burst shares one request. */
+  private _rankingFlight = keyedInFlight<string, string[] | null>();
+  /** Leading+trailing throttle for the distance-filter slider. */
+  private _proximity = throttle(
+    (path: string, percent: number) => this._runProximity(path, percent),
+    PROXIMITY_THROTTLE_MS,
+  );
   /** Monotonic step id: a stale async apply must not overwrite a newer one. */
-  private _proximitySeq = 0;
+  private _proximitySeq = latestSeq();
   /** Path whose descriptions loaded successfully (avoids a refetch per tab switch). */
   private _describePath: string | null = null;
-  /** Path with a describe fetch in flight, so a tab burst shares one request. */
-  private _describeInFlight: string | null = null;
+  /** One shared describe fetch per path, so a tab burst shares one request. */
+  private _describeFlight = keyedInFlight<string, DescribeResponse>();
   /** Slider direction: keep the closest (near) or the furthest (anti-track). */
   private _rankMode: "near" | "far" = "near";
   /** Error from the last full-ranking fetch, shown when the slider has no data. */
@@ -122,7 +122,6 @@ export class InspectCoordinator {
       // dot, so closing it ends the audition.
       this.deps.stopPreview(path);
       this._describePath = null;
-      this._describeInFlight = null;
       // A proximity filter outlives the card as a view modifier, so its
       // direction must survive; only an unfiltered card resets to nearest.
       if (!this._proximityModifierId) this._rankMode = "near";
@@ -205,19 +204,19 @@ export class InspectCoordinator {
    */
   private async ensureDescribe(path: string): Promise<void> {
     if (this._describePath === path) return;
-    if (this._describeInFlight === path) return;
-    this._describeInFlight = path;
+    if (this._describeFlight.has(path)) return;
     this.deps.view.setInspect({ describe: emptyDescribe(path, true) });
     let res: DescribeResponse;
     try {
-      res = await this.deps.fetchDescribe(path, DESCRIBE_K);
+      res = await this._describeFlight.run(path, () =>
+        this.deps.fetchDescribe(path, DESCRIBE_K),
+      );
     } catch (err) {
       res = {
         ok: false,
         error: err instanceof Error ? err.message : "Describe lookup failed",
       };
     }
-    if (this._describeInFlight === path) this._describeInFlight = null;
     if (!res.ok) {
       this.deps.view.setInspect({
         describe: {
@@ -267,51 +266,19 @@ export class InspectCoordinator {
    * deterministic without exposing the timer.
    */
   private _scheduleProximity(path: string, percent: number): Promise<void> {
-    this._proximityPending = { path, percent };
-    const wait = new Promise<void>((resolve) =>
-      this._proximityWaiters.push(resolve),
-    );
-    if (this._proximityTimer !== null) return wait;
-    const elapsed = Date.now() - this._proximityLastRun;
-    if (elapsed >= PROXIMITY_THROTTLE_MS) this._runProximity();
-    else
-      this._proximityTimer = setTimeout(
-        () => this._runProximity(),
-        PROXIMITY_THROTTLE_MS - elapsed,
-      );
-    return wait;
+    return this._proximity.call(path, percent);
   }
 
-  /** Apply the pending slider step and release everyone waiting on it. */
-  private _runProximity(): void {
-    if (this._proximityTimer !== null) {
-      clearTimeout(this._proximityTimer);
-      this._proximityTimer = null;
-    }
-    const pending = this._proximityPending;
-    this._proximityPending = null;
-    if (!pending) return;
-    this._proximityLastRun = Date.now();
-    const waiters = this._proximityWaiters;
-    this._proximityWaiters = [];
-    const seq = ++this._proximitySeq;
-    void this.setProximity(pending.path, pending.percent, seq)
-      .catch(() => {})
-      .finally(() => {
-        for (const resolve of waiters) resolve();
-      });
+  /** Apply the pending slider step with a fresh sequence token. */
+  private _runProximity(path: string, percent: number): Promise<void> {
+    return this.setProximity(path, percent, this._proximitySeq.next()).catch(
+      () => {},
+    );
   }
 
   /** Drop a pending slider step and release its waiters (superseded action). */
   private _cancelProximity(): void {
-    if (this._proximityTimer !== null) {
-      clearTimeout(this._proximityTimer);
-      this._proximityTimer = null;
-    }
-    this._proximityPending = null;
-    const waiters = this._proximityWaiters;
-    this._proximityWaiters = [];
-    for (const resolve of waiters) resolve();
+    this._proximity.cancel();
   }
 
   /**
@@ -337,7 +304,7 @@ export class InspectCoordinator {
     }
     const ranked = await this.rankedFor(path);
     if (ranked === null) {
-      if (seq === this._proximitySeq) {
+      if (this._proximitySeq.isCurrent(seq)) {
         this.deps.view.setInspect({
           busy: false,
           message: this._rankingError ?? "No ranking available",
@@ -345,7 +312,7 @@ export class InspectCoordinator {
       }
       return;
     }
-    if (seq !== this._proximitySeq) return;
+    if (!this._proximitySeq.isCurrent(seq)) return;
     const keepCount = Math.ceil((p / 100) * ranked.length);
     const slice =
       this._rankMode === "far"
@@ -422,22 +389,11 @@ export class InspectCoordinator {
     if (this._rankingPath === path && this._ranking.length) {
       return Promise.resolve(this._ranking);
     }
-    if (this._rankingPending && this._rankingPendingPath === path) {
-      return this._rankingPending;
-    }
-    this._rankingPendingPath = path;
-    this._rankingPending = this.fetchRanking(path);
-    return this._rankingPending;
+    return this._rankingFlight.run(path, () => this.fetchRanking(path));
   }
 
   private async fetchRanking(path: string): Promise<string[] | null> {
     const res = await this.fetch(path, "near", PROXIMITY_ALL);
-    // Only this request's own slot is cleared: a stale fetch for another path
-    // must not cancel the newer path's in-flight request.
-    if (this._rankingPendingPath === path) {
-      this._rankingPending = null;
-      this._rankingPendingPath = null;
-    }
     // The pre-load is silent: the error is only surfaced when the slider
     // actually needs the ranking (see `setProximity`).
     if (!res.ok || !res.ranking?.length) {

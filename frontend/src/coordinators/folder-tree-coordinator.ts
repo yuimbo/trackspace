@@ -20,6 +20,7 @@ import {
 } from "../lib/bloom";
 import { postJSON } from "../lib/api";
 import { confirmAction } from "../lib/util";
+import { clearOnNewTimer } from "../lib/async";
 import { displayFolderLeaf, displayFolderPath } from "../lib/path-presenter";
 import { hotkeyLabel } from "../hotkeys";
 import htmx from "htmx.org";
@@ -119,7 +120,7 @@ export class FolderTreeCoordinator {
   /** The row whose action popout is open, if any. */
   private _actionsRow: HTMLElement | null = null;
   private _actionsEl!: HTMLElement;
-  private _hideActionsTimer: number | null = null;
+  private _actionsHide = clearOnNewTimer();
 
   /** Active tab of the selected-tracks overlay; falls back to folders when empty. */
   private _overlayTab: OverlayTab = "folders";
@@ -356,15 +357,11 @@ export class FolderTreeCoordinator {
   }
 
   private _scheduleHideActions(): void {
-    this._cancelHideActions();
-    this._hideActionsTimer = window.setTimeout(() => this._hideActions(), 150);
+    this._actionsHide.set(() => this._hideActions(), 150);
   }
 
   private _cancelHideActions(): void {
-    if (this._hideActionsTimer != null) {
-      window.clearTimeout(this._hideActionsTimer);
-      this._hideActionsTimer = null;
-    }
+    this._actionsHide.cancel();
   }
 
   private _hideActions(): void {

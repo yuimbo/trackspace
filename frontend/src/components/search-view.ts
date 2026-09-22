@@ -8,6 +8,7 @@
 // `onSearch` / `onFocusResult` / `onHoverTrack` / `onHoverEnd`.
 
 import type { Model } from "../model";
+import { debounce } from "../lib/async";
 
 /** Live-search delay: a burst of keystrokes collapses into one query. */
 export const SEARCH_DEBOUNCE_MS = 300;
@@ -43,7 +44,10 @@ export class SearchView {
   onCommit: (() => void) | null = null;
 
   /** Pending live-search timer, so a keystroke burst collapses into one query. */
-  private _debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  private _searchDebounced = debounce(
+    () => this.onSearch?.(this.$input.value),
+    SEARCH_DEBOUNCE_MS,
+  );
 
   constructor(model: Model, section: HTMLElement) {
     this.model = model;
@@ -54,7 +58,7 @@ export class SearchView {
     this.$input.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        clearTimeout(this._debounceTimer);
+        this._searchDebounced.cancel();
         this.onSearch?.(this.$input.value);
         // Enter commits: the popup closes, the search stays live as a chip.
         this.onCommit?.();
@@ -65,16 +69,12 @@ export class SearchView {
     });
     // Search while typing: the box no longer waits for Enter.
     this.$input.addEventListener("input", () => {
-      clearTimeout(this._debounceTimer);
-      const value = this.$input.value;
-      if (!value.trim()) {
+      this._searchDebounced.cancel();
+      if (!this.$input.value.trim()) {
         this.onSearch?.("");
         return;
       }
-      this._debounceTimer = setTimeout(
-        () => this.onSearch?.(value),
-        SEARCH_DEBOUNCE_MS,
-      );
+      this._searchDebounced();
     });
     // A click on the dimmed backdrop closes the popup without clearing.
     this.$el.addEventListener("mousedown", (e) => {
@@ -108,7 +108,7 @@ export class SearchView {
 
   /** Esc in the box: clear the search and close the popup. */
   private _dismiss(): void {
-    clearTimeout(this._debounceTimer);
+    this._searchDebounced.cancel();
     this.$input.value = "";
     this.onSearch?.("");
     this.onActiveChange?.(false);
@@ -122,7 +122,7 @@ export class SearchView {
    * the canvas shows the search field.
    */
   setQuery(query: string): void {
-    clearTimeout(this._debounceTimer);
+    this._searchDebounced.cancel();
     this.$input.value = query;
     this.open();
     this.onSearch?.(query);

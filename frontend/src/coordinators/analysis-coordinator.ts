@@ -22,6 +22,7 @@ import { clusterColor } from "../lib/colors";
 import { stepColorMode, type ColorMode } from "../lib/lenses";
 import { api, postJSON } from "../lib/api";
 import { clamp, confirmAction } from "../lib/util";
+import { CoalescedTask, SseSubscription } from "../lib/async";
 
 export interface AnalysisDeps {
   model: Model;
@@ -129,11 +130,11 @@ interface ProblemsResponse {
 }
 
 export class AnalysisCoordinator {
-  private _jobsEventSource: EventSource | null = null;
-  private _clusterFetchPending = false;
-  /** A resolution change landed mid-fetch; refetch the latest when it settles. */
-  private _clusterFetchAgain = false;
-  private _predictionsFetchPending = false;
+  private _jobsStream = new SseSubscription();
+  /** One cluster fetch at a time; a resolution change mid-fetch queues one more. */
+  private _clusterFetch = new CoalescedTask(() => this._fetchClusters());
+  /** One predictions fetch at a time; a head change mid-fetch queues one more. */
+  private _predictionsFetch = new CoalescedTask(() => this._fetchFolderPredictions());
   /** Supervise jobs outstanding at the previous status poll, to spot a finish. */
   private _prevSuperviseOutstanding: number | null = null;
 
@@ -713,8 +714,10 @@ export class AnalysisCoordinator {
 
   /** Fetch the head's nearest learned folder per track. */
   async fetchFolderPredictions(): Promise<void> {
-    if (this._predictionsFetchPending) return;
-    this._predictionsFetchPending = true;
+    return this._predictionsFetch.run();
+  }
+
+  private async _fetchFolderPredictions(): Promise<void> {
     const m = this.deps.model;
     // The fetch walks the library, so show it is working in the status bar.
     m.folderPredictionsLoading = true;
@@ -732,7 +735,6 @@ export class AnalysisCoordinator {
     } catch {
       /* api() already toasted */
     } finally {
-      this._predictionsFetchPending = false;
       m.folderPredictionsLoading = false;
       this.deps.status.update(m);
     }
@@ -783,8 +785,7 @@ export class AnalysisCoordinator {
    */
   private _listenJobStream(): void {
     this._closeJobStream();
-    const es = new EventSource("/api/jobs/stream");
-    this._jobsEventSource = es;
+    const es = this._jobsStream.open("/api/jobs/stream");
 
     const applySnapshot = (data: QueueStatus) => {
       this.deps.model.queueStatus = data;
@@ -893,10 +894,7 @@ export class AnalysisCoordinator {
   }
 
   private _closeJobStream(): void {
-    if (this._jobsEventSource) {
-      this._jobsEventSource.close();
-      this._jobsEventSource = null;
-    }
+    this._jobsStream.close();
   }
 
   /** Pull authoritative queue counts (SQL aggregates on the server). */
@@ -934,13 +932,10 @@ export class AnalysisCoordinator {
 
   /** Fetch cluster assignments at the selected resolution. */
   async fetchClusters(): Promise<void> {
-    if (this._clusterFetchPending) {
-      // A drag moved the slider while this fetch was in flight; remember to fetch
-      // the latest position once it settles, so the final one is never dropped.
-      this._clusterFetchAgain = true;
-      return;
-    }
-    this._clusterFetchPending = true;
+    return this._clusterFetch.run();
+  }
+
+  private async _fetchClusters(): Promise<void> {
     const m = this.deps.model;
     try {
       const d = await api<ClusterResponse>(
@@ -976,12 +971,6 @@ export class AnalysisCoordinator {
       this.deps.scheduleDraw();
     } catch {
       /* api() already toasted */
-    } finally {
-      this._clusterFetchPending = false;
-      if (this._clusterFetchAgain) {
-        this._clusterFetchAgain = false;
-        void this.fetchClusters();
-      }
     }
   }
 
