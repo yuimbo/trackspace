@@ -44,7 +44,11 @@ outside it so blobs stay legible against the grid and the glow. Colour is the ke
 average, so a blob of one hue stays pure and a mixed blob blends proportionally; the summed weight
 is divided out, so a blob's interior stays at full saturation however many points stack. Point alpha
 dims a blob's colour (search fade, external tracks) without shrinking its shape, so faded points still
-merge.
+merge. A grey point — a track the head cannot place, or an unanalysed one — is **down-prioritised**
+(`PointSpec.weight`, `GREY_COLOUR_WEIGHT`): it still adds shape, but almost none of its colour, so a
+blob it merges into keeps the hue of its information-bearing members instead of washing out to grey. The
+grey points are also splatted and composited **first**, the coloured points over them, so a grey dot never
+occludes a coloured one.
 
 **Hovered and selected points are excluded from the field** and drawn crisp on top
 (`_dot`), so a single track never dissolves into a blob. Hit testing stays CPU-side on
@@ -117,18 +121,30 @@ means the track sits directly at the root.
   `Controller._runCanvasAction` the hotkeys call), `POST /api/folders/reveal`,
   `POST /api/roots/role`, `POST /api/roots/remove` (after a `confirm`), `POST /api/folders/create`,
   or the head panel's imprint prefill via `onImprintRoot`.
+- **The Folders header** is `#folder-head`: the `<h2>` and a compact **+ Root**
+  button (`#btn-add-root`, top-right of the same row). There is no drop-hint text.
 - Root rows: *role* flips My library ↔ External via `POST /api/roots/role`; *remove* drops the
   root via `POST /api/roots/remove` — files stay on disk and cached analysis is kept, so
-  re-adding restores it; dragging a root row out of the sidebar does the same without a
-  button. *imprint* (external roots only) prefills the head panel's imprint target with the
-  root's absolute path through the controller's `onImprintRoot` dep.
+  re-adding restores it. **Right-clicking a folder inside an External root reuses the same row
+  action popout** (there is no separate context menu): it carries *Project folder structure onto
+  here*, which prefills the projection target with that folder's absolute path (the root's
+  `data-root-abs` plus the row's relative path) through the controller's `onImprintRoot` dep,
+  which opens the head modal. Dragging a root row out of the sidebar shows the **drop zone**
+  (below) and removes the root after a `confirm`.
 - **Adding a root is always an explicit role choice.** *+ Root* opens the modal (path from the
   clipboard); a **Finder drop** on the sidebar opens the same modal with the dropped path
   prefilled rather than silently adding a library root — a dropped folder may be a download the
   user wants **External**. The modal's *External (not My library)* checkbox sets the `role` sent
-  to `POST /api/roots/add`.
-- `#show-external-toggle` (in `#folder-controls`, hidden while no external roots exist)
-  is bound to `model.showExternal`; toggling it is a **pure redraw**, never a refetch.
+  to `POST /api/roots/add`. A drop with no absolute path shows the warning **anchored at the drop
+  point** (`toast(…, { x, y })`), not in the global stack; an internal root-row drag that is
+  released in place is a no-op and never reaches the drop handler.
+- **Drop zone to remove a root.** While a root row is dragged, `#root-drop-zone` (`.root-drop-zone`,
+  at the left edge of `#main`, just right of the sidebar) appears with a red gradient outline and a
+  trashcan glyph; dropping the row there (or anywhere outside the sidebar) removes the root after a
+  `confirm`.
+- **External visibility and refit are view-modifier chips**, not graph controls.
+  The permanent **Library + External / Library Only** chip is the click target for
+  `model.showExternal` (**V**); toggling it is a **pure redraw**, never a refetch.
   When on, external dots are drawn at half alpha (`CanvasView._pointSpec`) so they read as
   secondary to My library. External positions ride along with **every** projection request
   (`EmbeddingCoordinator._projectionQueryString` sends `include_external=1` whenever
@@ -138,13 +154,13 @@ means the track sits directly at the root.
   thing that waits. `FolderTreeCoordinator._syncExternalRoots` reads roles from the swapped
   tree, so a role change only needs a tree `refresh()`, never the expensive
   `onRootsChanged()` reload.
-- `#external-projection-toggle` (hidden with the same condition) is bound to
-  `model.externalInProjection`. It is **off by default**: showing externals keeps the
-  library t-SNE layout and the server places the external dots onto it by Nyström
-  extension (`fit_scope=library`, the default). Turning it on sends `fit_scope=all`
-  and refits the map with externals included — the old behaviour. Only this switch calls
-  `refreshProjection()`; it is the only one that changes the fitted track set, so only it
-  moves the library dots.
+- The chip's inline **Refit** checkbox (`model.externalInProjection`, action
+  `"toggle-external-refit"`, **R**) is shown only while externals are on the map. It is
+  **off by default**: showing externals keeps the library t-SNE layout and the server places
+  the external dots onto it by Nyström extension (`fit_scope=library`, the default).
+  Turning it on sends `fit_scope=all` and refits the map with externals included — the old
+  behaviour. Only this switch calls `refreshProjection()`; it is the only one that changes
+  the fitted track set, so only it moves the library dots.
 
 ---
 
@@ -166,43 +182,48 @@ server-side by `backend/services/dir_colors.py` for the Jinja folder-tree swatch
 
 ## Right panel (tabs)
 
-The right column pins the two "what am I looking at?" sections — **Search** and
-**Properties** — above a tab strip (`#rp-tabs`, `RightPanelBinder`). Everything else
-lives in one of four tabs, so the panel no longer scrolls to the brim:
+The right column pins **Properties** above a tab strip (`#rp-tabs`,
+`RightPanelBinder`). Everything else lives in one of three tabs, so the panel no
+longer scrolls to the brim:
 
 | Tab | Sections | Concern |
 |-----|----------|---------|
-| **Analysis** | Analysis (coverage + per-stage retrigger), Microgenres | what the analysis says |
-| **Organise** | Folder head (train/export/import/compare, training folders, imprint) | the learned folder structure |
+| **Analysis** | Analysis (coverage + per-stage retrigger), Microgenres, Folder head | what the analysis says |
 | **Tracks** | Batch Edit, Features, Personal tags | the selection and its metadata |
-| **View** | Options (hover preview, view mode, explode) | how the map is drawn |
 
 - Sections are tagged **in place** with `data-rp-panel="<tab>"`; their cross-tab DOM order
   is irrelevant because only one tab is shown at a time. `RightPanelBinder.sync` toggles each
   tagged section's `hidden` and the tab's `active`/`aria-selected` from `model.rightPanelTab`.
 - The active tab is persisted in `localStorage` (like `showExternal`), so a reload returns to
   the same tab; an unknown stored value falls back to **Analysis**.
-- `HeadCoordinator.prefillImprint` reveals the **Organise** tab through the controller's
-  `showRightPanel` dep before filling `#head-imprint-path`, so an imprint started from an
-  external root row is visible even when another tab was active.
+- **Search is not here.** It is a `⌘F` popup (see *Search popup*) that commits to an
+  **active view modifier** chip.
+- **View options are not here either.** Lens and colour live in the persistent top
+  tabbers (a click or **E** / **C**); hover preview lives in the status bar (see
+  *Hover preview and tooltip*); and the contextual display toggles live in the
+  top-right **View options** panel (`#view-options`) on the canvas edge. There is no
+  View tab. The panel appears whenever at least one of its `.view-option` rows is
+  relevant — currently only the **Confident only** gate (`#head-confident-fold`),
+  shown in predicted-folder colour mode.
+- **The imprint controls are not here either.** They live in the **head modal** (see below);
+  the head's info and training/export/import/compare live in the Analysis tab's **Folder
+  head** section.
 
 ---
 
-## Folder head panel
+## Head modal
 
-The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):
+`HeadCoordinator.openModal` opens `#head-modal` — the dialog for **projecting the folder
+head onto a folder outside the library**. It is reached by **right-clicking a folder inside an
+External root** and choosing *Project folder structure onto here* in the shared row action popout
+(`FolderTreeCoordinator._bindFolderContextMenu` just routes the right-click to
+`_showFolderActions`). Training and the head tools live in the **Analysis panel's Folder head
+section** (see below), not in this dialog, so the modal stays focused on the fan-out.
 
-- **Train folder view** sends the checked *Training folders* as `folders`; an empty
-  selection means every **My library** root (the default) — external roots are only
-  learned from when checked explicitly. The checkbox tree is the folder tree from
-  `GET /api/folders`, fetched lazily when the section is opened — never on startup —
-  and rendered as `.head-folder-row` rows with collapsible children. *All library
-  folders* clears the selection. External roots are labelled `(external)`. The checked
-  folders are mirrored onto `model.trainFolders` and
-  persisted in `localStorage`, so a selection survives a reload.
-- **Imprint on a folder…** takes an absolute path (or is prefilled from an external
-  root row's hover action popout), calls
-  `POST /api/supervised/imprint/analyze`, then polls
+- **Project folder structure onto here** fills `#head-imprint-path` with the folder's absolute
+  path and shows it in `#head-modal-target`, then opens the modal.
+- **Project onto** takes an absolute path (prefilled from the right-clicked external folder),
+  calls `POST /api/supervised/imprint/analyze`, then polls
   `GET /api/supervised/imprint/status` until `pending == 0` before *Review plan* and
   *Apply moves* run the ordinary `POST /api/supervised/fanout`. The fan-out is always
   `recursive`, so nested files under the target are gathered and lifted. The ephemeral root is
@@ -217,10 +238,8 @@ The right-column *Folder head* controls (`HeadCoordinator.bindPanel`):
 - **Discard** appears only when `GET /api/supervised/imprint/temp_roots` reports an
   imprint a closed browser left behind; it drops those roots via
   `POST /api/supervised/imprint/discard` without touching the files.
-- **Import** retries once with `force=1` when the server refuses a head trained on
-  different encoder versions, after a `confirm` explains the mismatch.
-- Head actions live in the collapsed *Folder head* `<details>`; the folder tree and the
-  imprint controls are nested `<details>` so the panel stays short.
+- Esc, the `×`, or a click on the backdrop closes the modal without reaching the global Esc
+  handler.
 
 ---
 
@@ -258,34 +277,74 @@ already provides optimistic behavior for that hot path.
 
 `frontend/src/hotkeys.ts` owns all keyboard shortcut definitions and dispatch.
 
-- **`HOTKEY_MAP`** — single array of `{ action, key, mod?, shift?, alt?, label, description }`.
-  Each entry defines a named action (e.g. `"undo"`, `"fit-view"`) with its key binding.
-- **`MOUSE_HINTS`** — non-keyboard hints (shift+drag, alt+drag) shown in the F1 modal
-  but not dispatched.
+- **`HOTKEY_MAP`** — single array of `{ action, key, code?, mod?, shift?, alt?, label, description, dispatch? }`.
+  Each entry defines a named action (e.g. `"undo"`, `"fit-view"`) with its key binding. Entries with
+  `dispatch: false` are still declared here for the F1 list and for UI badges, but their keydown/keyup is
+  owned elsewhere: the canvas gesture keys **X**/**M**/**D**/**Alt** by `CanvasInteractionController`, and
+  **F1** by the Alpine shortcuts modal.
+- **`MOUSE_HINTS`** — pointer-only hints (shift+drag, alt+drag) shown in the F1 modal but not dispatched.
 - **`HotkeyManager`** — listens to `keydown`, matches against `HOTKEY_MAP`, and fires
   registered handlers for the matching action. The controller calls `hk.on("action", fn)`.
 - **`renderShortcutList(container)`** — populates the F1 shortcuts modal from the maps.
   Called once at startup in `main.ts`.
+- **`hotkeyLabel` / `hotkeyBinding` / `hotkeyCode` / `hotkeyKey`** — lookups every render site uses
+  (folder-row popout, view-modifier chips, tooltip seekbar) and the gesture handlers use to match their
+  physical key, so no key or label is hard-coded outside this module.
+- **`applyHotkeyLabels()`** — fills static markup from the table: `[data-hotkey-action]` gets the action's
+  label as its text, `[data-hotkey-title]` gets the description as its `title`, and `data-hotkey-template`
+  substitutes `{key}` into a prose `title`. Called once at startup in `main.ts`.
 
-Canvas visibility filtering is described to users as **isolate** (only selection or folder remains;
-action `"isolate-selection"`, **s**) and **exclude** (remove from view, often repeated; action
-`"exclude-selection"`, **Shift+s**), with **Alt+s** as `"show-all-tracks"`. Implementation still
-uses `hiddenPaths` and `hiddenFolderPrefixes` on the model.
+Canvas visibility filtering is described to users as **isolate** (only the bloom class, hovered
+element, or selection remains; action `"isolate-selection"`, **s**) and **exclude** (remove from view,
+often repeated; action `"exclude-selection"`, **Shift+s**), with **Alt+s** as `"show-all-tracks"`.
+Implementation still uses `hiddenPaths` and `hiddenFolderPrefixes` on the model.
 
-**S**, **H**, **F** and **Shift+S** all act on the *hovered navigation element* — a folder row, a
-cluster row, or a card chip (key/BPM). That is one `HoverTarget` descriptor resolved by
-`CanvasInteractionController.effectiveHoverTarget()` (hovered target first, else the hovered dot's
+**S** first solos the **hovered dot's bloom class** (`Model.bloomPaths`) — for folder colour that is the
+whole subtree under the bloom's ancestor, i.e. the left-browser folder-click behaviour; for every other
+variable it is the range-aware bloom class. With no dot hovered it falls back to the *hovered navigation
+element* — a folder row, a cluster row, or a card chip (key/BPM). That is one `HoverTarget` descriptor
+resolved by `CanvasInteractionController.effectiveHoverTarget()` (hovered target first, else the hovered dot's
 folder); `Model.trackMatchesHoverTarget` is the only place a target is interpreted. See
 `design-patterns.md` → *Navigation targets* before adding another element of this kind.
 
-**Cycle preview section** (action `"cycle-preview-section"`, **d**) advances the hover preview through
-the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active chip is
-highlighted in the tooltip (`model.previewSection`).
+**Cycle preview section** (action `"cycle-preview-section"`, **W**; backward with
+**Shift+W**, action `"cycle-preview-section-prev"`) advances the hover preview through
+the sections the auditioned track has (drop → break → intro) and re-seeks the audio; the active
+marker is highlighted and labelled in the tooltip's seekbar (`model.previewSection`).
+
+**Selection bloom cursor** (action `"cycle-selection-bloom"`, **D**; backward with **Shift+D**) is a
+second marker drawn around the **top colour tabber**, separate from the active-mode highlight. It picks
+the variable used for the **selection bloom**: hovering a bare dot glows every track that falls in the hovered
+track's bloom on the cursor variable (`Model.trackBloomsWith`), the way the old rule only bloomed the hovered
+dot's folder. So the map can be coloured by one variable and bloom by another.
+
+**The cursor ring borrows the hovered class's colour** (`trackColor(hovered, selectionBloom)`), so it reads as
+that class; with nothing hovered it is the warm default. **A chip under the cursor** names the hovered class
+(folder path, cluster, key, `128 BPM`) and, where the variable has a range, its meaning; the status pills dock
+below it. **For a folder (or predicted folder) the chip adapts to the range**: the path is drawn segment by segment
+with the segment the range climbed to highlighted in the class colour and deeper segments faded to grey — so
+`GENRES/Ambient/dark` highlights `dark` at exact, `Ambient` (fading `dark`) at +1, `GENRES` (greying `Ambient/dark`)
+at +2. **D** is owned by `CanvasInteractionController` (`dispatch: false`): a bare tap moves the cursor, but
+**D + scroll** sets the bloom **range** and shows a cursor-adjacent panel (`CanvasView.showBloomHud`),
+mirroring **M**. Clicking a colour tab sets both the colour mode and the cursor, so the mouse can pick the bloom
+variable too. The cursor and range persist in `localStorage`.
+
+**The range is the bloom's tolerance, and it means something different per variable** (`lib/bloom.ts`, one
+module so the matcher and the HUD cannot disagree): folder and predicted folder climb *N parent directories*
+(a wider range includes sibling subtrees under a shared ancestor), tempo allows *± N % BPM*, key allows *± N Camelot
+steps*; cluster has no range — an exact id match. **Each variable keeps its own range** (`model.bloomRanges`,
+keyed by `BloomRangeKey`; folder and predicted folder share one slot, since they are the same directory climb), so
+widening the tempo bloom does not also widen the folder bloom. The scroll is **additive**, not the volume's
+multiplicative taper, because range 0 (exact class) is a real state a scroll must be able to leave. The HUD names the
+meaning (`+2 parent directories`, `±16% BPM`, `exact key`) instead of a bare percentage, and for a variable with no range
+(cluster) it renders **no slider** — there is nothing to slide.
 
 **Colour mode** (action `"toggle-clusters"`, **C**; backward with **Shift+C**) cycles `model.colorMode` through
 folder → predicted folder → cluster → tempo → key. The active mode is always visible in the **top colour tabber** (below the lens
-tabber) and can also be clicked there; the **View** tab select mirrors it. Selecting cluster while none are
-available is refused with a warn toast. The tempo and key modes reuse the polar geometry of their lenses
+tabber) and can also be clicked there; there is no separate select. Selecting cluster while none are
+available is refused with a warn toast. Moving the cluster **granularity** slider (resolution) applies
+live, as the handle moves, and switches to cluster colour, so the re-partition it triggers is visible rather than
+hidden behind another mode. The tempo and key modes reuse the polar geometry of their lenses
 (`bpmSpiralPolar` / `camelotPolar`) — angle → hue, radius → brightness — so tracks close on that map read as
 close in colour. See `design-patterns.md` → *Persistent canvas tabbers*.
 
@@ -293,18 +352,40 @@ close in colour. See `design-patterns.md` → *Persistent canvas tabbers*.
 virtual path), not the track's own folder, so the map shows where the head *thinks* a track belongs. It is fetched
 lazily on first selection from `GET /api/supervised/predictions` (`model.folderPredictions` +
 `model.folderPredictionMatches`) and invalidated when the head changes (a drained supervise job or an import).
-The **Predicted** select in the View tab picks between *Confident only* (`model.headColorConfident`, the default: only
-tracks clearing their class's match floor, the same rule the fan-out uses) and *All nearest* (every track's nearest
-folder regardless of similarity). A track with no prediction, or a weak one under *Confident only*, falls back to its
-actual folder colour.
+A track the head has **no prediction for** is **grey** (`CONFIDENT_MISS_COLOR`), so the map never hides a track
+the head places — a prediction equal to the track's current folder still takes that folder's colour. The
+**Confident only** checkbox (`#head-confident-fold`) is a **view option** in the top-right options
+panel, shown only while the *Predicted folder* tab is active. Checked (`model.headColorConfident`, the
+default) is the same rule the fan-out uses: a projection too weak to clear its class's match floor is also
+grey. Unchecked is *All nearest*: every track with a projected folder takes its nearest folder's colour.
 
-**Inspect card** is pinned by **Alt** (not a `HOTKEY_MAP` action — it is a bare modifier over a hovered
-dot, so it lives in `CanvasInteractionController._bindInspectKey`). See *Inspect card* below.
+When the head has no prediction for a track, the genres pop-up's **Projected folder** row reads one short word
+instead of an em dash (`TooltipCard.projectedNote`): *No head*, *Not analysed*, or *Loading…*. The sentence
+that explains it (`TooltipCard.projectedHint`) is the chip's **hover title**: an unanalysed track ("Not analysed yet — the
+head has no embedding for it"), a missing head ("No trained folder head yet"), or predictions still loading.
+A weak-but-real projection still shows the folder, with *low confidence* only in the hover title.
+
+**Show external tracks** (action `"toggle-external"`, **V**) toggles `model.showExternal`; the
+permanent **Library + External / Library Only** chip mirrors it and is the click target. Hiding externals
+is a visibility filter, so the chip is never dismissed and carries no ×. While hidden, the External section
+is dimmed (`#folder-tree.externals-off`) and the row action popout greys out *Project folder structure onto
+here*, offering *Show external tracks* at the top instead. The inline **Refit** checkbox (action
+`"toggle-external-refit"`, **R**) is shown only while externals are on the map — there is nothing to refit
+while they are hidden.
+
+**Predicting folders** walks the library server-side, so while
+`model.folderPredictionsLoading` is set the status bar shows *Predicting folders…* — otherwise selecting the
+*Predicted folder* colour mode looks like nothing happened until the map recolours.
+
+**Inspect card** is pinned by **Alt** (action `"pin-inspect"`, `dispatch: false`) — a bare modifier over
+a hovered dot, so its keydown lives in `CanvasInteractionController._bindInspectKey`. See *Inspect card* below.
 
 **Adding a new hotkey:**
-1. Add an entry to `HOTKEY_MAP` in `hotkeys.ts`.
-2. Register a handler in `Controller._bindKeyboard` via `hk.on("your-action", () => { ... })`.
-3. The F1 modal updates automatically.
+1. Add an entry to `HOTKEY_MAP` in `hotkeys.ts` with its key, display `label`, and `description`.
+2. Register a handler in `Controller._bindKeyboard` via `hk.on("your-action", () => { ... })`; a gesture
+   key instead matches in `CanvasInteractionController` using `hotkeyCode` / `hotkeyKey`.
+3. The F1 modal and every `<kbd>` badge update automatically; static markup opts in with
+   `data-hotkey-action` / `data-hotkey-title`.
 
 ---
 
@@ -394,8 +475,11 @@ so a cluster can be read in a different space without leaving the map.
   **circle** scope at the cursor or scales the open one (it starts small in *screen* space
   and grows outwards, so it reads the same at any zoom; growth is exponential in the wheel
   delta so a trackpad's burst of events accumulates). The scope starts on the last-used
-  scope lens immediately. A bare **X** tap, **Esc**, or a click outside the region closes
-  it and animates its tracks back out.
+  scope lens immediately. A bare **X** / **Shift+X** tap **near the scope** cycles its lens
+  (forward / backward) through `scopeLenses()`; **far outside** it (or with none open) it
+  closes the scope and animates its tracks back out, as does **Esc** or a click outside the
+  region. The open scope is a `scope` view modifier chip (labelled with its lens), so
+  **Esc** pops it as the newest modifier.
 - A tab bar of the available lenses is drawn just outside the region; clicking a tab
   switches the scope's lens (morphing between the two layouts) and remembers it as the
   default for the next scope.
@@ -414,11 +498,16 @@ so a cluster can be read in a different space without leaving the map.
 - While a scope is open, in-scope dots behave like embedding-mode dots: tag
   drag/transform is disabled. Switching the outer lens drops the scope.
 
-### Search field
+### Search popup and field
 
-While the search box is **focused** and the **CLAP lens** is the one on screen (the
-scope's lens when a scope is open, else `model.lensId`), the canvas draws a
-**search field**: a glowing "where does my query match" layer.
+**Search is a `⌘F` popup, not a sidebar box.** The query input and ranked result
+list live in `#search-modal`, a centered overlay (`SearchView`); **Esc** in the box
+clears the search and closes it, **Enter** (or a result click) commits — the popup
+closes and the search stays live as a **search view modifier** chip.
+
+While a search is active and the **CLAP lens** is the one on screen (the scope's lens
+when a scope is open, else `model.lensId`), the canvas draws a **search field**: a
+glowing "where does my query match" layer.
 
 - All canvas glow — this field and the hover halo — is one WebGL pass in
   `lib/glow-layer.ts` on a transparent canvas layered **under** the scatter
@@ -428,13 +517,16 @@ scope's lens when a scope is open, else `model.lensId`), the canvas draws a
   blend, not additive) with a gradual Gaussian falloff, so a dense region reads as
   one soft zone rather than a pile of bright circles.
 
-- `/` or **⌘/Ctrl+F** focuses the box; **Esc** clears it and leaves the field,
-  which is the only thing that hides the glow.
-- The box searches **as you type** (debounced ~300 ms; Enter searches at once, an
-  emptied box clears at once). The input stays editable during a fetch, and a
-  response superseded by a newer query is dropped. While a fetch is in flight the
-  box dims and a **Searching…** row shows above the previous results
-  (`SearchView.setBusy`), so a programmatic search has visible feedback.
+- `/` or **⌘/Ctrl+F** opens the popup and focuses the box. The box searches **as
+  you type** (debounced ~300 ms; Enter commits at once, an emptied box clears at
+  once). The input stays editable during a fetch, and a response superseded by a newer
+  query is dropped. While a fetch is in flight the box dims and a **Searching…** row
+  shows above the previous results (`SearchView.setBusy`), so a programmatic search has
+  visible feedback.
+- **The search is an active view modifier.** Once a query is live, `SearchCoordinator`
+  pushes/refreshes one `search` chip (label = the query) and `CanvasView.searchActive`
+  follows that, not the input's focus. Dismissing the chip (or **Esc**) clears the
+  field, the fade and the selection.
 - **Matched tracks stand out.** `CanvasView.searchResults` (a `Set`, `null` = no
   search) fades every track the query did *not* match to 15 % alpha, so the result
   set reads against the rest of the map. The selected set *is* the result set, so the
@@ -448,25 +540,71 @@ scope's lens when a scope is open, else `model.lensId`), the canvas draws a
   t-SNE preserves only local neighbourhoods, so two tracks with equal CLAP cosine
   can sit far apart on screen.
 
+### View controls (top tabbers + view options + status bar)
+
+Lens and colour live in the persistent top tabbers (a click or **E** / **C**); the
+contextual display toggles live in the top-right **View options** panel
+(`#view-options`) — currently the *Confident only* checkbox, shown only while the
+*Predicted folder* mode is active (the panel itself appears whenever at least one
+`.view-option` row is relevant); and hover preview is a **right-aligned**
+status-bar speaker toggle + volume (`#status-preview`). The status bar does **not** repeat the
+active lens — the top tabber is that feedback. `OptionsPanelBinder` owns only the hover-preview
+control; the lens `<select>`, the colour `<select>` and the preset save/delete buttons were
+removed, because the top tabbers are now their single surface. (The lens-preset model methods
+remain for a future surface; nothing in the UI reaches them yet.)
+
+### Active view modifiers
+
+The corner chip stack (`#view-modifiers`, bottom-left above the status bar, under an
+**Active viewport filters:** heading) shows the **active view modifiers** — search,
+proximity, scope, exclusions, tag filters, shown externals. **Esc** dismisses the
+newest dismissible chip; a chip's `×` dismisses one. A **permanent** chip (the
+external visibility filter) has no `×` and is never popped. The stack, its coordinator
+and the clear-callback contract are in `design-patterns.md` → *Active view modifiers*;
+each owner pushes/updates its own chip:
+
+- **Search** — `SearchCoordinator` (one chip, refreshed in place per query).
+- **Proximity** — `InspectCoordinator`: the distance slider pushes a chip whose inline
+  slider still works after the card closes, and whose clear reveals every track it hid.
+  Proximity hides are tracked in `proximityHiddenPaths`, **apart** from the explicit
+  `hiddenPaths`, so the two chips never mask each other and each is dismissed
+  independently.
+- **Scope** — `EmbeddingCoordinator`: an open scope pushes a chip naming its lens;
+  closing it (a lens switch, a click away, **X**, or the chip) removes it.
+- **Exclusions** — **one chip per solo/exclude action** (pushed where the action
+  runs), so the stack reads as the history of what filtered the view: a *Solo* chip whose
+  × clears the exclusions, and an *Excluded* chip per excluded target whose × reveals
+  just that target. When no exclusions remain (**Alt+s**, or a chip's ×) the stale chips
+  are dropped. It deliberately does **not** count the distance filter's hides.
+- **Filters** — one chip per active `filterRanges` tag; its `×` drops that range.
+- **External** — one **permanent** chip, never dismissed: it reads *Library +
+  External* while `showExternal` is on and *Library Only* while off, and clicking it
+  (or **V**) toggles. It carries an inline *Refit* toggle (**R**) on a second line,
+  shown only while externals are on the map.
+
 ---
 
 ## Hover preview and tooltip
 
-- **Hover preview** (**M** toggles, volume slider in Options) streams the track
-  through `/api/audio/…`. **M** is owned by `CanvasInteractionController`, not
+- **Hover preview** (**M** toggles; the status bar's right-aligned **speaker icon**
+  + volume slider, `#status-preview`) streams the
+  track through `/api/audio/…`. **M** is owned by `CanvasInteractionController`, not
   `HotkeyManager` (`dispatch: false`): a bare tap toggles the preview, but **M +
-  scroll** scales `model.previewVolume` instead and shows a cursor-adjacent
-  percentage readout (`CanvasView.showVolumeHud`) — a scroll during the hold marks
-  the gesture used, so the keyup does not also toggle the preview. It seeks to the **detected drop** when the track has a
-  cached structure row, else to 40 % of the track — `previewStartSeconds` in
+  scroll** scales `model.previewVolume` instead and shows a cursor-adjacent **panel**
+  with a level progress bar and a glass blur (`CanvasView.showVolumeHud`) — a scroll
+  during the hold marks the gesture used, so the keyup does not also toggle the preview.
+  Toggling it **on** auditions the track already under the pointer (so **M** works
+  without moving the mouse); toggling it **off** stops playback.
+  It seeks to the **detected drop** when the track has a
+  cached structure row, else **from the start of the track** — `previewStartSeconds` in
   `lib/structure.ts` owns that choice. A **search hit** overrides that: the hit's
   best-matching CLAP segment centre (`model.searchSections`, a duration fraction)
   wins, so hovering a result auditions the part that actually matched the query.
-  **D** cycles the preview between the sections the track actually has (drop →
-  break → intro) and re-seeks; the intro seeks to `intro_start` (the detected audio
-  start after lead-in silence), falling back to `0`.
-  `model.previewTrackPath` / `model.previewSection` are in-memory preview state,
-  not persisted.
+  **W** cycles the preview between the sections the track actually has (drop →
+  break → intro; **Shift+W** backward) and re-seeks; the intro seeks to `intro_start`
+  (the detected audio start after lead-in silence), falling back to `0`.
+  `model.previewTrackPath` / `model.previewSection` / `model.previewTime` are
+  in-memory preview state, not persisted.
 - **A search hit behaves like a track.** Hovering a result row glows its dot
   (`canvas.hoverTarget` = `{kind: "track", path}`), auditions it, and shows the
   same info **card** a canvas hover would, anchored at its dot — so a result reads
@@ -482,21 +620,47 @@ scope's lens when a scope is open, else `model.lensId`), the canvas draws a
   `renderTooltip`), not a block of text. It shows a **title/artist header** (the
   title is bold; the artist line is dropped when there is no artist metadata, and the
   whole header collapses to just the **filename** when there is neither), a
-  **location stack** with the folder and cluster tags on separate lines,
-  **structure chips** (`intro 0:12–0:32`, `drop 1:04`, `break 3:12`; the
-  auditioned one is highlighted) and two stat areas — user **Personal tags** and
-  audio **Features**. The location tags are told apart by their icon: the folder uses a
-  **folder** glyph and the cluster a **tag** glyph, and each tag is **filled** with
-  its colour (`tt-loc-filled`; a nested folder gets a parent→own **gradient**,
-  `dirTagColors`) with the icon/name in the dark canvas colour for contrast. The
-  cluster tag also carries a `genre-spanning` badge whose hover text explains that the
-  intro and drop excerpts disagree. The cluster tag truncates a long genre name, so
-  hovering it opens a **pop-over** (`renderGenrePop`, a body-level `.tt-pop` fixed
-  element — never a child of the card, so expanding a name cannot reflow it) with the
-  full name. When the folder head predicts a destination that differs from the track's
-  current folder, the pop-over also shows it as a **Projected folder** line (the
-  confident match floor is marked, a weak one is labelled *low confidence*); the
-  predictions are fetched the first time a card is pinned. Feature axis ids never render as tags, and BPM/key
+  **location stack** with the folder and cluster tags on separate lines, a
+  **preview seekbar** and two stat areas — user **Personal tags** and audio
+  **Features**. The **seekbar** (`tt-seek`) is always rendered — the structure
+  sections never render as chips: a timeline filled to the current position/duration with
+  a **playhead** at the leading edge and a `pos / total` readout (`0:32 / 4:16`), and
+  the cached structure sections (`intro 0:12–0:32`, `drop 1:04`, `break 3:12`) as
+  markers; only the auditioned section's marker expands to its label, so the timeline
+  stays legible. When the track is not auditioning the seekbar is **inactive**
+  (`tt-seek-inactive`: dimmed, empty fill, playhead at the start, no label) rather than
+  swapping to another layout. Its length is the
+  `duration` the `/api/tracks/structure` response carries (probed from the file
+  header, so no decode), falling back to the audio element's own duration until the
+  fetch lands — but only for the track being auditioned. The fill, playhead, and readout
+  are moved by `updateSeekProgress` on every audio `timeupdate`
+  (the card's re-render `key` carries the duration and play state but deliberately
+  not the live position). The seekbar is **interactive on the pinned card**
+  (`CanvasView` delegates its mousedown to `onSeek`): clicking or dragging the
+  track seeks the audition to that fraction and resumes playback, and hovering the
+  track **highlights** it (`:hover`), so a paused/inactive timeline still reads as
+  seekable. The card is re-queried on each drag move, since a seek rebuilds it.
+  A **hotkey hint** (`tt-seek-hint`, `W seek · M mute ·
+  M+scroll volume`) floats absolutely in the readout row's empty left space, so it sits
+  beside the seekbar without reflowing the card; the full descriptions are its hover
+  **title**. Every pill is the one `chip` component, parameterised by an
+  optional **icon** and **label** around its **value**, with any elaboration in a
+  hover **title** so the chip itself stays short: the location tags are told apart by
+  their glyph (the folder uses a **folder** glyph and the cluster a **tag** glyph), and
+  the stat chips carry a **Tempo** / **Key** caption. A chip with a colour is
+  **filled** (`tt-chip-filled`; a nested folder gets a parent→own **gradient**,
+  `dirTagColors`) with its text in the dark canvas colour for contrast. The
+  **pinned card expands the genres inline** (`genreList`), replacing the compact
+  location stack: a caption **above** each chip (so the chip gets the full row width),
+  for the track's **Folder**, the head's **Projected folder**, and its **Cluster**,
+  all styled the same. The projected row reads one short word when the head has no
+  prediction for the track (*No head*, *Not analysed*, *Loading…*); the full destination path,
+  the *low confidence* note, and the head's reasoning are **hover titles**. The folder
+  and cluster chips are navigation targets, so **S** / **H** / **F** act on them like
+  a sidebar row, and a `genre-spanning` note is a **hover title** on the cluster chip,
+  not a footer or badge. The plain
+  hover card keeps the compact folder/cluster tags. The predictions are fetched the first
+  time a card is pinned. Feature axis ids never render as tags, and BPM/key
   are **not** duplicated near the title: both render as **chips** in Features
   (`TooltipBar.chip`) because a key or a BPM has no magnitude to bar. The BPM and key
   chips are **filled** with the same colours as the tempo/key colour modes
@@ -506,8 +670,7 @@ scope's lens when a scope is open, else `model.lensId`), the canvas draws a
   row of its own.
   Personal tags are **sorted by label** so the card does not jump as you move between
   dots. The card has a **fixed width** (300 px) so rows wrap the same way for every
-  track, and the structure chips are compact enough that the usual trio stays on one
-  row. `buildTooltip` returns a `key`; the canvas re-renders the DOM only when that
+  track. `buildTooltip` returns a `key`; the canvas re-renders the DOM only when that
   key changes, so pan/zoom frames do not rebuild the card.
 
 ## Analysis panel (coverage + retrigger)
@@ -520,10 +683,13 @@ produced per track, and the way to re-run one stage.
   CLAP, Supervised) as a determinate bar `done / total`; a pending count renders
   red. The summary line is `fingerprinted / total`. This is how a missing
   **structure** row (no section timestamps) becomes visible.
-- Each stage has a **retrigger** button that POSTs `/api/embeddings/generate` with
-  `stages: ["<kind>"]`, queueing only tracks missing that stage; **Re-run all**
-  sends every stage with `force: true`. The durable queue then reports progress in
-  the status bar and the on-canvas pill as usual.
+- Each retriggerable stage's coverage row reveals a **reload icon on hover**
+  (`↻`, at the row's trailing edge) that POSTs `/api/embeddings/generate` with
+  `stages: ["<kind>"]`, queueing only tracks missing that stage; a row that only
+  shares a stage (Rhythm → features) or has no per-track stage (Supervised) has no
+  icon. **Re-run all** stays a button below the bars and sends every stage with
+  `force: true`. Every retrigger confirms first (`window.confirm`). The durable queue
+  then reports progress in the status bar and the on-canvas pill as usual.
 - **Broken files.** `AnalysisCoordinator.fetchProblems()` reads
   `/api/analysis/problems` (unfingerprinted tracks + per-path terminal job failures) and
   renders a collapsible **Broken files (N)** list under the coverage bars. A row click
@@ -537,6 +703,32 @@ produced per track, and the way to re-run one stage.
   a determinate bar when a count is known and an **indeterminate** one otherwise,
   so a phase with no iteration callback (the layout base phase) never looks stalled.
 
+## Folder head (analysis panel)
+
+The Analysis panel's **Folder head** section (`#head-section`) is the trained head's
+at-a-glance status plus its training and bundle actions.
+
+- `HeadCoordinator.refreshHeadInfo()` reads `GET /api/supervised/head` and renders one
+  `.head-info-row` per fact: **Trained/Imported** timestamp (the latter wins when a head
+  was imported), **Folders** (`n_classes`), **Sources** (`input_sources`), **Input**
+  (`in_dim`), **Match floor** (`match_percentile`), and **Run** (`run_id`). With no head
+  installed it renders a single *No folder head yet — Train to learn your folder structure*
+  hint. It is refetched on startup, after an import, and when the queue sees a `supervise`
+  run drain (`AnalysisCoordinator.refreshQueueStatus` → `head.refreshHeadInfo`).
+- **Train** sends the checked *Training folders* as `folders`; an empty selection means
+  every **My library** root (the default) — external roots are only learned from when checked
+  explicitly. The checkbox tree is the folder tree from `GET /api/folders`, fetched lazily when
+  the `<details>` is opened — never on startup — and rendered as `.head-folder-row` rows with
+  collapsible children. *All library folders* clears the selection. External roots are labelled
+  `(external)`. The checked folders are mirrored onto `model.trainFolders` and persisted in
+  `localStorage`, so a selection survives a reload. The queue disables Train while a `supervise`
+  run is outstanding (`AnalysisCoordinator._syncApplyEnabled` → `head.syncTrainEnabled`).
+- **Export / Import / Compare** are the head bundle tools. Export downloads the installed head;
+  Import installs an uploaded bundle and re-projects the library (retrying once with `force=1` when
+  the server refuses a head trained on different encoder versions, after a `confirm` explains the
+  mismatch); Compare reports the shared folders and mean centroid cosine against an uploaded bundle.
+  The `#head-note` line carries their results.
+
 ## Inspect card (pinned, interactive)
 
 The tooltip is `pointer-events: none` and follows the hover. **Alt** over a hovered
@@ -544,7 +736,9 @@ dot pins it: `CanvasView.inspect` is set, the card anchors to the dot's
 *current* screen position (so a viewport tween carries it along), gets
 `pointer-events: auto` and a **Navigate / Describe** tab strip. It stays
 open when the pointer leaves the canvas (that is how you reach it), and closes on
-**Esc**, a plain click on empty canvas, the card's `×`, or another Alt press.
+**Esc**, a plain click on empty canvas, the card's `×`, or another Alt press. A
+second **Alt** only releases the pin — it does **not** end the audition, which keeps
+playing while the pointer is still over the dot.
 `CanvasInteractionController._bindInspectKey` owns the Alt toggle; `CanvasView`
 owns the pin/anchor state and delegates clicks (`data-inspect-action`,
 `data-inspect-focus`, `data-inspect-close`) to `onInspectAction`.
@@ -584,6 +778,8 @@ same seam as `SearchCoordinator`:
   step's async ranking result is dropped (`_proximitySeq`), and any other card action
   cancels the pending step. A failed pre-load is silent; the error is only shown when
   the slider actually needs the ranking.
+  The filter is a `proximity` **view modifier** chip whose inline slider drives the
+  same path, so it survives the card closing; its `×` reveals every track it hid.
 - **Nearest / Anti-track list** — the ranked rows for the toggle's current direction
   (`mode=near` → `NEAR_K` closest; `mode=far` → `ANTI_K` furthest), fetched when
   the card is pinned and again when the toggle flips.

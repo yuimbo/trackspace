@@ -143,12 +143,55 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Frontend
 
+- [ ] **Lens presets are unreachable.** The lens `<select>` and the Save/Delete
+      preset buttons were removed from the view panel, so `Model.addLensPreset` /
+      `applyLensPreset` / `deleteLensPreset` and `localStorage` persistence are
+      dead UI. Re-surface presets in the top lens tabber (a preset row) or delete
+      the feature. Files: `frontend/src/model.ts`, `frontend/src/lib/lenses.ts`,
+      `frontend/src/components/canvas-view.ts` (`_drawTopTabs`).
+- [ ] **The bloom cursor is silent when its variable cannot place a track.** Moving the
+      selection-bloom cursor onto *Cluster colour* with no clusters, or *Predicted folder*
+      with no head, blooms nothing without saying why — unlike the colour mode's warn toast.
+      Either warn on the cursor move or grey the cursor tab. Files:
+      `frontend/src/coordinators/analysis-coordinator.ts` (`applySelectionBloom`),
+      `frontend/src/components/canvas-view.ts` (`_drawTabCursor`).
+- [ ] **Modifier chips: inline editing and keyboard nav.** The `⌘F` popup has no
+      arrow-key navigation of the ranked rows (Up/Down + Enter), and a `filters` chip
+      is read-only — editing its range still needs the tag panel's slider. Adding both
+      makes the chips true view-modifier surfaces. Files:
+      `frontend/src/components/search-view.ts`,
+      `frontend/src/components/view-modifier-view.ts`,
+      `frontend/src/controller.ts` (`_syncFilterModifiers`).
+- [ ] **Proximity ranking is pinned to the last inspected track.** The `proximity` chip
+      survives the inspect card closing, but re-ranks around that track; re-homing to the
+      current selection would decouple it from the card. Files:
+      `frontend/src/coordinators/inspect-coordinator.ts`.
 - [ ] **Folder action popout is mouse-only.** `#folder-actions` opens on row hover and
       closes on leave; it has no keyboard path (focus the row, open with a key, arrow
       between buttons) and no focus-visible styling. Also the 6 px gap between row and
       popout briefly clears `canvas.hoverTarget` when the pointer crosses it (restored on
       popout `mouseenter`). Files: `frontend/src/coordinators/folder-tree-coordinator.ts`,
       `frontend/src/trackspace.css`.
+- [ ] **Alt+click folder exclusions push no chip.** The one-chip-per-action stack is
+      pushed from `_runCanvasAction` (the S / Shift+S hotkeys and the row popout), but
+      `FolderTreeCoordinator._onFolderLabelActivate`'s Alt+click calls `hideFolderTree`
+      directly, so that exclusion has no chip to dismiss. Route it through the same push.
+      Files: `frontend/src/coordinators/folder-tree-coordinator.ts`,
+      `frontend/src/controller.ts`.
+- [ ] **The head modal is mouse-only.** `#head-modal` opens by right-clicking a folder
+      inside an External root (or the row popout's *Imprint structure…*); there is no
+      keyboard path to open it, and the folder context menu has no arrow-key navigation
+      or focus-visible styling. Files:
+      `frontend/src/coordinators/folder-tree-coordinator.ts`,
+      `frontend/src/coordinators/head-coordinator.ts`.
+- [ ] **Flag a head with no centroids or match floors in the info block.**
+      `GET /api/supervised/head` reports `has_centroids` and `has_match_thresholds`,
+      but the Analysis panel's *Folder head* block ignores both. A head without
+      centroids still renders as healthy yet `supervised_predictions` returns
+      `available: false`, so *Predicted folder* colouring and fan-out silently do
+      nothing. Render a warning row (and point at *Train*) when either is false.
+      Files: `frontend/src/coordinators/head-coordinator.ts`,
+      `backend/services/analysis_pipeline.py` (`supervised_head_info`).
 
 - [ ] **Residual lens disagreement is real, not gauge noise.** After Procrustes
       alignment the mean pairwise RMSE is still 0.305 (worst pair 0.40): lenses
@@ -395,7 +438,8 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       startup and the queue's startup backfill regenerates it (decode-dominated — hours
       on the real library). The supervised head consumes the `clap` block
       (`SUPERVISED_INPUT_WEIGHTS`), so its weights are stale against the new vectors —
-      retrain via *Train folder view* once the CLAP backfill drains, or its
+      retrain via *Train* in the Analysis panel's *Folder head* section once the CLAP
+      backfill drains, or its
       `supervised` block is misleading. (A version purge is now self-healing at startup:
       see *Startup backfill* in `architecture.md`.)
 - [ ] **`transformers` is installed at 5.3** against a `>=4.40` floor — a major bump.

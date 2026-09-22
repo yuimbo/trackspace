@@ -43,12 +43,13 @@ frontend/src/
   command.ts              Command pattern (optimistic UI + undo)
   coordinators/           controller fragments, one concern per file:
                             analysis-coordinator   queue SSE + status polling + cluster panel
-                            head-coordinator       head train/export/import/compare + imprint + undo
+                            head-coordinator       head info/train/export/import/compare + imprint + undo
                             embedding-coordinator  layout cache + SSE + position animations
                             folder-tree-coordinator HTMX tree, roots, highlights, overlay
                             canvas-interaction     pointer gestures + transforms + fit view
-                            options-panel          right-column controls
+                            options-panel          status-bar hover-preview control
                             search-coordinator     semantic search: fetch, selection, results panel
+                            view-modifier-coordinator  active-view-modifier stack + chips
   components/             one view per file (canvas, tags, properties, batch, status, search)
   lib/toast.ts            shared DOM helpers
   lib/api.ts              shared fetch / postJSON
@@ -78,8 +79,8 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Clustering | `backend/embeddings/clustering.py` | ~560 | |
 | Layout fidelity (bench) | `backend/embeddings/layout_fidelity.py` | ~60 | Neighbourhood recall; imported only by tests, not production |
 | Frontend orchestration | `frontend/src/controller.ts` | ~840 | Wiring, data loading, tag-write queue, preview, keyboard |
-| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~575 | Queue SSE + cluster panel + source weights |
-| Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | ~610 | Train/export/import/compare, imprint, fan-out undo |
+| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~1040 | Queue SSE + cluster panel + source weights |
+| Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | ~750 | Head info + train/export/import/compare, imprint, fan-out undo |
 | Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~1080 | Layout cache + SSE + animations + lenses + scopes |
 | Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | ~675 | HTMX tree + roots + highlights |
 | Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1200 | Pointer gestures + transforms + scope gesture |
@@ -205,7 +206,7 @@ queue, worker pool, and cluster store. `main()` builds it after CLI parsing and
   blanked (`backfill_purged_analysis`, a background thread), so a version bump self-heals.
   A standing schema backlog that is *not* a version purge — e.g. the CLAP segment vectors
   added later — is deliberately not swept into an unrelated restart; it is retriggered from the
-  coverage panel, whose per-stage buttons now revive terminal jobs too.
+  coverage panel, whose per-stage re-run icons now revive terminal jobs too.
 - Flask runs with `use_reloader=False`: the reloader would fork a second set of worker
   threads competing for the same queue.
 - **Every cache connection goes through `sqlite_conn.ClosingConnection`.** The stdlib
@@ -235,13 +236,13 @@ recomputed on load (`services/roots_registry.py`). Each root carries a role:
   are scanned, analysed and embedded exactly like library roots (the fingerprint-keyed
   `FeatureCache` never cares where a file lives), but they stay out of the default
   projection: `/api/embeddings/projection` walks the library roots only unless the
-  request carries `include_external=1`, which the frontend sends when the "External"
-  toggle is on. Showing externals does **not** refit the map: the fit scope is
+  request carries `include_external=1`, which the frontend sends when externals are
+  shown. Showing externals does **not** refit the map: the fit scope is
   controlled separately by `fit_scope=library|all` (default `library`), so with the
   default the server fits the library chart and places the external tracks onto it by
   Nyström extension (`landmark_projection.build_landmark_model(..., place_infos=…)`).
-  The "Refit with external" checkbox sends `fit_scope=all` to opt into the old
-  external-inclusive refit. The visibility toggle also gates their drawing
+  The external view-modifier chip's **Refit** toggle sends `fit_scope=all` to opt into
+  the old external-inclusive refit. Visibility also gates their drawing
   (`Model.trackInViewUnion`), and the head does not learn from their folder labels by
   default.
   Because analysis is content-addressed, marking a root external — or removing it —
@@ -280,7 +281,8 @@ fan-out's pre-move relative folder survives the move journal being pruned.
 - **Analysis reads are read-only over `FeatureCache`.** `/api/search` (CLAP text
   ranking), `/api/tracks/describe` (zero-shot phrase ranking + semantic
   coordinates against one track's cached CLAP audio vector),
-  `/api/tracks/structure` (cached intro/drop/break + genre-spanning flag) and
+  `/api/tracks/structure` (cached intro/drop/break + genre-spanning flag, plus
+  the header-probed track duration the seekbar needs) and
   `/api/tracks/similar` (nearest/anti-track over the composite vectors) never
   re-encode a track's *audio* on a request thread; expensive analysis goes
   through the queue. `/api/search` and `/api/tracks/describe` run only the CLAP
@@ -330,24 +332,30 @@ with vitest coverage:
   (`command.ts` shares it, passing `silent` where its manager toasts).
 - ✅ `AnalysisCoordinator` — job-queue SSE stream, status polling, cluster fetch/panel,
   and the source-weight sliders.
-- ✅ `HeadCoordinator` — the folder-supervised head: train (and its persisted folder
-  selection), export/import/compare, the imprint flow, and the fan-out move undo. The
-  queue reaches it only through `syncTrainEnabled`, so the head panel is independent of
-  the queue + cluster panel.
+- ✅ `HeadCoordinator` — the folder-supervised head: the trained-head info block, train
+  (and its persisted folder selection), export/import/compare, the imprint flow, and the
+  fan-out move undo. The queue reaches it only through `syncTrainEnabled` (and the info
+  refresh through `refreshHeadInfo`), so the head panel is independent of the queue +
+  cluster panel.
 - ✅ `EmbeddingCoordinator` — layout cache, embedding SSE, projection polling, lens
   switching, scope re-layout, and all canvas position animations. Owns the shared
   `canvas.animPositions` overlay and the single animation frame, so tag-axis and
   embedding animations cannot fight over the overlay.
 - ✅ `FolderTreeCoordinator` — HTMX refresh/bind, root import/removal, tree interaction,
-  highlights, selected-folders overlay. Undoable renames and root-driven library reloads stay
+  highlights, the selected-tracks overlay (tabs: folders / BPMs / keys / clusters).
+  Undoable renames and root-driven library reloads stay
   in the controller via deps callbacks (`renameFolder`, `onRootsChanged`).
 - ✅ `CanvasInteractionController` — pointer gestures (click/box/lasso select, tag drag,
   transform handles, pan/zoom, folder-drop), scope gesture, fit view. Owns the mouse state;
   exposes `isPointerBusy()` (consumed by the folder coordinator), `cancelActiveGesture()`,
   `fitView()`, `effectiveHoveredFolderPrefix()`. The debounced tag-write queue stays in the
   controller (shared with `BatchView.onApply`) behind `queueTagWrite` / `flushTagWrites` deps.
-- ✅ `OptionsPanelBinder` — right-column controls (lens select + presets, hover preview +
-  volume) with `bind()` / `sync()`.
+- ✅ `OptionsPanelBinder` — the status-bar hover-preview control (toggle +
+  volume) with `bind()` / `sync()` / `syncPreviewVolume()`. The lens and colour
+  controls were removed; the top tabbers are their single surface.
+- ✅ `ViewModifierCoordinator` — the active-view-modifier stack (search, proximity, scope,
+  exclusions, filters, external) with `push`/`update`/`dismiss`/`remove`/`popNewest`, plus
+  the corner chip view. See `design-patterns.md` → *Active view modifiers*.
 
 ---
 

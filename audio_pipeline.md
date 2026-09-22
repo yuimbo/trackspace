@@ -716,8 +716,9 @@ openTSNE fit and composite caches include it via `_source_versions_token`.
 are recorded at training time; `project_supervised_missing` refuses to project new
 tracks when the gathered input space no longer matches (it logs "input space changed"
 and returns 0). Any change to `FROZEN_SOURCES` — e.g. adding the `clap` block or
-removing a source — therefore requires one manual retrain (the *Train folder view*
-button) before new tracks get supervised rows again.
+removing a source — therefore requires one manual retrain (the *Train*
+button in the Analysis panel's *Folder head* section) before new tracks get
+supervised rows again.
 
 **Training scope is selectable.** `POST /api/supervised/train` takes an optional
 `folders` list of virtual folders (a root id or a subtree). Only tracks under those
@@ -727,8 +728,9 @@ selection rides on the singleton job's payload and is recorded in the head meta
 (`train_folders`).
 
 **Triggers and staleness.** Training is a library-wide singleton (`"library"` dedupe
-key). It is queued manually (the *Train folder view* button) or automatically once
-after the first MAEST pass drains while no head exists. New tracks analysed later are
+key). It is queued manually (the *Train* button in the Analysis panel's *Folder
+head* section) or automatically once after the first MAEST pass drains while no
+head exists. New tracks analysed later are
 projected through the current head at the top of every cluster pass (a cheap matmul), so
 they get a row without a retrain. A retrain is an explicit user action — folder
 reorganisation is invisible to the filesystem watcher.

@@ -21,7 +21,8 @@ type HoverTarget =
   | { kind: "folder"; prefix: string }   // "" = library root
   | { kind: "cluster"; id: number }
   | { kind: "key"; value: string }       // musical key, e.g. "Am"
-  | { kind: "bpm"; value: number };      // ± BPM_MATCH_TOLERANCE
+  | { kind: "bpm"; value: number }       // ± BPM_MATCH_TOLERANCE
+  | { kind: "paths"; paths: string[]; color?: string }; // a bloom cluster
 ```
 
 - `Model.trackMatchesHoverTarget(track, target)` is the **only** place a target is
@@ -30,21 +31,25 @@ type HoverTarget =
   state on the view (no model event), per `ui_conventions.md` → *Adding new
   interaction surfaces*.
 - Whichever list renders an element owns setting/clearing that field on
-  `mouseenter`/`mouseleave`: the folder tree and selected-folders overlay for
-  folders, the cluster panel for clusters, and the inspect card for key/BPM chips.
+  `mouseenter`/`mouseleave`: the folder tree for folders, the cluster panel for
+  clusters, the inspect card for key/BPM chips, and the selected-tracks overlay —
+  whose tabs break the current selection down by folder, BPM, key, or cluster — for
+  all four. A BPM/key overlay row is a *bloom cluster*, so it names its members as a
+  `paths` set (and carries the cluster's colour for the halo) rather than a single
+  representative value.
 
 **What every target gets, for free:**
 
 | Affordance | Implementation | Effect |
 |---|---|---|
-| Glow | `CanvasView._inHoverGlow` / `_hoverGlowColor` | matching dots halo (folder colour, cluster swatch, or the neutral accent) |
-| **S** solo | `CanvasInteractionController.solo()` → `Model.focusPaths` | isolate to the target's tracks; press again to show all |
+| Glow | `CanvasView._inHoverGlow` / `_hoverGlowColor` | matching dots halo (folder colour, cluster swatch, a bloom cluster's own colour, or the neutral accent) |
+| **S** solo | `CanvasInteractionController.solo()` → `Model.focusPaths` / `Model.bloomPaths` | over a bloomed dot: isolate its bloom class (folder subtree for folder colour); else the target's tracks; press again to show all |
 | **H** fit | `CanvasInteractionController.fitView()` | 80th-percentile disc around the target's visible tracks |
 | **F** select | `Model.selectOnlyHoverTarget` | replace the selection with the target's visible tracks |
 | **Shift+S** exclude | folder: `hideFolderTree`; others: `hidePaths` | hide the target; press again on a fully hidden target to reveal it |
 
-`solo()`/`fitView()` resolve the target through
-`CanvasInteractionController.effectiveHoverTarget()`: a hovered target wins, otherwise
+`solo()` resolves a hovered **bloomed dot** first (`Model.bloomPaths`), then the target
+through `CanvasInteractionController.effectiveHoverTarget()`: a hovered target wins, otherwise
 the hovered canvas dot's folder. That fallback is why **S**/**H** over a bare dot still
 mean "this dot's folder".
 
@@ -135,6 +140,78 @@ flash disappears exactly when the user wants to confirm the state.
   each frame, so no model event or persistence is needed — just `scheduleDraw()`.
 - A mode that cannot apply is still explained with a warn toast; a one-off outcome
   ("Analysis complete") is still a toast.
+- **A tabber can carry a second, independent cursor.** The colour row draws both the
+  active-mode highlight and the **selection-bloom cursor** (`model.selectionBloom`,
+  moved with **D** / **Shift+D**), because the bloom variable is a separate choice from
+  the dot colour. The cursor ring borrows the hovered class's colour, and a chip under
+  it names the hovered class and (where the variable has a range) the range's semantic
+  meaning (`+2 parent directories`, `±16% BPM`). For a folder the chip draws the path
+  segment by segment, highlighting the segment the range climbed to and fading deeper
+  ones to grey, so the chip shows *which ancestor* the bloom reached. A click sets both;
+  the cursor alone moves with the key. The extra marker and chip are drawn by
+  `_drawTabCursor` / `_drawBloomChip` after `_drawTabs`, so they never change the hit
+  rects a click resolves against.
+
+---
+
+## Pattern: active view modifiers
+
+**The problem.** Several affordances change *what the canvas shows* without being a
+mode: a semantic search, a neighbourhood-proximity filter, a scope, the exclusions, a
+tag filter, the shown externals. Each was surfaced differently — search lived in the
+right panel, "Show all" was a lone button, the proximity slider only existed inside
+the pinned inspect card, a scope only had its on-canvas region — so there was no one
+place that answered "what is currently constraining my view?", and no one key that
+undid the most recent one.
+
+**The pattern.** One ordered stack of descriptors on the model, one owner for the
+clear callbacks, one chip stack in a canvas corner:
+
+```ts
+type ViewModifierKind =
+  | "search" | "proximity" | "scope" | "exclusions" | "filters" | "external";
+interface ViewModifier { id: string; kind: ViewModifierKind; label: string; detail?: string; value?: number; checked?: boolean; permanent?: boolean; }
+```
+
+- `Model.viewModifiers` is the stack, **oldest → newest**. Session-only, like the
+  exclusions and the scope it may describe.
+- `ViewModifierCoordinator` owns the stack operations and a `Map<id, clear>`:
+  `push(mod, clear)`, `update(id, patch)`, `dismiss(id)`, `remove(id)`,
+  `popNewest()`, `find(kind)`. A modifier owns only its *descriptor*; the
+  coordinator owns the callback that undoes it, so the clear runs in one place.
+- `ViewModifierView` renders the stack as chips in `#view-modifiers` (bottom-left,
+  above the status bar, under an **Active viewport filters:** heading). Each chip has
+  a label, an optional detail readout, and a `×` — unless it is a **permanent** view
+  filter (the external visibility chip), which has no `×` and is never popped. A
+  `proximity` chip exposes its slider inline; an `external` chip exposes its refit
+  toggle inline and its label is itself the show/hide control — the chip is the
+  control, not just a status light.
+- **Esc dismisses the newest dismissible modifier.** `Controller`'s `deselect` handler closes a
+  transient surface first (the search popup, the pinned inspect card, an in-flight
+  gesture), then calls `popNewest()`, and only clears the selection when the stack is
+  empty.
+
+**Clear callbacks must be idempotent, and direct closes must remove their entry.**
+A modifier can be cleared from outside the chip (a lens switch drops a scope, **Alt+s**
+clears the exclusions, a new inspect pin replaces the proximity filter), so each owner
+calls `viewMods.remove(id)` on its own direct-close path *as well as* registering the
+callback. `dismiss` removes the entry first and then runs the callback; `remove` removes
+it without running the callback, for a path that already reverted the state.
+
+**Adding a view modifier kind:**
+
+1. Add the kind to `VIEW_MODIFIER_KINDS`.
+2. Push/update it from the owner as its state changes (`ViewModifierSink`), and
+   register a clear callback that reverts the underlying model state.
+3. On the owner's direct-close path, call `viewMods.remove(id)` so the chip never
+   goes stale.
+4. Refresh in place (`update`) rather than re-pushing on every step, so a slider drag
+   or a keystroke burst does not stack chips.
+
+**Not every mode is a modifier.** A *base mode* (the lens, the colour mode) is
+persisted and always exactly one active; it stays in the top tabbers. An inspect card
+pin is a focused overlay, not a filter of the visible set; it stays separate and **Esc**
+closes it before the stack is popped.
 
 ---
 
