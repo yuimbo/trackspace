@@ -465,30 +465,17 @@ export class AnalysisCoordinator {
       const line = document.createElement("div");
       line.className = "analysis-coverage-row";
 
+      const head = document.createElement("div");
+      head.className = "analysis-coverage-head";
+
       const name = document.createElement("span");
       name.className = "analysis-coverage-name";
       name.textContent = row.label;
+      head.appendChild(name);
 
-      const count = document.createElement("span");
-      count.className = "analysis-coverage-count";
-      count.textContent = `${row.done} / ${total}`;
-      if (row.pending > 0) count.classList.add("has-pending");
-      // A short bar with terminal failures is a real gap, not pending work: flag
-      // it and point at the row's re-run icon.
-      const failed = row.failed;
-      if (failed > 0) count.classList.add("has-failed");
-
-      const bar = document.createElement("span");
-      bar.className = "analysis-coverage-bar";
-      const fill = document.createElement("i");
-      fill.style.width = `${Math.round((row.done / total) * 100)}%`;
-      if (row.pending > 0) fill.classList.add("has-pending");
-      bar.appendChild(fill);
-
-      line.append(name, bar, count);
-      // The canonical row for a stage reveals a reload icon on hover, next to the
-      // counts it affects. Rows sharing a stage (Rhythm → features) or without a
-      // per-track stage (Supervised) stay icon-free.
+      // The canonical row for a stage reveals a reload icon on hover, between the
+      // label and its counts. Rows sharing a stage (Rhythm → features) or without
+      // a per-track stage (Supervised) stay icon-free.
       if (row.retrigger) {
         const rerun = document.createElement("button");
         rerun.type = "button";
@@ -499,8 +486,27 @@ export class AnalysisCoordinator {
         rerun.addEventListener("click", () =>
           void this._retrigger(row.stage, row.label),
         );
-        line.appendChild(rerun);
+        head.appendChild(rerun);
       }
+
+      const count = document.createElement("span");
+      count.className = "analysis-coverage-count";
+      count.textContent = `${row.done} / ${total}`;
+      if (row.pending > 0) count.classList.add("has-pending");
+      // A short bar with terminal failures is a real gap, not pending work: flag
+      // it and point at the row's re-run icon.
+      const failed = row.failed;
+      if (failed > 0) count.classList.add("has-failed");
+      head.appendChild(count);
+
+      const bar = document.createElement("span");
+      bar.className = "analysis-coverage-bar";
+      const fill = document.createElement("i");
+      fill.style.width = `${Math.round((row.done / total) * 100)}%`;
+      if (row.pending > 0) fill.classList.add("has-pending");
+      bar.appendChild(fill);
+
+      line.append(head, bar);
       line.title = `${row.done} of ${total} analysed${
         row.pending > 0 ? `, ${row.pending} pending` : ""
       }${failed > 0 ? `, ${failed} failed (retrigger to retry)` : ""}`;

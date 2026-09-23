@@ -2133,14 +2133,21 @@ kbd {
 
 .analysis-coverage-row {
   display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  padding: 2px 0;
+}
+
+/* Label and counts share the top line; the bar runs full-width beneath them. */
+.analysis-coverage-head {
+  display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 11px;
-  padding: 1px 0;
 }
 
 .analysis-coverage-name {
-  flex: 1 1 0;
+  flex: 1 1 auto;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
@@ -2149,8 +2156,7 @@ kbd {
 }
 
 .analysis-coverage-bar {
-  flex: 1 1 0;
-  min-width: 0;
+  width: 100%;
   height: 4px;
   border-radius: 2px;
   background: #ffffff14;
@@ -2164,8 +2170,7 @@ kbd {
 .analysis-coverage-bar i.has-pending { background: var(--dot); }
 
 .analysis-coverage-count {
-  flex: 1 1 0;
-  min-width: 0;
+  flex: 0 0 auto;
   text-align: right;
   font-variant-numeric: tabular-nums;
   color: var(--fg-dim);
