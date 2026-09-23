@@ -505,13 +505,13 @@ describe("renderTooltip", () => {
     );
     expect(host.querySelector(".tt-meta")).toBeNull();
     // BPM and key are labels: chips in Features, not magnitude bars.
-    expect(host.querySelectorAll(".tt-stat-chips .tt-chip")).toHaveLength(2);
+    expect(host.querySelectorAll(".tt-stat-chips .chip")).toHaveLength(2);
     const values = [
-      ...host.querySelectorAll(".tt-stat-chips .tt-chip-value"),
+      ...host.querySelectorAll(".tt-stat-chips .chip-value"),
     ].map((v) => v.textContent);
     expect(values).toEqual(["128 BPM", "Am"]);
     const targets = [
-      ...host.querySelectorAll<HTMLElement>(".tt-stat-chips .tt-chip"),
+      ...host.querySelectorAll<HTMLElement>(".tt-stat-chips .chip"),
     ].map((c) => c.dataset.hoverTarget);
     expect(targets).toEqual([
       JSON.stringify({ kind: "bpm", value: 128.4 }),
@@ -540,12 +540,12 @@ describe("renderTooltip", () => {
       ),
     );
     const chips = [
-      ...host.querySelectorAll<HTMLElement>(".tt-stat-chips .tt-chip"),
+      ...host.querySelectorAll<HTMLElement>(".tt-stat-chips .chip"),
     ];
     const tempo = chips.find((c) => c.textContent?.startsWith("Tempo"))!;
     const key = chips.find((c) => c.textContent?.startsWith("Key"))!;
-    expect(tempo.classList.contains("tt-chip-filled")).toBe(true);
-    expect(key.classList.contains("tt-chip-filled")).toBe(true);
+    expect(tempo.classList.contains("chip-filled")).toBe(true);
+    expect(key.classList.contains("chip-filled")).toBe(true);
     // happy-dom normalises the `hsl()` spacing, so compare space-insensitively.
     const norm = (c: string) => c.replace(/\s/g, "");
     expect(norm(tempo.style.background)).toBe(norm(tempoColor(0.5)));
@@ -638,7 +638,7 @@ describe("renderTooltip", () => {
     );
 
     const [folder, cluster] = [
-      ...host.querySelectorAll<HTMLElement>(".tt-loc .tt-chip"),
+      ...host.querySelectorAll<HTMLElement>(".tt-loc .chip"),
     ];
     expect(folder.dataset.hoverTarget).toBe(
       JSON.stringify({ kind: "folder", prefix: "House" }),
@@ -651,7 +651,7 @@ describe("renderTooltip", () => {
     );
 
     const chips = [
-      ...host.querySelectorAll<HTMLElement>(".tt-stat-chips .tt-chip"),
+      ...host.querySelectorAll<HTMLElement>(".tt-stat-chips .chip"),
     ];
     const tempo = chips.find((c) => c.textContent?.startsWith("Tempo"));
     expect(tempo?.dataset.hoverTarget).toBe(
@@ -673,16 +673,16 @@ describe("renderTooltip", () => {
     );
 
     const [folder, cluster] = [
-      ...host.querySelectorAll<HTMLElement>(".tt-loc .tt-chip"),
+      ...host.querySelectorAll<HTMLElement>(".tt-loc .chip"),
     ];
     // The glyph shape, not the colour, tells a folder from a cluster.
-    expect(folder.querySelector(".tt-chip-icon-folder")).not.toBeNull();
-    expect(cluster.querySelector(".tt-chip-icon-tag")).not.toBeNull();
+    expect(folder.querySelector(".chip-icon-folder")).not.toBeNull();
+    expect(cluster.querySelector(".chip-icon-tag")).not.toBeNull();
     // A nested folder fills its chip with a parent→own gradient.
-    expect(folder.classList.contains("tt-chip-filled")).toBe(true);
+    expect(folder.classList.contains("chip-filled")).toBe(true);
     expect(folder.style.background).toContain("linear-gradient");
     // The cluster fills its chip with its solid colour.
-    expect(cluster.classList.contains("tt-chip-filled")).toBe(true);
+    expect(cluster.classList.contains("chip-filled")).toBe(true);
     expect(cluster.style.background).not.toContain("linear-gradient");
     expect(host.querySelector(".tt-artist")?.textContent).toBe("A");
   });
@@ -907,7 +907,7 @@ describe("genres list (pinned card)", () => {
         true,
       );
     }
-    const chips = [...host.querySelectorAll<HTMLElement>(".tt-genres .tt-chip")];
+    const chips = [...host.querySelectorAll<HTMLElement>(".tt-genres .chip")];
     expect(chips).toHaveLength(3);
     expect(chips[0].textContent).toContain("Techno");
     expect(chips[1].textContent).toContain("House");
@@ -929,7 +929,7 @@ describe("genres list (pinned card)", () => {
     m.folderPredictionMatches = new Set();
     const host = document.createElement("div");
     renderTooltip(host, buildTooltip(makeTrack(), m, pinned()));
-    const chips = [...host.querySelectorAll<HTMLElement>(".tt-genres .tt-chip")];
+    const chips = [...host.querySelectorAll<HTMLElement>(".tt-genres .chip")];
     // Low confidence is the projected chip's hover title; spanning the cluster's.
     expect(chips[1].title).toContain("low confidence");
     expect(chips[2].title).toContain("dispersion");
@@ -941,7 +941,7 @@ describe("genres list (pinned card)", () => {
   it("explains the missing projected folder in the hover title", () => {
     const host = document.createElement("div");
     renderTooltip(host, buildTooltip(makeTrack(), new Model(), pinned()));
-    const chips = [...host.querySelectorAll<HTMLElement>(".tt-genres .tt-chip")];
+    const chips = [...host.querySelectorAll<HTMLElement>(".tt-genres .chip")];
     expect(chips).toHaveLength(3);
     // The projected row reads one short word; the sentence is its hover title.
     expect(chips[1].textContent).toContain("Loading…");

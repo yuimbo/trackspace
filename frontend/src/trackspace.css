@@ -1448,12 +1448,12 @@ kbd {
   margin-bottom: 6px;
 }
 
-/* One chip for every pill in the card: the location tags, the genre rows, the
-   tempo/key stats, the projected-head state, and the structure sections. A chip
+/* One chip for every pill: the tooltip's location tags, genre rows, tempo/key
+   stats and structure sections, and the view-modifier stack's rule readouts. A chip
    carries an optional leading glyph and caption around its value; any elaboration
    (a full path, a weak projection, the head's reasoning) is a hover title, so the
    chip stays short. */
-.tt-chip {
+.chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1471,36 +1471,36 @@ kbd {
 
 /* A chip with a colour is filled with it (a gradient when the folder is nested);
    its caption flips to the dark canvas colour for contrast. */
-.tt-chip-filled {
+.chip-filled {
   border-color: transparent;
 }
-.tt-chip-filled .tt-chip-label {
+.chip-filled .chip-label {
   color: inherit;
   opacity: 0.72;
 }
 
 /* Navigation targets cancel the row highlight's negative margins and keep the pill
    shape, which the generic `.tt-target` would otherwise square off. */
-.tt-chip.tt-target {
+.chip.tt-target {
   margin: 0;
   padding: 1px 8px;
   border-radius: 999px;
 }
 
-.tt-chip-icon {
+.chip-icon {
   width: 11px;
   height: 11px;
   flex: 0 0 auto;
 }
 
-.tt-chip-label {
+.chip-label {
   color: var(--fg-dim);
   font-size: 9px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
 
-.tt-chip-value {
+.chip-value {
   min-width: 0;
   font-size: 10px;
   font-weight: 600;
@@ -1628,11 +1628,11 @@ kbd {
   text-transform: uppercase;
 }
 
-.tt-genres .tt-chip {
+.tt-genres .chip {
   align-self: stretch;
 }
 
-.tt-genres .tt-chip-value {
+.tt-genres .chip-value {
   white-space: normal;
   word-break: break-word;
 }

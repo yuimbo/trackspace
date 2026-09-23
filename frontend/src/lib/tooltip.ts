@@ -19,13 +19,8 @@ import {
   LIBROSA_FEATURE_AXIS_IDS,
   isAudioFeatureAxisId,
 } from "../model";
-import {
-  clusterColor,
-  dirTagColors,
-  hslToRgb,
-  keyColor,
-  tempoColor,
-} from "./colors";
+import { clusterColor, dirTagColors, keyColor, tempoColor } from "./colors";
+import { chip as buildChip, type ChipParts } from "./chip";
 import { trackTempoNorm } from "./lenses";
 import { clamp, clamp01 } from "./util";
 import { displayFolderPath } from "./path-presenter";
@@ -461,102 +456,23 @@ function markTarget(
   return el;
 }
 
-const SVG_NS = "http://www.w3.org/2000/svg";
-/** Feather-style folder / tag glyphs, stroked in the tag's contrast colour. */
-const FOLDER_GLYPH = "M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z";
-const TAG_GLYPH = "M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z";
-
-/** Folder or tag glyph, stroked in `currentColor` so the chip sets the contrast. */
-function chipIcon(kind: "folder" | "tag"): SVGSVGElement {
-  const svg = document.createElementNS(SVG_NS, "svg");
-  svg.setAttribute("viewBox", "0 0 24 24");
-  svg.setAttribute("class", `tt-chip-icon tt-chip-icon-${kind}`);
-  svg.setAttribute("aria-hidden", "true");
-  svg.setAttribute("fill", "none");
-  svg.setAttribute("stroke", "currentColor");
-  svg.setAttribute("stroke-width", "2");
-  svg.setAttribute("stroke-linecap", "round");
-  svg.setAttribute("stroke-linejoin", "round");
-  const path = document.createElementNS(SVG_NS, "path");
-  path.setAttribute("d", kind === "folder" ? FOLDER_GLYPH : TAG_GLYPH);
-  svg.appendChild(path);
-  if (kind === "tag") {
-    const dot = document.createElementNS(SVG_NS, "circle");
-    dot.setAttribute("cx", "7");
-    dot.setAttribute("cy", "7");
-    dot.setAttribute("r", "1");
-    dot.setAttribute("fill", "currentColor");
-    svg.appendChild(dot);
-  }
-  return svg;
-}
-
-/** Tag fill: a solid colour, or a parent→own gradient for a nested folder. */
-function tagFill(colors: string[]): string | null {
-  if (colors.length === 0) return null;
-  if (colors.length === 1) return colors[0];
-  return `linear-gradient(135deg, ${colors.join(", ")})`;
-}
-
-/** Relative luminance of an `hsl(h,s%,l%)` colour, for contrast decisions. */
-function hslLuminance(h: number, s: number, l: number): number {
-  const [r, g, b] = hslToRgb(h, s / 100, l / 100);
-  const linear = (v: number): number =>
-    v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
-  return 0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b);
-}
-
-/** Icon/name colour with enough contrast for the tag's fill(s). */
-function tagTextColor(colors: string[]): string {
-  const luminances = colors.map((c) => {
-    const m = /hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*\)/.exec(c);
-    return m ? hslLuminance(+m[1], +m[2], +m[3]) : 0.5;
-  });
-  // 0.179 is where dark and light text have equal contrast against the fill.
-  const avg = luminances.reduce((a, b) => a + b, 0) / luminances.length;
-  return avg > 0.179 ? "#0d1219" : "#f4f7fb";
+/** A chip that is also a navigation target (hover glows + S/H act on it). */
+interface TooltipChipParts extends ChipParts {
+  target?: HoverTarget | null;
 }
 
 /**
- * The one chip in the card. Every pill — the folder/cluster location tags, the
- * genre rows, the tempo/key stats, the projected-head state, and the structure
- * sections — is this, so they share one geometry, fill, and contrast rule. Only
- * *value* is required; *icon* and *label* are the optional visible parts, and
- * *title* carries any elaboration on hover so the chip itself stays short.
+ * The one chip in the card, built on the shared `chip`. Every pill — the
+ * folder/cluster location tags, the genre rows, the tempo/key stats, the
+ * projected-head state, and the structure sections — shares its geometry, fill, and
+ * contrast rule; a navigation-target chip also carries the S / H hint.
  */
-interface ChipParts {
-  /** The chip's main text. */
-  value: string;
-  /** Leading glyph, stroked in the chip's contrast colour. */
-  icon?: "folder" | "tag";
-  /** Small uppercase caption before the value (e.g. "Tempo"). */
-  label?: string;
-  /** Colour stops: a solid fill or a parent→own gradient; `[]` = neutral. */
-  colors?: string[];
-  /** Navigation target: glow/solo/fit, like a sidebar row. */
-  target?: HoverTarget | null;
-  /** Hover elaboration; the navigation hint is appended when the chip is a target. */
-  title?: string | null;
-}
-
-function chip(parts: ChipParts): HTMLElement {
-  const node = el("span", "tt-chip");
-  const colors = parts.colors ?? [];
-  const fill = tagFill(colors);
-  if (fill) {
-    node.classList.add("tt-chip-filled");
-    node.style.background = fill;
-    node.style.color = tagTextColor(colors);
-  }
-  if (parts.icon) node.appendChild(chipIcon(parts.icon));
-  if (parts.label) node.appendChild(el("span", "tt-chip-label", parts.label));
-  node.appendChild(el("span", "tt-chip-value", parts.value));
+function chip(parts: TooltipChipParts): HTMLElement {
+  const node = buildChip(parts);
   if (parts.target) {
     // Keep the S / H hint discoverable; prepend the chip's own elaboration.
     const hint = parts.title ? `${parts.title} · ${TARGET_HINT}` : TARGET_HINT;
     markTarget(node, parts.target, hint);
-  } else if (parts.title) {
-    node.title = parts.title;
   }
   return node;
 }
