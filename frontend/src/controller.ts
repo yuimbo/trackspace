@@ -2,6 +2,7 @@ import {
   type HoverTarget,
   type Model,
   type PreviewSection,
+  type RuleChip,
   type Track,
   type TrackStructure,
   isAudioFeatureAxisId,
@@ -994,6 +995,8 @@ export class Controller {
   /** Push one visibility-filter chip (solo / exclude), with its own reverse. */
   private _pushExclusionChip(
     label: string,
+    glyph: string,
+    rule: RuleChip | null,
     detail: string,
     clear: () => void,
   ): void {
@@ -1001,6 +1004,8 @@ export class Controller {
       {
         kind: "exclusions",
         label,
+        glyph,
+        rule: rule ?? undefined,
         detail,
         matches: (t) => !this.model.isExcludedTrack(t),
       },
@@ -1008,9 +1013,8 @@ export class Controller {
     );
   }
 
-  /** A short readout of how many tracks a hover target covers. */
-  private _targetDetail(target: HoverTarget): string {
-    const n = this.model.hoverTargetPaths(target).size;
+  /** A short readout of how many tracks a set covers. */
+  private _countDetail(n: number): string {
     return `${n} track${n === 1 ? "" : "s"}`;
   }
 
@@ -1022,14 +1026,19 @@ export class Controller {
     }
     const target = this.interaction.effectiveHoverTarget();
     if (action === "isolate-selection") {
-      // Solo is a visibility filter, so it pushes a chip that reveals again.
-      const had = m.hasExclusions;
-      this.interaction.solo();
-      if (!had && m.hasExclusions) {
-        const detail = target
-          ? this._targetDetail(target)
-          : `${m.selected.size} selected`;
-        this._pushExclusionChip("Solo", detail, () => m.clearExclusions());
+      // Solo is a visibility filter: each isolating press pushes its own chip (the
+      // stack reads as the history of what filtered the view), and any chip's ×
+      // clears the exclusions again. The detail counts the keep-set the press
+      // actually isolated, not the hovered element's own size.
+      const outcome = this.interaction.solo();
+      if (outcome && m.hasExclusions) {
+        this._pushExclusionChip(
+          "Solo",
+          "◉",
+          outcome.rule,
+          this._countDetail(outcome.keep.size),
+          () => m.clearExclusions(),
+        );
       }
       return;
     }
@@ -1047,8 +1056,12 @@ export class Controller {
         m.revealFolderSubtree(target.prefix);
       } else {
         m.hideFolderTree(target.prefix);
-        this._pushExclusionChip("Excluded", this._targetDetail(target), () =>
-          m.revealFolderSubtree(target.prefix),
+        this._pushExclusionChip(
+          "Excluded",
+          "⊘",
+          m.hoverTargetRule(target),
+          this._countDetail(m.hoverTargetPaths(target).size),
+          () => m.revealFolderSubtree(target.prefix),
         );
       }
     } else {
@@ -1058,8 +1071,12 @@ export class Controller {
         m.revealPaths(paths);
       } else {
         m.hidePaths(paths);
-        this._pushExclusionChip("Excluded", this._targetDetail(target), () =>
-          m.revealPaths(paths),
+        this._pushExclusionChip(
+          "Excluded",
+          "⊘",
+          m.hoverTargetRule(target),
+          this._countDetail(paths.size),
+          () => m.revealPaths(paths),
         );
       }
     }

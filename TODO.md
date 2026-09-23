@@ -178,6 +178,13 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       directly, so that exclusion has no chip to dismiss. Route it through the same push.
       Files: `frontend/src/coordinators/folder-tree-coordinator.ts`,
       `frontend/src/controller.ts`.
+- [ ] **Key/BPM nav-target rule chips render uncoloured.** `Model.hoverTargetRule` has no
+      track to read `audio_features` from for a `key`/`bpm` `HoverTarget`, so those
+      rule pills come out neutral while the bloom branch (which has the hovered track)
+      colours them. Look the matching track up (or thread the hovered track through)
+      to fill them with the feature-lens colour. Files:
+      `frontend/src/model.ts` (`hoverTargetRule`),
+      `frontend/src/controller.ts` (`_runCanvasAction`).
 - [ ] **The head modal is mouse-only.** `#head-modal` opens by right-clicking a folder
       inside an External root (or the row popout's *Imprint structure…*); there is no
       keyboard path to open it, and the folder context menu has no arrow-key navigation

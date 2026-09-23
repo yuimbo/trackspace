@@ -4,6 +4,7 @@ import {
   nextLensId,
   prevLensId,
   stepColorMode,
+  trackTempoNorm,
   type ColorMode,
   type Lens,
   type LensPreset,
@@ -14,11 +15,14 @@ import {
   bloomFolderLevels,
   bloomKeySteps,
   bloomRangeKey,
+  bloomRangeLabel,
   bloomTempoPct,
   camelotSteps,
   folderAncestor,
   type BloomRangeKey,
 } from "./lib/bloom";
+import { clusterColor, dirTagColors, keyColor, tempoColor } from "./lib/colors";
+import { displayFolderPath } from "./lib/path-presenter";
 import { clamp01 } from "./lib/util";
 import clusterWeights from "./lib/cluster-weights.json";
 
@@ -289,10 +293,23 @@ export type HoverTarget =
   | { kind: "bpm"; value: number }
   | { kind: "track"; path: string }
   /** An explicit path set (a bloom cluster); `color` tints the halo. */
-  | { kind: "paths"; paths: string[]; color?: string };
+  | { kind: "paths"; paths: string[]; color?: string; label?: string };
 
 /** BPM window that counts as "the same tempo" for the BPM chip's hover target. */
 export const BPM_MATCH_TOLERANCE = 2;
+
+/**
+ * The class a Solo / Excluded chip filtered with, ready to render as a chip pill:
+ * a folder path in its colour family, a cluster or key/BPM in its lens colour, or a
+ * bare track / path set. ``title`` carries the elaboration the short value drops
+ * (a full multi-folder list, a widened bloom range).
+ */
+export interface RuleChip {
+  value: string;
+  icon?: "folder" | "tag";
+  colors?: string[];
+  title?: string;
+}
 
 /**
  * Kinds of **active view modifier**: a reversible change to what the canvas
@@ -329,6 +346,13 @@ export interface ViewModifier {
    * a direct close must leave in place.
    */
   permanent?: boolean;
+  /**
+   * An exclusions chip's action glyph (◉ solo / ⊘ excluded), shown before the rule
+   * readout that replaces the label.
+   */
+  glyph?: string;
+  /** The rule the chip filtered with, rendered in place of the plain label. */
+  rule?: RuleChip;
 }
 
 /**
@@ -1163,6 +1187,144 @@ export class Model extends EventBus {
       if (this.trackMatchesHoverTarget(t, target)) out.add(t.path);
     }
     return out;
+  }
+
+  /* ── Rule readouts (Solo / Excluded chips) ─────────────────── */
+
+  /**
+   * The rule a hover target filters with, as a chip readout: a folder in its colour
+   * family, a cluster or key/BPM in its lens colour, a bare track, or a path-set's
+   * own label. ``null`` when the target has no short name.
+   */
+  hoverTargetRule(target: HoverTarget | null): RuleChip | null {
+    if (!target) return null;
+    switch (target.kind) {
+      case "folder": {
+        const path = target.prefix;
+        const display = displayFolderPath(path);
+        return {
+          value: display,
+          icon: "folder",
+          colors: dirTagColors(path),
+          title: display,
+        };
+      }
+      case "cluster": {
+        const name = this.clusterNames.get(target.id);
+        return {
+          value: name ?? `Cluster ${target.id}`,
+          icon: "tag",
+          colors: [clusterColor(target.id)],
+          title: name ? `Cluster ${target.id}` : undefined,
+        };
+      }
+      case "key":
+        return { value: `Key ${target.value}` };
+      case "bpm":
+        return { value: `${Math.round(target.value)} BPM ±${BPM_MATCH_TOLERANCE}` };
+      case "track": {
+        const t = this.trackByPath(target.path);
+        return { value: t ? (t.title || "").trim() || t.filename : target.path };
+      }
+      case "paths":
+        return {
+          value:
+            target.label ??
+            `${target.paths.length} track${target.paths.length === 1 ? "" : "s"}`,
+          icon: target.label ? "tag" : undefined,
+          colors: target.color ? [target.color] : [],
+        };
+    }
+  }
+
+  /**
+   * The rule the selection-bloom isolates at *hovered*: the bloom cursor's variable
+   * at its current range, in the same words as the bloom HUD, coloured by the
+   * feature lens. Only called when the hovered dot's bloom class is non-empty.
+   */
+  bloomRule(hovered: Track): RuleChip {
+    const range = this.bloomRange();
+    switch (this.selectionBloom) {
+      case "folder": {
+        const levels = bloomFolderLevels(range);
+        const prefix = folderAncestor(hovered.folder ?? "", levels);
+        return {
+          value: displayFolderPath(prefix),
+          icon: "folder",
+          colors: dirTagColors(prefix),
+          title: levels > 0 ? bloomRangeLabel("folder", range) ?? undefined : undefined,
+        };
+      }
+      case "head": {
+        const levels = bloomFolderLevels(range);
+        const prefix = folderAncestor(
+          this.folderPredictions.get(hovered.path) ?? "",
+          levels,
+        );
+        const note = levels > 0 ? bloomRangeLabel("head", range) : null;
+        return {
+          value: displayFolderPath(prefix),
+          icon: "folder",
+          colors: dirTagColors(prefix),
+          title: ["Projected folder", note].filter(Boolean).join(" · "),
+        };
+      }
+      case "cluster": {
+        const id = this.clusterAssignments.get(hovered.path);
+        if (id === undefined) return { value: "Unclustered", icon: "tag" };
+        const name = this.clusterNames.get(id);
+        return {
+          value: name ?? `Cluster ${id}`,
+          icon: "tag",
+          colors: [clusterColor(id)],
+          title: name ? `Cluster ${id}` : undefined,
+        };
+      }
+      case "tempo": {
+        const bpm = hovered.bpm;
+        const pct = bloomTempoPct(range);
+        const tnorm = trackTempoNorm(hovered);
+        return {
+          value:
+            bpm == null || !Number.isFinite(bpm)
+              ? "Tempo"
+              : `${Math.round(bpm)} BPM${pct ? ` ±${pct}%` : ""}`,
+          colors: tnorm != null ? [tempoColor(tnorm)] : [],
+        };
+      }
+      case "key": {
+        const steps = bloomKeySteps(range);
+        const af = hovered.audio_features;
+        return {
+          value: `Key ${hovered.musical_key ?? "?"}${
+            steps ? ` ±${steps} step${steps === 1 ? "" : "s"}` : ""
+          }`,
+          colors: af ? [keyColor(af.key, af.mode)] : [],
+        };
+      }
+    }
+  }
+
+  /**
+   * The rule a selection isolates: the folders its tracks live in, capped to two names
+   * with the rest counted (the full list is the chip's hover title). A single folder
+   * keeps its colour family; a set spanning folders has no single colour.
+   */
+  selectionRule(): RuleChip | null {
+    const folders = new Set<string>();
+    for (const t of this.allTracks) {
+      if (this.selected.has(t.path)) folders.add(t.folder ?? "");
+    }
+    if (folders.size === 0) return null;
+    const sorted = [...folders].sort();
+    const shown = sorted.slice(0, 2).map((f) => displayFolderPath(f));
+    const extra = sorted.length - shown.length;
+    return {
+      value: extra > 0 ? `${shown.join(", ")} +${extra} more` : shown.join(", "),
+      icon: "folder",
+      colors: sorted.length === 1 ? dirTagColors(sorted[0]) : [],
+      title: sorted.map((f) => displayFolderPath(f)).join("\n"),
+    };
   }
 
   /** Replace the selection with every visible track belonging to *target*. */

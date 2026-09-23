@@ -686,6 +686,17 @@ body { display: flex; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+/* An exclusions chip's action glyph (◉ solo / ⊘ excluded), ahead of the rule chip. */
+.view-modifier .vm-mark {
+  flex-shrink: 0;
+  color: var(--fg-dim);
+  font-size: 11px;
+  line-height: 1;
+}
+/* The rule readout is the shared chip pill; let a long path ellipsize in place. */
+.view-modifier .chip {
+  min-width: 0;
+}
 .view-modifier .vm-detail {
   color: var(--fg-dim);
   font-variant-numeric: tabular-nums;

@@ -574,8 +574,14 @@ each owner pushes/updates its own chip:
 - **Exclusions** — **one chip per solo/exclude action** (pushed where the action
   runs), so the stack reads as the history of what filtered the view: a *Solo* chip whose
   × clears the exclusions, and an *Excluded* chip per excluded target whose × reveals
-  just that target. When no exclusions remain (**Alt+s**, or a chip's ×) the stale chips
-  are dropped. It deliberately does **not** count the distance filter's hides.
+  just that target. Each chip names the **rule** it filtered with as a coloured chip pill
+  in place of the plain label — a folder in its colour family, a cluster/key/BPM in its
+  lens colour — behind the action glyph (◉ solo / ⊘ excluded); the readout is the
+  keep/exclude set size (`Model.hoverTargetRule` / `bloomRule` / `selectionRule`), and a
+  long path or a multi-folder selection (capped at two names, `+N more`) lives in the
+  chip's hover title. A second **S** stacks another entry rather than updating the first.
+  When no exclusions remain (**Alt+s**, or a chip's ×) the stale chips are dropped. It
+  deliberately does **not** count the distance filter's hides.
 - **Filters** — one chip per active `filterRanges` tag; its `×` drops that range.
 - **External** — one **permanent** chip, never dismissed: it reads *Library +
   External* while `showExternal` is on and *Library Only* while off, and clicking it
@@ -648,7 +654,7 @@ each owner pushes/updates its own chip:
   hover **title** so the chip itself stays short: the location tags are told apart by
   their glyph (the folder uses a **folder** glyph and the cluster a **tag** glyph), and
   the stat chips carry a **Tempo** / **Key** caption. A chip with a colour is
-  **filled** (`tt-chip-filled`; a nested folder gets a parent→own **gradient**,
+  **filled** (`chip-filled`; a nested folder gets a parent→own **gradient**,
   `dirTagColors`) with its text in the dark canvas colour for contrast. The
   **pinned card expands the genres inline** (`genreList`), replacing the compact
   location stack: a caption **above** each chip (so the chip gets the full row width),

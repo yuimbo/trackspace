@@ -12,6 +12,7 @@
 import {
   type HoverTarget,
   type Model,
+  type RuleChip,
   type Scope,
   type Track,
   isAudioFeatureAxisId,
@@ -22,6 +23,12 @@ import type { CanvasView, TxHandle } from "../components";
 import { hotkeyCode, hotkeyKey, isTextEntryTarget } from "../hotkeys";
 import { scopeLenses, type ColorMode } from "../lib/lenses";
 import { clamp } from "../lib/util";
+
+/** What an **S** press isolated: the rule it filtered with and its keep-set. */
+export interface SoloOutcome {
+  rule: RuleChip | null;
+  keep: Set<string>;
+}
 
 /** Physical keys for the gesture bindings, sourced from the hotkey config. */
 const SCOPE_KEY = hotkeyCode("scope-gesture");
@@ -1164,54 +1171,65 @@ export class CanvasInteractionController {
    * subtree for folder colour), else the hovered navigation element, else the
    * selection, else everything. A second press on an already-isolated target
    * clears the exclusions (show all); with nothing hovered and no selection it
-   * also shows all.
+   * also shows all. Returns the rule it isolated with and its keep-set, so the
+   * caller can push a chip that names what filtered the view; ``null`` when the
+   * press revealed or cleared instead.
    */
-  solo(): void {
+  solo(): SoloOutcome | null {
     const m = this.deps.model;
     const cv = this.deps.canvas;
 
     // A hovered dot blooms a class: S isolates exactly that class.
     if (cv.hoverTarget === null && cv.hoveredBloomTrack) {
       const keep = m.bloomPaths(cv.hoveredBloomTrack);
-      if (keep.size === 0) return;
-      if (m.pathsFullyHidden(keep)) {
-        m.revealThenFocusPaths(keep);
-      } else if (m.hasVisibleTracksOutside(keep)) {
-        m.focusPaths(keep);
-      } else {
-        m.clearExclusions();
-      }
+      if (keep.size === 0) return null;
+      const outcome = this._isolate(keep, m.bloomRule(cv.hoveredBloomTrack));
       m.saveLS();
-      return;
+      return outcome;
     }
 
     const target = this.effectiveHoverTarget();
     if (target) {
       const keep = m.hoverTargetPaths(target);
-      if (keep.size === 0) return;
-      if (m.pathsFullyHidden(keep)) {
-        m.revealThenFocusPaths(keep);
-      } else if (m.hasVisibleTracksOutside(keep)) {
-        m.focusPaths(keep);
-      } else {
-        m.clearExclusions();
-      }
+      if (keep.size === 0) return null;
+      const outcome = this._isolate(keep, m.hoverTargetRule(target));
       m.saveLS();
-      return;
+      return outcome;
     }
 
     if (m.selected.size) {
       if (m.hasVisibleTracksOutside(m.selected)) {
         m.focusSelection();
-      } else {
-        m.clearExclusions();
+        m.saveLS();
+        return { rule: m.selectionRule(), keep: new Set(m.selected) };
       }
+      m.clearExclusions();
       m.saveLS();
-      return;
+      return null;
     }
 
     m.clearExclusions();
     m.saveLS();
+    return null;
+  }
+
+  /**
+   * Apply one isolation: reveal a fully hidden keep-set, focus it when visible
+   * tracks lie outside, else toggle the exclusions off. Returns the outcome when it
+   * isolated, so the caller can push a chip naming the rule.
+   */
+  private _isolate(keep: Set<string>, rule: RuleChip | null): SoloOutcome | null {
+    const m = this.deps.model;
+    if (m.pathsFullyHidden(keep)) {
+      m.revealThenFocusPaths(keep);
+      return { rule, keep };
+    }
+    if (m.hasVisibleTracksOutside(keep)) {
+      m.focusPaths(keep);
+      return { rule, keep };
+    }
+    m.clearExclusions();
+    return null;
   }
 
   /**

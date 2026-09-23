@@ -1143,8 +1143,9 @@ export class FolderTreeCoordinator {
     const lo = sorted[0][0];
     const hi = sorted[sorted.length - 1][0];
     const colours = sorted.map(([, c]) => c);
+    const label = lo === hi ? `${lo} BPM` : `${lo}–${hi} BPM`;
     return {
-      text: lo === hi ? `${lo} BPM` : `${lo}–${hi} BPM`,
+      text: label,
       title:
         lo === hi ? `${lo} BPM` : `Tracks from ${lo} to ${hi} BPM`,
       count: cluster.length,
@@ -1153,6 +1154,7 @@ export class FolderTreeCoordinator {
         kind: "paths",
         paths: cluster.map((t) => t.path),
         color: colours[0],
+        label,
       },
     };
   }
@@ -1175,8 +1177,9 @@ export class FolderTreeCoordinator {
     const colours = [...byFifth.entries()]
       .sort((a, b) => a[0] - b[0])
       .map(([, c]) => c);
+    const label = names[0]?.[0] ?? "—";
     return {
-      text: names[0]?.[0] ?? "—",
+      text: label,
       title: names.map(([n]) => n).join(", ") || "No key",
       count: cluster.length,
       swatch: this._classSwatch(colours),
@@ -1184,6 +1187,7 @@ export class FolderTreeCoordinator {
         kind: "paths",
         paths: cluster.map((t) => t.path),
         color: colours[0],
+        label,
       },
     };
   }

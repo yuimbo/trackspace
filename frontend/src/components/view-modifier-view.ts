@@ -12,6 +12,7 @@
 
 import type { ViewModifier } from "../model";
 import { hotkeyLabel } from "../hotkeys";
+import { chip as buildChip } from "../lib/chip";
 import { createKbd } from "../lib/dom";
 
 export class ViewModifierView {
@@ -91,7 +92,17 @@ export class ViewModifierView {
     const label = document.createElement("span");
     label.className = "vm-label";
 
-    if (mod.kind === "external") {
+    if (mod.rule) {
+      // An exclusions chip names the rule it filtered with: a coloured rule chip
+      // in place of the plain label, prefixed by the action glyph (◉ solo /
+      // ⊘ excluded), whose hover title says which action it is.
+      const glyph = document.createElement("span");
+      glyph.className = "vm-mark";
+      glyph.textContent = mod.glyph ?? "";
+      glyph.title = mod.label;
+      chip.appendChild(glyph);
+      chip.appendChild(buildChip(mod.rule));
+    } else if (mod.kind === "external") {
       // The permanent external chip: the label is the control (V toggles it), and
       // the refit checkbox sits on its own line below it (R).
       chip.classList.add("vm-external");
@@ -159,7 +170,8 @@ export class ViewModifierView {
   }
 
   private _updateChip(chip: HTMLElement, mod: ViewModifier): void {
-    (chip.querySelector(".vm-label") as HTMLElement).textContent = mod.label;
+    const label = chip.querySelector(".vm-label");
+    if (label) label.textContent = mod.label;
     const detail = chip.querySelector(".vm-detail") as HTMLElement;
     detail.textContent = mod.detail ?? "";
     detail.hidden = !mod.detail;

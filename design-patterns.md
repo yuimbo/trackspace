@@ -170,12 +170,20 @@ clear callbacks, one chip stack in a canvas corner:
 ```ts
 type ViewModifierKind =
   | "search" | "proximity" | "scope" | "exclusions" | "filters" | "external";
-interface ViewModifier { id: string; kind: ViewModifierKind; label: string; detail?: string; value?: number; checked?: boolean; permanent?: boolean; }
+interface ViewModifier { id: string; kind: ViewModifierKind; label: string; detail?: string; value?: number; checked?: boolean; permanent?: boolean; glyph?: string; rule?: RuleChip; }
 interface ViewRule extends ViewModifier {
   matches?(track: Track): boolean;      // true = keep; absent = no visibility effect
   scope?: "tags" | "all";              // a tag filter only applies in tags mode
 }
 ```
+
+An exclusions chip carries a `rule` (`RuleChip`) naming the class it filtered with,
+rendered as a coloured chip pill in place of the plain label and prefixed by its action
+`glyph` (◉ solo / ⊘ excluded); the chip is built by the shared `lib/chip` pill, so the
+stack and the hover card share one geometry. `Model.hoverTargetRule` / `bloomRule` /
+`selectionRule` build the readouts, and `CanvasInteractionController.solo` returns the
+`{ rule, keep }` it isolated so `Controller` can push a chip whose detail is the keep-set
+size.
 
 - `Model.viewRules` is the stack, **oldest → newest**; `Model.viewModifiers` is a
   getter over the same array (the corner view renders the descriptors). A rule that

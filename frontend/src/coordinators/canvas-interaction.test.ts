@@ -815,9 +815,12 @@ describe("CanvasInteractionController solo", () => {
     ]);
     model.selectionBloom = "tempo";
     canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
-    coord.solo();
+    const outcome = coord.solo();
     expect(model.isTrackHidden(model.trackByPath("c.mp3")!)).toBe(true);
     expect(model.isTrackHidden(model.trackByPath("b.mp3")!)).toBe(false);
+    // The outcome names the rule the press isolated with and its keep-set.
+    expect(outcome?.rule?.value).toBe("128 BPM");
+    expect(outcome?.keep).toEqual(new Set(["a.mp3", "b.mp3"]));
   });
 
   it("isolates the hovered folder's whole subtree for folder colour", () => {
@@ -829,10 +832,11 @@ describe("CanvasInteractionController solo", () => {
     ]);
     model.selectionBloom = "folder";
     canvas.hoveredBloomTrack = model.trackByPath("House/a.mp3")!;
-    coord.solo();
+    const outcome = coord.solo();
     expect(model.isTrackHidden(model.trackByPath("Techno/c.mp3")!)).toBe(true);
     expect(model.isTrackHidden(model.trackByPath("House/a.mp3")!)).toBe(false);
     expect(model.isTrackHidden(model.trackByPath("House/sub/b.mp3")!)).toBe(false);
+    expect(outcome?.rule?.value).toBe("House");
   });
 
   it("isolates to a hovered cluster", () => {
@@ -931,5 +935,26 @@ describe("CanvasInteractionController solo", () => {
     coord.solo();
     expect(model.isTrackHidden(model.trackByPath("b.mp3")!)).toBe(true);
     expect(model.isTrackHidden(model.trackByPath("a.mp3")!)).toBe(false);
+  });
+
+  it("returns null when a press reveals or clears instead of isolating", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    // Nothing hovered and nothing selected: S shows everything.
+    expect(coord.solo()).toBeNull();
+  });
+
+  it("names a multi-folder selection's rule", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "Techno/b.mp3", folder: "Techno" }),
+      makeTrack({ path: "Disco/c.mp3", folder: "Disco" }),
+    ]);
+    model.selected.add("House/a.mp3");
+    model.selected.add("Techno/b.mp3");
+    const outcome = coord.solo();
+    expect(outcome?.rule?.value).toBe("House, Techno");
+    expect(model.isTrackHidden(model.trackByPath("Disco/c.mp3")!)).toBe(true);
   });
 });

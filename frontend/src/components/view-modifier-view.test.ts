@@ -141,4 +141,38 @@ describe("ViewModifierView", () => {
     expect(chips).toHaveLength(1);
     expect(chips[0].dataset.modifierId).toBe("vm-2");
   });
+
+  it("renders an exclusions chip's rule in place of its label", () => {
+    const { view, el } = makeView();
+    view.render([
+      mod({
+        id: "vm-9",
+        kind: "exclusions",
+        label: "Solo",
+        glyph: "◉",
+        rule: {
+          value: "House/sub",
+          icon: "folder",
+          colors: ["hsl(0,60%,55%)"],
+          title: "House/sub",
+        },
+        detail: "2 tracks",
+      }),
+    ]);
+    // The rule chip replaces the plain label, behind the action glyph.
+    expect(el.querySelector(".vm-label")).toBeNull();
+    expect(el.querySelector(".vm-mark")?.textContent).toBe("◉");
+    expect(el.querySelector<HTMLElement>(".vm-mark")?.title).toBe("Solo");
+    expect(el.querySelector(".chip-value")?.textContent).toBe("House/sub");
+    expect(el.querySelector(".chip-icon-folder")).not.toBeNull();
+    expect(el.querySelector<HTMLElement>(".chip")?.title).toBe("House/sub");
+    expect(el.querySelector(".vm-detail")?.textContent).toBe("2 tracks");
+  });
+
+  it("keeps the plain label for a chip without a rule", () => {
+    const { view, el } = makeView();
+    view.render([mod({ id: "vm-9", kind: "exclusions", label: "Solo" })]);
+    expect(el.querySelector(".vm-label")?.textContent).toBe("Solo");
+    expect(el.querySelector(".chip")).toBeNull();
+  });
 });

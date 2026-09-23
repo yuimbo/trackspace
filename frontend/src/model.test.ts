@@ -496,3 +496,148 @@ describe("Model view rules", () => {
     expect(m.isVisible(b)).toBe(true);
   });
 });
+
+describe("Model rule readouts", () => {
+  beforeEach(() => localStorage.clear());
+
+  function featureTrack(path: string, folder: string): Track {
+    return {
+      ...track(path, folder),
+      bpm: 128,
+      musical_key: "Am",
+      audio_features: {
+        tempo: 0.5,
+        key: 0.25,
+        mode: 1,
+        energy: 0.5,
+        danceability: 0.5,
+      },
+    };
+  }
+
+  it("names a folder target with its colour family", () => {
+    const m = new Model();
+    const rule = m.hoverTargetRule({ kind: "folder", prefix: "House/sub" })!;
+    expect(rule.value).toBe("House/sub");
+    expect(rule.icon).toBe("folder");
+    expect(rule.colors).toHaveLength(1);
+    expect(rule.title).toBe("House/sub");
+    const nested = m.hoverTargetRule({ kind: "folder", prefix: "House/sub/deep" })!;
+    expect(nested.colors).toHaveLength(2);
+  });
+
+  it("names the library root", () => {
+    const m = new Model();
+    const rule = m.hoverTargetRule({ kind: "folder", prefix: "" })!;
+    expect(rule.value).toBe("Library root");
+    expect(rule.title).toBe("Library root");
+  });
+
+  it("names a cluster with its label and hue", () => {
+    const m = new Model();
+    m.clusterNames = new Map([[3, "Deep house"]]);
+    const rule = m.hoverTargetRule({ kind: "cluster", id: 3 })!;
+    expect(rule.value).toBe("Deep house");
+    expect(rule.icon).toBe("tag");
+    expect(rule.colors).toHaveLength(1);
+    expect(rule.title).toBe("Cluster 3");
+  });
+
+  it("names a BPM and key target", () => {
+    const m = new Model();
+    expect(m.hoverTargetRule({ kind: "bpm", value: 128.4 })!.value).toBe(
+      "128 BPM ±2",
+    );
+    expect(m.hoverTargetRule({ kind: "key", value: "Am" })!.value).toBe("Key Am");
+  });
+
+  it("names a track target by title, falling back to filename", () => {
+    const m = new Model();
+    m.setAllTracks([{ ...track("a.mp3", "x"), title: "Untitled" }]);
+    expect(m.hoverTargetRule({ kind: "track", path: "a.mp3" })!.value).toBe(
+      "Untitled",
+    );
+    expect(m.hoverTargetRule({ kind: "track", path: "b.mp3" })!.value).toBe(
+      "b.mp3",
+    );
+  });
+
+  it("uses a path set's own label, else its size", () => {
+    const m = new Model();
+    expect(
+      m.hoverTargetRule({
+        kind: "paths",
+        paths: ["a.mp3", "b.mp3"],
+        label: "120–130 BPM",
+      })!.value,
+    ).toBe("120–130 BPM");
+    expect(m.hoverTargetRule({ kind: "paths", paths: ["a.mp3"] })!.value).toBe(
+      "1 track",
+    );
+  });
+
+  it("names the bloom's folder at its current range", () => {
+    const m = new Model();
+    m.selectionBloom = "folder";
+    const t = featureTrack("House/sub/deep/a.mp3", "House/sub/deep");
+    m.setBloomRange(0, "folder");
+    expect(m.bloomRule(t).value).toBe("House/sub/deep");
+    m.setBloomRange(0.25, "folder");
+    expect(m.bloomRule(t).value).toBe("House/sub");
+    expect(m.bloomRule(t).title).toContain("parent");
+  });
+
+  it("names the bloom's tempo with its tolerance", () => {
+    const m = new Model();
+    m.selectionBloom = "tempo";
+    const t = featureTrack("a.mp3", "x");
+    m.setBloomRange(0, "tempo");
+    expect(m.bloomRule(t).value).toBe("128 BPM");
+    m.setBloomRange(0.4, "tempo");
+    expect(m.bloomRule(t).value).toBe("128 BPM ±10%");
+  });
+
+  it("names the bloom's key with its step count", () => {
+    const m = new Model();
+    m.selectionBloom = "key";
+    const t = featureTrack("a.mp3", "x");
+    m.setBloomRange(0, "key");
+    expect(m.bloomRule(t).value).toBe("Key Am");
+    m.setBloomRange(0.5, "key");
+    expect(m.bloomRule(t).value).toBe("Key Am ±3 steps");
+  });
+
+  it("names a single-folder selection with its colour family", () => {
+    const m = new Model();
+    m.setAllTracks([track("House/a.mp3", "House")]);
+    m.selected = new Set(["House/a.mp3"]);
+    const rule = m.selectionRule()!;
+    expect(rule.value).toBe("House");
+    expect(rule.colors).toHaveLength(1);
+  });
+
+  it("caps a multi-folder selection and lists it on hover", () => {
+    const m = new Model();
+    m.setAllTracks([
+      track("House/a.mp3", "House"),
+      track("Techno/b.mp3", "Techno"),
+      track("Trance/c.mp3", "Trance"),
+      track("Disco/d.mp3", "Disco"),
+    ]);
+    m.selected = new Set([
+      "House/a.mp3",
+      "Techno/b.mp3",
+      "Trance/c.mp3",
+      "Disco/d.mp3",
+    ]);
+    const rule = m.selectionRule()!;
+    expect(rule.value).toBe("Disco, House +2 more");
+    expect(rule.title?.split("\n")).toEqual([
+      "Disco",
+      "House",
+      "Techno",
+      "Trance",
+    ]);
+    expect(rule.colors).toHaveLength(0);
+  });
+});
