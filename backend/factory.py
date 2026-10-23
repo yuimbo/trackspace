@@ -105,6 +105,7 @@ class TrackspaceBlueprintDeps:
     save_roots_state: Callable[[], None]
     track_cache: Any
     dir_color_fn: Callable[[str], str]
+    dir_anchors_fn: Callable[[], dict[str, str]]
     # Path helpers (shared)
     resolve_virtual_path: Callable[[str], str]
     virtual_from_abs: Callable[[str], str]
@@ -227,6 +228,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             save_roots_state=deps.save_roots_state,
             track_cache=deps.track_cache,
             dir_color_fn=deps.dir_color_fn,
+            dir_anchors_fn=deps.dir_anchors_fn,
         )
     )
     app.register_blueprint(

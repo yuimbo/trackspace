@@ -300,6 +300,7 @@ def folders_client():
         save_roots_state=lambda: None,
         track_cache=None,
         dir_color_fn=lambda p: "#000",
+        dir_anchors_fn=dict,
     )
     return _app(bp).test_client()
 

@@ -22,7 +22,8 @@ backend/
   services/
     analysis_pipeline.py  job handlers + ClusterStore (queue ↔ models seam)
     request_validation.py ApiValidationError + payload helpers
-    ...                   roots registry, path helpers, status caches, payload builders
+    ...                   roots registry, path helpers, status caches, payload builders,
+                          folder colour anchors
   embeddings/
     layout.py             composite vectors + compute_projection orchestration
     semantic_weighting.py folder centroid decomposition + CLAP text directions
@@ -298,7 +299,12 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   library scan is needed on a request. `/api/tracks/similar` is the one exception
   to "reads are cheap": it rebuilds the weighted matrix that clustering/layout use,
   cached by `(clustering revision, weights, library mtime)` with a TTL — see
-  `services/similarity.py`.
+  `services/similarity.py`. **Folder colour anchors** (`services/folder_anchors.py`)
+  are the same shape of read: subtree centroids over the frozen weighted matrix
+  decide whether a folder is a sub-genre of its parent, cached by library
+  signature + roots + roles, and embedded in the folder-tree partial for the
+  client. The build runs off the request thread so the library load never waits
+  on it — see `ui_conventions.md` → *Folder colours*.
 - **`/api/analysis/problems` is the actionable counterpart to the coverage counts.**
   It lists tracks fpcalc cannot fingerprint at all plus per-path terminal job failures
   (aggregated across kinds), so the UI can surface the damaged files behind a short

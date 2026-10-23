@@ -235,6 +235,21 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       gives no key for what a hue or a bright/dark shade means. Add a small legend
       when the colour mode is tempo or key (hue = angle, brightness = radius), or
       fade the mode back to folder when the matching guide is off screen.
+- [ ] **The folder-anchor build walks the library twice.** `FolderAnchors._refresh`
+      computes the library signature (a full walk + `getmtime` per file) and then
+      `_build_track_infos` walks again for the fingerprint gather. Both are off
+      the request thread now, but on a Dropbox-backed library the duplicate walk
+      is the slow part. Reuse the signature walk's path list in the gather, or make
+      the signature a by-product of the gather, so the tree refresh pays one walk.
+      Files: `backend/services/folder_anchors.py`,
+      `backend/services/virtual_paths.py`.
+- [ ] **Tune the semantic anchor threshold against the real library.**
+      `VARIATION_MIN_COSINE` (0.6) and `MIN_ANCHOR_TRACKS` (4) in
+      `backend/services/folder_anchors.py` are a starting point; the absolute
+      cosine depends on the frozen weighting, so a diffuse parent or a dominant
+      child can misclassify. If genres collapse or sub-genres split wrongly on
+      the canvas, tune the two constants (or switch the test to the parent's own
+      median track-to-centroid cosine, which self-calibrates per folder).
 - [ ] **Optional sibling hue wiggle.** Family tints currently differ only in
       lightness/saturation (`frontend/src/lib/colors.ts` / `backend/services/dir_colors.py`).
       If same-depth siblings still read too alike on the canvas, add a small hue deviation

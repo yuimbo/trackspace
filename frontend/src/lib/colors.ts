@@ -45,17 +45,27 @@ export function parseColor(css: string): [number, number, number] {
 
 // ─── Folder coloring ─────────────────────────────────────────
 //
-// `dirColor` is a pure function of a virtual folder path (`rootId/sub/…`). Roots
-// and their top-level folders keep the original path-hash hue, so every playlist
-// stays vivid and distinguishable. Deeper folders are tints/shades of their
-// top-level ancestor's hue, and the deviation halves with each nesting level, so a
-// subtree reads as one colour family that tightens as it deepens.
+// `dirColor` paints a folder as a tint of an ancestor's hue — its *anchor*. The
+// default anchor is structural (a root or top-level folder is its own anchor, a
+// deeper folder inherits its top-level ancestor's hue), so an unanalysed library
+// keeps one vivid colour per playlist and the deviation halves with each nesting
+// level. `setDirAnchors` overrides it with the semantic anchors from the backend
+// (`backend/services/folder_anchors.py`), so a sub-genre tints its genre while an
+// unrelated folder starts its own hue family.
 //
 // The algorithm is mirrored in `backend/services/dir_colors.py` (the folder-tree
 // Jinja partial paints the same swatches server-side); both test suites assert the
 // same golden vectors in `dir-color-vectors.json`.
 
 const HASH_MASK = 0x3ffff;
+
+/** Semantic folder anchors (folder path → ancestor path), set from the partial. */
+let dirAnchors: Record<string, string> = {};
+
+/** Replace the semantic folder anchors; an empty map restores the structural rule. */
+export function setDirAnchors(anchors: Record<string, string> | null): void {
+  dirAnchors = anchors ?? {};
+}
 
 /** Original 31-rolling path hash; the mult/seed args salt the offset channels. */
 function hashPath(s: string, mult: number, seed: number): number {
@@ -79,14 +89,17 @@ export function dirColor(folderPath: string): string {
   if (!folderPath) return "hsl(350,60%,55%)";
   const segments = folderPath.split("/");
   const depth = segments.length - 1;
-  const base = hashPath(folderPath, 31, 0);
-  if (depth <= 1) return `hsl(${base % 360},65%,60%)`;
+  const anchor =
+    dirAnchors[folderPath] ??
+    (depth <= 1 ? folderPath : `${segments[0]}/${segments[1]}`);
+  const below = depth - (anchor.split("/").length - 1);
+  if (below <= 0) return `hsl(${hashPath(anchor, 31, 0) % 360},65%,60%)`;
 
-  const hue = hashPath(`${segments[0]}/${segments[1]}`, 31, 0) % 360;
-  // Depth 2 is the widest tint; each level past it halves the deviation. The
-  // amplitude is deliberately wide (lightness ±30, saturation ±18 at depth 2) so
-  // sibling subgenres stay separable on the map.
-  const f = Math.pow(0.5, depth - 2);
+  const hue = hashPath(anchor, 31, 0) % 360;
+  // One level below the anchor is the widest tint; each further level halves the
+  // deviation. The amplitude is deliberately wide (lightness ±30, saturation ±18 one
+  // level below the anchor) so sibling subgenres stay separable on the map.
+  const f = Math.pow(0.5, below - 1);
   const dl = signedUnit(hashPath(folderPath, 7, 11)) * 30 * f;
   const ds = signedUnit(hashPath(folderPath, 13, 23)) * 18 * f;
   const light = roundHalfUp(60 + dl);

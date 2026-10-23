@@ -11,7 +11,13 @@
 
 import { type HoverTarget, type Model, type Track } from "../model";
 import { toast } from "../lib/toast";
-import { clusterColor, dirColor, keyColor, tempoColor } from "../lib/colors";
+import {
+  clusterColor,
+  dirColor,
+  keyColor,
+  setDirAnchors,
+  tempoColor,
+} from "../lib/colors";
 import { trackTempoNorm } from "../lib/lenses";
 import {
   clusterTracksByKey,
@@ -466,6 +472,7 @@ export class FolderTreeCoordinator {
     // Auto-opened state must be recomputed from scratch after a swap.
     this._autoOpenedFolders.clear();
     this._syncExternalRoots();
+    this._syncDirAnchors();
     this.updateHighlights();
     this.syncActiveLabels();
     this._wireRootRowDrags();
@@ -483,6 +490,26 @@ export class FolderTreeCoordinator {
     this.deps.model.setExternalRoots(external);
     this.syncExternalVisibility();
     this._healExternalPositions();
+  }
+
+  /**
+   * Read the semantic colour anchors the server embedded in the swapped tree,
+   * then repaint: the canvas colours each dot from them, so the map's folders
+   * match the sidebar swatches. A missing or malformed block falls back to the
+   * structural rule.
+   */
+  private _syncDirAnchors(): void {
+    const el = this.$folderTree.querySelector("#dir-anchors");
+    let anchors: Record<string, string> = {};
+    if (el?.textContent) {
+      try {
+        anchors = JSON.parse(el.textContent) as Record<string, string>;
+      } catch {
+        anchors = {};
+      }
+    }
+    setDirAnchors(anchors);
+    this.deps.canvas.scheduleDraw();
   }
 
   /**

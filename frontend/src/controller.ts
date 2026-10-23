@@ -195,6 +195,9 @@ export class Controller {
         model.replaceSelection([path]);
         this.interaction.fitViewToPaths([path]);
       },
+      // A drained run adds embeddings, so the folder tree's colour anchors
+      // (and the map's folder colours) must be recomputed.
+      refreshFolderTree: () => void this.folders.refresh(),
     });
 
     this.embedding = new EmbeddingCoordinator({
@@ -647,6 +650,9 @@ export class Controller {
         es.close();
         streamDone = true;
         flush(true);
+        // The colour anchors are computed off the request thread; refetch the
+        // tree once the scan is done so its swatches pick them up.
+        void this.folders.refresh();
       }) as EventListener);
 
       es.onerror = () => {

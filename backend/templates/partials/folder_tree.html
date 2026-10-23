@@ -1,4 +1,7 @@
 {# Recursive folder list – consumed by HTMX; classes must match trackspace.css #}
+{# Semantic colour anchors (folder → ancestor whose hue it tints), read by the
+   canvas so server-rendered swatches and client-painted dots agree. #}
+<script type="application/json" id="dir-anchors">{{ dir_anchors | tojson }}</script>
 {% macro branch(node, depth, active_folders, pending_rename) -%}
   {%- set norm_path = '' if node.path == '.' else node.path -%}
   {%- set is_active = node.path in active_folders -%}

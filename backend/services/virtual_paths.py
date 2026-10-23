@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 
 
@@ -45,19 +45,32 @@ def is_mp3(name: str) -> bool:
     return name.lower().endswith(".mp3")
 
 
-def list_mp3s_under_abs(folder: str, recursive: bool = False) -> list[str]:
-    """Return absolute paths of mp3 files in one absolute folder."""
+def list_mp3s_under_abs(
+    folder: str,
+    recursive: bool = False,
+    *,
+    on_progress: Callable[[int], None] | None = None,
+) -> list[str]:
+    """Return absolute paths of mp3 files in one absolute folder.
+
+    *on_progress* is called with the running mp3 count after each directory, so a
+    caller can report how far a large walk has got.
+    """
     results = []
     if recursive:
         for dirpath, _, filenames in os.walk(folder):
             for filename in filenames:
                 if is_mp3(filename):
                     results.append(os.path.join(dirpath, filename))
+            if on_progress is not None:
+                on_progress(len(results))
     else:
         for filename in os.listdir(folder):
             full = os.path.join(folder, filename)
             if os.path.isfile(full) and is_mp3(filename):
                 results.append(full)
+        if on_progress is not None:
+            on_progress(len(results))
     return sorted(results)
 
 
@@ -67,12 +80,14 @@ def list_mp3s(
     recursive: bool = False,
     *,
     root_ids: Iterable[str] | None = None,
+    on_progress: Callable[[int], None] | None = None,
 ) -> list[str]:
     """Return absolute mp3 paths for one virtual folder, or all roots when empty.
 
     *root_ids* limits the empty-folder (all-roots) case to those roots — the
     projection passes the library roots so external roots are not walked at all.
-    A specific folder is always resolved as given.
+    A specific folder is always resolved as given. *on_progress* is forwarded the
+    running mp3 count across roots.
     """
     if folder_vpath in ("", "."):
         selected = (
@@ -82,6 +97,16 @@ def list_mp3s(
         )
         results: list[str] = []
         for root_abs in selected.values():
-            results.extend(list_mp3s_under_abs(root_abs, recursive=True))
+            base = len(results)
+
+            def _rel(n: int, base: int = base) -> None:
+                if on_progress is not None:
+                    on_progress(base + n)
+
+            results.extend(
+                list_mp3s_under_abs(root_abs, recursive=True, on_progress=_rel)
+            )
         return sorted(results)
-    return list_mp3s_under_abs(resolve_virtual_path(folder_vpath, roots), recursive)
+    return list_mp3s_under_abs(
+        resolve_virtual_path(folder_vpath, roots), recursive, on_progress=on_progress
+    )

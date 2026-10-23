@@ -588,6 +588,13 @@ export class Model extends EventBus {
    * phase here instead of riding `queueStatus`.
    */
   layoutProgress: { phase: string; done: number; total: number } | null = null;
+  /**
+   * In-flight phase of the folder colour anchors build, streamed on
+   * `/api/jobs/stream` as ``colors_progress``. Like the layout it is a plain
+   * background computation rather than a queued job, so it carries its own phase
+   * instead of riding `queueStatus`.
+   */
+  colorsProgress: { phase: string; done: number; total: number } | null = null;
   /** True while the required models are not ready yet (embedding mode waits on `_pollModelReady`). */
   embeddingModelsLoading = false;
   /**

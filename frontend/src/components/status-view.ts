@@ -161,6 +161,18 @@ ${last}
 <div class="status-detail-note">Each track loads ID3 tags and a Chromaprint fingerprint. SQLite caches results by path and file modification time; cache hits avoid opening the MP3.</div>`;
   }
 
+  private _colorsPanelHtml(model: Model): string {
+    const c = model.colorsProgress!;
+    const detail =
+      c.total > 0
+        ? `${c.done} / ${c.total} (${Math.round((100 * c.done) / c.total)}%)`
+        : `${c.done} found`;
+    return `
+<div class="status-detail-title">Folder colours</div>
+<div class="status-detail-kv"><span>${esc(phaseLabel(c.phase))}</span><span>${detail}</span></div>
+<div class="status-detail-note">The semantic colour anchors are gathered from the cached embeddings on a background thread, so the library load never waits on them. The folder tree is refetched when the scan and each analysis run finish.</div>`;
+  }
+
   private _queuePanelHtml(model: Model): string {
     const q: QueueStatus | null = model.queueStatus;
     if (!q) {
@@ -280,6 +292,21 @@ ${maestError}
       this.$el.appendChild(span);
     }
 
+    // The folder colour anchors build is a background computation, not a queued
+    // job; show it while it runs so it is not silent.
+    if (model.colorsProgress) {
+      addSep();
+      const c = model.colorsProgress;
+      const a = document.createElement("span");
+      a.className = "status-hoverable";
+      a.dataset.detailKind = "colors";
+      a.tabIndex = 0;
+      a.setAttribute("aria-describedby", "status-detail-panel");
+      const counts = c.total > 0 ? ` ${c.done}/${c.total}` : "";
+      a.textContent = `colours: ${phaseLabel(c.phase)}${counts}`;
+      this.$el.appendChild(a);
+    }
+
     if (reopenKind === "library" && model.libraryLoadProgress) {
       const el = this.$el.querySelector(
         '[data-detail-kind="library"]',
@@ -291,6 +318,11 @@ ${maestError}
         '[data-detail-kind="queue"]',
       ) as HTMLElement | null;
       if (el) this._showPanel(el, this._queuePanelHtml(model), "queue");
+    } else if (reopenKind === "colors" && model.colorsProgress) {
+      const el = this.$el.querySelector(
+        '[data-detail-kind="colors"]',
+      ) as HTMLElement | null;
+      if (el) this._showPanel(el, this._colorsPanelHtml(model), "colors");
     } else if (reopenKind) {
       this._panel.hidden = true;
       delete this._panel.dataset.openKind;

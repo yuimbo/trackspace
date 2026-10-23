@@ -19,6 +19,7 @@ import {
 } from "../model";
 import { toast } from "../lib/toast";
 import { clusterColor } from "../lib/colors";
+import { phaseLabel } from "../lib/pipeline";
 import { stepColorMode, type ColorMode } from "../lib/lenses";
 import { api, postJSON } from "../lib/api";
 import { clamp, confirmAction } from "../lib/util";
@@ -50,6 +51,11 @@ export interface AnalysisDeps {
   };
   /** Select one track and fit the view to it (broken-files row click). */
   focusTrack?(path: string): void;
+  /**
+   * Refresh the folder tree once a run drains, so the semantic colour anchors
+   * the server embeds follow newly analysed tracks (optional in tests).
+   */
+  refreshFolderTree?(): void;
 }
 
 /** Shape of ``GET /api/clusters``. */
@@ -418,6 +424,41 @@ export class AnalysisCoordinator {
   }
 
   /** Render one row per source: done / total with a progress bar. */
+  /**
+   * One row for the folder colour anchors build, cleared when it finishes.
+   *
+   * The anchors are a background computation rather than a queued stage, so they
+   * do not appear in the per-source coverage; this row says the map is still
+   * settling its folder families instead of silently showing the structural ones.
+   */
+  private _renderColorsProgress(m: Model): void {
+    const host = document.getElementById("analysis-colors");
+    if (!host) return;
+    host.replaceChildren();
+    const c = m.colorsProgress;
+    if (!c) return;
+    const line = document.createElement("div");
+    line.className = "analysis-coverage-row";
+    const head = document.createElement("div");
+    head.className = "analysis-coverage-head";
+    const name = document.createElement("span");
+    name.className = "analysis-coverage-name";
+    name.textContent = "Folder colours";
+    const count = document.createElement("span");
+    count.className = "analysis-coverage-count";
+    count.textContent = c.total > 0 ? `${c.done} / ${c.total}` : `${c.done}`;
+    head.append(name, count);
+    const bar = document.createElement("span");
+    bar.className = "analysis-coverage-bar";
+    const fill = document.createElement("i");
+    if (c.total > 0)
+      fill.style.width = `${Math.round((100 * c.done) / c.total)}%`;
+    bar.appendChild(fill);
+    line.append(head, bar);
+    line.title = `${phaseLabel(c.phase)} — the semantic colour anchors are gathered from the cached embeddings`;
+    host.appendChild(line);
+  }
+
   private _renderCoverage(d: CoverageResponse): void {
     const host = document.getElementById("analysis-coverage");
     if (!host) return;
@@ -819,6 +860,23 @@ export class AnalysisCoordinator {
       this.deps.scheduleDraw();
     }) as EventListener);
 
+    es.addEventListener("colors_progress", ((e: MessageEvent) => {
+      // The folder colour anchors build is a background computation, not a
+      // queued job, so it carries its own event instead of `stage_progress`.
+      const d = JSON.parse(e.data) as {
+        phase: string;
+        done?: number;
+        total?: number;
+      };
+      const m = this.deps.model;
+      m.colorsProgress =
+        d.phase === "done"
+          ? null
+          : { phase: d.phase, done: d.done ?? 0, total: d.total ?? 0 };
+      this.deps.status.update(m);
+      this._renderColorsProgress(m);
+    }) as EventListener);
+
     es.addEventListener("progress", ((e: MessageEvent) => {
       const d = JSON.parse(e.data) as {
         kind: string;
@@ -854,6 +912,9 @@ export class AnalysisCoordinator {
       void this.refreshQueueStatus().then(() => {
         if ((this.deps.model.queueStatus?.outstanding ?? 0) === 0) {
           toast("Analysis complete", "ok");
+          // Newly analysed tracks move the semantic colour anchors, which the
+          // server embeds in the tree partial.
+          this.deps.refreshFolderTree?.();
         }
         void this.fetchCoverage();
         void this.fetchProblems();

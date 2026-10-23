@@ -166,15 +166,33 @@ means the track sits directly at the root.
 
 ## Folder colours (family tints)
 
-`dirColor` (`lib/colors.ts`) is a pure function of a virtual folder path, mirrored
-server-side by `backend/services/dir_colors.py` for the Jinja folder-tree swatches.
+`dirColor` (`lib/colors.ts`) paints a folder as a tint of an ancestor's hue — its
+*anchor* — mirrored server-side by `backend/services/dir_colors.py` for the Jinja
+folder-tree swatches.
 
-- A root and its top-level folders keep the original path-hash hue (one vivid colour per
-  playlist), so existing colours do not move.
-- Folders deeper than the top level are tints/shades of their top-level ancestor's hue:
-  lightness/saturation deviate by a per-path hash, and the deviation halves per nesting
-  level (`0.5^(depth-2)`). A subtree therefore reads as one colour family that tightens
-  as it deepens. Hue is exactly the ancestor's — only lightness/saturation vary.
+- The default anchor is structural: a root and its top-level folders keep the original
+  path-hash hue (one vivid colour per playlist), and a deeper folder inherits its
+  top-level ancestor's hue. Lightness/saturation deviate by a per-path hash and the
+  deviation halves per nesting level below the anchor (`0.5^(below-1)`), so a subtree
+  reads as one colour family that tightens as it deepens. Hue is exactly the
+  anchor's — only lightness/saturation vary.
+- `backend/services/folder_anchors.py` overrides the anchor per folder with a semantic
+  one: a folder is a *variation* of its parent when the two subtree centroids are at
+  least `VARIATION_MIN_COSINE` similar in the map's weighted space, and a variation
+  inherits its parent's anchor. So `GENRES/<genre>/<subgenre>` reads as one family
+  while uncorrelated folders each start their own hue. Folders too thin to measure fall
+  back to the root role (external roots are never variations).
+- The server embeds the anchors in the folder-tree partial (`#dir-anchors`);
+  `FolderTreeCoordinator` reads them into `setDirAnchors`, which the canvas, tooltips
+  and rule chips share. With no anchors the structural rule applies, so the golden
+  vectors still hold.
+- The anchor build runs on a background thread: the partial only reads the cache, so
+  the library load never waits on a full-library gather (the first read returns the
+  structural fallback). The tree is refetched when the scan finishes and when a run
+  drains, so the semantic colours appear once the embeddings exist.
+- The build streams its phases as `colors_progress` events (`scanning files` →
+  `gathering vectors` → `weighting vectors`), shown as a *Folder colours* row in the
+  analysis panel and a hoverable status-bar readout, so a long walk is not silent.
 - The two implementations must agree byte-for-byte; both suites assert the shared golden
   vectors in `frontend/src/lib/dir-color-vectors.json`.
 

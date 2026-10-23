@@ -779,6 +779,7 @@ def gather_source_blocks(
     infos: list[dict[str, Any]],
     *,
     clap_version: int,
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> tuple[list[str], dict[str, np.ndarray], np.ndarray | None]:
     """Assemble aligned per-source matrices for the tracks that have MAEST data.
 
@@ -786,20 +787,32 @@ def gather_source_blocks(
     has no meaningful position in the genre space. Optional sources are filled
     with zero rows where missing so every block keeps the same row order as
     *paths*; a zero row is neutral after per-block standardisation.
+    *on_progress* receives ``(sources_done, sources_total)`` after each source.
     """
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
     if not fps:
         return [], {}, None
 
     fc = deps.feature_cache
-    maest_map = fc.get_all("maest", fps, version=deps.maest_version)
-    logits_map = fc.get_all("maest_logits", fps, version=deps.maest_version)
-    rhythm_map = fc.get_all("rhythm", fps, version=deps.rhythm_version)
-    feat_map = fc.get_all("features", fps, version=deps.features_version)
-    clap_map = fc.get_all("clap", fps, version=clap_version)
-    supervised_map = fc.get_all(
-        "supervised", fps, version=supervised_mod.cache_version(fc)
+    sources = (
+        ("maest", "maest", deps.maest_version),
+        ("maest_logits", "maest_logits", deps.maest_version),
+        ("rhythm", "rhythm", deps.rhythm_version),
+        ("features", "features", deps.features_version),
+        ("clap", "clap", clap_version),
+        ("supervised", "supervised", supervised_mod.cache_version(fc)),
     )
+    maps: dict[str, dict[str, np.ndarray]] = {}
+    for i, (name, source, version) in enumerate(sources):
+        maps[name] = fc.get_all(source, fps, version=version)
+        if on_progress is not None:
+            on_progress(i + 1, len(sources))
+    maest_map = maps["maest"]
+    logits_map = maps["maest_logits"]
+    rhythm_map = maps["rhythm"]
+    feat_map = maps["features"]
+    clap_map = maps["clap"]
+    supervised_map = maps["supervised"]
 
     paths: list[str] = []
     picked: list[str] = []

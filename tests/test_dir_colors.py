@@ -80,3 +80,28 @@ def test_sibling_subfolders_get_distinct_tints() -> None:
 def test_deterministic() -> None:
     path = "abc12345/GENRES/Rock/70s"
     assert dir_color(path) == dir_color(path)
+
+
+def test_anchors_rebase_the_hue_family() -> None:
+    """A semantic anchor makes a genre its own family and its sub-genre a tint."""
+    anchors = {
+        "abc12345/GENRES/Rock": "abc12345/GENRES/Rock",
+        "abc12345/GENRES/Rock/70s": "abc12345/GENRES/Rock",
+        "abc12345/GENRES/Jazz": "abc12345/GENRES/Jazz",
+    }
+    rock = dir_color("abc12345/GENRES/Rock", anchors)
+    rock_70s = dir_color("abc12345/GENRES/Rock/70s", anchors)
+    jazz = dir_color("abc12345/GENRES/Jazz", anchors)
+    # Rock and Jazz start their own families; 70s tints Rock.
+    assert rock != jazz
+    assert rock_70s.startswith(rock[: rock.index(",")] + ",")
+    assert dir_color("abc12345/GENRES/Rock") != dir_color(
+        "abc12345/GENRES/Rock", anchors
+    )
+
+
+def test_missing_anchor_falls_back_to_structural() -> None:
+    anchors = {"abc12345/GENRES/Jazz": "abc12345/GENRES/Jazz"}
+    assert dir_color("abc12345/GENRES/Rock", anchors) == dir_color(
+        "abc12345/GENRES/Rock"
+    )

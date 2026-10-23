@@ -58,6 +58,10 @@ const PHASE_LABELS: Record<string, string> = {
   layout: "laying out",
   chart: "landmarks",
   jacobian: "Jacobian",
+  // Folder colour anchor phases (streamed as `colors_progress`).
+  scanning: "scanning files",
+  reading: "gathering vectors",
+  matrix: "weighting vectors",
 };
 
 /** Kinds that produce the per-track embeddings the map is built from. */

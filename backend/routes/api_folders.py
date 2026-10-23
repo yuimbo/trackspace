@@ -53,6 +53,7 @@ def create_api_folders_blueprint(
     save_roots_state: Callable[[], None],
     track_cache: Any,
     dir_color_fn: Callable[[str], str],
+    dir_anchors_fn: Callable[[], dict[str, str]],
 ) -> Blueprint:
     bp = Blueprint("api_folders", __name__)
 
@@ -81,6 +82,7 @@ def create_api_folders_blueprint(
             active_folders=active_folders,
             pending_rename=pending_rename,
             dir_color=dir_color_fn,
+            dir_anchors=dir_anchors_fn(),
         )
 
     @bp.route("/api/folders")
@@ -88,7 +90,9 @@ def create_api_folders_blueprint(
         """Return the folder tree for all roots (or a subpath)."""
         rel = request.args.get("root", "")
         if rel in ("", "."):
-            return jsonify({"roots": _roots_payload()})
+            return jsonify(
+                {"roots": _roots_payload(), "anchors": dir_anchors_fn()}
+            )
         root_abs = resolve_virtual_path(rel)
         parts = rel.split("/", 1)
         root_id = parts[0]

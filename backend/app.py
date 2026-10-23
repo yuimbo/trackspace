@@ -69,6 +69,7 @@ from backend.services.analysis_pipeline import (
     make_supervised_handler,
 )
 from backend.services.dir_colors import dir_color
+from backend.services.folder_anchors import FolderAnchors
 from backend.services.layout_revision_for_status import layout_revision_for_projection
 from backend.services.lens_layout import compute_lens_projection
 from backend.services.library_scan import (
@@ -377,9 +378,15 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
 
     def _list_mp3s(
-        folder_vpath: str, recursive: bool = False, *, root_ids=None
+        folder_vpath: str, recursive: bool = False, *, root_ids=None, on_progress=None
     ) -> list[str]:
-        return list_mp3s_service(folder_vpath, state.roots, recursive, root_ids=root_ids)
+        return list_mp3s_service(
+            folder_vpath,
+            state.roots,
+            recursive,
+            root_ids=root_ids,
+            on_progress=on_progress,
+        )
 
 
     def _folder_tree(root: str, root_id: str, rel_prefix: str = "") -> dict:
@@ -458,16 +465,23 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
 
     def _build_track_infos(
-        folder_vpath: str, recursive: bool, *, include_external: bool = True
+        folder_vpath: str,
+        recursive: bool,
+        *,
+        include_external: bool = True,
+        on_progress=None,
     ) -> list[dict]:
         """Build lightweight track info dicts with path + fingerprint for embedding ops.
 
         *include_external* False scopes an all-roots walk to the library roots
         only, so external tracks do not enter the default projection (they are
         still analysed; the External toggle requests them explicitly).
+        *on_progress* receives the running mp3 count as the walk proceeds.
         """
         root_ids = None if include_external else _library_root_ids()
-        paths = _list_mp3s(folder_vpath, recursive, root_ids=root_ids)
+        paths = _list_mp3s(
+            folder_vpath, recursive, root_ids=root_ids, on_progress=on_progress
+        )
         prefetch_track_cache(state.track_cache, paths)
         infos = []
         for p, info in iter_parallel_reads(
@@ -560,6 +574,22 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             {"type": "decode_warning", "path": rel, "message": msg}
         ),
     )
+
+    # Folder colour anchors: the semantic (sub-genre) anchor per folder, so a
+    # sub-genre tints its genre while an unrelated folder starts its own hue.
+    FOLDER_ANCHORS = FolderAnchors(
+        ANALYSIS_DEPS,
+        roots=state.roots,
+        root_roles=state.root_roles,
+        build_track_infos=_build_track_infos,
+        library_mtime_signature=_library_mtime_signature,
+        on_progress=lambda event: _broadcast_embed_event(
+            {"type": "colors_progress", **event}
+        ),
+    )
+
+    def _dir_color(folder_vpath: str) -> str:
+        return dir_color(folder_vpath, FOLDER_ANCHORS.get())
 
 
     def _on_job_event(event: dict) -> None:
@@ -829,7 +859,8 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             unschedule_root_watch=_unschedule_root_watch,
             save_roots_state=_save_roots_state,
             track_cache=state.track_cache,
-            dir_color_fn=dir_color,
+            dir_color_fn=_dir_color,
+            dir_anchors_fn=FOLDER_ANCHORS.get,
             resolve_virtual_path=_resolve,
             virtual_from_abs=_virtual_from_abs,
             dist_dir=state.dist_dir,

@@ -1,12 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import vectors from "./dir-color-vectors.json";
 import {
   dirColor,
   dirTagColors,
   keyColor,
   parseColor,
+  setDirAnchors,
   tempoColor,
 } from "./colors";
+
+afterEach(() => setDirAnchors(null));
 
 /** The pre-family algorithm, kept to prove depth <= 1 is byte-identical. */
 function legacyDirColor(folderPath: string): string {
@@ -100,6 +103,25 @@ describe("dirColor", () => {
     expect(dirColor("abc12345/GENRES/Rock/70s")).toBe(
       dirColor("abc12345/GENRES/Rock/70s"),
     );
+  });
+
+  it("rebases the hue family on a semantic anchor", () => {
+    setDirAnchors({
+      "abc12345/GENRES/Rock": "abc12345/GENRES/Rock",
+      "abc12345/GENRES/Rock/70s": "abc12345/GENRES/Rock",
+      "abc12345/GENRES/Jazz": "abc12345/GENRES/Jazz",
+    });
+    const rock = dirColor("abc12345/GENRES/Rock");
+    const rock70s = dirColor("abc12345/GENRES/Rock/70s");
+    const jazz = dirColor("abc12345/GENRES/Jazz");
+    // Rock and Jazz start their own families; 70s tints Rock.
+    expect(rock).not.toBe(jazz);
+    expect(rock70s.startsWith(`${rock.slice(0, rock.indexOf(","))},`)).toBe(true);
+  });
+
+  it("falls back to the structural rule when a folder has no anchor", () => {
+    setDirAnchors({ "abc12345/GENRES/Jazz": "abc12345/GENRES/Jazz" });
+    expect(dirColor("abc12345/GENRES/Rock")).toBe(dirColor("abc12345/GENRES/Rock"));
   });
 });
 
