@@ -2280,7 +2280,7 @@ kbd {
 #shortcuts-modal {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
+  background: rgba(0, 0, 0, 0.6);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2291,36 +2291,177 @@ kbd {
   background: var(--bg-side);
   border: 1px solid #ffffff18;
   border-radius: 8px;
-  padding: 20px 28px;
-  min-width: 300px;
+  padding: 24px 32px 28px;
+  width: min(1560px, 97vw);
+  max-height: 95vh;
+  overflow-y: auto;
 }
 
 #shortcuts-content h2 {
-  font-size: 10px;
+  font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
+  color: var(--accent);
+  margin-bottom: 16px;
+}
+
+/* The F1 modal mirrors the main screen: each zone sits where its UI
+   affordance does (sidebar left, tab bar top, canvas centre, ghost properties
+   right, statusbar full-width at the bottom). */
+.shortcut-wireframe {
+  display: grid;
+  grid-template-columns: minmax(250px, 1fr) minmax(0, 3.4fr) minmax(150px, 0.8fr);
+  grid-template-areas:
+    "folders topbar    properties"
+    "folders canvas    properties"
+    "status  status    status";
+  gap: 16px;
+}
+
+.shortcut-zone {
+  background: #ffffff08;
+  border: 1px solid #ffffff10;
+  border-radius: 6px;
+  padding: 14px 18px 18px;
+  min-width: 0;
+}
+
+.shortcut-zone-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
   color: var(--accent);
   margin-bottom: 12px;
 }
 
-.shortcut-list {
+.zone-folders { grid-area: folders; }
+.zone-topbar { grid-area: topbar; }
+.zone-canvas { grid-area: canvas; }
+.zone-properties { grid-area: properties; background: #ffffff04; }
+.zone-properties .shortcut-zone-title { color: var(--fg-dim); }
+.zone-status { grid-area: status; }
+
+.shortcut-groups {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  font-size: 12px;
+  gap: 18px;
+}
+
+/* Side-by-side groups fill the zone width and wrap onto new lines instead of overflowing. */
+.shortcut-groups.row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 18px 28px;
+}
+
+/* A group is a two-column grid (chords | text); rows and clusters join it via
+   subgrid, so every title in a group starts at the same x. */
+.shortcut-group {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  column-gap: 14px;
+  row-gap: 12px;
+  align-content: start;
+}
+
+.shortcut-group > * { grid-column: 1 / -1; }
+
+/* The floating Search card spans the full canvas row, like the popup. */
+.shortcut-group.card {
+  grid-column: 1 / -1;
+  background: #ffffff0a;
+  border: 1px solid #ffffff14;
+  border-radius: 6px;
+  padding: 10px 14px;
+}
+
+.shortcut-group-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
   color: var(--fg-dim);
 }
 
-.shortcut-row {
-  display: flex;
+.shortcut-row,
+.shortcut-cluster {
+  display: grid;
+  grid-template-columns: subgrid;
   align-items: baseline;
-  gap: 10px;
 }
 
-.shortcut-row kbd {
-  min-width: 72px;
-  text-align: right;
-  flex-shrink: 0;
+/* Siblings (same key or gesture, different modifiers): a left rule ties them
+   together; their caps share fixed slots so modifiers line up row to row. */
+.shortcut-cluster {
+  border-left: 2px solid var(--accent);
+  padding-left: 10px;
+  row-gap: 8px;
+}
+
+.shortcut-cluster > .shortcut-row { grid-column: 1 / -1; }
+
+.chords {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-self: end;
+}
+
+.chord {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.chord-sep {
+  font-size: 10px;
+  color: var(--fg-dim);
+}
+
+.cap,
+.cap-slot {
+  box-sizing: border-box;
+  min-width: 24px;
+  text-align: center;
+}
+
+.cap {
+  padding: 1px 5px;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--fg);
+}
+
+.cap.mod { color: var(--accent-hi); }
+.cap.gesture,
+.cap-slot.gesture { min-width: 62px; }
+.cap.gesture {
+  color: var(--fg-dim);
+  font-size: 10px;
+  background: transparent;
+  border-style: dashed;
+}
+
+.cap-slot { display: inline-block; height: 1px; }
+
+.shortcut-text { min-width: 0; }
+
+.shortcut-title {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--fg);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.shortcut-desc {
+  font-size: 10px;
+  color: var(--fg-dim);
+  line-height: 1.45;
+  margin: 0;
+  overflow-wrap: anywhere;
 }
 
 #shortcuts-hint {

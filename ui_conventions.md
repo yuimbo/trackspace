@@ -361,16 +361,30 @@ already provides optimistic behavior for that hot path.
 
 `frontend/src/hotkeys.ts` owns all keyboard shortcut definitions and dispatch.
 
-- **`HOTKEY_MAP`** — single array of `{ action, key, code?, mod?, shift?, alt?, label, description, dispatch? }`.
-  Each entry defines a named action (e.g. `"undo"`, `"fit-view"`) with its key binding. Entries with
-  `dispatch: false` are still declared here for the F1 list and for UI badges, but their keydown/keyup is
-  owned elsewhere: the canvas gesture keys **X**/**M**/**D**/**Alt** by `CanvasInteractionController`, and
-  **F1** by the Alpine shortcuts modal.
-- **`MOUSE_HINTS`** — pointer-only hints (shift+drag, alt+drag) shown in the F1 modal but not dispatched.
+- **`HOTKEY_MAP`** — single array of `{ action, key, code?, mod?, shift?, alt?, gesture?, label, title, description, dispatch? }`.
+  Each entry defines a named action (e.g. `"undo"`, `"fit-view"`) with its key binding. `title` is the
+  short F1 heading; `description` is one plain sentence and **never mentions another key or modifier**
+  (a vitest guards this) — a variant that behaves differently is its own entry (`Shift+X` is
+  `scope-lens-prev`, `M`+scroll is `preview-volume`), and `gesture` marks a pointer gesture performed
+  while the key is held. Entries with `dispatch: false` are still declared here for the F1 list and for
+  UI badges, but their keydown/keyup is owned elsewhere: the canvas gesture keys
+  **X**/**M**/**D**/**Alt** by `CanvasInteractionController`, and **F1** by the Alpine shortcuts modal.
+- **`MOUSE_HINTS`** — pointer-only hints shown in the F1 modal but not dispatched. Each has a stable `id`
+  (referenced by the F1 zone table), a `title`, and `chords` (`{ mods, key?, gesture? }`) so the
+  modifier is data, not prose.
+- **`SHORTCUT_ZONES`** — the F1 modal's wireframe layout: one zone per main-screen region
+  (Folders sidebar, Top bar, Canvas, Properties, Statusbar), each zone listing groups of actions and
+  mouse-hint ids. `shortcutCoverageProblems()` asserts every binding and hint appears in exactly one
+  zone (covered by vitest), so a new shortcut can't silently vanish from the F1 list.
 - **`HotkeyManager`** — listens to `keydown`, matches against `HOTKEY_MAP`, and fires
   registered handlers for the matching action. The controller calls `hk.on("action", fn)`.
-- **`renderShortcutList(container)`** — populates the F1 shortcuts modal from the maps.
-  Called once at startup in `main.ts`.
+- **`renderShortcutList(container)`** — populates the F1 shortcuts modal (near-fullscreen): zones as a grid
+  mirroring the screen layout, each action a two-line row (`[caps] Title` over a small description) whose
+  titles align per group via subgrid. Every chord renders as icon caps — modifiers (⌘/Ctrl, ⌥/Alt, ⇧) in
+  fixed slots, the key, and a dashed gesture cap (`drag`, `scroll`, …). **Sibling** entries (same key or
+  gesture, different modifiers) listed next to each other in a group form one `.shortcut-cluster` with a
+  left rule and aligned cap slots, so the modifier — not text — distinguishes them. Multi-key actions
+  (`/` and ⌘F) show both chords in one row. Called once at startup in `main.ts`.
 - **`hotkeyLabel` / `hotkeyBinding` / `hotkeyCode` / `hotkeyKey`** — lookups every render site uses
   (folder-row popout, view-modifier chips, tooltip seekbar) and the gesture handlers use to match their
   physical key, so no key or label is hard-coded outside this module.
