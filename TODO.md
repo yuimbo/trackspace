@@ -5,7 +5,22 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 `design-patterns.md`.
 
 ## User feedback
-- [ ] Whacko idea? Add a 3d view for the embedding space?
+- [ ] **3-D view: verify in a real browser and tune.** The depth pre-passes in
+  `lib/point-layer.ts` and `lib/glow-layer.ts` (MAX-blend front depth, `DEPTH_SLAB` /
+  `DEPTH_MASK` / `DEPTH_EPS`), the `depthShade` cue and the perspective default have no
+  GL test coverage (happy-dom has no WebGL). Eyeball with `3` on a real library, check
+  the 2-D↔3-D tween and a spherical scope; expose slab/shade strength as a query param
+  (like `?persp=`) if they need fiddling.
+- [ ] **3-D scopes: sphere radius under perspective.** `worldRadiusForPx` / the drawn
+  circle use the perspective scale at the sphere centre, so the outline is exact only for
+  the centre; members near the rim can look slightly in/out under strong `?persp`.
+
+- [ ] **Hide or remove the custom-tags UI.** Tags are no longer central (the 3-D view,
+  scopes and weight sliders ignore them). Hide-only is ~10 files (`lenses.ts` drop the
+  `tags` lens + E-cycle slot, `tag-panel-view.ts`, `batch-view.ts`, `index.html`
+  sections, `canvas-view.ts` axis labels + transform box, `canvas-interaction.ts` tag
+  drag/txform, `controller.ts`, `main.ts`); full removal ~25 incl. `model.ts`,
+  `command.ts`, `backend/routes/api_tags.py`, `backend/tags.py` and ~8 test files.
 
 - [ ] **Undo leaves empty fan-out folders.** The move journal restores every
   file but does not remove the subfolders a fan-out created (they are often empty

@@ -56,6 +56,69 @@ occludes a coloured one.
 takes the nearest member of the cursor's 3×3 screen-grid neighbourhood (only when it holds
 at least two points, so a far lone dot is never grabbed).
 
+### 3-D view
+
+`model.view3d {on, yaw, pitch}` is a client-side view option, persisted in localStorage.
+Two gates read it: `model.is3d` (the *mode*: on, not eval gallery, projection lens — query
+string, interactions, scope/tag rules) and `model.shows3d` (the *rendering*: `is3d`'s gate
+that stays true while the collapse tween runs). Toggle: the `3D` tab beside the lens tabs, or
+the **3** key (`EmbeddingCoordinator.setView3D`, which refetches with `dims=3` — a true 3-D
+t-SNE, cached separately from the 2-D layout).
+
+- **Camera.** `lib/camera3d.ts` rotates the unit cube about its centre and applies a slight
+  perspective (`?persp=0.28` default, `0` = orthographic; read once at load). The rotated x/y
+  go through the existing `w2s`, so pan/zoom are unchanged; `depth` (0.05–1, 1 = nearest) and
+  the perspective `scale` (point radius) are the only new values. Every world→screen consumer
+  of track positions goes through `CanvasView._trackScreen`.
+- **Transition.** `model.view3dBlend` (0 = head-on orthographic, 1 = full 3-D, not persisted)
+  scales yaw, pitch, perspective and the depth shading; `EmbeddingCoordinator._tweenBlend`
+  animates it on its own rAF handle (it moves a camera parameter, not a dot, so it may run
+  alongside a position lerp). A toggle is one gesture: the blend tween and the dot lerp start
+  together (`TOGGLE_MS`) once the new layout is applied, so a slow 3-D fit delays the whole
+  motion rather than splitting it. The grid and the cube frame crossfade with it.
+- **Gauge.** A 3-D layout is fitted so its head-on (x,y) matches the same lens's 2-D layout
+  (`lens_gauge.gauge_layout_3d`; z sign anchored per track-set family). The 2-D layouts are
+  already aligned across lenses, so 2-D↔3-D barely moves x/y and 3-D lens switches stay
+  consistent.
+- **Controls.** Alt+drag or middle-drag orbits; Alt+Shift+drag and trackpad scroll pan; wheel
+  zooms. In 2-D, Alt/middle-drag still pan. Orbit persists on mouse-up, not per move.
+- **Depth-aware metaballs.** `MetaballLayer.render(points, true)` MAX-blends each pixel's front
+  depth, then splats only points within a thin slab behind it, so depth layers stay separate
+  blobs. Far points are also darkened (`depthShade`). Hit testing picks the front-most
+  candidate within the hit radius.
+- **Depth-aware glow.** `GlowLayer.render(points, occluders)` depth-tests each halo against the
+  scatter points and crisp dots, so a halo is hidden by blobs at its depth or nearer and shows
+  over deeper ones. In 3-D the glow canvas is hidden and blitted into the scatter canvas right
+  after the blobs (below the crisp dots); in 2-D it stays a DOM layer under the scatter.
+- **Scopes are spheres** (`Scope.shape === "sphere"`, centre `cx,cy,cz`, radius `r`), the one
+  shape whose members do not change under orbit; membership is tested in cube coordinates
+  (`scopeContains(..., wz)`) and the outline is a projected circle. X+scroll opens one at the
+  cursor (centre = nearest dot within 20 px, else the cube-centre plane); X+drag originates at
+  the nearest dot (same snap) with the drag distance as radius. Toggling 2-D ↔ 3-D with a
+  scope open converts it (circle/box ↔ sphere) and re-lays it out.
+  - **Contents are the flat 2-D scope view**, never a nested 3-D map: the scope lens is always
+    fetched with `dims=2` (shared cache with 2-D), and the members are drawn *billboarded* —
+    a flat disc facing the camera at the sphere's projected centre, not rotating with the orbit.
+  - **Wormhole.** Non-members nearer the camera than the sphere's centre and near its screen
+    circle are pushed radially out to the rim band and faded to ghost silhouettes
+    (`wormhole()` in `canvas-view.ts`: `WORMHOLE_REACH`, `GHOST_FADE`). A ghost sinks to the
+    lowest depth so it cannot occlude the contents, and is neither hoverable nor selectable.
+  - **Frames.** A scope member's position carries its own frame (`MapPos.billboard`: the sphere
+    centre it is laid out around), and a move between two frames (scope open/close/lens switch,
+    2-D↔3-D conversion) is stored as `{…, from, mix}` and blended in *view* space by
+    `CanvasView._viewFrame` — never lerped in world coordinates, which would glide toward an
+    unrelated cube point before snapping.
+  - **Frosted glass.** The scope disc is a pane of glass over the rest of the map: non-members
+    that project inside its circle are pushed to the inner rim band (`rimPush()`, not hoverable
+    or selectable) and stay visible *behind* the glass, which blurs and tints the grid, cube and
+    outer blobs (`_drawGlass`: clip + `ctx.filter` blur self-copy + background tint). The
+    scope's members render sharp on top. Blur radius is `?glass=<css px>` (default 7, `0` =
+    tint only); without `ctx.filter` support (Safari) the tint alone is used, stronger.
+- **Weight sliders** work live in 3-D: the landmark Jacobian is dimension-agnostic and the
+  frontend approximates z like x/y; a Jacobian fetched for the other dimensionality is never
+  applied (`_jacobianKey` carries `dims`).
+- **Off in 3-D:** the 2-D grid (a cube frame is drawn), tag drag/transform.
+
 ---
 
 ## Tag values and persistence

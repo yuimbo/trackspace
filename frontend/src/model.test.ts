@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { Model, type Track } from "./model";
+import { MAX_PITCH } from "./lib/camera3d";
 
 function track(path: string, folder: string): Track {
   return { path, filename: path, folder, tags: {}, artist: "", title: "" };
@@ -669,5 +670,140 @@ describe("Model eval-mode persistence", () => {
     m2.loadLS();
     expect(m2.hoverPreview).toBe(true);
     expect(m2.showExternal).toBe(true);
+  });
+});
+
+describe("Model 3-D orbit view", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("defaults to off", () => {
+    expect(new Model().view3d).toEqual({ on: false, yaw: 0.6, pitch: 0.35 });
+  });
+
+  it("persists the orbit", () => {
+    const m = new Model();
+    m.view3d = { on: true, yaw: 1.2, pitch: 0.4 };
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.view3d).toEqual({ on: true, yaw: 1.2, pitch: 0.4 });
+  });
+
+  it("falls back to defaults for garbage persisted input", () => {
+    const defaults = { on: false, yaw: 0.6, pitch: 0.35 };
+    for (const stored of [
+      { view3d: "bogus" },
+      { view3d: { on: "yes", yaw: 1.2, pitch: 0.4 } },
+      { view3d: { on: true } },
+      { view3d: { on: true, yaw: "1.2", pitch: 0.4 } },
+      { view3d: { on: false, yaw: 1.2, pitch: 0.4 } },
+    ]) {
+      localStorage.setItem("trackspace", JSON.stringify(stored));
+      const m = new Model();
+      m.loadLS();
+      expect(m.view3d).toEqual(defaults);
+    }
+  });
+
+  it("clamps a persisted pitch to ±MAX_PITCH", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: true, yaw: 0.4, pitch: 99 } }),
+    );
+    const m = new Model();
+    m.loadLS();
+    expect(m.view3d).toEqual({ on: true, yaw: 0.4, pitch: MAX_PITCH });
+
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: true, yaw: 0.4, pitch: -99 } }),
+    );
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.view3d).toEqual({ on: true, yaw: 0.4, pitch: -MAX_PITCH });
+  });
+
+  it("is3d only for a projection lens with the view on, outside eval mode", () => {
+    const m = new Model();
+    expect(m.is3d).toBe(false);
+    m.view3d = { on: true, yaw: 0.6, pitch: 0.35 };
+    // Tags lens: no z axis.
+    m.lensId = "tags";
+    expect(m.is3d).toBe(false);
+    // Projection lens: 3-D.
+    m.lensId = "combined";
+    expect(m.is3d).toBe(true);
+    // Deterministic lens: stays 2-D.
+    m.lensId = "camelot";
+    expect(m.is3d).toBe(false);
+    // Eval gallery forces 2-D even for a projection lens.
+    m.lensId = "combined";
+    m.setEvalMode(true);
+    expect(m.is3d).toBe(false);
+    m.setEvalMode(false);
+    expect(m.is3d).toBe(true);
+    // Toggle off.
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    expect(m.is3d).toBe(false);
+  });
+
+  it("shows3d follows is3d, plus the still-blending collapse state", () => {
+    const m = new Model();
+    m.lensId = "combined";
+    // Not armed, not blending: neither renders 3-D.
+    expect(m.is3d).toBe(false);
+    expect(m.shows3d).toBe(false);
+    // Armed (mid-entry or full): both render 3-D.
+    m.view3d = { on: true, yaw: 0.6, pitch: 0.35 };
+    expect(m.is3d).toBe(true);
+    expect(m.shows3d).toBe(true);
+    // Turned off but still blending back: the collapse tween keeps rendering 3-D.
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3dBlend = 0.5;
+    expect(m.is3d).toBe(false);
+    expect(m.shows3d).toBe(true);
+    // Blend reaches 0: rendering falls back to 2-D.
+    m.view3dBlend = 0;
+    expect(m.shows3d).toBe(false);
+  });
+
+  it("shows3d honours the lens and eval gates, not just the blend", () => {
+    const m = new Model();
+    m.lensId = "tags";
+    m.view3dBlend = 0.5;
+    expect(m.shows3d).toBe(false);
+    m.lensId = "combined";
+    expect(m.shows3d).toBe(true);
+    m.setEvalMode(true);
+    expect(m.shows3d).toBe(false);
+  });
+
+  it("loadLS snaps the blend to the persisted on/off state", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: true, yaw: 0.6, pitch: 0.35 } }),
+    );
+    const m = new Model();
+    m.loadLS();
+    expect(m.view3dBlend).toBe(1);
+
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: false, yaw: 0.6, pitch: 0.35 } }),
+    );
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.view3dBlend).toBe(0);
+  });
+
+  it("does not persist the blend (it is transient)", () => {
+    const m = new Model();
+    m.view3d = { on: true, yaw: 1.2, pitch: 0.4 };
+    m.view3dBlend = 0.3; // mid-tween
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    // The reloaded view starts fully on, not frozen mid-tween.
+    expect(m2.view3dBlend).toBe(1);
   });
 });

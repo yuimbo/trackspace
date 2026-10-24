@@ -2,10 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   Model,
   DEFAULT_CLUSTER_WEIGHTS,
+  type MapPos,
   type Track,
   type ViewModifier,
 } from "../model";
-import { EmbeddingCoordinator } from "./embedding-coordinator";
+import { EmbeddingCoordinator, lerpPos } from "./embedding-coordinator";
 import type { ViewModifierSink } from "./view-modifier-coordinator";
 
 // ─── Fakes ───────────────────────────────────────────────────
@@ -121,10 +122,10 @@ interface Harness {
   update: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   canvas: {
-    animPositions: Map<string, { x: number; y: number }> | null;
+    animPositions: Map<string, MapPos> | null;
     scheduleDraw: ReturnType<typeof vi.fn>;
-    worldPosForTrack(t: Track): { wx: number; wy: number } | null;
-    outerPosForTrack(t: Track): { wx: number; wy: number } | null;
+    worldPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null;
+    outerPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null;
   };
   coord: EmbeddingCoordinator;
   fetchSpy: ReturnType<typeof vi.fn>;
@@ -162,7 +163,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
   const update = vi.fn();
   const scheduleDraw = vi.fn();
   const canvas = {
-    animPositions: null as Map<string, { x: number; y: number }> | null,
+    animPositions: null as Map<string, MapPos> | null,
     scheduleDraw,
     // The real canvas resolves these from the embedding/tag lens; the tests only
     // need a stable outer position for scope membership and anchors.
@@ -186,9 +187,13 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
 /** Outer position for scope membership/anchors: the embedding map, else 0.5. */
-function outerPos(m: Model, t: Track): { wx: number; wy: number } | null {
+function outerPos(m: Model, t: Track): { wx: number; wy: number; wz?: number } | null {
   const ep = m.embeddingPositions.get(t.path);
-  return ep ? { wx: ep.x, wy: ep.y } : { wx: 0.5, wy: 0.5 };
+  return ep
+    ? ep.z === undefined
+      ? { wx: ep.x, wy: ep.y }
+      : { wx: ep.x, wy: ep.y, wz: ep.z }
+    : { wx: 0.5, wy: 0.5 };
 }
 
 function fetchCalls(fetchSpy: ReturnType<typeof vi.fn>, prefix: string): number {
@@ -382,6 +387,489 @@ describe("EmbeddingCoordinator projection fetch", () => {
     model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
     await coord.fetchWeightJacobian();
     expect(jacCalls()).toBe(2);
+  });
+});
+
+// ─── 3-D orbit view ─────────────────────────────────────────
+
+describe("EmbeddingCoordinator 3-D view", () => {
+  it("appends dims=3 to the projection URL only when 3-D is on", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    let proj = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.startsWith("/api/embeddings/projection"));
+    expect(proj.at(-1)!).not.toContain("dims=3");
+
+    model.view3d.on = true;
+    await coord.ensureAndProject();
+    proj = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.startsWith("/api/embeddings/projection"));
+    expect(proj.at(-1)!).toContain("dims=3");
+  });
+
+  it("keeps z from the server in embeddingPositions", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/projection")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.2, y: 0.3, z: 0.7 }],
+            revision: "rev-1",
+          }
+        : STATUS_OK,
+    );
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({
+      x: 0.2,
+      y: 0.3,
+      z: 0.7,
+    });
+  });
+
+  it("setView3D refetches with dims=3, back without, and revisits hit the cache", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.2, y: 0.3 }]]);
+
+    await coord.setView3D(true);
+    let proj = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.startsWith("/api/embeddings/projection"));
+    expect(proj.at(-1)!).toContain("dims=3");
+    expect(model.view3d.on).toBe(true);
+
+    await coord.setView3D(false);
+    proj = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.startsWith("/api/embeddings/projection"));
+    expect(proj.at(-1)!).not.toContain("dims=3");
+    expect(model.view3d.on).toBe(false);
+
+    const before = proj.length;
+    await coord.setView3D(true); // the 3-D layout is cached now: no extra fetch
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(before);
+  });
+
+  it("lerpPos lerps x/y, and z only when either side has one", () => {
+    expect(lerpPos({ x: 0, y: 0 }, { x: 1, y: 1 }, 0.5)).toEqual({
+      x: 0.5,
+      y: 0.5,
+    });
+    expect(
+      lerpPos({ x: 0, y: 0, z: 0 }, { x: 1, y: 1, z: 1 }, 0.5),
+    ).toEqual({ x: 0.5, y: 0.5, z: 0.5 });
+    // A missing side reads as the cube centre (0.5).
+    expect(lerpPos({ x: 0, y: 0 }, { x: 1, y: 1, z: 1 }, 0.5)).toEqual({
+      x: 0.5,
+      y: 0.5,
+      z: 0.75,
+    });
+  });
+
+  it("lerpPos carries a shared billboard anchor through a same-frame lerp", () => {
+    const bb = { cx: 0.5, cy: 0.5, cz: 0.5 };
+    expect(
+      lerpPos(
+        { x: 0.4, y: 0.3, billboard: bb },
+        { x: 0.6, y: 0.5, billboard: bb },
+        0.5,
+      ),
+    ).toEqual({ x: 0.5, y: 0.4, billboard: bb });
+    // A different anchor is a different frame → cross-frame blend.
+    const other = { cx: 0.6, cy: 0.4, cz: 0.5 };
+    const blended = lerpPos(
+      { x: 0.4, y: 0.3, billboard: bb },
+      { x: 0.6, y: 0.5, billboard: other },
+      0.5,
+    );
+    expect(blended).toEqual({
+      x: 0.6,
+      y: 0.5,
+      billboard: other,
+      from: { x: 0.4, y: 0.3, billboard: bb },
+      mix: 0.5,
+    });
+  });
+
+  it("lerpPos blends different frames in view space via from/mix", () => {
+    const outer = { x: 0.2, y: 0.3, z: 0.7 };
+    const scope = { x: 0.6, y: 0.5, billboard: { cx: 0.5, cy: 0.5, cz: 0.5 } };
+    // e = 0 → entirely the start frame (mix 1); e = 1 → exactly the target (mix 0).
+    expect(lerpPos(outer, scope, 0)).toEqual({
+      x: 0.6,
+      y: 0.5,
+      billboard: scope.billboard,
+      from: outer,
+      mix: 1,
+    });
+    expect(lerpPos(outer, scope, 1)).toEqual({
+      x: 0.6,
+      y: 0.5,
+      billboard: scope.billboard,
+      from: outer,
+      mix: 0,
+    });
+    expect(lerpPos(outer, scope, 0.25)).toEqual({
+      x: 0.6,
+      y: 0.5,
+      billboard: scope.billboard,
+      from: outer,
+      mix: 0.75,
+    });
+    // The reverse (close) keeps the billboard on the `from` side and the target
+    // has no z (a flat outer map).
+    expect(lerpPos(scope, outer, 0.25)).toEqual({
+      x: 0.2,
+      y: 0.3,
+      z: 0.7,
+      from: { x: 0.6, y: 0.5, billboard: scope.billboard },
+      mix: 0.75,
+    });
+  });
+
+  it("carries z through the position animation overlay", async () => {
+    const { model, coord, canvas } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/projection")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.2, y: 0.3, z: 0.7 }],
+            revision: "rev-1",
+          }
+        : STATUS_OK,
+    );
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5 }]]);
+    await coord.setView3D(true);
+    pump(275); // half of the 550 ms toggle tween: ease = 0.5
+    expect(canvas.animPositions!.get("a.mp3")).toEqual({
+      x: expect.closeTo(0.35, 5),
+      y: expect.closeTo(0.4, 5),
+      z: expect.closeTo(0.6, 5),
+    });
+  });
+
+  it("tweens the camera blend to 1 on and back to 0 off", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.2, y: 0.3 }]]);
+    expect(model.view3dBlend).toBe(0);
+
+    await coord.setView3D(true);
+    expect(model.view3dBlend).toBe(0); // the tween has only just started
+    pump(275); // half of the 550 ms blend tween: ease = 0.5
+    expect(model.view3dBlend).toBeCloseTo(0.5, 5);
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+
+    await coord.setView3D(false);
+    pump(600);
+    expect(model.view3dBlend).toBe(0);
+  });
+
+  it("re-toggling mid-tween continues from the current blend", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.2, y: 0.3 }]]);
+
+    await coord.setView3D(true);
+    pump(137.5); // blend ≈ 0.125 (ease at t=0.25)
+    const mid = model.view3dBlend;
+    expect(mid).toBeGreaterThan(0.1);
+    expect(mid).toBeLessThan(0.2);
+
+    await coord.setView3D(false);
+    // The new tween restarts from `mid`, not from 1 (nor from 0): half of the
+    // way back is half of the current value.
+    pump(275);
+    expect(model.view3dBlend).toBeCloseTo(mid / 2, 5);
+    pump(600);
+    expect(model.view3dBlend).toBe(0);
+  });
+
+  it("a position animation started mid-tween does not cancel the blend", async () => {
+    const { model, coord, canvas } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.2, y: 0.3 }]]);
+
+    await coord.setView3D(true); // starts the blend tween AND the position tween
+    pump(137.5);
+    const blendAtRestart = model.view3dBlend;
+    expect(blendAtRestart).toBeGreaterThan(0);
+
+    // A cache-hit refetch restarts the POSITION animation on the shared frame;
+    // the blend tween must keep running on its own frame.
+    await coord.refreshProjection();
+    pump(137.5);
+    expect(model.view3dBlend).toBeGreaterThan(blendAtRestart);
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+    expect(canvas.animPositions).toBeNull();
+  });
+
+  it("sets the blend instantly for a non-projection lens", async () => {
+    const { model, coord } = makeHarness();
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    expect(model.lens().kind).toBe("tags");
+
+    await coord.setView3D(true);
+    expect(model.view3dBlend).toBe(1);
+    expect(raf.pending.size).toBe(0); // no tween frame was started
+
+    await coord.setView3D(false);
+    expect(model.view3dBlend).toBe(0);
+  });
+
+  /** 2-D and 3-D layouts that differ, so a toggle lerp moves x/y/z visibly. */
+  const dimsRoute = (url: string): unknown => {
+    if (url.startsWith("/api/embeddings/status")) return STATUS_OK;
+    if (url.startsWith("/api/embeddings/projection")) {
+      return String(url).includes("dims=3")
+        ? {
+            positions: [
+              { path: "a.mp3", x: 0.5, y: 0.6, z: 0.7 },
+              { path: "b.mp3", x: 0.9, y: 0.7, z: 0.1 },
+            ],
+            revision: "rev-1",
+          }
+        : {
+            positions: [
+              { path: "a.mp3", x: 0.2, y: 0.3 },
+              { path: "b.mp3", x: 0.8, y: 0.9 },
+            ],
+            revision: "rev-1",
+          };
+    }
+    return {};
+  };
+
+  it("holds the camera still until the toggled layout lands, then runs blend and positions together", async () => {
+    const { model, coord, canvas } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([
+      ["a.mp3", { x: 0.5, y: 0.5 }],
+      ["b.mp3", { x: 0.1, y: 0.1 }],
+    ]);
+
+    let resolveProjection!: (v: unknown) => void;
+    const base = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).startsWith("/api/embeddings/projection")) {
+          return new Promise<Response>((resolve) => {
+            resolveProjection = (v: unknown) => resolve(jsonResponse(v));
+          });
+        }
+        return base(input, init);
+      }),
+    );
+
+    const toggling = coord.setView3D(true);
+    // The flag flipped, but with the 3-D layout still in flight the camera has
+    // not started: the blend stays 0 and no tween frame is queued.
+    expect(model.view3d.on).toBe(true);
+    expect(model.view3dBlend).toBe(0);
+    expect(raf.pending.size).toBe(0);
+
+    pump(600); // a long cold fit passes — still flat, still no tween
+    expect(model.view3dBlend).toBe(0);
+    expect(raf.pending.size).toBe(0);
+
+    resolveProjection({
+      positions: [
+        { path: "a.mp3", x: 0.2, y: 0.3, z: 0.7 },
+        { path: "b.mp3", x: 0.8, y: 0.9, z: 0.1 },
+      ],
+      revision: "rev-1",
+    });
+    await toggling;
+
+    // Both animations started on the landed layout, same tick, same duration:
+    // half way, the blend and the dot lerp are both at ease(0.5).
+    pump(275); // half of the 550 ms toggle
+    expect(model.view3dBlend).toBeCloseTo(0.5, 5);
+    const mid = canvas.animPositions!.get("a.mp3")!;
+    expect(mid.x).toBeCloseTo(0.35, 5);
+    expect(mid.y).toBeCloseTo(0.4, 5);
+    expect(mid.z).toBeCloseTo(0.6, 5);
+
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+    expect(canvas.animPositions).toBeNull();
+  });
+
+  it("starts both tweens immediately on a cache-hit toggle", async () => {
+    const { model, coord, canvas } = makeHarness(dimsRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject(); // 2-D layout cached
+    await coord.setView3D(true); // 3-D layout fetched + cached, tween runs out
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+    await coord.setView3D(false); // 2-D cache hit, tween runs out
+    pump(600);
+    expect(model.view3dBlend).toBe(0);
+    expect(canvas.animPositions).toBeNull();
+
+    // Toggle back on: the cached 3-D layout needs no round trip, so the camera
+    // blend and the position lerp start in the same tick as the toggle itself.
+    const toggling = coord.setView3D(true);
+    expect(raf.pending.size).toBe(2); // blend frame + position frame
+    await toggling;
+
+    pump(275); // half of the 550 ms toggle: ease = 0.5
+    expect(model.view3dBlend).toBeCloseTo(0.5, 5);
+    const mid = canvas.animPositions!.get("a.mp3")!;
+    expect(mid.x).toBeCloseTo(0.35, 5); // 2-D (0.2,0.3) → 3-D (0.5,0.6,0.7)
+    expect(mid.y).toBeCloseTo(0.45, 5);
+    expect(mid.z).toBeCloseTo(0.6, 5);
+
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+    expect(canvas.animPositions).toBeNull();
+  });
+
+  it("completes the camera tween when the toggled layout fetch fails", async () => {
+    const { model, coord, canvas } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.2, y: 0.3 }]]);
+
+    const base = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).startsWith("/api/embeddings/projection")) {
+          return Promise.resolve(jsonResponse({ error: "boom" }, false));
+        }
+        return base(input, init);
+      }),
+    );
+
+    await coord.setView3D(true);
+    expect(model.view3d.on).toBe(true);
+    // No 3-D layout arrived: positions are untouched and no position animation
+    // started, but the camera still fades in (the `finally` path).
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({ x: 0.2, y: 0.3 });
+    expect(canvas.animPositions).toBeNull();
+
+    pump(275); // half of the 550 ms blend tween: ease = 0.5
+    expect(model.view3dBlend).toBeCloseTo(0.5, 5);
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+  });
+
+  it("toggles back to 2-D with blend and positions moving together", async () => {
+    const { model, coord, canvas } = makeHarness(dimsRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject(); // 2-D cached
+    await coord.setView3D(true); // 3-D fetched, blend + positions tween in
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({
+      x: 0.5,
+      y: 0.6,
+      z: 0.7,
+    });
+
+    await coord.setView3D(false); // 2-D cache hit: both tweens start together
+    pump(275); // half of the toggle: ease = 0.5
+    expect(model.view3dBlend).toBeCloseTo(0.5, 5);
+    const mid = canvas.animPositions!.get("a.mp3")!;
+    expect(mid.x).toBeCloseTo(0.35, 5);
+    expect(mid.y).toBeCloseTo(0.45, 5);
+    expect(mid.z).toBeCloseTo(0.6, 5); // z lerps back to the missing side (0.5)
+
+    pump(600);
+    expect(model.view3dBlend).toBe(0);
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({ x: 0.2, y: 0.3 });
+    expect(canvas.animPositions).toBeNull();
+  });
+
+  it("fetches the weight Jacobian with dims=3 while 3-D is on", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.1, y: 0.2, z: 0.7 }],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: { maest: [[0.01, 0.02, 0.03]] },
+          }
+        : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "r" },
+    );
+    model.viewMode = "embeddings";
+    model.embeddingsReady = true;
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.1, y: 0.2 }]]);
+    model.view3d.on = true;
+    await coord.fetchWeightJacobian();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).includes("jacobian=1"),
+    );
+    expect(String(call![0])).toContain("dims=3");
+    expect(String(call![0])).toContain("jacobian=1");
+  });
+
+  it("applies approximate weight drags in 3-D, writing z", async () => {
+    const { model, coord, canvas } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [
+              { path: "a.mp3", x: 0.2, y: 0.3, z: 0.5 },
+              { path: "b.mp3", x: 0.7, y: 0.7, z: 0.5 },
+            ],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: {
+              maest: [
+                [0.1, 0, 0.2],
+                [0, 0.1, -0.2],
+              ],
+            },
+          }
+        : { positions: [{ path: "a.mp3", x: 0.2, y: 0.3 }], revision: "r" },
+    );
+    model.viewMode = "embeddings";
+    model.embeddingsReady = true;
+    model.embeddingPositions = new Map([
+      ["a.mp3", { x: 0.2, y: 0.3 }],
+      ["b.mp3", { x: 0.7, y: 0.7 }],
+    ]);
+    model.view3d.on = true;
+    await coord.fetchWeightJacobian();
+    expect(
+      coord.applyApproximateWeights({ ...DEFAULT_CLUSTER_WEIGHTS, maest: 0.6 }),
+    ).toBe(true);
+    // Per-axis renormalisation puts each extreme on its frame edge, z included.
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({ x: 0, y: 0, z: 1 });
+    expect(model.embeddingPositions.get("b.mp3")).toEqual({ x: 1, y: 1, z: 0 });
+    expect(canvas.scheduleDraw).toHaveBeenCalled();
+  });
+
+  it("does not apply a 2-D Jacobian once 3-D is on", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: { maest: [[0.1, 0]] },
+          }
+        : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "r" },
+    );
+    model.viewMode = "embeddings";
+    model.embeddingsReady = true;
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.1, y: 0.2 }]]);
+    await coord.fetchWeightJacobian(); // cached under the 2-D query key
+    model.view3d.on = true; // the key now carries dims=3: stale, refuse
+    expect(
+      coord.applyApproximateWeights({ ...DEFAULT_CLUSTER_WEIGHTS, maest: 0.6 }),
+    ).toBe(false);
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({ x: 0.1, y: 0.2 });
   });
 });
 
@@ -679,6 +1167,297 @@ describe("EmbeddingCoordinator scopes", () => {
       expect(Math.abs(p.x - 0.5)).toBeLessThanOrEqual(0.1 + 1e-9);
       expect(Math.abs(p.y - 0.5)).toBeLessThanOrEqual(0.05 + 1e-9);
     }
+  });
+
+  it("a sphere's membership uses z: equal (x,y) split by depth", async () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([
+      { path: "in.mp3", filename: "in.mp3", folder: "", tags: {}, artist: "", title: "", audio_features: feats(0.5, 1, 0.5) },
+      { path: "out.mp3", filename: "out.mp3", folder: "", tags: {}, artist: "", title: "", audio_features: feats(0.75, 0, 0.5) },
+    ]);
+    // Identical (x, y); only z differs. The sphere at the cube centre (r = 0.2)
+    // contains the centre plane but not the far wall.
+    model.embeddingPositions = new Map([
+      ["in.mp3", { x: 0.5, y: 0.5, z: 0.5 }],
+      ["out.mp3", { x: 0.5, y: 0.5, z: 1 }],
+    ]);
+    await coord.openScope(
+      { shape: "sphere", cx: 0.5, cy: 0.5, cz: 0.5, r: 0.2, lensId: "" },
+      "camelot",
+    );
+    expect(model.scopePositions.has("in.mp3")).toBe(true);
+    expect(model.scopePositions.has("out.mp3")).toBe(false);
+  });
+
+  it("maps a sphere scope's layout like the circle of its radius, with no z", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/projection")
+        ? {
+            positions: [
+              { path: "a.mp3", x: 0.1, y: 0.2 },
+              { path: "b.mp3", x: 0.9, y: 0.8 },
+            ],
+            revision: "rev-1",
+          }
+        : {},
+    );
+    model.setAllTracks([
+      { path: "a.mp3", filename: "a.mp3", folder: "", tags: {}, artist: "", title: "" },
+      { path: "b.mp3", filename: "b.mp3", folder: "", tags: {}, artist: "", title: "" },
+    ]);
+    model.embeddingPositions = new Map([
+      ["a.mp3", { x: 0.5, y: 0.5, z: 0.5 }],
+      ["b.mp3", { x: 0.5, y: 0.5, z: 0.5 }],
+    ]);
+    await coord.openScope(
+      { shape: "sphere", cx: 0.5, cy: 0.5, cz: 0.5, r: 0.2, lensId: "" },
+      "clap",
+    );
+    const sphere = new Map(model.scopePositions);
+    // A sphere's flat layout is tagged with the sphere centre as its billboard
+    // anchor (still no z), so the canvas can draw it facing the camera.
+    for (const p of sphere.values()) {
+      expect(p.z).toBeUndefined();
+      expect(p.billboard).toEqual({ cx: 0.5, cy: 0.5, cz: 0.5 });
+    }
+    // The same raw layout under a circle with the same centre and radius maps
+    // identically — the sphere is the 3-D membership volume, but its contents
+    // are the flat inscribed square, and scopePositions carry no z.
+    await coord.openScope(
+      { shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "" },
+      "clap",
+    );
+    expect([...model.scopePositions.keys()].sort()).toEqual(
+      [...sphere.keys()].sort(),
+    );
+    for (const [path, p] of model.scopePositions) {
+      expect(p.z).toBeUndefined();
+      expect(p.billboard).toBeUndefined();
+      const s = sphere.get(path)!;
+      expect(p.x).toBeCloseTo(s.x, 6);
+      expect(p.y).toBeCloseTo(s.y, 6);
+    }
+  });
+
+  it("does not tag circle or box scope positions with a billboard", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" },
+      "camelot",
+    );
+    for (const p of model.scopePositions.values()) {
+      expect(p.billboard).toBeUndefined();
+    }
+    await coord.openScope(
+      { shape: "box", cx: 0.5, cy: 0.5, r: 0.1, rx: 0.08, ry: 0.04, lensId: "" },
+      "camelot",
+    );
+    for (const p of model.scopePositions.values()) {
+      expect(p.billboard).toBeUndefined();
+    }
+  });
+
+  it("animates a scope open through the overlay with from = the outer position", async () => {
+    const { model, coord, canvas } = makeHarness();
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "sphere", cx: 0.5, cy: 0.5, cz: 0.5, r: 0.2, lensId: "" },
+      "camelot",
+    );
+    // Half of the 280 ms open tween: ease = 0.5.
+    pump(140);
+    const entry = canvas.animPositions!.get("near.mp3")!;
+    // The main frame is the billboarded scope position; `from` is the outer
+    // cube position it started at, blended with mix = 1 - ease strictly in (0, 1).
+    expect(entry.billboard).toEqual({ cx: 0.5, cy: 0.5, cz: 0.5 });
+    expect(entry.from).toEqual({ x: 0.5, y: 0.5 });
+    expect(entry.mix).toBeGreaterThan(0);
+    expect(entry.mix).toBeLessThan(1);
+    expect(entry.mix).toBeCloseTo(0.5, 5);
+  });
+
+  it("keeps the billboard frame on the close-animation entries after scope is null", async () => {
+    const { model, coord, canvas } = makeHarness();
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "sphere", cx: 0.5, cy: 0.5, cz: 0.5, r: 0.2, lensId: "" },
+      "camelot",
+    );
+    pump(600); // open animation completes
+    coord.closeScope();
+    expect(model.scope).toBeNull();
+    // Mid-close: the entry's main frame is the outer target (no z) and its
+    // `from` still carries the billboard anchor, so the canvas can project the
+    // start even though the sphere is gone.
+    pump(140);
+    const entry = canvas.animPositions!.get("near.mp3")!;
+    expect(entry.from!.billboard).toEqual({ cx: 0.5, cy: 0.5, cz: 0.5 });
+    expect(entry.mix).toBeCloseTo(0.5, 5);
+    expect(entry.z).toBeUndefined();
+  });
+
+  it("fetches the scope lens in 2-D while the 3-D view is on", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/projection")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.2, y: 0.3 }],
+            revision: "rev-1",
+          }
+        : {},
+    );
+    model.viewMode = "embeddings"; // active lens: combined (projection) → is3d
+    model.view3d.on = true;
+    model.setAllTracks([
+      { path: "a.mp3", filename: "a.mp3", folder: "", tags: {}, artist: "", title: "" },
+    ]);
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.5, y: 0.5, z: 0.5 }]]);
+    await coord.openScope(
+      { shape: "sphere", cx: 0.5, cy: 0.5, cz: 0.5, r: 0.2, lensId: "" },
+      "clap",
+    );
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).includes("sources=clap"),
+    );
+    expect(String(call![0])).not.toContain("dims=3");
+  });
+
+  it("reuses the cached 2-D scope layout when toggling 3-D with a scope open", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/projection")
+        ? {
+            positions: [
+              { path: "a.mp3", x: 0.2, y: 0.3 },
+              { path: "b.mp3", x: 0.8, y: 0.9 },
+            ],
+            revision: "rev-1",
+          }
+        : {},
+    );
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    model.setAllTracks([
+      { path: "a.mp3", filename: "a.mp3", folder: "", tags: {}, artist: "", title: "" },
+      { path: "b.mp3", filename: "b.mp3", folder: "", tags: {}, artist: "", title: "" },
+    ]);
+    model.embeddingPositions = new Map([
+      ["a.mp3", { x: 0.5, y: 0.5 }],
+      ["b.mp3", { x: 0.52, y: 0.5 }],
+    ]);
+    // Open a 2-D scope: the scope lens layout is fetched and cached under the
+    // 2-D key.
+    await coord.openScope(
+      { shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" },
+      "clap",
+    );
+    const lensUrl = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .find((u) => u.startsWith("/api/embeddings/projection"))!;
+    expect(lensUrl).not.toContain("dims=3");
+
+    // Toggle to 3-D: the main map refetches with dims=3, but the scope re-lays
+    // out from the cached 2-D lens layout — no second lens fetch.
+    await coord.setView3D(true);
+    expect(model.view3d.on).toBe(true);
+    const projectionUrls = fetchSpy.mock.calls
+      .map(([u]) => String(u))
+      .filter((u) => u.startsWith("/api/embeddings/projection"));
+    expect(projectionUrls).toHaveLength(2);
+    expect(projectionUrls[1]).toContain("dims=3");
+  });
+
+  it("converts an open circle scope to a sphere on entering 3-D and back on leaving", async () => {
+    const { model, coord, viewMods } = makeHarness((url) => {
+      if (!url.startsWith("/api/embeddings/projection")) return {};
+      const dims = String(url).includes("dims=3");
+      const row = (path: string, x: number, y: number) =>
+        dims ? { path, x, y, z: 0.5 } : { path, x, y };
+      return {
+        positions: [
+          row("near.mp3", 0.5, 0.5),
+          row("far.mp3", 0.52, 0.5),
+          row("outside.mp3", 1, 1),
+        ],
+        revision: "rev-1",
+      };
+    });
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "circle", cx: 0.5, cy: 0.5, r: 0.1, lensId: "" },
+      "camelot",
+    );
+    const chipId = viewMods.stack[0].id;
+    expect(model.scope?.shape).toBe("circle");
+
+    await coord.setView3D(true);
+    expect(model.scope?.shape).toBe("sphere");
+    expect(model.scope?.r).toBe(0.1);
+    expect(model.scope?.cz).toBe(0.5);
+    expect(model.scope?.lensId).toBe("camelot");
+    // The chip survives the toggle: same id, still the scope modifier.
+    expect(viewMods.stack).toHaveLength(1);
+    expect(viewMods.stack[0].id).toBe(chipId);
+    expect(viewMods.stack[0].kind).toBe("scope");
+
+    await coord.setView3D(false);
+    expect(model.scope?.shape).toBe("circle");
+    expect(model.scope?.r).toBe(0.1);
+    expect(model.scope?.cz).toBeUndefined();
+    expect(model.scope?.lensId).toBe("camelot");
+    expect(viewMods.stack).toHaveLength(1);
+    expect(viewMods.stack[0].id).toBe(chipId);
+  });
+
+  it("converts an open box scope to a sphere spanning its longer half-extent", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/projection")
+        ? {
+            positions: [
+              { path: "near.mp3", x: 0.5, y: 0.5, z: 0.5 },
+              { path: "far.mp3", x: 0.52, y: 0.5, z: 0.5 },
+              { path: "outside.mp3", x: 1, y: 1, z: 0.5 },
+            ],
+            revision: "rev-1",
+          }
+        : {},
+    );
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.viewMode = "embeddings";
+    threeTracks(model);
+    await coord.openScope(
+      { shape: "box", cx: 0.5, cy: 0.5, r: 0.1, rx: 0.08, ry: 0.04, lensId: "" },
+      "camelot",
+    );
+    await coord.setView3D(true);
+    expect(model.scope?.shape).toBe("sphere");
+    expect(model.scope?.r).toBeCloseTo(0.08, 6); // max(rx, ry)
+    expect(model.scope?.rx).toBeUndefined();
+    expect(model.scope?.ry).toBeUndefined();
+  });
+
+  it("scales a sphere's radius with clamping", async () => {
+    const { model, coord } = makeHarness();
+    threeTracks(model);
+    // 3-D outer positions at the sphere's centre depth so membership holds.
+    model.embeddingPositions = new Map([
+      ["near.mp3", { x: 0.5, y: 0.5, z: 0.3 }],
+      ["far.mp3", { x: 0.52, y: 0.5, z: 0.3 }],
+      ["outside.mp3", { x: 1, y: 1, z: 0.3 }],
+    ]);
+    await coord.openScope(
+      { shape: "sphere", cx: 0.5, cy: 0.5, cz: 0.3, r: 0.1, lensId: "" },
+      "camelot",
+    );
+    expect(model.scopePositions.size).toBe(2);
+    await coord.resizeScope(2);
+    expect(model.scope?.r).toBeCloseTo(0.2, 6);
+    expect(model.scope?.cz).toBe(0.3); // centre depth kept, not reset
+    await coord.resizeScope(0.001);
+    expect(model.scope?.r).toBeCloseTo(0.02, 6); // clamped to the minimum
+    await coord.resizeScope(40);
+    expect(model.scope?.r).toBeCloseTo(0.75, 6); // clamped to the maximum
   });
 
   it("opens an empty scope when allowEmpty is set", async () => {

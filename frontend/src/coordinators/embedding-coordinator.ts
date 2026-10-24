@@ -12,10 +12,16 @@
 // `animateAxisChange` (a tag-space animation) lives here too: it writes the same
 // overlay and must cancel the same frame.
 //
+// One camera-only exception to the one-frame rule: the 2-D↔3-D blend tween
+// (`_blendFrame`) writes `model.view3dBlend` — a camera parameter, never a dot
+// position — so it runs on its own frame and can animate alongside a position
+// lerp (a toggle starts them together on the fetched layout) without either
+// cancelling the other.
+//
 // Deps are minimal structural interfaces (not the concrete views) so the
 // coordinator is unit-testable without the DOM-heavy component classes.
 
-import { type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight, scopeContains, scopeHalfExtents } from "../model";
+import { type Billboard, type MapPos, type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight, scopeContains, scopeHalfExtents } from "../model";
 import { type Lens, getLens, lensWaitSources, lensWeights } from "../lib/lenses";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
@@ -34,6 +40,12 @@ type EmbeddingLayoutStatusHint = {
 };
 
 const LAYOUT_CACHE_MAX = 8;
+
+/**
+ * Length of the 2-D↔3-D toggle. The camera blend tween and the dot-position
+ * lerp run together at this length, so the switch reads as one gesture.
+ */
+const TOGGLE_MS = 550;
 
 /** One per-source coverage row from ``GET /api/embeddings/status``. */
 interface CoverageSource {
@@ -74,12 +86,15 @@ function _encodeWeights(w: Record<string, number>): string {
 
 interface CachedLayout {
   revision: string;
-  positions: Map<string, { x: number; y: number }>;
+  positions: Map<string, MapPos>;
 }
+
+/** A single row of ``/api/embeddings/projection``'s ``positions`` array. */
+type ProjectionPos = { path: string; x: number; y: number; z?: number };
 
 /** ``/api/embeddings/projection`` returns ``{ positions, revision }`` (legacy bare array unsupported). */
 function parseProjectionResponse(raw: unknown): {
-  positions: { path: string; x: number; y: number }[];
+  positions: ProjectionPos[];
   revision: string;
 } {
   if (
@@ -88,10 +103,75 @@ function parseProjectionResponse(raw: unknown): {
     "positions" in (raw as object) &&
     Array.isArray((raw as { positions: unknown }).positions)
   ) {
-    const o = raw as { positions: { path: string; x: number; y: number }[]; revision?: string };
+    const o = raw as { positions: ProjectionPos[]; revision?: string };
     return { positions: o.positions, revision: o.revision ?? "" };
   }
   return { positions: [], revision: "" };
+}
+
+/** Build a path → position map from a response's ``positions``, keeping ``z`` when sent. */
+function toPositionMap(positions: ProjectionPos[]): Map<string, MapPos> {
+  const out = new Map<string, MapPos>();
+  for (const p of positions) {
+    out.set(
+      p.path,
+      p.z === undefined ? { x: p.x, y: p.y } : { x: p.x, y: p.y, z: p.z },
+    );
+  }
+  return out;
+}
+
+/** The frame a position lives in: null for the cube, else its billboard anchor. */
+function frameOf(p: MapPos): Billboard | null {
+  return p.billboard ?? null;
+}
+
+/** True when *a* and *b* draw in the same frame (same billboard anchor, or neither). */
+function sameFrame(a: MapPos, b: MapPos): boolean {
+  const fa = frameOf(a);
+  const fb = frameOf(b);
+  if (!fa || !fb) return fa === fb;
+  return fa.cx === fb.cx && fa.cy === fb.cy && fa.cz === fb.cz;
+}
+
+/** A position without its own in-flight blend fields (the pure frame to blend from). */
+function stripped(p: MapPos): MapPos {
+  const out: MapPos = { x: p.x, y: p.y };
+  if (p.z !== undefined) out.z = p.z;
+  if (p.billboard) out.billboard = p.billboard;
+  return out;
+}
+
+/**
+ * Lerp two positions on the shared animation frame. ``z`` (the 3-D orbit axis)
+ * is interpolated only when either side has one; a missing side reads as the
+ * cube centre (0.5), so a 2-D↔3-D toggle tweens depth in while x/y slide.
+ *
+ * When the two positions live in DIFFERENT frames — one a cube position and one
+ * a sphere-scope member's flat ``billboard`` layout, or two billboards with
+ * different anchors — no single world position exists: the dot must move in
+ * VIEW space. The result then carries the target frame ``b`` plus ``from`` (the
+ * start position, stripped of any animation fields) and ``mix = 1 - e``; the
+ * canvas blends the two frames' projections linearly, so at e = 1 the dot is
+ * exactly ``b``'s frame and at e = 0 exactly ``a``'s. Same-frame positions keep
+ * today's x/y (and z) lerp, and share the billboard anchor through.
+ */
+export function lerpPos(a: MapPos, b: MapPos, e: number): MapPos {
+  if (!sameFrame(a, b)) {
+    return {
+      x: b.x,
+      y: b.y,
+      z: b.z,
+      billboard: b.billboard,
+      from: stripped(a),
+      mix: 1 - e,
+    };
+  }
+  const x = a.x + (b.x - a.x) * e;
+  const y = a.y + (b.y - a.y) * e;
+  if (a.billboard) return { x, y, billboard: a.billboard };
+  if (a.z === undefined && b.z === undefined) return { x, y };
+  return { x, y, z: (a.z ?? 0.5) + ((b.z ?? 0.5) - (a.z ?? 0.5)) * e };
 }
 
 export interface EmbeddingDeps {
@@ -102,12 +182,12 @@ export interface EmbeddingDeps {
   viewMods: ViewModifierSink;
   /** The canvas overlay the position animations drive (mutable, not just a repaint). */
   canvas: {
-    animPositions: Map<string, { x: number; y: number }> | null;
+    animPositions: Map<string, MapPos> | null;
     scheduleDraw(): void;
     /** Current resolved position (scope-aware), or null when hidden. */
-    worldPosForTrack(t: Track): { wx: number; wy: number } | null;
+    worldPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null;
     /** Position ignoring any scope, for membership and open/close anchors. */
-    outerPosForTrack(t: Track): { wx: number; wy: number } | null;
+    outerPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null;
   };
 }
 
@@ -126,10 +206,27 @@ export class EmbeddingCoordinator {
 
   /** Source-weight Jacobian at the last fetched weights, for live drags. */
   private _weightJacobian: WeightJacobian | null = null;
-  /** Query string the cached Jacobian was evaluated at (empty = none). */
+  /** Query string the cached Jacobian was evaluated at (empty = none). Also
+   *  gates application: the key carries ``dims=3``, so a Jacobian fetched for
+   *  the other dimensionality is never applied to the current view. */
   private _jacobianKey = "";
 
   private _animFrame = 0;
+  /**
+   * Own rAF handle for the 3-D camera-blend tween. Deliberately NOT the shared
+   * `_animFrame`: it writes only `view3dBlend` (a camera parameter, never a dot
+   * position), so it must be able to run alongside a position lerp — a 2-D↔3-D
+   * toggle starts the blend tween and the position tween together on the new
+   * layout, on their own frames — without either cancelling the other.
+   */
+  private _blendFrame = 0;
+  /**
+   * Camera-blend target (0 or 1) of an in-flight 2-D↔3-D toggle whose layout
+   * has not applied yet. `_applyPositions` consumes it and starts the blend and
+   * position tweens together; a re-toggle simply overwrites it, dropping the
+   * old pending target. Null while no toggle is waiting on a layout.
+   */
+  private _toggleTarget: 0 | 1 | null = null;
   /** Monotonic request id; a slow projection must not overwrite a newer one. */
   private _projectionSeq = latestSeq();
   /** Monotonic request id for scope recomputes (lens switch / resize). */
@@ -190,6 +287,7 @@ export class EmbeddingCoordinator {
     clearTimeout(this._embedPollTimer);
     this._embedPollTimer = 0;
     this._closeEmbeddingStream();
+    cancelAnimationFrame(this._blendFrame);
     this.cancelAnimation();
   }
 
@@ -227,11 +325,105 @@ export class EmbeddingCoordinator {
     return this._fetchProjection();
   }
 
+  /**
+   * Toggle the 3-D orbit view. A projection lens is refetched so the positions
+   * carry z; tags/deterministic lenses stay 2-D and the flag just flips without
+   * a fetch. Layouts are cached by query string (with vs. without `dims=3`), so
+   * a back-and-forth toggle is instant. The camera blend tween and the position
+   * lerp start together, at the same length, once the toggled layout is in hand
+   * (`_applyPositions` consumes `_toggleTarget`): entering fades from head-on
+   * orthographic out to the orbit angle while the dots gain depth, leaving
+   * reverses both. If the fetch never applies (failure, superseded, nothing to
+   * place), `finally` still runs the camera tween alone so the blend completes.
+   *
+   * An open scope survives the toggle: its shape converts with the view (circle
+   * → sphere entering, sphere → circle leaving) and it re-lays out over the NEW
+   * outer layout once the refetch has landed — membership is decided in the
+   * dimensionality being entered. The scope chip stays put.
+   */
+  async setView3D(on: boolean): Promise<void> {
+    const m = this.deps.model;
+    if (this._evalInert || m.view3d.on === on) return;
+    m.view3d.on = on;
+    m.saveLS();
+    this.deps.status.update(m);
+    this.deps.canvas.scheduleDraw();
+    if (m.lens().kind === "projection") {
+      // Hold the blend target until the toggled layout is in hand: the camera
+      // tween and the position lerp then start together (see `_applyPositions`),
+      // so the switch reads as one gesture instead of rotate-then-move. A
+      // re-toggle just overwrites the target; a fetch that never applies
+      // (failure, superseded, nothing to place) still completes the camera in
+      // `finally` below.
+      this._toggleTarget = on ? 1 : 0;
+      try {
+        if (m.embeddingPositions.size === 0) await this.ensureAndProject();
+        else await this._fetchProjection();
+      } finally {
+        const target = this._toggleTarget;
+        this._toggleTarget = null;
+        if (target !== null) this._tweenBlend(target);
+      }
+    } else {
+      // Tags/deterministic lenses never render 3-D: flip the blend instantly.
+      this._tweenBlend(on ? 1 : 0);
+    }
+    // Convert and re-lay out an open scope over the new outer positions. Only a
+    // projection lens ever renders 3-D, so `is3d` (not the bare flag) picks the
+    // shape: on a tags/deterministic lens the toggle is a no-op and the scope
+    // keeps its 2-D shape.
+    if (m.scope) {
+      const next = this._convertScopeShape(m.scope);
+      if (next !== m.scope) {
+        const start = new Map(m.scopePositions);
+        m.scope = next;
+        const targets = await this._relayoutScope(next);
+        if (targets) this._animateOverlay(start, targets);
+      }
+    }
+  }
+
+  /**
+   * Tween the 3-D camera blend (`view3dBlend`) to *target* (0 = head-on
+   * orthographic, 1 = full orbit + perspective) on its OWN frame (`_blendFrame`),
+   * so a re-toggle cancels the in-flight tween and continues from wherever the
+   * blend has reached. A 2-D↔3-D toggle starts it from `_applyPositions`
+   * alongside the position lerp at the same length, so the camera and the dots
+   * arrive together. On a non-projection lens nothing ever renders 3-D, so the
+   * blend is set instantly instead of animating a no-op.
+   */
+  private _tweenBlend(target: number, ms = TOGGLE_MS): void {
+    const m = this.deps.model;
+    const cv = this.deps.canvas;
+    if (m.lens().kind !== "projection") {
+      m.view3dBlend = target;
+      return;
+    }
+    const from = m.view3dBlend;
+    if (from === target) return;
+    cancelAnimationFrame(this._blendFrame);
+    const t0 = performance.now();
+    const step = () => {
+      const t = Math.min(1, (performance.now() - t0) / ms);
+      const e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      m.view3dBlend = from + (target - from) * e;
+      cv.scheduleDraw();
+      if (t < 1) {
+        this._blendFrame = requestAnimationFrame(step);
+      } else {
+        m.view3dBlend = target;
+        cv.scheduleDraw();
+      }
+    };
+    this._blendFrame = requestAnimationFrame(step);
+  }
+
   /** Fetch the source-weight Jacobian at the current weights, once per weights.
    *
    *  The server evaluates it at the weights it is queried with, so the base
    *  vector must match the one the drag starts from. It costs one projection per
-   *  source, so the result is cached by the query string: reopening the panel or
+   *  source, so the result is cached by the query string — 2-D and 3-D payloads
+   *  cache separately, as the key carries ``dims=3``: reopening the panel or
    *  dragging back to the same weights must not recompute it. A failed fetch
    *  leaves the approximation unavailable and the drag falls back to the full
    *  recompute.
@@ -260,12 +452,23 @@ export class EmbeddingCoordinator {
   /** Approximate positions for a live slider drag; false when unavailable.
    *
    *  The Jacobian carries the base positions it was evaluated at, so repeated
-   *  drag events each step from that same base rather than compounding.
+   *  drag events each step from that same base rather than compounding. It is
+   *  only applied when its query key matches the current projection query, so a
+   *  Jacobian fetched for the other dimensionality (2-D vs 3-D) is never applied
+   *  to the wrong view.
    */
   applyApproximateWeights(weights: Record<string, number>): boolean {
     if (this._evalInert) return false;
     const m = this.deps.model;
-    if (!this._weightJacobian || m.embeddingPositions.size === 0) return false;
+    if (
+      !this._weightJacobian ||
+      // A Jacobian fetched for the other dimensionality (2-D vs 3-D) must never
+      // be applied: the key carries ``dims=3``, so it only matches the current
+      // projection query.
+      this._jacobianKey !== this._projectionQueryString() ||
+      m.embeddingPositions.size === 0
+    )
+      return false;
     m.embeddingPositions = approximatePositions(this._weightJacobian, weights);
     this.deps.canvas.scheduleDraw();
     return true;
@@ -486,6 +689,7 @@ export class EmbeddingCoordinator {
   private _projectionQueryString(
     methodOverride?: string,
     lensOverride?: Lens,
+    dimsOverride?: 2 | 3,
   ): string {
     const method = methodOverride ?? "tsne";
     const m = this.deps.model;
@@ -505,7 +709,14 @@ export class EmbeddingCoordinator {
     // key must stay stable so existing cached layouts remain valid.
     const w = lensWeights(lens, m.clusterWeights);
     const wq = _weightsAreDefault(w) ? "" : `&w=${_encodeWeights(w)}`;
-    return `${base}${src}${wq}${ext}${fit}`;
+    // 3-D is a client-side toggle with a server z axis, so it gets its own
+    // query key: 2-D and 3-D layouts cache separately. A scope lens layout is
+    // always 2-D — a sphere's contents are a flat map, and the 2-D key is the
+    // one a plain 2-D request uses — so `_fetchLensPositions` overrides the
+    // dimensionality; everything else follows the view.
+    const dim = dimsOverride ?? (m.is3d ? 3 : 2);
+    const dims = dim === 3 ? "&dims=3" : "";
+    return `${base}${src}${wq}${ext}${fit}${dims}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.
@@ -535,10 +746,7 @@ export class EmbeddingCoordinator {
       if (!positions.length) return;
 
       const isFirst = m.embeddingPositions.size === 0;
-      const newPositions = new Map<string, { x: number; y: number }>();
-      for (const p of positions) {
-        newPositions.set(p.path, { x: p.x, y: p.y });
-      }
+      const newPositions = toPositionMap(positions);
       m.embeddingsReady = true;
 
       if (isFirst && m.viewMode === "embeddings") {
@@ -555,14 +763,19 @@ export class EmbeddingCoordinator {
     }
   }
 
-  /** Smoothly lerp from current embedding positions to *newPositions*. */
+  /**
+   * Smoothly lerp from current embedding positions to *newPositions*. A 2-D↔3-D
+   * toggle passes TOGGLE_MS so the dots arrive in step with the camera blend
+   * tween (see `_applyPositions`); every other transition keeps 260 ms.
+   */
   private _animatePositionUpdate(
-    newPositions: Map<string, { x: number; y: number }>,
+    newPositions: Map<string, MapPos>,
+    ms = 260,
   ): void {
     const cv = this.deps.canvas;
     const m = this.deps.model;
 
-    const startPos = new Map<string, { x: number; y: number }>();
+    const startPos = new Map<string, MapPos>();
     for (const [path] of newPositions) {
       const cur =
         cv.animPositions?.get(path) ?? m.embeddingPositions.get(path);
@@ -578,7 +791,7 @@ export class EmbeddingCoordinator {
     }
 
     cv.animPositions = new Map(startPos);
-    const DURATION = 260;
+    const DURATION = ms;
     const t0 = performance.now();
 
     cancelAnimationFrame(this._animFrame);
@@ -590,10 +803,7 @@ export class EmbeddingCoordinator {
       for (const [path, start] of startPos) {
         const target = m.embeddingPositions.get(path);
         if (!target) continue;
-        cv.animPositions!.set(path, {
-          x: start.x + (target.x - start.x) * ease,
-          y: start.y + (target.y - start.y) * ease,
-        });
+        cv.animPositions!.set(path, lerpPos(start, target, ease));
       }
       for (const [path, pos] of m.embeddingPositions) {
         if (!startPos.has(path)) cv.animPositions!.set(path, pos);
@@ -665,10 +875,7 @@ export class EmbeddingCoordinator {
       // takes seconds); its response must win, not this stale one.
       if (!this._projectionSeq.isCurrent(reqSeq)) return;
       const { positions, revision } = parseProjectionResponse(raw);
-      const newPositions = new Map<string, { x: number; y: number }>();
-      for (const p of positions) {
-        newPositions.set(p.path, { x: p.x, y: p.y });
-      }
+      const newPositions = toPositionMap(positions);
       if (revision) {
         this._layoutCachePut(qs, { revision, positions: newPositions });
       }
@@ -696,14 +903,24 @@ export class EmbeddingCoordinator {
     this.deps.canvas.scheduleDraw();
   }
 
-  /** Apply a positions map to the model, animating the transition. */
-  private _applyPositions(
-    newPositions: Map<string, { x: number; y: number }>,
-  ): void {
+  /**
+   * Apply a positions map to the model, animating the transition. Every layout
+   * application funnels through here (fetches and client-cache hits alike), so a
+   * pending 2-D↔3-D toggle target is consumed here: its camera blend tween and
+   * the position lerp start together at TOGGLE_MS — one gesture — instead of the
+   * camera rotating ahead of a slow refetch. A re-toggle overwrote the target,
+   * so the newest toggle always wins.
+   */
+  private _applyPositions(newPositions: Map<string, MapPos>): void {
     const m = this.deps.model;
+    const target = this._toggleTarget;
+    this._toggleTarget = null;
     if (m.viewMode === "embeddings") {
       if (m.embeddingPositions.size > 0) {
-        this._animatePositionUpdate(newPositions);
+        this._animatePositionUpdate(
+          newPositions,
+          target !== null ? TOGGLE_MS : undefined,
+        );
       } else {
         m.embeddingPositions = newPositions;
         this._animateToEmbeddings();
@@ -711,6 +928,7 @@ export class EmbeddingCoordinator {
     } else {
       m.embeddingPositions = newPositions;
     }
+    if (target !== null) this._tweenBlend(target, TOGGLE_MS);
   }
 
   private _animateToEmbeddings(): void {
@@ -718,7 +936,7 @@ export class EmbeddingCoordinator {
     const m = this.deps.model;
 
     // Capture current screen positions as starting points
-    const startPos = new Map<string, { x: number; y: number }>();
+    const startPos = new Map<string, MapPos>();
     for (const t of m.tracks) {
       if (m.viewMode === "embeddings" && m.embeddingPositions.has(t.path)) {
         const existing = cv.animPositions?.get(t.path);
@@ -745,10 +963,7 @@ export class EmbeddingCoordinator {
       for (const [path, start] of startPos) {
         const target = m.embeddingPositions.get(path);
         if (!target) continue;
-        cv.animPositions!.set(path, {
-          x: start.x + (target.x - start.x) * ease,
-          y: start.y + (target.y - start.y) * ease,
-        });
+        cv.animPositions!.set(path, lerpPos(start, target, ease));
       }
       cv.scheduleDraw();
       if (t < 1) {
@@ -1044,12 +1259,58 @@ export class EmbeddingCoordinator {
     if (!scope) return Promise.resolve();
     const next = this._scaleScope(scope, factor);
     m.scope = next;
+    // No animation here: a scroll-resize accumulates and the region updates
+    // synchronously, so the dots follow in the same tick.
+    return this._relayoutScope(next).then(() => undefined);
+  }
+
+  /**
+   * Recompute the open scope's positions over the current outer layout and
+   * apply them (no animation — the caller animates when a tween is wanted).
+   * Guarded by `_scopeSeq`: a newer scope op (resize, lens switch, 3-D toggle)
+   * supersedes an in-flight recompute. Returns the new positions, or null when
+   * a newer op won.
+   */
+  private async _relayoutScope(
+    next: Scope,
+  ): Promise<Map<string, MapPos> | null> {
+    const m = this.deps.model;
     const seq = this._scopeSeq.next();
-    return this._computeScopeRaw(next).then(({ raw }) => {
-      if (!this._scopeSeq.isCurrent(seq)) return;
-      m.scopePositions = this._mapIntoScope(raw, next);
-      this.deps.canvas.scheduleDraw();
-    });
+    const { raw } = await this._computeScopeRaw(next);
+    if (!this._scopeSeq.isCurrent(seq)) return null;
+    const targets = this._mapIntoScope(raw, next);
+    m.scopePositions = targets;
+    this.deps.canvas.scheduleDraw();
+    return targets;
+  }
+
+  /** Convert an open scope between its 2-D and 3-D shapes for the current view.
+   *
+   *  In 3-D a circle becomes the sphere inscribed at its centre, a box the
+   *  sphere whose radius spans its longer half-extent; the reverse drops the
+   *  3-D-only fields. A shape already matching the view is returned unchanged.
+   */
+  private _convertScopeShape(scope: Scope): Scope {
+    if (this.deps.model.is3d) {
+      if (scope.shape === "sphere") return scope;
+      const { hw, hh } = scopeHalfExtents(scope);
+      return {
+        shape: "sphere",
+        cx: scope.cx,
+        cy: scope.cy,
+        cz: 0.5,
+        r: scope.shape === "box" ? Math.max(hw, hh) : scope.r,
+        lensId: scope.lensId,
+      };
+    }
+    if (scope.shape === "circle") return scope;
+    return {
+      shape: "circle",
+      cx: scope.cx,
+      cy: scope.cy,
+      r: scope.r,
+      lensId: scope.lensId,
+    };
   }
 
   /** Close the active scope, animating its tracks back to their outer positions. */
@@ -1067,7 +1328,7 @@ export class EmbeddingCoordinator {
   private _closeScopeState(): void {
     const m = this.deps.model;
     if (!m.scope) return;
-    const start = new Map<string, { x: number; y: number }>();
+    const start = new Map<string, MapPos>();
     for (const path of m.scopePositions.keys()) {
       const p = m.scopePositions.get(path);
       if (p) start.set(path, { ...p });
@@ -1075,12 +1336,19 @@ export class EmbeddingCoordinator {
     m.scope = null;
     m.scopePositions = new Map();
 
-    const targets = new Map<string, { x: number; y: number }>();
+    const targets = new Map<string, MapPos>();
     for (const path of start.keys()) {
       const t = m.trackByPath(path);
       if (!t) continue;
       const p = this.deps.canvas.outerPosForTrack(t);
-      if (p) targets.set(path, { x: p.wx, y: p.wy });
+      if (p) {
+        targets.set(
+          path,
+          p.wz === undefined
+            ? { x: p.wx, y: p.wy }
+            : { x: p.wx, y: p.wy, z: p.wz },
+        );
+      }
     }
     this._animateOverlay(start, targets);
   }
@@ -1089,20 +1357,20 @@ export class EmbeddingCoordinator {
   private async _computeScopeRaw(
     scope: Scope,
   ): Promise<{
-    raw: Map<string, { x: number; y: number }>;
+    raw: Map<string, MapPos>;
     inScope: Track[];
   }> {
     const m = this.deps.model;
     const lens = getLens(scope.lensId);
     const inScope = m.allTracks.filter((t) => {
       const p = this.deps.canvas.outerPosForTrack(t);
-      return p != null && scopeContains(scope, p.wx, p.wy);
+      return p != null && scopeContains(scope, p.wx, p.wy, p.wz);
     });
     const all =
       lens.kind === "deterministic" && lens.compute
         ? null
         : await this._fetchLensPositions(lens);
-    const raw = new Map<string, { x: number; y: number }>();
+    const raw = new Map<string, MapPos>();
     for (const t of inScope) {
       const p = lens.compute ? lens.compute(t) : (all?.get(t.path) ?? null);
       if (p) raw.set(t.path, p);
@@ -1113,14 +1381,21 @@ export class EmbeddingCoordinator {
   /** Outer positions for *paths*, as scope-open anchors. */
   private _startFromOuter(
     paths: Iterable<string>,
-  ): Map<string, { x: number; y: number }> {
+  ): Map<string, MapPos> {
     const m = this.deps.model;
-    const out = new Map<string, { x: number; y: number }>();
+    const out = new Map<string, MapPos>();
     for (const path of paths) {
       const t = m.trackByPath(path);
       if (!t) continue;
       const p = this.deps.canvas.outerPosForTrack(t);
-      if (p) out.set(path, { x: p.wx, y: p.wy });
+      if (p) {
+        out.set(
+          path,
+          p.wz === undefined
+            ? { x: p.wx, y: p.wy }
+            : { x: p.wx, y: p.wy, z: p.wz },
+        );
+      }
     }
     return out;
   }
@@ -1134,6 +1409,9 @@ export class EmbeddingCoordinator {
       const ry = clampR(hh * factor);
       return { ...scope, rx, ry, r: Math.max(rx, ry) };
     }
+    if (scope.shape === "sphere") {
+      return { ...scope, r: clampR(scope.r * factor) };
+    }
     return { ...scope, r: clampR(hw * factor) };
   }
 
@@ -1141,12 +1419,18 @@ export class EmbeddingCoordinator {
    * Normalise a scope lens's subset and map it into the region.
    *
    * A circle gets the lens square inscribed in it (no dot escapes the outline); a
-   * box fills the box, so a wide or tall region uses its whole extent.
+   * box fills the box, so a wide or tall region uses its whole extent. A sphere's
+   * contents are a flat map too: the sphere is the 3-D membership volume, but its
+   * tracks are laid out in the same inscribed square as the circle of its radius,
+   * centred on the sphere's (cx, cy). Every scope maps to {x, y} with no z; a
+   * sphere's positions additionally carry the sphere centre as their `billboard`
+   * anchor, so the canvas can draw them facing the camera without reading the
+   * (possibly already-closed) scope.
    */
   private _mapIntoScope(
-    raw: Map<string, { x: number; y: number }>,
+    raw: Map<string, MapPos>,
     scope: Scope,
-  ): Map<string, { x: number; y: number }> {
+  ): Map<string, MapPos> {
     if (raw.size === 0) return new Map();
     let minX = Infinity,
       maxX = -Infinity,
@@ -1163,35 +1447,38 @@ export class EmbeddingCoordinator {
     const { hw, hh } = scopeHalfExtents(scope);
     const sideX = scope.shape === "box" ? hw * 2 : hw * Math.SQRT2;
     const sideY = scope.shape === "box" ? hh * 2 : hh * Math.SQRT2;
-    const out = new Map<string, { x: number; y: number }>();
+    const bb = scope.shape === "sphere" ? { cx: scope.cx, cy: scope.cy, cz: scope.cz ?? 0.5 } : undefined;
+    const out = new Map<string, MapPos>();
     for (const [path, p] of raw) {
-      out.set(path, {
-        x: scope.cx + ((p.x - minX) / rx - 0.5) * sideX,
-        y: scope.cy + ((p.y - minY) / ry - 0.5) * sideY,
-      });
+      const x = scope.cx + ((p.x - minX) / rx - 0.5) * sideX;
+      const y = scope.cy + ((p.y - minY) / ry - 0.5) * sideY;
+      out.set(path, bb ? { x, y, billboard: bb } : { x, y });
     }
     return out;
   }
 
-  /** Fetch one lens's layout without touching the active lens or its positions. */
+  /** Fetch one lens's layout without touching the active lens or its positions.
+   *
+   *  Always fetched in 2-D: a scope's contents are laid out as a flat map in
+   *  every view dimensionality, and the key is the one a plain 2-D request
+   *  uses, so toggling 3-D with a scope open hits the cache. */
   private async _fetchLensPositions(
     lens: Lens,
-  ): Promise<Map<string, { x: number; y: number }>> {
-    const qs = this._projectionQueryString(undefined, lens);
+  ): Promise<Map<string, MapPos>> {
+    const qs = this._projectionQueryString(undefined, lens, 2);
     const cached = this._layoutCache.get(qs);
     if (cached) return new Map(cached.positions);
     const raw = await api<unknown>(`/api/embeddings/projection?${qs}`);
     const { positions, revision } = parseProjectionResponse(raw);
-    const out = new Map<string, { x: number; y: number }>();
-    for (const p of positions) out.set(p.path, { x: p.x, y: p.y });
+    const out = toPositionMap(positions);
     if (revision) this._layoutCachePut(qs, { revision, positions: out });
     return out;
   }
 
   /** Lerp a set of tracks between two position maps on the shared frame. */
   private _animateOverlay(
-    start: Map<string, { x: number; y: number }>,
-    targets: Map<string, { x: number; y: number }>,
+    start: Map<string, MapPos>,
+    targets: Map<string, MapPos>,
   ): void {
     const cv = this.deps.canvas;
     if (start.size === 0 || targets.size === 0) {
@@ -1208,10 +1495,7 @@ export class EmbeddingCoordinator {
       for (const [path, from] of start) {
         const to = targets.get(path);
         if (!to) continue;
-        cv.animPositions!.set(path, {
-          x: from.x + (to.x - from.x) * e,
-          y: from.y + (to.y - from.y) * e,
-        });
+        cv.animPositions!.set(path, lerpPos(from, to, e));
       }
       cv.scheduleDraw();
       if (t < 1) {

@@ -117,7 +117,8 @@ The frontend uses **Vite + TypeScript**, **Alpine.js**, and **HTMX**.
   `tag-panel-view.ts`, …). Shared DOM helpers (toast, loading overlay) live in
   `frontend/src/lib/toast.ts`; folder/cluster/tempo/key colours live in `frontend/src/lib/colors.ts`;
   the max-blended glow overlay is `frontend/src/lib/glow-layer.ts`; the metaball
-  scatter pass is `frontend/src/lib/point-layer.ts`.
+  scatter pass is `frontend/src/lib/point-layer.ts`; the 3-D orbit camera is the pure
+  `frontend/src/lib/camera3d.ts` (see `ui_conventions.md` → *3-D view*).
 - **Alpine.js:** Declarative islands in `frontend/index.html` (e.g. shortcuts modal
   `x-data`, `x-cloak`). Heavier logic stays in TypeScript (controller, coordinators, canvas).
 - **HTMX:** The folder sidebar list is HTML from Flask (`GET /partials/folder-tree`) loaded
@@ -266,7 +267,8 @@ recomputed on load (`services/roots_registry.py`). Each root carries a role:
   The external view-modifier chip's **Refit** toggle sends `fit_scope=all` to opt into
   the old external-inclusive refit. Visibility also gates their drawing
   (`Model.isVisible`), and the head does not learn from their folder labels by
-  default.
+  default. A `dims=3` request is always a single chart over every visible track (no
+  Nyström placement; see `audio_pipeline.md`).
   Because analysis is content-addressed, marking a root external — or removing it —
   never discards its cached embeddings; re-adding restores it instantly.
 

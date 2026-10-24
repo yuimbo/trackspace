@@ -1,5 +1,12 @@
-import type { HoverTarget, Model, Track } from "../model";
+import type { Billboard, HoverTarget, MapPos, Model, Track } from "../model";
 import { clamp01 } from "../lib/util";
+import {
+  blendCamera,
+  orbitProject,
+  orbitUnproject,
+  readPerspective,
+  type Camera,
+} from "../lib/camera3d";
 import {
   isAudioFeatureAxisId,
   scopeContains,
@@ -26,7 +33,7 @@ import {
   type ColorMode,
 } from "../lib/lenses";
 import { pipelineProgress, phaseLabel, type PipelineProgress } from "../lib/pipeline";
-import { GlowLayer, type GlowPoint } from "../lib/glow-layer";
+import { GlowLayer, type GlowOccluder, type GlowPoint } from "../lib/glow-layer";
 import {
   MetaballLayer,
   POINT_SPLAT_R,
@@ -48,6 +55,24 @@ export interface DotPosition {
   idx: number;
   sx: number;
   sy: number;
+  /** Normalised depth, 1 = nearest the viewer (always 1 in 2-D). */
+  depth: number;
+}
+
+/**
+ * A track's resolved world position: a cube position, or a sphere-scope member's
+ * flat ``billboard`` layout (see ``MapPos``). ``from``/``mix`` describe an
+ * in-flight move between frames: the projection of ``from`` is blended into this
+ * frame's projection with weight ``mix`` (1 = entirely ``from``, 0 = entirely
+ * this position), so cross-frame animations are continuous in view space.
+ */
+interface ResolvedTrackPos {
+  wx: number;
+  wy: number;
+  wz?: number;
+  billboard?: Billboard;
+  from?: { wx: number; wy: number; wz?: number; billboard?: Billboard };
+  mix?: number;
 }
 
 /** One landmark sample point for the search field (path + query cosine). */
@@ -111,8 +136,76 @@ const HIT_RADIUS = 10;
 const HIT_CELL = 24;
 /** Extra screen pixels kept around the viewport before a dot is culled. */
 const CULL_MARGIN = 64;
+/** A 3-D scope gesture snaps to the nearest on-screen dot within this many px. */
+const SNAP_PX = 20;
 const TX_PAD = 14;
 const TX_KNOB_HIT = 9;
+/**
+ * Depth of the front-most splat is scaled into [DEPTH_FLOOR, 1]; the floor keeps a
+ * point's depth strictly positive, because 0 means "no point" in the depth pre-pass.
+ */
+const DEPTH_FLOOR = 0.05;
+/** Depth-cue extremes: how the colour scales at the back (0) vs front (1). */
+const DEPTH_SHADE_MIN = 0.45;
+const DEPTH_SHADE_SPAN = 0.55;
+/** A wormhole-ghosted dot fades to this opacity at full influence (ghost = 1). */
+const GHOST_FADE = 0.85;
+/**
+ * A sphere scope's wormhole pushes in-front non-members out to this multiple of
+ * the sphere's screen radius, ghosting them as they clear the disc. Inside the
+ * circle the frosted glass takes over (`rimPush`); past this reach nothing moves.
+ */
+const WORMHOLE_REACH = 1.7;
+/**
+ * Width of the inner rim band a glassed point is pushed onto, as a fraction of
+ * the sphere's screen radius. `rimPush` maps the inside of the circle onto
+ * [(1 − RIM_BAND)·r, (1 − RIM_BAND + RIM_BAND·0.8)·r].
+ */
+const RIM_BAND = 0.18;
+/**
+ * Frosted-glass tint over the sphere scope at full blur: the disc softens the
+ * grid and the outer blobs, and this tint dims what the blur leaves.
+ */
+export const GLASS_TINT = 0.5;
+/**
+ * Glass tint without a blur (the canvas `filter` is unavailable, e.g. Safari):
+ * the tint alone must hide more, since nothing softens the covered content.
+ */
+export const GLASS_TINT_FLAT = 0.8;
+/** Default sphere-scope glass blur radius in CSS px; `?glass=` tunes it live. */
+export const GLASS_BLUR_PX = 7;
+/** The glass blur is clamped to this ceiling (CSS px). */
+export const MAX_GLASS_BLUR = 24;
+
+/**
+ * A cube-unit depth difference → normalised depth units, the scale `_trackScreen`
+ * maps raw rotated depth to (a cube-unit Δ lands at (1 - DEPTH_FLOOR)·Δ/√3 there).
+ */
+function depthUnits(delta: number): number {
+  return ((1 - DEPTH_FLOOR) * delta) / Math.sqrt(3);
+}
+
+/** GLSL-style smoothstep: 0 below *edge0*, 1 above *edge1*, smooth in between. */
+function smoothstep(edge0: number, edge1: number, x: number): number {
+  const t = clamp01((x - edge0) / (edge1 - edge0));
+  return t * t * (3 - 2 * t);
+}
+
+/** The 8 corners of the unit cube, (x, y, z) each 0 or 1. */
+const CUBE_CORNERS: readonly (readonly [number, number, number])[] = [
+  [0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0],
+  [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1],
+];
+/** The 12 edges of the unit cube, as corner index pairs. */
+const CUBE_EDGES: readonly (readonly [number, number])[] = [
+  [0, 1], [2, 3], [4, 5], [6, 7],
+  [0, 2], [1, 3], [4, 6], [5, 7],
+  [0, 4], [1, 5], [2, 6], [3, 7],
+];
+/** The view-row tabs: a single 3-D orbit toggle. */
+const VIEW_TABS: readonly { id: string; label: string }[] = [
+  { id: "3d", label: "3D" },
+];
 
 /** Halo colour for a key/BPM hover target (folders/clusters use their own colours). */
 const TARGET_GLOW_COLOR = "#8e9bff";
@@ -170,6 +263,107 @@ export function tabAt(
     if (sx >= t.x0 && sx <= t.x1 && sy >= t.y0 && sy <= t.y1) return t.id;
   }
   return null;
+}
+
+/**
+ * 3-D depth shade for a splat: how much brighter a point draws at *depth*
+ * (0 back … 1 front) than a flat 2-D dot. The back of the cube is 45 % of the
+ * colour; the front is full brightness. Point *size* no longer scales here —
+ * perspective (the `scale` from `orbitProject`) owns that, so in 2-D every
+ * point keeps its flat size. Pure, so it is unit-tested directly.
+ *
+ * *blend* scales the whole cue with the 2-D↔3-D camera blend: at 0 every depth
+ * draws at full brightness (exactly the 2-D colours, so the toggle has no pop),
+ * at 1 the full depth shade, linearly between.
+ */
+export function depthShade(depth: number, blend = 1): number {
+  const b = clamp01(blend);
+  const shade = DEPTH_SHADE_MIN + DEPTH_SHADE_SPAN * depth;
+  // `shade * b + (1 - b)` (≡ 1 − (1 − shade)·b) keeps the blend-1 endpoint the
+  // exact old value: 1 − (1 − shade) cancels catastrophically in floats.
+  return shade * b + (1 - b);
+}
+
+/**
+ * The sphere-scope wormhole: displace a NON-member that is nearer the camera
+ * than the sphere's centre and whose screen position falls near the sphere's
+ * projected circle radially OUT of the circle, fading it into a ghost. The
+ * influence ramps up (with *depthReach*) the nearer the point is, and fades out
+ * (with *Rinf = WORMHOLE_REACH·r*) the farther it is from the circle's centre,
+ * so the rim band stays continuous with the untouched outside. Pure, so it is
+ * unit-tested directly.
+ *
+ * *depth* and *centreDepth* are the normalised 0.05–1 depths `_trackScreen`
+ * returns; the displacement itself is done in screen px on the projected circle.
+ */
+export function wormhole(
+  p: { sx: number; sy: number; depth: number },
+  circle: { cx: number; cy: number; r: number },
+  centreDepth: number,
+  depthReach: number,
+): { sx: number; sy: number; ghost: number } {
+  // A degenerate reach/circle cannot displace anything; skip before smoothstep
+  // divides by zero.
+  if (depthReach <= 0 || circle.r <= 0) {
+    return { sx: p.sx, sy: p.sy, ghost: 0 };
+  }
+  // 0 at/behind the centre plane, 1 once the point is depthReach nearer.
+  const s = smoothstep(0, depthReach, p.depth - centreDepth);
+  if (s === 0) return { sx: p.sx, sy: p.sy, ghost: 0 };
+  const Rinf = circle.r * WORMHOLE_REACH;
+  const dx = p.sx - circle.cx;
+  const dy = p.sy - circle.cy;
+  const d = Math.hypot(dx, dy);
+  // 1 inside the circle, fading to 0 at Rinf, so everything past it is untouched.
+  const f = 1 - smoothstep(circle.r, Rinf, d);
+  const w = s * f;
+  if (w === 0) return { sx: p.sx, sy: p.sy, ghost: 0 };
+  // Monotone: maps [0, Rinf] onto [r, Rinf] — inside points push to the rim band.
+  const dOut = circle.r + (Rinf - circle.r) * (d / Rinf);
+  // Away from the centre (fixed +x for a point exactly at it, so it is deterministic).
+  const [ux, uy] = d < 1e-3 ? [1, 0] : [dx / d, dy / d];
+  return {
+    sx: p.sx + (circle.cx + ux * dOut - p.sx) * w,
+    sy: p.sy + (circle.cy + uy * dOut - p.sy) * w,
+    ghost: w,
+  };
+}
+
+/**
+ * Push a non-member that still projects inside a sphere scope's circle onto the
+ * inner rim band, so it stays visible under the frosted glass instead of being
+ * hidden outright. Monotone: maps the inside (`d < r`) onto
+ * [(1 − RIM_BAND)·r, (1 − RIM_BAND + RIM_BAND·0.8)·r] — near the rim, clear of
+ * the circle's centre — along the ray away from the centre (fixed +x for a
+ * point exactly at it, so the result is deterministic). Points at or beyond the
+ * circle are returned unchanged. Pure, so it is unit-tested directly.
+ */
+export function rimPush(
+  p: { sx: number; sy: number },
+  circle: { cx: number; cy: number; r: number },
+): { sx: number; sy: number } {
+  const dx = p.sx - circle.cx;
+  const dy = p.sy - circle.cy;
+  const d = Math.hypot(dx, dy);
+  if (d >= circle.r) return { sx: p.sx, sy: p.sy };
+  const dOut =
+    circle.r * (1 - RIM_BAND) + circle.r * RIM_BAND * 0.8 * (d / circle.r);
+  // Away from the centre (fixed +x for a point exactly at it, so deterministic).
+  const [ux, uy] = d < 1e-3 ? [1, 0] : [dx / d, dy / d];
+  return { sx: circle.cx + ux * dOut, sy: circle.cy + uy * dOut };
+}
+
+/**
+ * Read the sphere-scope glass blur radius from a query string's ``glass``
+ * parameter: finite and clamped to [0, MAX_GLASS_BLUR], else GLASS_BLUR_PX.
+ * ``search`` may be ``"?glass=12"`` or ``"glass=12"``; 0 = no blur, tint only.
+ */
+export function readGlassBlur(search: string): number {
+  const m = /(?:^|[?&])glass=([^&]+)/.exec(search);
+  if (!m) return GLASS_BLUR_PX;
+  const v = Number(m[1]);
+  if (!Number.isFinite(v)) return GLASS_BLUR_PX;
+  return Math.max(0, Math.min(MAX_GLASS_BLUR, v));
 }
 
 export class CanvasView {
@@ -239,19 +433,37 @@ export class CanvasView {
   boxSel: BoxSel | null = null;
   /** True while a lasso/box drag is in intersect (AND) mode — shown in cyan. */
   intersectMode = false;
-  dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null = null;
-  /** In-progress scope box in screen coordinates (drag corners). */
-  scopeDrag: { x0: number; y0: number; x1: number; y1: number } | null = null;
+  dragGhosts: Map<string, { wx: number; wy: number; wz?: number; folder: string }> | null =
+    null;
+  /** In-progress scope drag: screen corners, plus the 3-D sphere origin. */
+  scopeDrag: {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+    /** Sphere centre in cube coords (3-D drags only; the release re-projects it). */
+    sphere?: { cx: number; cy: number; cz: number };
+  } | null = null;
   /** Clickable lens tabs drawn around the open scope (screen rects). */
   scopeTabs: TabHit[] = [];
   /** Clickable lens tabs in the persistent top tabber. */
   lensTabs: TabHit[] = [];
+  /** Clickable view tabs (the 3-D toggle) in the persistent top tabber. */
+  viewTabs: TabHit[] = [];
   /** Clickable colour-mode tabs in the persistent top tabber. */
   colorTabs: TabHit[] = [];
   private _waitTimer = 0;
   _rafId = 0;
   /** Bottom of the top tabbers this frame, so status pills dock below the bloom chip. */
   private _topTabsBottom = TOP_TABS_BOTTOM;
+  /** Perspective strength for the 3-D view; tunable live via ``?persp=…``. */
+  private persp = readPerspective(
+    typeof location !== "undefined" ? location.search : "",
+  );
+  /** Sphere-scope glass blur radius in CSS px; tunable live via ``?glass=…``. */
+  private glassBlur = readGlassBlur(
+    typeof location !== "undefined" ? location.search : "",
+  );
 
   txHandles: TxHandle[] = [];
   _txBox: TxBox | null = null;
@@ -260,7 +472,7 @@ export class CanvasView {
   _txAllowBoxDrag = false;
 
   /** Transient per-track positions used during animated mode transitions. */
-  animPositions: Map<string, { x: number; y: number }> | null = null;
+  animPositions: Map<string, MapPos> | null = null;
 
   /** Transparent WebGL overlay under the scatter: every glow is one additive SDF pass. */
   glow: GlowLayer;
@@ -273,8 +485,17 @@ export class CanvasView {
   points: MetaballLayer;
   /** This frame's splats (all points except the crisp hover/selected ones). */
   private _pointSpecs: PointSpec[] = [];
+  /**
+   * The open sphere scope's member splats (3-D only), rendered in a second pass
+   * above the scope's frosted glass; empty everywhere else.
+   */
+  private _scopeSpecs: PointSpec[] = [];
   /** Hover/selected dots, excluded from the merge so they read as single tracks. */
-  private _crispDots: { sx: number; sy: number; idx: number }[] = [];
+  private _crispDots: { sx: number; sy: number; idx: number; depth: number }[] = [];
+  /** Reused occluder list for the 3-D glow pass (see `_glowOccluders`). */
+  private _occluders: GlowOccluder[] = [];
+  /** Cached map background colour for the sphere-scope glass tint. */
+  private _mapBg: string | null = null;
   /** Screen grid over the visible dots, for the blob-aware hit fallback. */
   private _hitGrid = new Map<string, DotPosition[]>();
 
@@ -330,6 +551,114 @@ export class CanvasView {
     ];
   }
 
+  /**
+   * The camera for this frame: the user's orbit (and perspective strength)
+   * scaled by the 2-D↔3-D blend. At blend 0 it is head-on orthographic; at
+   * blend 1 the full orbit + perspective. Everything that projects — tracks,
+   * the cube, world positions for fit — goes through this one camera so the
+   * transition moves them together.
+   */
+  private _camera(): Camera {
+    return blendCamera(this.model.view3d, this.model.view3dBlend, this.persp);
+  }
+
+  /**
+   * Project a world position into the view frame: the rotated (rx, ry) that
+   * feeds the viewport transform, the rotated depth ``d``, and the perspective
+   * ``scale``. In 2-D this is the raw position with depth 0 and scale 1. Shared
+   * by ``_trackScreen`` (which turns it into screen px + a depth shade), the
+   * sphere scope drawing, which needs the view frame and scale to size its
+   * screen circle, and ``worldPosForTrack``.
+   *
+   * A position carrying a ``billboard`` anchor (a sphere-scope member's flat 2-D
+   * layout) is drawn as a disc facing the camera: it takes the anchor's
+   * projection and lays the member's world offset out at the anchor's
+   * perspective scale, so a member at world offset ``r`` lands on the sphere's
+   * projected circle edge and the disc never rotates with the orbit. The anchor
+   * rides on the position itself, so it survives the scope closing. In 2-D the
+   * flag is ignored — the flat position is drawn as-is.
+   *
+   * This is the ONE place that blends frames: when ``pos.from`` is set, this
+   * frame and the frame of ``from`` (itself from-less) are both projected and
+   * their results blended linearly with weight ``mix``, so a cross-frame move
+   * (a scope member leaving the cube or landing on the billboard) is continuous
+   * in screen space.
+   */
+  private _viewFrame(pos: ResolvedTrackPos): {
+    rx: number;
+    ry: number;
+    d: number;
+    scale: number;
+  } {
+    let frame: { rx: number; ry: number; d: number; scale: number };
+    if (!this.model.shows3d) {
+      frame = { rx: pos.wx, ry: pos.wy, d: 0, scale: 1 };
+    } else if (pos.billboard) {
+      const c = this._viewFrame({
+        wx: pos.billboard.cx,
+        wy: pos.billboard.cy,
+        wz: pos.billboard.cz,
+      });
+      frame = {
+        rx: c.rx + (pos.wx - pos.billboard.cx) * c.scale,
+        ry: c.ry + (pos.wy - pos.billboard.cy) * c.scale,
+        d: c.d,
+        scale: c.scale,
+      };
+    } else {
+      const cam = this._camera();
+      const [rx, ry, d, scale] = orbitProject(
+        cam,
+        pos.wx,
+        pos.wy,
+        pos.wz,
+        cam.persp,
+      );
+      frame = { rx, ry, d, scale };
+    }
+    if (pos.from && pos.mix !== undefined && pos.mix > 0) {
+      const f = this._viewFrame({
+        wx: pos.from.wx,
+        wy: pos.from.wy,
+        wz: pos.from.wz,
+        billboard: pos.from.billboard,
+      });
+      const mix = pos.mix;
+      return {
+        rx: frame.rx * (1 - mix) + f.rx * mix,
+        ry: frame.ry * (1 - mix) + f.ry * mix,
+        d: frame.d * (1 - mix) + f.d * mix,
+        scale: frame.scale * (1 - mix) + f.scale * mix,
+      };
+    }
+    return frame;
+  }
+
+  /**
+   * Project a track's world position to screen for drawing and hit testing. In
+   * 3-D the unit cube is rotated about its centre first — the rotated (rx, ry)
+   * feeds the existing viewport transform, and the rotated z becomes a depth in
+   * [DEPTH_FLOOR, 1], 1 = nearest the viewer. Perspective scales the centred
+   * offsets by `scale` (1 in 2-D, and at the cube centre in 3-D). In 2-D this
+   * is plain `w2s` and depth/scale are 1. Renders 3-D whenever `shows3d` is
+   * true, so the collapse tween keeps projecting until it lands on head-on.
+   */
+  private _trackScreen(pos: ResolvedTrackPos): {
+    sx: number;
+    sy: number;
+    depth: number;
+    scale: number;
+  } {
+    const { rx, ry, d, scale } = this._viewFrame(pos);
+    const [sx, sy] = this.w2s(rx, ry);
+    if (!this.model.shows3d) {
+      return { sx, sy, depth: 1, scale: 1 };
+    }
+    const depth =
+      DEPTH_FLOOR + (1 - DEPTH_FLOOR) * clamp01(0.5 + d / Math.sqrt(3));
+    return { sx, sy, depth, scale };
+  }
+
   /** Minimum zoom: let the user zoom out until the longest axis drives the limit. */
   minZoom(): number {
     const iw = Math.max(1, this.$canvas.clientWidth - 2 * PAD);
@@ -348,9 +677,18 @@ export class CanvasView {
     this.points.sync(this.$canvas);
   }
 
+  /**
+   * Request one draw on the next frame. Requests coalesce: while a draw is pending
+   * further calls are no-ops. (Cancel-and-requeue would let two animation loops that
+   * each call this every frame cancel one another's draw — the canvas then freezes
+   * until they both stop.)
+   */
   scheduleDraw(): void {
-    cancelAnimationFrame(this._rafId);
-    this._rafId = requestAnimationFrame(() => this.draw());
+    if (this._rafId) return;
+    this._rafId = requestAnimationFrame(() => {
+      this._rafId = 0;
+      this.draw();
+    });
   }
 
   /* ── Viewport pan clamping ──────────────────────────────── */
@@ -371,12 +709,21 @@ export class CanvasView {
   /* ── Hit testing ────────────────────────────────────────── */
 
   hitTest(sx: number, sy: number): number {
+    const is3d = this.model.shows3d;
     let best = -1,
-      bestD = HIT_RADIUS;
+      bestD = HIT_RADIUS,
+      bestDepth = -Infinity;
     for (const p of this.positions) {
       const d = Math.hypot(p.sx - sx, p.sy - sy);
-      if (d < bestD) {
+      if (d >= HIT_RADIUS) continue;
+      // In 3-D the front-most candidate wins and distance breaks ties; in 2-D
+      // the nearest candidate wins, as always.
+      const better = is3d
+        ? p.depth > bestDepth || (p.depth === bestDepth && d < bestD)
+        : d < bestD;
+      if (better) {
         bestD = d;
+        bestDepth = p.depth;
         best = p.idx;
       }
     }
@@ -413,6 +760,9 @@ export class CanvasView {
 
   draw(): void {
     this._clampVP();
+    // In 3-D the glow is blitted into the scatter canvas (see the draw order
+    // below); hide its own stacked canvas so it is not composited a second time.
+    this.glow.canvas.style.visibility = this.model.shows3d ? "hidden" : "";
     const m = this.model;
     const tracks = m.tracks;
     const w = this.$canvas.clientWidth,
@@ -423,6 +773,7 @@ export class CanvasView {
     this.txHandles = [];
     this.scopeTabs = [];
     this.lensTabs = [];
+    this.viewTabs = [];
     this.colorTabs = [];
     this._txBox = null;
     this._txWorld = null;
@@ -441,12 +792,33 @@ export class CanvasView {
       return;
     }
 
-    this._drawGrid(w, h);
+    // The 2-D grid and the 3-D cube frame crossfade during the camera tween:
+    // at blend 1 only the cube, at blend 0 (or fully 2-D) only the grid. Each
+    // draws at the opposite alpha, so the transition reads as one continuous
+    // frame rather than a pop between the two guides.
+    if (this.model.shows3d) {
+      const blend = this.model.view3dBlend;
+      if (blend > 0) this._drawCube(blend);
+      if (blend < 1) this._drawGrid(w, h, 1 - blend);
+    } else {
+      this._drawGrid(w, h, 1);
+    }
     this._drawLensGuide();
     this._drawDragGhosts();
     this._drawScatter(tracks);
-    this._renderPoints(tracks);
-    this._renderGlow(tracks);
+    if (this.model.shows3d) {
+      // The 3-D glow is composed into the scatter canvas between the blobs and
+      // the crisp dots: it renders first, occluded by the blobs' depth field,
+      // then is blitted over the blobs so a halo shows over deeper blobs yet
+      // stays under its own and anything nearer (the crisp dots).
+      this._renderBlobs(true);
+      this._renderGlow(tracks);
+      this._blitGlow();
+      this._drawCrispDots(tracks);
+    } else {
+      this._renderPoints(tracks);
+      this._renderGlow(tracks);
+    }
     this._drawTransformBox();
     this._drawBoxSel();
     this._drawLasso();
@@ -528,14 +900,17 @@ export class CanvasView {
 
     let lo = Infinity,
       hi = -Infinity;
-    const placed: { x: number; y: number; score: number }[] = [];
+    const placed: { x: number; y: number; score: number; depth: number }[] = [];
     for (const p of field) {
       const t = m.trackByPath(p.path);
       if (!t) continue;
       const pos = this._resolveTrackWPos(t);
       if (!pos) continue;
-      const [x, y] = this.w2s(pos.wx, pos.wy);
-      placed.push({ x, y, score: p.score });
+      const { sx, sy, depth } = this._trackScreen(pos);
+      // A non-member that projects inside the circle is glassed behind the
+      // scope's disc, so its landmark glow must not bleed through the glass.
+      if (this._behindScope(p.path, sx, sy)) continue;
+      placed.push({ x: sx, y: sy, score: p.score, depth });
       if (p.score < lo) lo = p.score;
       if (p.score > hi) hi = p.score;
     }
@@ -547,6 +922,7 @@ export class CanvasView {
       return {
         x: p.x,
         y: p.y,
+        depth: p.depth,
         radius: FIELD_GLOW_R * (0.55 + 0.45 * w),
         core: 0,
         color: FIELD_GLOW_RGB,
@@ -567,6 +943,7 @@ export class CanvasView {
       points.push({
         x: pos.sx,
         y: pos.sy,
+        depth: pos.depth,
         radius: HOVER_GLOW_R,
         core: HOVER_GLOW_CORE,
         color: parseColor(this._hoverGlowColor(track)),
@@ -576,17 +953,46 @@ export class CanvasView {
     return points;
   }
 
-  /** Splat every glow for this frame in one additive overlay pass. */
+  /** Splat every glow for this frame in one additive overlay pass. In 3-D the
+   * blobs (and crisp dots) in front of a halo are passed as occluders, so the
+   * glow composits behind its own blob yet above deeper ones. */
   private _renderGlow(tracks: Track[]): void {
-    this.glow.render([
+    const points = [
       ...this.collectSearchGlowPoints(),
       ...this.collectHoverGlowPoints(tracks),
-    ]);
+    ];
+    if (this.model.shows3d) {
+      this.glow.render(points, this._glowOccluders());
+    } else {
+      this.glow.render(points);
+    }
+  }
+
+  /**
+   * The 3-D glow's occluders: every splat the metaball layer merges (the outer
+   * map field plus the sphere scope's member field) plus the crisp
+   * hover/selected dots, each with the depth a halo must sit behind.
+   * Point-splat radii are already perspective-scaled, so the occlusion
+   * footprint matches the blob on screen; crisp dots get a `DOT_R_SEL` disc.
+   */
+  private _glowOccluders(): GlowOccluder[] {
+    const occ = this._occluders;
+    occ.length = 0;
+    for (const p of this._pointSpecs) {
+      occ.push({ x: p.x, y: p.y, radius: p.radius, depth: p.depth ?? 0.5 });
+    }
+    for (const p of this._scopeSpecs) {
+      occ.push({ x: p.x, y: p.y, radius: p.radius, depth: p.depth ?? 0.5 });
+    }
+    for (const c of this._crispDots) {
+      occ.push({ x: c.sx, y: c.sy, radius: DOT_R_SEL, depth: c.depth });
+    }
+    return occ;
   }
 
   /* ── Grid + tick labels (adaptive to zoom) ──────────────── */
 
-  private _drawGrid(w: number, h: number): void {
+  private _drawGrid(w: number, h: number, alpha = 1): void {
     const ctx = this.ctx;
     const m = this.model;
 
@@ -601,6 +1007,9 @@ export class CanvasView {
     const [, sTop] = this.w2s(0, 1);
 
     ctx.save();
+    // The 2-D↔3-D crossfade fades the whole grid (overlay, lines, labels)
+    // together; the frame's own save/restore resets it.
+    ctx.globalAlpha = alpha;
 
     // Dark overlay outside [0,1] bounds
     ctx.fillStyle = "rgba(0,0,0,0.55)";
@@ -722,6 +1131,33 @@ export class CanvasView {
     ctx.restore();
   }
 
+  /** 3-D frame replacing the 2-D grid: the 12 edges of the unit cube, projected
+   * through the same orbit as the tracks. An edge whose average end-depth lies
+   * behind the cube centre draws at half alpha, so the near face reads. The
+   * *alpha* argument crossfades it with the 2-D grid during the camera tween. */
+  private _drawCube(alpha = 1): void {
+    const ctx = this.ctx;
+    const corners = CUBE_CORNERS.map(([x, y, z]) =>
+      this._trackScreen({ wx: x, wy: y, wz: z }),
+    );
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.lineWidth = 1;
+    for (const [a, b] of CUBE_EDGES) {
+      const p0 = corners[a];
+      const p1 = corners[b];
+      ctx.strokeStyle =
+        (p0.depth + p1.depth) / 2 < 0.5
+          ? "rgba(255,255,255,0.07)"
+          : "rgba(255,255,255,0.14)";
+      ctx.beginPath();
+      ctx.moveTo(p0.sx, p0.sy);
+      ctx.lineTo(p1.sx, p1.sy);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   /**
    * Large watermark-style axis titles at the plot edges (tag mode only).
    * Drawn behind grid lines and points so they read as canvas background.
@@ -785,13 +1221,25 @@ export class CanvasView {
     };
   }
 
-  /** World (normalised) position for fit / tooling; not clamped. */
-  worldPosForTrack(t: Track): { wx: number; wy: number } | null {
-    return this._resolveTrackWPos(t);
+  /**
+   * World (normalised) position for fit / tooling; not clamped. In 3-D the
+   * returned position is the *rotated* view-frame position (perspective
+   * included), so fit-to-paths / fit-to-folder frame exactly what is on screen.
+   */
+  worldPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null {
+    const pos = this._resolveTrackWPos(t);
+    if (!pos) return null;
+    if (this.model.shows3d) {
+      const { rx, ry } = this._viewFrame(pos);
+      return { wx: rx, wy: ry };
+    }
+    // Drop the billboard anchor and cross-frame blend: they only matter to the
+    // 3-D projection (and in 2-D a from/mix entry draws at its own x/y anyway).
+    return { wx: pos.wx, wy: pos.wy, wz: pos.wz };
   }
 
   /** Outer (pre-scope) position, for scope membership and anchors. */
-  outerPosForTrack(t: Track): { wx: number; wy: number } | null {
+  outerPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null {
     return this._outerTrackWPos(t);
   }
 
@@ -805,28 +1253,53 @@ export class CanvasView {
     return tabAt(this.lensTabs, sx, sy);
   }
 
+  /** View-toggle id under *sx,sy* in the top tabber, else null. */
+  topViewTabAt(sx: number, sy: number): string | null {
+    return tabAt(this.viewTabs, sx, sy);
+  }
+
   /** Colour-mode id under *sx,sy* in the top tabber, else null. */
   topColorTabAt(sx: number, sy: number): string | null {
     return tabAt(this.colorTabs, sx, sy);
   }
 
-  private _resolveTrackWPos(t: Track): { wx: number; wy: number } | null {
+  private _resolveTrackWPos(t: Track): ResolvedTrackPos | null {
     const m = this.model;
 
     // During animation, interpolated positions always take priority
     if (this.animPositions) {
       const ap = this.animPositions.get(t.path);
-      if (ap) return { wx: ap.x, wy: ap.y };
+      if (ap) {
+        return {
+          wx: ap.x,
+          wy: ap.y,
+          wz: ap.z,
+          billboard: ap.billboard,
+          from: ap.from
+            ? {
+                wx: ap.from.x,
+                wy: ap.from.y,
+                wz: ap.from.z,
+                billboard: ap.from.billboard,
+              }
+            : undefined,
+          mix: ap.mix,
+        };
+      }
     }
 
     const outer = this._outerTrackWPos(t);
     if (m.scope) {
       // A scope re-lays out its tracks; scopePositions holds only in-scope paths.
+      // In 3-D with a sphere scope those flat {x, y} layouts are billboarded to
+      // face the camera (see `_viewFrame`), the anchor carried by the position
+      // itself; everywhere else the flag is ignored.
       const sp = m.scopePositions.get(t.path);
-      if (sp) return { wx: sp.x, wy: sp.y };
+      if (sp) return { wx: sp.x, wy: sp.y, wz: sp.z, billboard: sp.billboard };
       // A track the scope lens could not place but whose outer position falls
-      // inside the circle would clutter the re-layout; hide it.
-      if (outer && scopeContains(m.scope, outer.wx, outer.wy)) {
+      // inside the region would clutter the re-layout; hide it. Spheres are
+      // tested in cube coordinates, so the outer wz rides along.
+      if (outer && scopeContains(m.scope, outer.wx, outer.wy, outer.wz)) {
         return null;
       }
     }
@@ -835,15 +1308,40 @@ export class CanvasView {
   }
 
   /** Position ignoring any scope: the embedding lens or the tag axes. */
-  private _outerTrackWPos(t: Track): { wx: number; wy: number } | null {
+  private _outerTrackWPos(t: Track): ResolvedTrackPos | null {
     const m = this.model;
     if (m.viewMode === "embeddings") {
       const ep = m.embeddingPositions.get(t.path);
-      if (ep) return { wx: ep.x, wy: ep.y };
+      if (ep) return { wx: ep.x, wy: ep.y, wz: ep.z };
       // No embedding → hide the track (don't fall back to tag positions)
       return null;
     }
     return this._tagPos(t);
+  }
+
+  /**
+   * A non-member whose (post-wormhole) screen position lies inside the open
+   * sphere scope's circle is glassed: `_drawScatter` pushes it to the inner rim
+   * band under the frosted-glass disc, where it is visible but not hit, and its
+   * search glow is dropped. Members (`scopePositions`) are the scope's own
+   * contents and are never glassed. *circle* is the already-projected sphere
+   * circle when the caller has one (the scatter loop's wormhole context); when
+   * omitted it is recomputed, and the rule is a no-op unless a 3-D sphere scope
+   * is shown.
+   */
+  private _behindScope(
+    path: string,
+    sx: number,
+    sy: number,
+    circle?: { cx: number; cy: number; r: number } | null,
+  ): boolean {
+    if (this.model.scopePositions.has(path)) return false;
+    const c =
+      circle ??
+      (this.model.shows3d && this.model.scope?.shape === "sphere"
+        ? this.scopeScreenCircle()
+        : null);
+    return c !== null && Math.hypot(sx - c.cx, sy - c.cy) < c.r;
   }
 
   private _drawScatter(tracks: Track[]): void {
@@ -852,11 +1350,38 @@ export class CanvasView {
     // Reuse the per-frame buffers: allocating three fresh containers for ~14k
     // tracks on every animation frame is pure GC pressure.
     this._pointSpecs.length = 0;
+    this._scopeSpecs.length = 0;
     this._crispDots.length = 0;
     this._hitGrid.clear();
     const w = this.$canvas.clientWidth;
     const h = this.$canvas.clientHeight;
     let anyFiltered = false;
+    // Sphere scope in 3-D: the disc is a frosted-glass backdrop for its members,
+    // so a non-member in front of the sphere is wormholed radially out of the
+    // projected circle, ghosting as it goes; one that still projects inside the
+    // circle lies behind the glass and is pushed to the inner rim band
+    // (`rimPush`) — visible under the glass, but not hittable. Members
+    // (`scopePositions`) are never displaced or glassed.
+    let wormholeCtx: {
+      circle: { cx: number; cy: number; r: number };
+      centreDepth: number;
+      depthReach: number;
+    } | null = null;
+    if (m.shows3d && m.scope?.shape === "sphere") {
+      const circle = this.scopeScreenCircle();
+      if (circle) {
+        const cz = m.scope.cz ?? 0.5;
+        wormholeCtx = {
+          circle,
+          centreDepth: this._trackScreen({
+            wx: m.scope.cx,
+            wy: m.scope.cy,
+            wz: cz,
+          }).depth,
+          depthReach: depthUnits(0.25 * m.scope.r),
+        };
+      }
+    }
     tracks.forEach((t, i) => {
       if (!m.isVisible(t)) {
         anyFiltered = true;
@@ -864,7 +1389,33 @@ export class CanvasView {
       }
       const pos = this._resolveTrackWPos(t);
       if (!pos) return;
-      const [sx, sy] = this.w2s(pos.wx, pos.wy);
+      const { sx: rawSx, sy: rawSy, depth, scale } = this._trackScreen(pos);
+      let sx = rawSx;
+      let sy = rawSy;
+      let ghost = 0;
+      if (wormholeCtx && !m.scopePositions.has(t.path)) {
+        const w = wormhole(
+          { sx, sy, depth },
+          wormholeCtx.circle,
+          wormholeCtx.centreDepth,
+          wormholeCtx.depthReach,
+        );
+        sx = w.sx;
+        sy = w.sy;
+        ghost = w.ghost;
+      }
+      // A non-member that still projects inside the circle lies behind the
+      // frosted glass: push it onto the inner rim band so it stays visible
+      // (blurred by the disc) instead of vanishing, and draw it at full
+      // colour — but, like a heavy ghost, never hittable or selectable.
+      let glassed = false;
+      if (wormholeCtx && this._behindScope(t.path, sx, sy, wormholeCtx.circle)) {
+        const rim = rimPush({ sx, sy }, wormholeCtx.circle);
+        sx = rim.sx;
+        sy = rim.sy;
+        glassed = true;
+        ghost = 0;
+      }
       // An off-screen dot cannot be seen or hit, so skip it entirely; while
       // zoomed in this is most of the library.
       if (
@@ -874,19 +1425,34 @@ export class CanvasView {
         sy > h + CULL_MARGIN
       )
         return;
-      this.positions.push({ idx: i, sx, sy });
+      // Heavily ghosted dots are rendered but not hittable or selectable, so
+      // hover, click, lasso and the hover glow ignore them. Glassed points are
+      // not hittable either, even though they draw at full colour.
+      if (!glassed && ghost < 0.5) this.positions.push({ idx: i, sx, sy, depth });
       if (!supported) {
         this._dot(sx, sy, t, i);
         return;
       }
-      const key = `${Math.round(sx / HIT_CELL)},${Math.round(sy / HIT_CELL)}`;
-      const cell = this._hitGrid.get(key);
-      if (cell) cell.push({ idx: i, sx, sy });
-      else this._hitGrid.set(key, [{ idx: i, sx, sy }]);
-      if (m.selected.has(t.path) || this.hoveredIdx === i) {
-        this._crispDots.push({ sx, sy, idx: i });
+      if (!glassed && ghost < 0.5) {
+        const key = `${Math.round(sx / HIT_CELL)},${Math.round(sy / HIT_CELL)}`;
+        const cell = this._hitGrid.get(key);
+        if (cell) cell.push({ idx: i, sx, sy, depth });
+        else this._hitGrid.set(key, [{ idx: i, sx, sy, depth }]);
+      }
+      const crisp = m.selected.has(t.path) || this.hoveredIdx === i;
+      if (crisp && !glassed && ghost < 0.5) {
+        this._crispDots.push({ sx, sy, idx: i, depth });
       } else {
-        this._pointSpecs.push(this._pointSpec(sx, sy, t));
+        // A heavily ghosted crisp dot merges back into the field as a silhouette.
+        const spec = this._pointSpec(sx, sy, t, depth, scale, ghost);
+        // A sphere scope's members render above its glass, so their splats go
+        // to the second field pass (`_renderBlobs`); everyone else — glassed
+        // points included — merges with the outer map.
+        if (wormholeCtx && m.scopePositions.has(t.path)) {
+          this._scopeSpecs.push(spec);
+        } else {
+          this._pointSpecs.push(spec);
+        }
       }
     });
     if (anyFiltered) {
@@ -900,21 +1466,121 @@ export class CanvasView {
     }
   }
 
-  /** One splat for a track, with its colour and search/external fade. */
-  private _pointSpec(sx: number, sy: number, track: Track): PointSpec {
+  /**
+   * One splat for a track, with its colour, search/external fade, and (in 3-D)
+   * the depth shade: nearer points draw brighter, scaled by the camera blend so
+   * the cue fades in with the 2-D↔3-D transition instead of popping at toggle
+   * start. Size comes from the perspective `scale` (1 in 2-D), so a nearer
+   * point also draws larger.
+   */
+  private _pointSpec(
+    sx: number,
+    sy: number,
+    track: Track,
+    depth: number,
+    scale: number,
+    ghost = 0,
+  ): PointSpec {
     const faded =
       this.searchResults !== null && !this.searchResults.has(track.path);
     const colour = this.trackColor(track);
+    const shows3d = this.model.shows3d;
+    const [r, g, b] = parseColor(colour);
+    const shade = depthShade(depth, this.model.view3dBlend);
     return {
       x: sx,
       y: sy,
-      radius: POINT_SPLAT_R,
-      color: parseColor(colour),
-      alpha: faded ? 0.15 : this.model.isExternalTrack(track) ? 0.5 : 1,
+      radius: POINT_SPLAT_R * scale,
+      color: shows3d
+        ? [r * shade, g * shade, b * shade]
+        : [r, g, b],
+      alpha:
+        (faded ? 0.15 : this.model.isExternalTrack(track) ? 0.5 : 1) *
+        (1 - GHOST_FADE * ghost),
       // A grey dot contributes shape but almost no colour, so a blob it merges
       // into keeps the hue of its coloured members instead of desaturating.
       weight: colour === CONFIDENT_MISS_COLOR ? GREY_COLOUR_WEIGHT : 1,
+      // A ghost sinks to the back, so the front-depth pre-pass can never
+      // occlude the scope contents drawn behind it.
+      depth: depth * (1 - ghost) + DEPTH_FLOOR * ghost,
     };
+  }
+
+  /**
+   * The map's background colour, read once from the page's `--bg` custom
+   * property. The scatter canvas is transparent over the page background, so
+   * the sphere scope's glass tint must repaint the same colour; computed-style
+   * reads are too slow to repeat every frame, hence the cache. Falls back to
+   * the CSS default when the property is unset (e.g. headless tests).
+   */
+  private mapBackground(): string {
+    if (this._mapBg === null) {
+      this._mapBg =
+        getComputedStyle(document.documentElement)
+          .getPropertyValue("--bg")
+          .trim() || "#1a1a2e";
+    }
+    return this._mapBg;
+  }
+
+  /**
+   * Render the metaball field and blit it over the grid; crisp dots come later.
+   *
+   * With a sphere scope in 3-D the disc is frosted glass: the outer (non-member)
+   * field is blitted first, a blurred + tinted circle covers it (`_drawGlass`),
+   * then the scope's member field goes over it — the glass softens what sits
+   * behind the disc (the grid/cube and the rim-pushed non-members) while the
+   * members stay sharp on top. Everywhere else the whole field renders in one
+   * pass, exactly as before.
+   */
+  private _renderBlobs(depthAware: boolean): void {
+    if (!this.points.supported) return;
+    const w = this.$canvas.clientWidth,
+      h = this.$canvas.clientHeight;
+    const ctx = this.ctx;
+    const circle = this.model.shows3d ? this.scopeScreenCircle() : null;
+    if (circle) {
+      this.points.render(this._pointSpecs, depthAware);
+      ctx.drawImage(this.points.canvas, 0, 0, w, h);
+      this._drawGlass(circle, w, h);
+      this.points.render(this._scopeSpecs, depthAware);
+      ctx.drawImage(this.points.canvas, 0, 0, w, h);
+      return;
+    }
+    this.points.render(this._pointSpecs, depthAware);
+    ctx.drawImage(this.points.canvas, 0, 0, w, h);
+  }
+
+  /**
+   * The sphere scope's frosted-glass disc: clip to the projected circle, blur
+   * the canvas bitmap under it (the grid + the outer blobs), then tint the disc
+   * with the map background. The blur softens what the disc covers, so the tint
+   * alone — at higher alpha — must do the hiding where the canvas `filter` is
+   * unavailable (Safari, and headless fakes). The scope's member splats render
+   * after and stay sharp.
+   */
+  private _drawGlass(
+    circle: { cx: number; cy: number; r: number },
+    w: number,
+    h: number,
+  ): void {
+    const ctx = this.ctx;
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(circle.cx, circle.cy, circle.r, 0, Math.PI * 2);
+    ctx.clip();
+    const blurred = this.glassBlur > 0 && typeof ctx.filter === "string";
+    if (blurred) {
+      // The canvas bitmap is device-pixel sized and drawn under the dpr
+      // transform, so a w×h dest copies it 1:1; the self-copy is what blurs.
+      ctx.filter = `blur(${this.glassBlur * (devicePixelRatio || 1)}px)`;
+      ctx.drawImage(this.$canvas, 0, 0, w, h);
+      ctx.filter = "none";
+    }
+    ctx.globalAlpha = blurred ? GLASS_TINT : GLASS_TINT_FLAT;
+    ctx.fillStyle = this.mapBackground();
+    ctx.fill();
+    ctx.restore();
   }
 
   /**
@@ -924,11 +1590,20 @@ export class CanvasView {
    * `_drawScatter` already drew every dot.
    */
   private _renderPoints(tracks: Track[]): void {
-    if (!this.points.supported) return;
-    this.points.render(this._pointSpecs);
+    this._renderBlobs(this.model.shows3d);
+    this._drawCrispDots(tracks);
+  }
+
+  /** Blit the (hidden) glow canvas over the blobs — the 3-D composition step. */
+  private _blitGlow(): void {
     const w = this.$canvas.clientWidth,
       h = this.$canvas.clientHeight;
-    this.ctx.drawImage(this.points.canvas, 0, 0, w, h);
+    this.ctx.drawImage(this.glow.canvas, 0, 0, w, h);
+  }
+
+  /** The crisp hover/selected dots on top of the merged field. */
+  private _drawCrispDots(tracks: Track[]): void {
+    if (!this.points.supported) return;
     for (const c of this._crispDots) this._dot(c.sx, c.sy, tracks[c.idx], c.idx);
   }
 
@@ -965,8 +1640,8 @@ export class CanvasView {
     ctx.save();
     ctx.setLineDash([2, 3]);
     ctx.lineWidth = 1.5;
-    for (const { wx, wy, folder } of ghosts.values()) {
-      const [sx, sy] = this.w2s(wx, wy);
+    for (const { wx, wy, wz, folder } of ghosts.values()) {
+      const { sx, sy } = this._trackScreen({ wx, wy, wz });
       const color = dirColor(folder);
       ctx.beginPath();
       ctx.arc(sx, sy, DOT_R, 0, Math.PI * 2);
@@ -1451,6 +2126,85 @@ export class CanvasView {
     }
   }
 
+  /* ── Scope picking (3-D) ───────────────────────────────── */
+
+  /**
+   * Pick a cube position for a 3-D scope gesture at *sx,sy*: the nearest
+   * on-screen dot within `SNAP_PX` (its own cube position, so membership is
+   * orbit-invariant), preferring the front-most among dots within 2 px of each
+   * other; otherwise the cursor unprojected onto the cube-centre depth plane.
+   * Pure projection, so the tests exercise the geometry directly.
+   */
+  pickCursorWorld3D(
+    sx: number,
+    sy: number,
+  ): { wx: number; wy: number; wz: number; snapped: boolean } {
+    let bestD = Infinity;
+    for (const p of this.positions) {
+      const d = Math.hypot(p.sx - sx, p.sy - sy);
+      if (d <= SNAP_PX && d < bestD) bestD = d;
+    }
+    if (isFinite(bestD)) {
+      let bestIdx = -1;
+      let bestDepth = -Infinity;
+      let bestDist = Infinity;
+      for (const p of this.positions) {
+        const d = Math.hypot(p.sx - sx, p.sy - sy);
+        // A dot within 2 px of the nearest is a tie: the front-most wins, and
+        // distance breaks a remaining depth tie.
+        if (d > bestD + 2) continue;
+        if (p.depth > bestDepth || (p.depth === bestDepth && d < bestDist)) {
+          bestIdx = p.idx;
+          bestDepth = p.depth;
+          bestDist = d;
+        }
+      }
+      const track = this.model.tracks[bestIdx];
+      const pos = track ? this._resolveTrackWPos(track) : null;
+      if (pos) {
+        return { wx: pos.wx, wy: pos.wy, wz: pos.wz ?? 0.5, snapped: true };
+      }
+    }
+    const cam = this._camera();
+    const [rx, ry] = this.s2w(sx, sy);
+    const [wx, wy, wz] = orbitUnproject(cam, rx, ry, 0, cam.persp);
+    return { wx, wy, wz, snapped: false };
+  }
+
+  /**
+   * World (cube) radius of a sphere centred at (cx,cy,cz) whose projected
+   * screen radius is *px*: invert the perspective scale at the centre against
+   * the viewport's pixels-per-world-unit. The exact inverse of the sphere
+   * drawing in `_drawScope`, so the two stay consistent.
+   */
+  worldRadiusForPx(cx: number, cy: number, cz: number, px: number): number {
+    const { rx, ry, scale } = this._viewFrame({ wx: cx, wy: cy, wz: cz });
+    const [s0] = this.w2s(rx, ry);
+    const [s1] = this.w2s(rx + 1, ry);
+    const zoomPxPerWorld = Math.abs(s1 - s0);
+    return px / (zoomPxPerWorld * scale);
+  }
+
+  /**
+   * The open sphere scope's screen circle (centre + radius px), or null for a
+   * circle/box scope (whose screen image is not a circle). `_drawScope` and the
+   * click / pointer-near tests share it, so the hit region always matches the
+   * drawn outline.
+   */
+  scopeScreenCircle(): { cx: number; cy: number; r: number } | null {
+    const scope = this.model.scope;
+    if (!scope || scope.shape !== "sphere") return null;
+    const cz = scope.cz ?? 0.5;
+    const { sx, sy } = this._trackScreen({ wx: scope.cx, wy: scope.cy, wz: cz });
+    const { rx, ry, scale } = this._viewFrame({
+      wx: scope.cx,
+      wy: scope.cy,
+      wz: cz,
+    });
+    const [edgeX] = this.w2s(rx + scope.r * scale, ry);
+    return { cx: sx, cy: sy, r: Math.abs(edgeX - sx) };
+  }
+
   /* ── Scope overlay ─────────────────────────────────────── */
 
   /** The open scope region, its lens tab switcher, and the in-progress drag. */
@@ -1465,40 +2219,82 @@ export class CanvasView {
     ctx.strokeStyle = "rgba(120,220,255,0.85)";
     ctx.fillStyle = "rgba(120,220,255,0.05)";
     if (drag) {
-      // The drag is a screen-space box; draw it as-is.
-      const x = Math.min(drag.x0, drag.x1);
-      const y = Math.min(drag.y0, drag.y1);
-      ctx.beginPath();
-      ctx.rect(x, y, Math.max(1, Math.abs(drag.x1 - drag.x0)), Math.max(1, Math.abs(drag.y1 - drag.y0)));
-      ctx.fill();
-      ctx.stroke();
+      if (this.model.shows3d && drag.sphere) {
+        // The 3-D drag preview is the sphere the release will open: centre at
+        // the drag origin's snapped cursor, radius = the drag distance in px.
+        const { sx, sy } = this._trackScreen({
+          wx: drag.sphere.cx,
+          wy: drag.sphere.cy,
+          wz: drag.sphere.cz,
+        });
+        const r = Math.max(1, Math.hypot(drag.x1 - drag.x0, drag.y1 - drag.y0));
+        ctx.beginPath();
+        ctx.arc(sx, sy, r, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+      } else {
+        // The drag is a screen-space box; draw it as-is.
+        const x = Math.min(drag.x0, drag.x1);
+        const y = Math.min(drag.y0, drag.y1);
+        ctx.beginPath();
+        ctx.rect(x, y, Math.max(1, Math.abs(drag.x1 - drag.x0)), Math.max(1, Math.abs(drag.y1 - drag.y0)));
+        ctx.fill();
+        ctx.stroke();
+      }
     }
     if (scope) {
-      // The region is world-space and w2s is non-uniform: it stretches the unit
-      // square to the viewport, so a circle's screen image is an ellipse and a
-      // box's is a rectangle. Draw the exact membership region so an
-      // out-of-scope track can never sit inside the outline.
-      const { hw, hh } = scopeHalfExtents(scope);
-      const [cx, cy] = this.w2s(scope.cx, scope.cy);
-      const [ex] = this.w2s(scope.cx + hw, scope.cy);
-      const [, ey] = this.w2s(scope.cx, scope.cy + hh);
-      const rx = Math.abs(ex - cx);
-      const ry = Math.abs(ey - cy);
-      ctx.beginPath();
-      if (scope.shape === "box") ctx.rect(cx - rx, cy - ry, rx * 2, ry * 2);
-      else ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-      ctx.setLineDash([]);
-      // The lens tabs sit just outside the region, above unless it is near the top.
-      const above = cy - ry - 16 > 26;
-      const tabCy = above ? cy - ry - 16 : cy + ry + 16;
-      this.scopeTabs = this._drawTabs(
-        scopeLenses(),
-        scope.lensId,
-        cx,
-        tabCy,
-      );
+      if (scope.shape === "sphere") {
+        const circle = this.scopeScreenCircle();
+        if (circle) {
+          ctx.beginPath();
+          ctx.arc(circle.cx, circle.cy, circle.r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+          ctx.setLineDash([]);
+          // A faint inner ring makes the disc read as a sphere.
+          ctx.save();
+          ctx.globalAlpha = 0.35;
+          ctx.beginPath();
+          ctx.arc(circle.cx, circle.cy, circle.r * 0.5, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+          // The lens tabs sit just outside the region, above unless it is near the top.
+          const above = circle.cy - circle.r - 16 > 26;
+          const tabCy = above ? circle.cy - circle.r - 16 : circle.cy + circle.r + 16;
+          this.scopeTabs = this._drawTabs(
+            scopeLenses(),
+            scope.lensId,
+            circle.cx,
+            tabCy,
+          );
+        }
+      } else {
+        // The region is world-space and w2s is non-uniform: it stretches the unit
+        // square to the viewport, so a circle's screen image is an ellipse and a
+        // box's is a rectangle. Draw the exact membership region so an
+        // out-of-scope track can never sit inside the outline.
+        const { hw, hh } = scopeHalfExtents(scope);
+        const [cx, cy] = this.w2s(scope.cx, scope.cy);
+        const [ex] = this.w2s(scope.cx + hw, scope.cy);
+        const [, ey] = this.w2s(scope.cx, scope.cy + hh);
+        const rx = Math.abs(ex - cx);
+        const ry = Math.abs(ey - cy);
+        ctx.beginPath();
+        if (scope.shape === "box") ctx.rect(cx - rx, cy - ry, rx * 2, ry * 2);
+        else ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // The lens tabs sit just outside the region, above unless it is near the top.
+        const above = cy - ry - 16 > 26;
+        const tabCy = above ? cy - ry - 16 : cy + ry + 16;
+        this.scopeTabs = this._drawTabs(
+          scopeLenses(),
+          scope.lensId,
+          cx,
+          tabCy,
+        );
+      }
     }
     ctx.setLineDash([]);
     ctx.restore();
@@ -1517,6 +2313,18 @@ export class CanvasView {
       BUILTIN_LENSES,
       m.activeBaseLensId(),
       w / 2,
+      16,
+    );
+    // The 3-D toggle tab sits just right of the lens row. It highlights while
+    // the client-side orbit is armed even on a lens that cannot show it (only a
+    // projection lens is actually 3-D), so the toggle state is always visible.
+    const ctx = this.ctx;
+    ctx.font = "11px monospace";
+    const viewTabW = ctx.measureText("3D").width + 18;
+    this.viewTabs = this._drawTabs(
+      VIEW_TABS,
+      m.view3d.on ? "3d" : "",
+      this.lensTabs[this.lensTabs.length - 1].x1 + 14 + viewTabW / 2,
       16,
     );
     this.colorTabs = this._drawTabs(colorModeTabs(), m.colorMode, w / 2, 40);

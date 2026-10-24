@@ -287,6 +287,9 @@ export class Controller {
       // The persistent top tabbers switch the main lens / colour mode.
       switchLens: (lensId) => void this.embedding.switchToLens(lensId),
       setColorMode: (mode) => this.analysis.applyColorMode(mode, true),
+      // The on-canvas view tab flips the 3-D orbit view — the same toggle as
+      // the `3` hotkey, so both route through one definition.
+      toggleView3D: () => this._toggleView3D(),
     });
 
     this.search = new SearchCoordinator({
@@ -1202,6 +1205,8 @@ export class Controller {
 
     hk.on("toggle-view-prev", () => void this.embedding.cycleLens(-1));
 
+    hk.on("toggle-3d", () => this._toggleView3D());
+
     hk.on("toggle-clusters", () => this.analysis.cycleColorMode());
 
     hk.on("toggle-clusters-prev", () => this.analysis.cycleColorMode(-1));
@@ -1221,6 +1226,11 @@ export class Controller {
   }
 
   /* ── Window resize ──────────────────────────────────────── */
+
+  /** Flip the 3-D orbit view; shared by the `3` hotkey and the on-canvas view tab. */
+  private _toggleView3D(): void {
+    void this.embedding.setView3D(!this.model.view3d.on);
+  }
 
   private _bindResize(): void {
     window.addEventListener("resize", () => {

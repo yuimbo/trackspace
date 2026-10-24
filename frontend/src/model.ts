@@ -22,6 +22,7 @@ import {
   type BloomRangeKey,
 } from "./lib/bloom";
 import { clusterColor, dirTagColors, keyColor, tempoColor } from "./lib/colors";
+import { MAX_PITCH, type Orbit } from "./lib/camera3d";
 import { displayFolderPath } from "./lib/path-presenter";
 import { clamp01 } from "./lib/util";
 import clusterWeights from "./lib/cluster-weights.json";
@@ -374,14 +375,56 @@ export interface Viewport {
   zoom: number;
 }
 
+/** Sphere centre in cube coordinates: the billboard anchor of a scope member's flat layout. */
+export interface Billboard {
+  cx: number;
+  cy: number;
+  cz: number;
+}
+
+/** A world position in the unit cube: 2-D or, with ``z``, the 3-D orbit input. */
+export interface MapPos {
+  x: number;
+  y: number;
+  z?: number;
+  /**
+   * Set on a sphere-scope member's flat layout position: it is drawn facing the
+   * camera at this sphere centre (x,y are world offsets around (cx,cy)), not as
+   * a cube position.
+   */
+  billboard?: Billboard;
+  /**
+   * In-flight move between two frames: the position `from` (another frame) is
+   * blended into this one in VIEW space, weight `mix` (1 = entirely `from`,
+   * 0 = entirely this position). Only ever set on animation overlay entries,
+   * never persisted in scopePositions.
+   */
+  from?: MapPos;
+  mix?: number;
+}
+
+/**
+ * Client-side 3-D orbit view option (persisted). ``on`` arms the mode; the
+ * projection and deterministic lenses stay 2-D regardless — see ``is3d``.
+ */
+export interface View3D extends Orbit {
+  on: boolean;
+}
+
 /** A region on the canvas whose tracks are re-laid-out by another lens. */
 export interface Scope {
-  /** Region shape: a circle (X + scroll) or an axis-aligned box (X + drag). */
-  shape: "circle" | "box";
+  /**
+   * Region shape: a circle (X + scroll) or an axis-aligned box (X + drag) in the 2-D
+   * map; a sphere in the 3-D view (the one shape that keeps its membership under
+   * orbit).
+   */
+  shape: "circle" | "box" | "sphere";
   /** Centre in world coordinates. */
   cx: number;
   cy: number;
-  /** Circle radius in world units (a box uses ``rx``/``ry`` instead). */
+  /** Sphere centre depth in cube coordinates (sphere only; default 0.5). */
+  cz?: number;
+  /** Circle / sphere radius in world units (a box uses ``rx``/``ry`` instead). */
   r: number;
   /** Box half-width in world units (box only). */
   rx?: number;
@@ -403,13 +446,25 @@ export function scopeHalfExtents(scope: Scope): { hw: number; hh: number } {
  *
  * This is the single membership test: the coordinator uses it to pick the in-scope
  * set and the canvas uses it to hide in-region tracks the scope lens cannot place.
- * The region is a world-space circle or box, so the canvas must draw its
- * (possibly non-circular) screen image — see ``CanvasView._drawScope``.
+ * A circle/box lives in the flat map, so the canvas must draw its (possibly
+ * non-circular) screen image — see ``CanvasView._drawScope``. A sphere is tested in
+ * cube coordinates (``wz`` defaults to the centre plane), so orbiting never changes
+ * its members.
  */
-export function scopeContains(scope: Scope, wx: number, wy: number): boolean {
+export function scopeContains(
+  scope: Scope,
+  wx: number,
+  wy: number,
+  wz = 0.5,
+): boolean {
   if (scope.shape === "box") {
     const { hw, hh } = scopeHalfExtents(scope);
     return Math.abs(wx - scope.cx) <= hw && Math.abs(wy - scope.cy) <= hh;
+  }
+  if (scope.shape === "sphere") {
+    return (
+      Math.hypot(wx - scope.cx, wy - scope.cy, wz - (scope.cz ?? 0.5)) <= scope.r
+    );
   }
   return Math.hypot(wx - scope.cx, wy - scope.cy) <= scope.r;
 }
@@ -493,6 +548,19 @@ export class Model extends EventBus {
   /** Duration of the auditioned track, in seconds; ``0`` until metadata loads. */
   previewDuration = 0;
   vp: Viewport = { ox: 0, oy: 0, zoom: 1 };
+  /**
+   * Client-side 3-D orbit view option; persisted. Only a projection lens with
+   * this on is actually 3-D — see ``is3d``.
+   */
+  view3d: View3D = { on: false, yaw: 0.6, pitch: 0.35 };
+  /**
+   * Camera blend 0..1 for the 2-D↔3-D transition: 0 = head-on orthographic,
+   * 1 = the full orbit + perspective. Transient, never persisted: ``loadLS``
+   * snaps it to ``view3d.on`` so a reload does not re-tween. The canvas renders
+   * 3-D while ``shows3d`` is true, so the collapse tween keeps drawing the
+   * rotated view until it lands back on head-on.
+   */
+  view3dBlend = 0;
   _knownTags: string[] = [];
 
   /**
@@ -533,6 +601,36 @@ export class Model extends EventBus {
           ? "combined"
           : this._lensId
         : "tags";
+  }
+
+  /**
+   * True when the canvas should draw the 3-D orbit view: the client-side toggle
+   * is on, the eval gallery is not active, and the lens is a projection lens
+   * (only those have a z axis — tags/deterministic lenses and the eval gallery
+   * stay 2-D).
+   */
+  get is3d(): boolean {
+    return (
+      this.view3d.on &&
+      !this.evalMode &&
+      this.lens().kind === "projection"
+    );
+  }
+
+  /**
+   * True while the canvas renders the 3-D view. Same gate as ``is3d`` but the
+   * *mode* flag is replaced by "armed or still blending": true while the 2-D↔3-D
+   * camera tween is mid-flight (``view3dBlend > 0``), so the collapse tween
+   * keeps drawing the rotated view until it reaches head-on. ``is3d`` stays the
+   * *mode* gate (query string, interactions, scope/tag rules); this is the
+   * *rendering* gate.
+   */
+  get shows3d(): boolean {
+    return (
+      (this.view3d.on || this.view3dBlend > 0) &&
+      !this.evalMode &&
+      this.lens().kind === "projection"
+    );
   }
 
   /** The active lens, resolving a preset id to its base lens. */
@@ -588,7 +686,7 @@ export class Model extends EventBus {
     if (this._lensId === id) this._lensId = "tags";
   }
 
-  embeddingPositions: Map<string, { x: number; y: number }> = new Map();
+  embeddingPositions: Map<string, MapPos> = new Map();
   embeddingsReady = false;
   embeddingsGenerating = false;
   projectionPending = false;
@@ -621,7 +719,7 @@ export class Model extends EventBus {
    * positions, so membership is "has a scope position".
    */
   scope: Scope | null = null;
-  scopePositions: Map<string, { x: number; y: number }> = new Map();
+  scopePositions: Map<string, MapPos> = new Map();
   /** Lens a newly drawn scope starts on; persisted so the last choice sticks. */
   scopeLensId = "camelot";
   libraryLoadProgress: {
@@ -1698,6 +1796,7 @@ export class Model extends EventBus {
         showExternal: this.showExternal,
         externalInProjection: this.externalInProjection,
         rightPanelTab: this.rightPanelTab,
+        view3d: this.view3d,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
@@ -1771,10 +1870,34 @@ export class Model extends EventBus {
         this.rightPanelTab = RIGHT_PANEL_TABS.includes(rpTab as RightPanelTab)
           ? (rpTab as RightPanelTab)
           : "analysis";
+        // A stored orbit is accepted only when it is fully valid: `on` must be
+        // exactly true and both angles finite numbers. Anything else (missing
+        // key, legacy shape, bad values) keeps the defaults — 3-D must never
+        // come on by accident.
+        const v3 = (d as { view3d?: unknown }).view3d;
+        if (v3 && typeof v3 === "object") {
+          const r = v3 as { on?: unknown; yaw?: unknown; pitch?: unknown };
+          if (
+            r.on === true &&
+            typeof r.yaw === "number" &&
+            Number.isFinite(r.yaw) &&
+            typeof r.pitch === "number" &&
+            Number.isFinite(r.pitch)
+          ) {
+            this.view3d = {
+              on: true,
+              yaw: r.yaw,
+              pitch: Math.max(-MAX_PITCH, Math.min(MAX_PITCH, r.pitch)),
+            };
+          }
+        }
       }
     } catch {
       /* start fresh */
     }
+    // The camera blend is transient: after a reload the view is fully 3-D or
+    // fully 2-D — never mid-tween, which would look like a torn frame.
+    this.view3dBlend = this.view3d.on ? 1 : 0;
     try {
       this._knownTags =
         JSON.parse(localStorage.getItem(LS_KEY + "_tags") ?? "null") || [];

@@ -22,6 +22,7 @@ import {
 import type { CanvasView, TxHandle } from "../components";
 import { hotkeyCode, hotkeyKey, isTextEntryTarget } from "../hotkeys";
 import { scopeLenses, type ColorMode } from "../lib/lenses";
+import { orbitDrag } from "../lib/camera3d";
 import { clamp } from "../lib/util";
 
 /** What an **S** press isolated: the rule it filtered with and its keep-set. */
@@ -88,6 +89,7 @@ interface TxBounds {
 type MouseMode =
   | "idle"
   | "pan"
+  | "orbit"
   | "lasso"
   | "boxsel"
   | "pending"
@@ -152,6 +154,8 @@ export interface CanvasInteractionDeps {
   moveSelectionBloom(dir: 1 | -1): void;
   /** Set the selection-bloom cursor from a colour-tab click. */
   setSelectionBloom(mode: ColorMode): void;
+  /** Flip the 3-D orbit view (the on-canvas view tab; same toggle as the `3` hotkey). */
+  toggleView3D(): void;
   /** Toggle hover preview on/off (a bare **M** tap). */
   togglePreview(): void;
   /** Scale the preview volume by *factor* (**M + scroll**). */
@@ -249,6 +253,16 @@ export class CanvasInteractionController {
     mouse.hitWasSelected = false;
     mouse.hitInSelectionBox = false;
 
+    // In the 3-D view Alt or middle orbits the map; Alt+Shift keeps the 2-D pan
+    // so the view can still be repositioned there. In 2-D nothing changes:
+    // Alt and middle pan as always, so this check just yields to the pan block.
+    const orbiting =
+      m.is3d && (e.button === 1 || (e.button === 0 && e.altKey && !e.shiftKey));
+    if (orbiting) {
+      mouse.mode = "orbit";
+      cv.$canvas.style.cursor = "grabbing";
+      return;
+    }
     if (e.button === 1 || (e.button === 0 && e.altKey)) {
       mouse.mode = "pan";
       cv.$canvas.style.cursor = "grabbing";
@@ -271,29 +285,51 @@ export class CanvasInteractionController {
       this.deps.setSelectionBloom(colorTab as ColorMode);
       return;
     }
+    // The 3-D view toggle is chrome too: a click flips the mode, never a gesture.
+    if (cv.topViewTabAt(sx, sy)) {
+      this.deps.toggleView3D();
+      return;
+    }
 
-    // X + drag draws a scope box; it takes priority over dot selection so a
-    // scope can be opened anywhere, including over a dense cluster.
+    // X + drag draws a scope box (or a sphere in 3-D); it takes priority over
+    // dot selection so a scope can be opened anywhere, including over a dense
+    // cluster.
     if (this._scopeArmed) {
       this._scopeGestureUsed = true;
       mouse.mode = "scope";
-      cv.scopeDrag = { x0: sx, y0: sy, x1: sx, y1: sy };
+      const pick = m.is3d ? cv.pickCursorWorld3D(sx, sy) : null;
+      cv.scopeDrag = {
+        x0: sx,
+        y0: sy,
+        x1: sx,
+        y1: sy,
+        sphere: pick ? { cx: pick.wx, cy: pick.wy, cz: pick.wz } : undefined,
+      };
       cv.scheduleDraw();
       return;
     }
 
     // A scope owns its region: a tab switches lens, a click outside closes it, and
-    // a click inside falls through to normal selection.
+    // a click inside falls through to normal selection. A sphere's membership is
+    // 3-D, so "inside" is a screen-space test against its projected circle.
     if (m.scope) {
       const tab = cv.scopeTabAt(sx, sy);
       if (tab) {
         if (tab !== m.scope.lensId) this.deps.setScopeLens(tab);
         return;
       }
-      const [wx, wy] = cv.s2w(sx, sy);
-      if (!scopeContains(m.scope, wx, wy)) {
-        this.deps.closeScope();
-        return;
+      if (m.scope.shape === "sphere") {
+        const circle = cv.scopeScreenCircle();
+        if (circle && Math.hypot(sx - circle.cx, sy - circle.cy) > circle.r) {
+          this.deps.closeScope();
+          return;
+        }
+      } else {
+        const [wx, wy] = cv.s2w(sx, sy);
+        if (!scopeContains(m.scope, wx, wy)) {
+          this.deps.closeScope();
+          return;
+        }
       }
     }
 
@@ -389,7 +425,10 @@ export class CanvasInteractionController {
     this._fillDragSnapFromSelection();
     mouse.mode = "drag";
     cv.$canvas.style.cursor = "move";
-    const ghosts = new Map<string, { wx: number; wy: number; folder: string }>();
+    const ghosts = new Map<
+      string,
+      { wx: number; wy: number; wz?: number; folder: string }
+    >();
     for (const [path, snap] of mouse.snap!) {
       // In embedding mode use the embedding position for the ghost dot so it sits
       // on top of the dot the user clicked rather than at the (invisible) tag position.
@@ -397,6 +436,7 @@ export class CanvasInteractionController {
       ghosts.set(path, {
         wx: ep ? ep.x : snap.x,
         wy: ep ? ep.y : snap.y,
+        wz: ep?.z,
         folder: snap.track.folder ?? "",
       });
     }
@@ -558,6 +598,14 @@ export class CanvasInteractionController {
     const sx = e.offsetX,
       sy = e.offsetY;
 
+    if (mouse.mode === "orbit") {
+      orbitDrag(m.view3d, sx - mouse.lx, sy - mouse.ly);
+      mouse.lx = sx;
+      mouse.ly = sy;
+      cv.scheduleDraw();
+      return;
+    }
+
     if (mouse.mode === "pan") {
       const [wx1, wy1] = cv.s2w(mouse.lx, mouse.ly);
       const [wx2, wy2] = cv.s2w(sx, sy);
@@ -660,28 +708,48 @@ export class CanvasInteractionController {
       mouse.mode = "idle";
       cv.scheduleDraw();
       if (d) {
-        const bL = Math.min(d.x0, d.x1),
-          bR = Math.max(d.x0, d.x1);
-        const bT = Math.min(d.y0, d.y1),
-          bB = Math.max(d.y0, d.y1);
-        // A tiny drag is a mis-click, not a region.
-        if (bR - bL >= 6 && bB - bT >= 6) {
-          const [wx0, wy0] = cv.s2w(bL, bB);
-          const [wx1, wy1] = cv.s2w(bR, bT);
-          const rx = Math.abs(wx1 - wx0) / 2;
-          const ry = Math.abs(wy1 - wy0) / 2;
-          this.deps.openScope(
-            {
-              shape: "box",
-              cx: (wx0 + wx1) / 2,
-              cy: (wy0 + wy1) / 2,
-              r: Math.max(rx, ry),
-              rx,
-              ry,
-              lensId: m.scopeLensId,
-            },
-            m.scopeLensId,
-          );
+        if (d.sphere) {
+          // The drag distance (px) is the sphere's screen radius; the centre
+          // was snapped once at the drag origin. A tiny drag is a mis-click.
+          const radiusPx = Math.hypot(d.x1 - d.x0, d.y1 - d.y0);
+          if (radiusPx >= 6) {
+            const { cx, cy, cz } = d.sphere;
+            this.deps.openScope(
+              {
+                shape: "sphere",
+                cx,
+                cy,
+                cz,
+                r: cv.worldRadiusForPx(cx, cy, cz, radiusPx),
+                lensId: m.scopeLensId,
+              },
+              m.scopeLensId,
+            );
+          }
+        } else {
+          const bL = Math.min(d.x0, d.x1),
+            bR = Math.max(d.x0, d.x1);
+          const bT = Math.min(d.y0, d.y1),
+            bB = Math.max(d.y0, d.y1);
+          // A tiny drag is a mis-click, not a region.
+          if (bR - bL >= 6 && bB - bT >= 6) {
+            const [wx0, wy0] = cv.s2w(bL, bB);
+            const [wx1, wy1] = cv.s2w(bR, bT);
+            const rx = Math.abs(wx1 - wx0) / 2;
+            const ry = Math.abs(wy1 - wy0) / 2;
+            this.deps.openScope(
+              {
+                shape: "box",
+                cx: (wx0 + wx1) / 2,
+                cy: (wy0 + wy1) / 2,
+                r: Math.max(rx, ry),
+                rx,
+                ry,
+                lensId: m.scopeLensId,
+              },
+              m.scopeLensId,
+            );
+          }
         }
       }
       return;
@@ -782,6 +850,11 @@ export class CanvasInteractionController {
       }
     }
 
+    // The orbit angle is persisted once when the gesture ends, not per move
+    // (mirrors how the 2-D viewport changes persist on release, and pan's
+    // reset path below — `_finalizeSelection` — restores the idle mode/cursor).
+    if (mouse.mode === "orbit") m.saveLS();
+
     if (mouse.mode !== "drag") {
       this._finalizeSelection();
     }
@@ -844,6 +917,22 @@ export class CanvasInteractionController {
       const factor = Math.exp(clamp(-dy / 600, -0.4, 0.4));
       if (m.scope) {
         this.deps.resizeScope(factor);
+      } else if (m.is3d) {
+        // A sphere centred at the picked cube position, starting small *on
+        // screen* so the scroll grows it outwards exactly like the 2-D circle.
+        const pick = cv.pickCursorWorld3D(sx, sy);
+        this.deps.openScope(
+          {
+            shape: "sphere",
+            cx: pick.wx,
+            cy: pick.wy,
+            cz: pick.wz,
+            r: cv.worldRadiusForPx(pick.wx, pick.wy, pick.wz, SCOPE_SCROLL_START_PX),
+            lensId: m.scopeLensId,
+          },
+          m.scopeLensId,
+          true,
+        );
       } else {
         const [wx, wy] = cv.s2w(sx, sy);
         // Start small *on screen* and grow outwards, so the opening circle looks
@@ -1335,6 +1424,16 @@ export class CanvasInteractionController {
   /** True while the last pointer position is in the scope region or just outside. */
   private _pointerNearScope(scope: Scope): boolean {
     const cv = this.deps.canvas;
+    if (scope.shape === "sphere") {
+      // Screen-space margin around the sphere's projected circle (a flat s2w
+      // has no depth to test against).
+      const circle = cv.scopeScreenCircle();
+      if (!circle) return false;
+      return (
+        Math.hypot(this.mouse.lx - circle.cx, this.mouse.ly - circle.cy) <=
+        circle.r + SCOPE_NEAR_PX
+      );
+    }
     const [wx, wy] = cv.s2w(this.mouse.lx, this.mouse.ly);
     // A ~40 px screen margin covers the lens tab bar drawn just outside.
     const [mx] = cv.s2w(this.mouse.lx + SCOPE_NEAR_PX, this.mouse.ly);

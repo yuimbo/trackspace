@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Model, type HoverTarget, type Track } from "../model";
+import { ORBIT_RAD_PER_PX } from "../lib/camera3d";
 import { setEvalReadOnly } from "../lib/eval-readonly";
 import type { CanvasView } from "../components";
 import {
@@ -31,7 +32,17 @@ interface FakeCanvas {
   boxSel: { x0: number; y0: number; x1: number; y1: number } | null;
   lassoPoints: [number, number][];
   intersectMode: boolean;
-  dragGhosts: Map<string, { wx: number; wy: number; folder: string }> | null;
+  scopeDrag: {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+    sphere?: { cx: number; cy: number; cz: number };
+  } | null;
+  dragGhosts: Map<
+    string,
+    { wx: number; wy: number; wz?: number; folder: string }
+  > | null;
   positions: { sx: number; sy: number; idx: number }[];
   tipTimer: unknown;
   tipReady: boolean;
@@ -45,11 +56,15 @@ interface FakeCanvas {
   scopeTabAt: ReturnType<typeof vi.fn>;
   topLensTabAt: ReturnType<typeof vi.fn>;
   topColorTabAt: ReturnType<typeof vi.fn>;
+  topViewTabAt: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
   unpinInspect: ReturnType<typeof vi.fn>;
   toggleInspect: ReturnType<typeof vi.fn>;
   showVolumeHud: ReturnType<typeof vi.fn>;
   showBloomHud: ReturnType<typeof vi.fn>;
+  pickCursorWorld3D: ReturnType<typeof vi.fn>;
+  worldRadiusForPx: ReturnType<typeof vi.fn>;
+  scopeScreenCircle: ReturnType<typeof vi.fn>;
 }
 
 function makeCanvas(): FakeCanvas {
@@ -63,6 +78,7 @@ function makeCanvas(): FakeCanvas {
     boxSel: null,
     lassoPoints: [],
     intersectMode: false,
+    scopeDrag: null,
     dragGhosts: null,
     positions: [],
     tipTimer: 0,
@@ -78,11 +94,20 @@ function makeCanvas(): FakeCanvas {
     scopeTabAt: vi.fn(() => null),
     topLensTabAt: vi.fn(() => null),
     topColorTabAt: vi.fn(() => null),
+    topViewTabAt: vi.fn(() => null),
     scheduleDraw: vi.fn(),
     unpinInspect: vi.fn(() => false),
     toggleInspect: vi.fn(),
     showVolumeHud: vi.fn(),
     showBloomHud: vi.fn(),
+    pickCursorWorld3D: vi.fn(() => ({
+      wx: 0.5,
+      wy: 0.5,
+      wz: 0.5,
+      snapped: true,
+    })),
+    worldRadiusForPx: vi.fn(() => 0.01),
+    scopeScreenCircle: vi.fn(() => null),
   };
 }
 
@@ -117,6 +142,7 @@ function makeHarness(): Harness {
     closeScope: vi.fn(),
     switchLens: vi.fn(),
     setColorMode: vi.fn(),
+    toggleView3D: vi.fn(),
     moveSelectionBloom: vi.fn(),
     setSelectionBloom: vi.fn(),
     togglePreview: vi.fn(),
@@ -685,6 +711,209 @@ describe("CanvasInteractionController gesture state", () => {
     expect(canvas.hoveredBloomTrack?.path).toBe("pinned.mp3");
     expect(deps.onHoverPreview).not.toHaveBeenCalled();
     expect(deps.onHoverFolderChanged).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 3-D orbit view ─────────────────────────────────────
+
+describe("CanvasInteractionController 3-D orbit", () => {
+  /** Flip the model into the 3-D orbit view: toggle on + a projection lens. */
+  function set3D(model: Model): void {
+    model.view3d.on = true;
+    model.lensId = "combined";
+  }
+
+  it("orbits on Alt+left-drag in 3-D without touching the viewport", () => {
+    const { model, canvas } = makeHarness();
+    set3D(model);
+    model.view3d.yaw = 0.6;
+    model.view3d.pitch = 0.35;
+    const vpBefore = { ...model.vp };
+
+    down(canvas, 100, 100, { altKey: true });
+    move(canvas, 200, 120); // +100 px x, +20 px y
+    up(canvas, 200, 120, { altKey: true });
+
+    // yaw += dx * k, pitch += dy * k (clamped).
+    expect(model.view3d.yaw).toBeCloseTo(0.6 + 100 * ORBIT_RAD_PER_PX, 5);
+    expect(model.view3d.pitch).toBeCloseTo(0.35 + 20 * ORBIT_RAD_PER_PX, 5);
+    expect(model.vp).toEqual(vpBefore);
+  });
+
+  it("orbits on middle-drag in 3-D without touching the viewport", () => {
+    const { model, canvas } = makeHarness();
+    set3D(model);
+    model.view3d.yaw = 0.6;
+    model.view3d.pitch = 0.35;
+    const vpBefore = { ...model.vp };
+
+    down(canvas, 100, 100, { button: 1 });
+    move(canvas, 150, 130);
+    up(canvas, 150, 130, { button: 1 });
+
+    expect(model.view3d.yaw).toBeCloseTo(0.6 + 50 * ORBIT_RAD_PER_PX, 5);
+    expect(model.view3d.pitch).toBeCloseTo(0.35 + 30 * ORBIT_RAD_PER_PX, 5);
+    expect(model.vp).toEqual(vpBefore);
+  });
+
+  it("pans on Alt+Shift+drag in 3-D without changing the orbit", () => {
+    const { model, canvas } = makeHarness();
+    set3D(model);
+    model.view3d.yaw = 0.6;
+    model.view3d.pitch = 0.35;
+    const vpBefore = { ...model.vp };
+    const orbitBefore = { ...model.view3d };
+
+    down(canvas, 100, 100, { altKey: true, shiftKey: true });
+    move(canvas, 200, 120, { altKey: true, shiftKey: true });
+    up(canvas, 200, 120, { altKey: true, shiftKey: true });
+
+    // Pan: vp.ox -= (wx2 - wx1); the fake maps 1 px → 0.001 world units.
+    expect(model.vp.ox).toBeCloseTo(vpBefore.ox - 100 / 1000, 5);
+    expect(model.vp.oy).toBeCloseTo(vpBefore.oy - 20 / 1000, 5);
+    expect(model.view3d).toEqual(orbitBefore);
+  });
+
+  it("pans on Alt+drag in 2-D, leaving the orbit untouched", () => {
+    const { model, canvas } = makeHarness(); // view3d.on is false by default
+    model.view3d.yaw = 0.6;
+    model.view3d.pitch = 0.35;
+    const vpBefore = { ...model.vp };
+
+    down(canvas, 100, 100, { altKey: true });
+    move(canvas, 200, 120, { altKey: true });
+    up(canvas, 200, 120, { altKey: true });
+
+    expect(model.vp.ox).toBeCloseTo(vpBefore.ox - 100 / 1000, 5);
+    expect(model.vp.oy).toBeCloseTo(vpBefore.oy - 20 / 1000, 5);
+    expect(model.view3d).toEqual({ on: false, yaw: 0.6, pitch: 0.35 });
+  });
+
+  it("toggles 3-D from the on-canvas view tab without starting a gesture", () => {
+    const { canvas, deps } = makeHarness();
+    canvas.topViewTabAt.mockReturnValue("3d");
+    down(canvas, 500, 60);
+    expect(deps.toggleView3D).toHaveBeenCalledTimes(1);
+    // Chrome: no gesture starts and selection logic never runs.
+    expect(canvas.boxSel).toBeNull();
+    expect(canvas.hitTest).not.toHaveBeenCalled();
+    expect(canvas.$canvas.style.cursor).toBe("");
+  });
+
+  it("arms the scope gesture in 3-D and opens a sphere on X + wheel", () => {
+    const { model, canvas, deps } = makeHarness();
+    set3D(model);
+    canvas.pickCursorWorld3D.mockReturnValue({
+      wx: 0.4,
+      wy: 0.3,
+      wz: 0.7,
+      snapped: true,
+    });
+    canvas.worldRadiusForPx.mockReturnValue(0.05);
+    canvas.$canvas.dispatchEvent(mouseEvent("mouseenter"));
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    canvas.$canvas.dispatchEvent(wheelEvent({ x: 20, y: 20, deltaY: -100 }));
+    expect(deps.openScope).toHaveBeenCalledTimes(1);
+    const [scope, lensId, allowEmpty] = (
+      deps.openScope as ReturnType<typeof vi.fn>
+    ).mock.calls[0] as [
+      { shape: string; cx: number; cy: number; cz: number; r: number },
+      string,
+      boolean,
+    ];
+    expect(scope.shape).toBe("sphere");
+    expect(scope.cx).toBe(0.4);
+    expect(scope.cy).toBe(0.3);
+    expect(scope.cz).toBe(0.7);
+    expect(scope.r).toBe(0.05);
+    expect(lensId).toBe(model.scopeLensId);
+    expect(allowEmpty).toBe(true);
+    // The pick was at the cursor; the radius inverts the 14 px scroll start.
+    expect(canvas.pickCursorWorld3D).toHaveBeenCalledWith(20, 20);
+    expect(canvas.worldRadiusForPx).toHaveBeenCalledWith(0.4, 0.3, 0.7, 14);
+  });
+
+  it("opens a sphere scope on an X + drag from the snapped origin", () => {
+    const { model, canvas, deps } = makeHarness();
+    set3D(model);
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.pickCursorWorld3D.mockReturnValue({
+      wx: 0.42,
+      wy: 0.31,
+      wz: 0.6,
+      snapped: true,
+    });
+    canvas.worldRadiusForPx.mockReturnValue(0.03);
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    down(canvas, 100, 100);
+    // The drag preview carries the sphere origin snapped once at mouse-down.
+    expect(canvas.scopeDrag).toEqual({
+      x0: 100,
+      y0: 100,
+      x1: 100,
+      y1: 100,
+      sphere: { cx: 0.42, cy: 0.31, cz: 0.6 },
+    });
+    move(canvas, 140, 130);
+    up(canvas, 140, 130);
+    expect(deps.openScope).toHaveBeenCalledTimes(1);
+    const [scope, lensId] = (deps.openScope as ReturnType<typeof vi.fn>).mock
+      .calls[0] as [
+      { shape: string; cx: number; cy: number; cz: number; r: number },
+      string,
+    ];
+    expect(scope.shape).toBe("sphere");
+    expect(scope.cx).toBe(0.42);
+    expect(scope.cy).toBe(0.31);
+    expect(scope.cz).toBe(0.6);
+    expect(scope.r).toBe(0.03);
+    expect(lensId).toBe(model.scopeLensId);
+    // Radius = the drag distance in px (hypot(40, 30) = 50), inverted to world.
+    expect(canvas.worldRadiusForPx).toHaveBeenCalledWith(0.42, 0.31, 0.6, 50);
+  });
+
+  it("ignores a 3-D scope drag shorter than 6 px", () => {
+    const { model, canvas, deps } = makeHarness();
+    set3D(model);
+    canvas.pickCursorWorld3D.mockReturnValue({
+      wx: 0.5,
+      wy: 0.5,
+      wz: 0.5,
+      snapped: true,
+    });
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { code: "KeyX", bubbles: true }),
+    );
+    down(canvas, 100, 100);
+    move(canvas, 102, 101);
+    up(canvas, 102, 101);
+    expect(deps.openScope).not.toHaveBeenCalled();
+  });
+
+  it("closes a sphere scope on a click outside its screen circle, keeps one inside", () => {
+    const { model, canvas, deps } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    model.scope = {
+      shape: "sphere",
+      cx: 0.5,
+      cy: 0.5,
+      cz: 0.5,
+      r: 0.1,
+      lensId: "camelot",
+    };
+    canvas.scopeScreenCircle.mockReturnValue({ cx: 500, cy: 250, r: 100 });
+    canvas.scopeTabAt.mockReturnValue(null);
+    canvas.hitTest.mockReturnValue(-1);
+    // Inside the screen circle the click falls through to selection.
+    down(canvas, 520, 250);
+    expect(deps.closeScope).not.toHaveBeenCalled();
+    // Outside the circle the scope closes.
+    down(canvas, 700, 250);
+    expect(deps.closeScope).toHaveBeenCalledTimes(1);
   });
 });
 

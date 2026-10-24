@@ -12,6 +12,12 @@
 // gradual Gaussian, so a dense region reads as one soft zone rather than a pile of
 // bright circles.
 //
+// In 3-D each halo carries a depth and `render` takes occluders — the blobs in
+// front of it. A pre-pass splats the occluders' solid kernels (MAX-blended) into
+// a half-float depth target, and the glow pass hides any halo pixel a nearer or
+// equal-depth occluder covers, so a halo sits behind its own blob yet shows over
+// deeper ones. The caller blits the glow between the blobs and the crisp dots.
+//
 // The 2-D canvas stays the single source of truth for *where* things are; this
 // module only turns points into light.
 
@@ -22,6 +28,7 @@ import {
   deviceSize,
   link,
 } from "./webgl-layer";
+import { CORE, DEPTH_MASK } from "./point-layer";
 
 /** One glow splat, in CSS pixels. */
 export interface GlowPoint {
@@ -35,22 +42,46 @@ export interface GlowPoint {
   color: [number, number, number];
   /** Peak opacity 0..1. */
   alpha: number;
+  /**
+   * Normalised depth, 1 = nearest the viewer (always 1 in 2-D). Only read when
+   * `render` is given occluders; without them a halo is never occluded.
+   */
+  depth?: number;
 }
 
-const FLOATS_PER_VERTEX = 10;
-const VERTICES_PER_POINT = 6;
+/**
+ * A solid disc that can hide a halo behind it: the same kernel the metaball
+ * layer uses, so the occlusion footprint matches the blob on screen.
+ */
+export interface GlowOccluder {
+  x: number;
+  y: number;
+  /** Kernel half-extent, in CSS pixels (same space as the glow points). */
+  radius: number;
+  /** Normalised depth, 1 = nearest the viewer. */
+  depth: number;
+}
 
-const VERT_SRC = `
-attribute vec2 a_center;
-attribute vec2 a_corner;
-attribute float a_radius;
-attribute float a_core;
-attribute vec4 a_color;
+/** How far *behind* an occluder a halo must sit before it can show. */
+const DEPTH_EPS = 0.01;
+
+const FLOATS_PER_VERTEX = 11;
+const VERTICES_PER_POINT = 6;
+const OCC_FLOATS_PER_VERTEX = 6;
+
+const VERT_SRC = `#version 300 es
+in vec2 a_center;
+in vec2 a_corner;
+in float a_radius;
+in float a_core;
+in vec4 a_color;
+in float a_depth;
 uniform vec2 u_resolution;
-varying vec2 v_local;
-varying float v_radius;
-varying float v_core;
-varying vec4 v_color;
+out vec2 v_local;
+out float v_radius;
+out float v_core;
+out vec4 v_color;
+out float v_depth;
 void main() {
   vec2 px = a_center + a_corner * a_radius;
   vec2 clip = px / u_resolution * 2.0 - 1.0;
@@ -59,14 +90,20 @@ void main() {
   v_radius = a_radius;
   v_core = a_core;
   v_color = a_color;
+  v_depth = a_depth;
 }`;
 
-const FRAG_SRC = `
-precision mediump float;
-varying vec2 v_local;
-varying float v_radius;
-varying float v_core;
-varying vec4 v_color;
+const FRAG_SRC = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+in vec2 v_local;
+in float v_radius;
+in float v_core;
+in vec4 v_color;
+in float v_depth;
+uniform sampler2D u_front;
+uniform float u_occlude;
+out vec4 outColor;
 void main() {
   float d = length(v_local) / v_radius;
   // Flat core (if any), then a gradual Gaussian tail that reaches zero at the rim,
@@ -74,7 +111,47 @@ void main() {
   float t = clamp((d - v_core) / (1.0 - v_core), 0.0, 1.0);
   float falloff = exp(-2.5 * t * t) * (1.0 - smoothstep(0.75, 1.0, t));
   float a = v_color.a * falloff;
-  gl_FragColor = vec4(v_color.rgb * a, a);
+  // In 3-D a halo shows only where the front surface (from the occluder
+  // pre-pass) is strictly behind it — or empty, which reads as depth 0.
+  if (u_occlude > 0.5) {
+    float front = texelFetch(u_front, ivec2(gl_FragCoord.xy), 0).r;
+    a *= step(front, v_depth - ${DEPTH_EPS});
+  }
+  outColor = vec4(v_color.rgb * a, a);
+}`;
+
+// Occluder pre-pass: the same kernel as the metaball depth pre-pass, MAX-blended
+// into a second target so each pixel holds the depth of the nearest solid
+// occluder (0 where none is). The glow pass reads this to hide halos behind it.
+const OCC_VERT_SRC = `#version 300 es
+in vec2 a_center;
+in vec2 a_corner;
+in float a_radius;
+in float a_depth;
+uniform vec2 u_resolution;
+out vec2 v_local;
+out float v_radius;
+out float v_depth;
+void main() {
+  vec2 px = a_center + a_corner * a_radius;
+  vec2 clip = px / u_resolution * 2.0 - 1.0;
+  gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_local = a_corner * a_radius;
+  v_radius = a_radius;
+  v_depth = a_depth;
+}`;
+
+const OCC_FRAG_SRC = `#version 300 es
+precision mediump float;
+in vec2 v_local;
+in float v_radius;
+in float v_depth;
+uniform float u_core;
+out vec4 outColor;
+void main() {
+  float d = length(v_local) / v_radius;
+  float w = 1.0 - smoothstep(u_core, 1.0, d);
+  outColor = vec4(w > ${DEPTH_MASK} ? v_depth : 0.0, 0.0, 0.0, 0.0);
 }`;
 
 /**
@@ -102,6 +179,28 @@ export function packGlowVertices(
       data[o++] = p.color[1];
       data[o++] = p.color[2];
       data[o++] = p.alpha;
+      data[o++] = p.depth ?? 1;
+    }
+  }
+  return data.length === need ? data : data.subarray(0, need);
+}
+
+/** Interleave the occluders into the vertex buffer the pre-pass shader reads. */
+function packOccluderVertices(
+  occluders: readonly GlowOccluder[],
+  out?: Float32Array,
+): Float32Array {
+  const need = occluders.length * VERTICES_PER_POINT * OCC_FLOATS_PER_VERTEX;
+  const data = out ?? new Float32Array(need);
+  let o = 0;
+  for (const p of occluders) {
+    for (const [cx, cy] of CORNERS) {
+      data[o++] = p.x;
+      data[o++] = p.y;
+      data[o++] = cx;
+      data[o++] = cy;
+      data[o++] = p.radius;
+      data[o++] = p.depth;
     }
   }
   return data.length === need ? data : data.subarray(0, need);
@@ -114,16 +213,32 @@ export function packGlowVertices(
  */
 export class GlowLayer {
   readonly supported: boolean;
-  private readonly canvas: HTMLCanvasElement;
+  /** The glow canvas; in 3-D the caller blits it into the scatter canvas. */
+  readonly canvas: HTMLCanvasElement;
   private readonly reference: HTMLCanvasElement;
   private gl: WebGL2RenderingContext | null = null;
   private program: WebGLProgram | null = null;
   private buffer: WebGLBuffer | null = null;
   private resolutionLoc: WebGLUniformLocation | null = null;
+  private frontLoc: WebGLUniformLocation | null = null;
+  private occludeLoc: WebGLUniformLocation | null = null;
+  private occProgram: WebGLProgram | null = null;
+  private occBuffer: WebGLBuffer | null = null;
+  private occResolutionLoc: WebGLUniformLocation | null = null;
+  private occCoreLoc: WebGLUniformLocation | null = null;
+  private depthTexture: WebGLTexture | null = null;
+  private depthFramebuffer: WebGLFramebuffer | null = null;
+  /** True once the depth target has storage and is a complete framebuffer. */
+  private occlusionReady = false;
+  /** True when the context can render into a half-float target. */
+  private depthExt = false;
+  private depthW = 0;
+  private depthH = 0;
   private width = 0;
   private height = 0;
   /** Reused vertex buffer, so a frame does not allocate one per draw. */
   private _vertexData = new Float32Array(0);
+  private _occVertexData = new Float32Array(0);
 
   constructor(host: HTMLElement, reference: HTMLCanvasElement) {
     this.reference = reference;
@@ -148,6 +263,32 @@ export class GlowLayer {
     const buffer = gl.createBuffer();
     if (!buffer) return false;
     this.resolutionLoc = gl.getUniformLocation(program, "u_resolution");
+    this.frontLoc = gl.getUniformLocation(program, "u_front");
+    this.occludeLoc = gl.getUniformLocation(program, "u_occlude");
+    // Occlusion is optional: without a renderable half-float target the halos
+    // simply draw un-occluded — the layer itself stays supported.
+    this.depthExt =
+      !!gl.getExtension("EXT_color_buffer_float") ||
+      !!gl.getExtension("EXT_color_buffer_half_float");
+    const occProgram = link(gl, OCC_VERT_SRC, OCC_FRAG_SRC);
+    const occBuffer = gl.createBuffer();
+    const depthTexture = gl.createTexture();
+    const depthFramebuffer = gl.createFramebuffer();
+    if (occProgram && occBuffer && depthTexture && depthFramebuffer) {
+      this.occProgram = occProgram;
+      this.occBuffer = occBuffer;
+      this.depthTexture = depthTexture;
+      this.depthFramebuffer = depthFramebuffer;
+      this.occResolutionLoc = gl.getUniformLocation(occProgram, "u_resolution");
+      this.occCoreLoc = gl.getUniformLocation(occProgram, "u_core");
+      // NEAREST is enough — the glow pass only indexes the target per pixel.
+      gl.bindTexture(gl.TEXTURE_2D, depthTexture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+    }
     this.gl = gl;
     this.program = program;
     this.buffer = buffer;
@@ -175,15 +316,63 @@ export class GlowLayer {
     this.width = cssW;
     this.height = cssH;
     this.gl!.viewport(0, 0, pw, ph);
+    this._syncDepthTarget(pw, ph);
   }
 
-  /** Clear the overlay and additively splat every point in one draw call. */
-  render(points: readonly GlowPoint[]): void {
+  /**
+   * Give the occlusion target the canvas's device-pixel size. Skipped silently
+   * when the context cannot render into a half-float target; occlusion then
+   * stays off rather than marking the layer unsupported.
+   */
+  private _syncDepthTarget(pw: number, ph: number): void {
+    const gl = this.gl;
+    const tex = this.depthTexture;
+    const fbo = this.depthFramebuffer;
+    if (!gl || !this.depthExt || !tex || !fbo) return;
+    if (this.occlusionReady && this.depthW === pw && this.depthH === ph) return;
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA16F,
+      pw,
+      ph,
+      0,
+      gl.RGBA,
+      gl.HALF_FLOAT,
+      null,
+    );
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER,
+      gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D,
+      tex,
+      0,
+    );
+    this.occlusionReady =
+      gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    this.depthW = pw;
+    this.depthH = ph;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  /**
+   * Clear the overlay and additively splat every point in one draw call. In 3-D
+   * `occluders` (the blobs in front of the halos) first splat their depth into
+   * the occlusion target, so each halo shows only where nothing at its own or a
+   * nearer depth covers the pixel.
+   */
+  render(points: readonly GlowPoint[], occluders?: readonly GlowOccluder[]): void {
     const gl = this.gl;
     if (!gl || gl.isContextLost()) return;
     gl.clearColor(0, 0, 0, 0);
     gl.clear(gl.COLOR_BUFFER_BIT);
     if (!points.length) return;
+
+    const occlude =
+      occluders !== undefined && occluders.length > 0 && this.occlusionReady;
+    if (occlude) this._splatOccluders(occluders!);
 
     gl.useProgram(this.program);
     gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
@@ -201,7 +390,55 @@ export class GlowLayer {
     bindAttrib(gl, program, "a_radius", 1, stride, 4 * Float32Array.BYTES_PER_ELEMENT);
     bindAttrib(gl, program, "a_core", 1, stride, 5 * Float32Array.BYTES_PER_ELEMENT);
     bindAttrib(gl, program, "a_color", 4, stride, 6 * Float32Array.BYTES_PER_ELEMENT);
+    bindAttrib(gl, program, "a_depth", 1, stride, 10 * Float32Array.BYTES_PER_ELEMENT);
     gl.uniform2f(this.resolutionLoc, this.width, this.height);
+    // Always point `u_front` at the depth target on unit 1, even when occlusion
+    // is off: WebGL validates sampler bindings regardless of the dynamic branch,
+    // and the default unit 0 holds the canvas this pass renders into (a feedback
+    // loop that drops the draw).
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.depthTexture);
+    gl.uniform1i(this.frontLoc, 1);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.uniform1f(this.occludeLoc, occlude ? 1 : 0);
     gl.drawArrays(gl.TRIANGLES, 0, points.length * VERTICES_PER_POINT);
+  }
+
+  /** Splat the occluders' solid kernels' depth into the occlusion target with
+   * MAX blending, so each pixel holds the depth of the nearest solid occluder
+   * (0 where none is). Only called when the depth target is usable. */
+  private _splatOccluders(occluders: readonly GlowOccluder[]): void {
+    const gl = this.gl!;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.depthFramebuffer);
+    gl.viewport(0, 0, this.depthW, this.depthH);
+    gl.clearColor(0, 0, 0, 0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.enable(gl.BLEND);
+    gl.blendEquation(gl.MAX);
+    gl.blendFunc(gl.ONE, gl.ONE);
+    gl.useProgram(this.occProgram!);
+    const need = occluders.length * VERTICES_PER_POINT * OCC_FLOATS_PER_VERTEX;
+    if (this._occVertexData.length < need) {
+      this._occVertexData = new Float32Array(need);
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.occBuffer);
+    gl.bufferData(
+      gl.ARRAY_BUFFER,
+      packOccluderVertices(occluders, this._occVertexData),
+      gl.DYNAMIC_DRAW,
+    );
+    const stride = OCC_FLOATS_PER_VERTEX * Float32Array.BYTES_PER_ELEMENT;
+    const program = this.occProgram!;
+    bindAttrib(gl, program, "a_center", 2, stride, 0);
+    bindAttrib(gl, program, "a_corner", 2, stride, 2 * Float32Array.BYTES_PER_ELEMENT);
+    bindAttrib(gl, program, "a_radius", 1, stride, 4 * Float32Array.BYTES_PER_ELEMENT);
+    bindAttrib(gl, program, "a_depth", 1, stride, 5 * Float32Array.BYTES_PER_ELEMENT);
+    gl.uniform2f(this.occResolutionLoc!, this.width, this.height);
+    gl.uniform1f(this.occCoreLoc!, CORE);
+    gl.drawArrays(gl.TRIANGLES, 0, occluders.length * VERTICES_PER_POINT);
+    // Back to the glow pass's own target and equation.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.blendEquation(gl.MAX);
   }
 }
