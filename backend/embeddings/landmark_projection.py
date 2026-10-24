@@ -63,9 +63,9 @@ class LandmarkModel:
     sources: tuple[str, ...]
     #: ``source -> (N, M)`` squared distances ``||u_is - u_ls||^2``.
     delta: dict[str, np.ndarray]
-    #: ``(M, 2)`` landmark coordinates fitted against the base layout.
+    #: ``(M, dims)`` landmark coordinates fitted against the base layout.
     coeffs: np.ndarray
-    #: ``(N, 2)`` base layout the coefficients were fitted against.
+    #: ``(N, dims)`` base layout the coefficients were fitted against.
     base: np.ndarray
     #: Softmax bandwidth, fixed per chart.
     tau: float
@@ -85,11 +85,11 @@ class LandmarkModel:
         return e / e.sum(axis=1, keepdims=True)
 
     def evaluate(self, weights: dict[str, float]) -> np.ndarray:
-        """``(N, 2)`` extension values ``g_i(w)`` at *weights*."""
+        """``(N, dims)`` extension values ``g_i(w)`` at *weights*."""
         return self.affinities(weights) @ self.coeffs
 
     def raw_jacobian(self, weights: dict[str, float]) -> dict[str, np.ndarray]:
-        """Exact ``dg_i/dw_s`` as ``source -> (N, 2)``, at *weights*.
+        """Exact ``dg_i/dw_s`` as ``source -> (N, dims)``, at *weights*.
 
         Closed form: ``dg/dw_s = -(1/tau) sum_l a_il Delta_ils (c_l - g_i)``.
         This is the derivative of the *nonlinear* extension, so a first-order step
@@ -239,27 +239,29 @@ def _tau_from(delta: dict[str, np.ndarray], quantile: float) -> float:
 
 
 def _remove_gauge(jac: np.ndarray, base: np.ndarray) -> np.ndarray:
-    """Project the translation + uniform-zoom component out of a movement field.
+    """Project the gauge component out of a movement field.
 
+    The gauge is a per-axis translation plus one shared uniform zoom — no rotation.
     A field that only translates or uniformly scales the whole map carries no shape
     information — the canvas refits the view regardless — so it reads as "nothing
-    happened". Fit ``J_i ~= alpha + beta * r_i`` with ``r_i = base_i - centroid``
-    (2 intercepts + one shared zoom) and keep the residual, which is the shape change.
+    happened". Fit ``J_i ~= alpha_k + beta * r_i`` with ``r_i = base_i - centroid``
+    (one intercept per axis + one shared zoom) and keep the residual, which is the
+    shape change. ``base.shape[1]`` fixes the dimensionality (2 or 3).
     """
     n = int(base.shape[0])
     if n < 4:
         return jac
+    dims = int(base.shape[1])
     r = base - base.mean(axis=0)
-    design = np.zeros((2 * n, 3), dtype=np.float64)
-    design[:n, 0] = 1.0
-    design[:n, 2] = r[:, 0]
-    design[n:, 1] = 1.0
-    design[n:, 2] = r[:, 1]
-    target = np.concatenate([jac[:, 0], jac[:, 1]]).astype(np.float64)
+    design = np.zeros((dims * n, dims + 1), dtype=np.float64)
+    for k in range(dims):
+        design[k * n:(k + 1) * n, k] = 1.0
+        design[k * n:(k + 1) * n, -1] = r[:, k]
+    # Axis-major flatten (all x rows, then all y rows, …), matching the design's
+    # row layout; for dims=2 this is exactly ``concatenate([jac[:, 0], jac[:, 1]])``.
+    target = jac.ravel(order="F").astype(np.float64)
     coef, *_ = np.linalg.lstsq(design, target, rcond=None)
-    fitted = np.empty((n, 2), dtype=np.float64)
-    fitted[:, 0] = coef[0] + coef[2] * r[:, 0]
-    fitted[:, 1] = coef[1] + coef[2] * r[:, 1]
+    fitted = (design @ coef).reshape(dims, n).T
     return (jac - fitted).astype(np.float32)
 
 
@@ -278,7 +280,7 @@ def build_landmark_model(
     seed: int = 42,
     place_infos: list[dict] | None = None,
 ) -> LandmarkModel | None:
-    """Fit the landmark extension against the existing base 2-D layout.
+    """Fit the landmark extension against the existing base layout (2-D or 3-D).
 
     Returns ``None`` when there is nothing to fit (fewer than two eligible tracks).
     The caller caches the result per chart revision: refitting ``c`` per drag would
@@ -320,8 +322,12 @@ def build_landmark_model(
     active_sources = tuple(s for s in sources if s in fit_delta)
 
     a0 = _affinities_at(fit_delta, active_sources, w0, tau)
+    # The layout dimensionality comes from the base positions themselves: a "z"
+    # key makes it a 3-D chart, otherwise 2-D.
+    first = by_path[fit_paths[0]]
+    keys = ("x", "y", "z") if "z" in first else ("x", "y")
     y0 = np.array(
-        [[by_path[p]["x"], by_path[p]["y"]] for p in fit_paths], dtype=np.float64
+        [[by_path[p][k] for k in keys] for p in fit_paths], dtype=np.float64
     )
     gram = a0.T @ a0 + FIT_RIDGE * np.eye(a0.shape[1])
     try:

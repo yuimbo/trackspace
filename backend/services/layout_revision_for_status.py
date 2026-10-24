@@ -29,4 +29,5 @@ def layout_revision_for_projection(
         cache_versions=tuple(cache_versions),
         weights=getattr(proj, "source_weights", None),
         sources=sources,
+        dims=getattr(proj, "dims", 2),
     )

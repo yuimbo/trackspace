@@ -1,5 +1,7 @@
 """Unit tests for the source-parameterised FeatureCache."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -455,3 +457,57 @@ def test_presence_memo_result_isolated_from_memo(tmp_path):
 
     assert fc.presence(versions, ["a"]) == {"clap": {"a": True}}
     assert counter[0] == n0  # memo untouched by the caller's mutations
+
+
+# ── Revision-keyed layout persistence (2-D and 3-D) ────────────
+
+
+def test_layout_roundtrip_2d(tmp_path):
+    fc = _mk(tmp_path)
+    positions = [
+        {"path": "a.mp3", "x": 0.25, "y": 0.5},
+        {"path": "b.mp3", "x": 0.75, "y": 1.0},
+    ]
+    fc.put_layout("rev-2d", positions)
+    assert fc.get_layout("rev-2d") == positions
+
+
+def test_layout_roundtrip_3d(tmp_path):
+    fc = _mk(tmp_path)
+    positions = [
+        {"path": "a.mp3", "x": 0.25, "y": 0.5, "z": 0.75},
+        {"path": "b.mp3", "x": 0.75, "y": 1.0, "z": 0.0},
+    ]
+    fc.put_layout("rev-3d", positions)
+    got = fc.get_layout("rev-3d")
+    assert got == positions
+    assert all("z" in p for p in got)
+
+
+def test_layout_rejects_mismatched_blob(tmp_path):
+    fc = _mk(tmp_path)
+    fc.put_layout(
+        "rev",
+        [{"path": "a.mp3", "x": 0.5, "y": 0.5}, {"path": "b.mp3", "x": 0.5, "y": 0.5}],
+    )
+    # Width 4 (neither 2 nor 3) reads as a miss, not as garbage positions.
+    with fc._conn() as conn:
+        conn.execute(
+            "UPDATE layout_cache SET xy=? WHERE revision=?",
+            (np.ones(8, dtype=np.float32).tobytes(), "rev"),
+        )
+    assert fc.get_layout("rev") is None
+    # A blob that does not divide evenly across the paths is a miss too.
+    with fc._conn() as conn:
+        conn.execute(
+            "UPDATE layout_cache SET xy=? WHERE revision=?",
+            (np.ones(3, dtype=np.float32).tobytes(), "rev"),
+        )
+    assert fc.get_layout("rev") is None
+    # The stored path list must match the blob's row count.
+    with fc._conn() as conn:
+        conn.execute(
+            "UPDATE layout_cache SET paths=? WHERE revision=?",
+            (json.dumps(["a.mp3", "b.mp3", "c.mp3"]), "rev"),
+        )
+    assert fc.get_layout("rev") is None

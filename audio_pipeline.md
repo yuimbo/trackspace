@@ -527,6 +527,22 @@ stays on the PCA preview. The fallback therefore PCA-reduces to
 `TRACKSPACE_SKLEARN_TSNE_PCA_DIM` (default 50) first, mirroring the openTSNE path;
 set it to 0 to disable. cuML and mlx-vis reduce internally and are untouched.
 
+**3-D layouts (`dims=3`).** Opt-in third axis: `GET /api/embeddings/projection?dims=3`
+returns `{"path","x","y","z"}` positions and fits every visible track in one chart
+(external tracks included — no Nyström placement). The openTSNE fit pins
+`negative_gradient_method="bh"` (openTSNE's auto-selected fft is 2-D only) and gets
+its own fit-cache namespace (`|dims=3`) and layout-revision payload, so 2-D and 3-D
+caches never collide. A 3-D layout is gauged *head-on* (`gauge_layout_3d`): the route
+first computes the same lens's 2-D layout (same query and fit scope) and the 3-D layout
+is similarity-fitted so its x,y match it, with the z sign pinned per track-set family
+(`GAUGE_3D_VERSION` is part of the 3-D revision). Because 2-D layouts are already
+aligned across lenses (below), 2-D↔3-D barely moves x/y and 3-D lens switches stay
+consistent; if the reference fails the 3-D layout is returned ungauged. The landmark
+extension and its weight Jacobian are dimension-agnostic: `?dims=3&jacobian=1` serves 3-component rows
+from a chart fitted on x/y/z, with the same gauge projection as 2-D (see below). The
+fallback chain is scikit-learn Barnes-Hut only (cuML and mlx-vis are 2-D only /
+unverified).
+
 ### Lens gauge (why a lens switch does not flip the map)
 
 t-SNE's objective is invariant to rotation, reflection and uniform scale, so two
@@ -903,11 +919,12 @@ dg_i/dw_s = −(1/tau) sum_l a_il Delta_ils (c_l − g_i)
 - The preview is the residual form `y~_i(w) = y_i^0 + g_i(w) − g_i(w0)`, so it
   reproduces the base layout *exactly* at `w = w0`. The frontend's `y^0 + J dw` is
   its first-order truncation.
-- **The translation + uniform-zoom component is projected out** of each source's Jacobian
-  (`_remove_gauge`): fit `J_i ≈ α + β·(y_i^0 − centroid)` and keep the residual. A
-  Jacobian that only offsets or scales the whole map carries no shape information — the
-  canvas refits the view anyway — so it reads as "nothing happened". Only the shape change
-  is returned, and the extremes of the map define the frame.
+- **The gauge component is projected out** of each source's Jacobian (`_remove_gauge`):
+  fit `J_i ≈ α_k + β·(y_i^0 − centroid)` — one intercept per axis plus a single shared
+  uniform zoom, no rotation — and keep the residual. A Jacobian that only offsets or
+  scales the whole map carries no shape information — the canvas refits the view anyway —
+  so it reads as "nothing happened". Only the shape change is returned, and the extremes
+  of the map define the frame. This applies to both `dims=2` and `dims=3`.
 - The frontend **re-normalises every preview state to the unit square**, matching the
   server's min-max normalisation of every layout, so a drag cannot drift or zoom the map
   out of frame.

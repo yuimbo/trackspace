@@ -1,8 +1,10 @@
-"""2-D projection backends: PCA preview and cuML / mlx-vis / scikit-learn t-SNE.
+"""Projection backends: PCA preview and cuML / mlx-vis / scikit-learn t-SNE.
 
 Extracted from ``layout``. The PCA reference-alignment state lives here too; it
 keeps successive PCA previews in a stable orientation so dots do not spin between
-incremental refreshes.
+incremental refreshes. The t-SNE backends are 2-D by default with an opt-in 3-D
+path (openTSNE or scikit-learn only); the 3-D namespaces its fit cache and
+revision independently so 2-D and 3-D layouts never collide.
 """
 
 from __future__ import annotations
@@ -79,12 +81,12 @@ def _pca_ref_store(paths: list[str], coords: np.ndarray) -> None:
         _pca_ref_stats["evict"] += 1
 
 
-def _project_pca(mat: np.ndarray, paths: list[str] | None = None) -> np.ndarray:
+def _project_pca(mat: np.ndarray, paths: list[str] | None = None, dims: int = 2) -> np.ndarray:
     centred = mat - mat.mean(axis=0)
     _, _, Vt = svd_singular(centred)
-    coords = centred @ Vt[:2].T
+    coords = centred @ Vt[:dims].T
 
-    if paths is not None:
+    if paths is not None and dims == 2:
         ref_entry = _pca_ref_lookup(paths)
         if ref_entry is not None:
             ref_paths, ref = ref_entry
@@ -203,7 +205,11 @@ def _sklearn_tsne_pca_dim(n_features: int) -> int | None:
     return max(2, min(dim, n_features - 1))
 
 
-def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
+def _project_tsne_fallback(mat: np.ndarray, dims: int = 2) -> np.ndarray:
+    # 3-D is openTSNE/sklearn only: cuML and mlx-vis are 2-D-only (and the mlx-vis
+    # 3-D path is unverified), so go straight to the sklearn Barnes-Hut fallback.
+    if dims == 3:
+        return _sklearn_tsne(mat, n_components=3)
     global _cuml_projection_enabled, _mlx_vis_projection_enabled
     if _use_cuml_projection():
         try:
@@ -252,17 +258,33 @@ def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
             except Exception as e:
                 log.warning("mlx-vis t-SNE failed; using scikit-learn: %s", e)
                 _mlx_vis_projection_enabled = False
+    return _sklearn_tsne(mat, n_components=2)
+
+
+def _sklearn_tsne(mat: np.ndarray, n_components: int) -> np.ndarray:
+    """scikit-learn t-SNE after the same PCA pre-reduction as the openTSNE path.
+
+    Raw composite vectors are ~2,000-D; Barnes-Hut t-SNE on that directly is
+    minutes-slow at library scale, so the matrix is reduced first
+    (``TRACKSPACE_SKLEARN_TSNE_PCA_DIM``, default 50; 0 disables). Used by the
+    2-D fallback chain and the whole 3-D path.
+    """
     from sklearn.manifold import TSNE  # lazy — heavy import
     pca_dim = _sklearn_tsne_pca_dim(int(np.asarray(mat).shape[1]))
     reduced = mat if pca_dim is None else _pca_reduce(mat, pca_dim)[0]
     perplexity = min(30.0, max(5.0, (len(reduced) - 1) / 3.0))
-    reducer = TSNE(
-        n_components=2,
-        perplexity=perplexity,
-        learning_rate="auto",
-        init="pca",
-        random_state=42,
-    )
+    kwargs: dict = {
+        "n_components": n_components,
+        "perplexity": perplexity,
+        "learning_rate": "auto",
+        "init": "pca",
+        "random_state": 42,
+    }
+    if n_components == 3:
+        # sklearn would auto-select the exact method for 3-D; Barnes-Hut is the
+        # fast path the 2-D fallback uses, so pin it explicitly for 3-D too.
+        kwargs["method"] = "barnes_hut"
+    reducer = TSNE(**kwargs)
     return reducer.fit_transform(reduced)
 
 
@@ -296,7 +318,7 @@ class _TsneFit:
     """A fitted openTSNE embedding plus the PCA basis that feeds it."""
 
     paths: list[str]
-    coords: np.ndarray  # 2-D coords aligned with ``paths``
+    coords: np.ndarray  # coords (2-D or 3-D) aligned with ``paths``
     pca: object  # fitted sklearn PCA, for projecting new rows
     embedding: object  # fitted openTSNE TSNEEmbedding, for .transform()
 
@@ -405,30 +427,38 @@ def _pca_reduce(mat: np.ndarray, dim: int) -> tuple[np.ndarray, object]:
     return pca.fit_transform(mat), pca
 
 
-def _fit_tsne(reduced: np.ndarray) -> tuple[object, np.ndarray]:
+def _fit_tsne(reduced: np.ndarray, dims: int = 2) -> tuple[object, np.ndarray]:
     from openTSNE import TSNE  # lazy — heavy import
 
-    tsne = TSNE(
-        n_components=2,
-        perplexity=_tsne_perplexity(len(reduced)),
-        random_state=42,
-        n_jobs=-1,
-        verbose=False,
-        n_iter=OPENTSNE_N_ITER,
-        early_exaggeration_iter=OPENTSNE_EARLY_EXAGGERATION_ITER,
-    )
+    kwargs: dict = {
+        "n_components": dims,
+        "perplexity": _tsne_perplexity(len(reduced)),
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbose": False,
+        "n_iter": OPENTSNE_N_ITER,
+        "early_exaggeration_iter": OPENTSNE_EARLY_EXAGGERATION_ITER,
+    }
+    if dims == 3:
+        # openTSNE auto-selects negative_gradient_method, but the fft it picks
+        # above 10k points is 2-D only — pin Barnes-Hut for 3-D explicitly.
+        kwargs["negative_gradient_method"] = "bh"
+    tsne = TSNE(**kwargs)
     embedding = tsne.fit(reduced)
     return embedding, np.asarray(embedding, dtype=np.float32)
 
 
-def _fit_cache_key(config_key: str) -> str:
+def _fit_cache_key(config_key: str, dims: int = 2) -> str:
     """Namespace the fit cache so a recipe change cannot reuse a stale fit.
 
     Bumping ``PROJECTION_RECIPE_VERSION`` changes this suffix, so an embedding
     fitted under an older recipe — in memory or persisted on disk — is a miss
-    and refits instead of being reused.
+    and refits instead of being reused. A 3-D fit appends ``|dims=3`` so a 2-D
+    and a 3-D embedding for the same vector config never share a key; 2-D keys
+    are byte-identical to before the dims parameter existed.
     """
-    return f"{config_key}|opentsne_recipe={PROJECTION_RECIPE_VERSION}"
+    key = f"{config_key}|opentsne_recipe={PROJECTION_RECIPE_VERSION}"
+    return key if dims == 2 else f"{key}|dims=3"
 
 
 def _fit_cache_get(key: str) -> "_TsneFit | None":
@@ -455,6 +485,7 @@ def _project_tsne_incremental(
     *,
     cache_fit: bool = True,
     feature_cache: object = None,
+    dims: int = 2,
 ) -> np.ndarray:
     """Fit once per vector config, then transform only newly added tracks.
 
@@ -464,7 +495,7 @@ def _project_tsne_incremental(
     transform rather than refit; only the config decides that key, so adding tracks
     still reuses it.
     """
-    fit_key = _fit_cache_key(config_key)
+    fit_key = _fit_cache_key(config_key, dims)
     fit = _fit_cache_get(fit_key)
     if fit is None and cache_fit:
         fit = _load_persisted_fit(feature_cache, fit_key)
@@ -479,7 +510,7 @@ def _project_tsne_incremental(
             _tsne_fit_stats["reuse"] += 1
             return np.asarray([fit.coords[index[p]] for p in paths], dtype=np.float32)
         if len(new_rows) <= _opentsne_refit_fraction() * max(1, len(fit.paths)):
-            coords = np.empty((len(paths), 2), dtype=np.float32)
+            coords = np.empty((len(paths), dims), dtype=np.float32)
             for i, p in enumerate(paths):
                 known = index.get(p)
                 if known is not None:
@@ -494,7 +525,7 @@ def _project_tsne_incremental(
             return coords
 
     reduced, pca = _pca_reduce(mat, _opentsne_pca_dim(mat.shape[1]))
-    embedding, coords = _fit_tsne(reduced)
+    embedding, coords = _fit_tsne(reduced, dims=dims)
     if cache_fit:
         fit = _TsneFit(list(paths), coords, pca, embedding)
         _fit_cache_put(fit_key, fit)
@@ -510,6 +541,7 @@ def _project_tsne(
     *,
     cache_fit: bool = True,
     feature_cache: object = None,
+    dims: int = 2,
 ) -> np.ndarray:
     if paths and config_key and _use_opentsne():
         cap = _opentsne_max_points()
@@ -521,7 +553,8 @@ def _project_tsne(
                     config_key,
                     cache_fit=cache_fit,
                     feature_cache=feature_cache,
+                    dims=dims,
                 )
             except Exception as e:
                 log.warning("openTSNE failed; using fitted-backend chain: %s", e)
-    return _project_tsne_fallback(mat)
+    return _project_tsne_fallback(mat, dims=dims)

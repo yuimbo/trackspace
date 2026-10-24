@@ -1,4 +1,4 @@
-"""Shared embedding-space layout: composite vectors and 2-D projection.
+"""Shared embedding-space layout: composite vectors and projection.
 
 CLAP model I/O lives in `clap.py`. Librosa descriptors live in
 `librosa_audio_features.py`. This module concatenates cached source rows
@@ -27,7 +27,7 @@ from .clap import (
     _load_audio_segments,
 )
 from .feature_encoding import FEATURE_ENCODING_VERSION, encode_feature_vector
-from .lens_gauge import gauge_layout
+from .lens_gauge import gauge_layout, gauge_layout_3d
 from .projection_backends import (
     _project_pca,
     _project_tsne,
@@ -746,6 +746,8 @@ def compute_projection(
     required_sources: tuple[str, ...] | None = None,
     with_jacobian: bool = False,
     on_progress: Callable[[str, int, int], None] | None = None,
+    dims: int = 2,
+    align_ref: list[dict] | None = None,
 ) -> list[dict] | tuple[list[dict], dict[str, np.ndarray]]:
     if layout_revision and method == "tsne":
         hit = revision_layout_cached(layout_revision, feature_cache)
@@ -754,6 +756,17 @@ def compute_projection(
             return hit
 
     weights0 = dict(source_weights or {})
+
+    # The 3-D gauge pins the head-on (x,y) of a 3-D layout to this lens's own
+    # 2-D layout (see `lens_gauge`); build the reference arrays once, not per
+    # projection call.
+    ref_paths: list[str] | None = None
+    ref_xy: np.ndarray | None = None
+    if align_ref is not None:
+        ref_paths = [p["path"] for p in align_ref]
+        ref_xy = np.asarray(
+            [[p["x"], p["y"]] for p in align_ref], dtype=np.float64
+        )
 
     def _project_at(w: dict[str, float], *, cache_fit: bool = True):
         """Gather → weight → project → normalise for one weight vector.
@@ -779,11 +792,14 @@ def compute_projection(
         # every block is dropped. The HTTP routes reject that vector before
         # reaching here; this keeps the function safe regardless.
         if len(inp.paths) < 2 or inp.mat.shape[0] < 2:
-            flat = [{"path": p, "x": 0.5, "y": 0.5} for p in inp.paths]
-            return flat, np.empty((0, 2), dtype=np.float32), inp.spans
+            flat = [
+                {"path": p, "x": 0.5, "y": 0.5, **({"z": 0.5} if dims == 3 else {})}
+                for p in inp.paths
+            ]
+            return flat, np.empty((0, dims), dtype=np.float32), inp.spans
 
         if method == "pca":
-            coords = _project_pca(inp.mat_proj, inp.paths)
+            coords = _project_pca(inp.mat_proj, inp.paths, dims=dims)
         else:
             if method != "tsne":
                 log.debug("unknown projection method %r; using t-SNE", method)
@@ -796,6 +812,7 @@ def compute_projection(
                 config_key=inp.tsne_config,
                 cache_fit=cache_fit,
                 feature_cache=feature_cache,
+                dims=dims,
             )
 
         # Put every lens in one shared gauge before normalising, so switching lens
@@ -803,15 +820,31 @@ def compute_projection(
         # Keyed by the track set + cache generations, not the lens: layouts are only
         # comparable within one such family. The Jacobian's perturbation fits are
         # excluded — they must stay in their own frame to difference correctly.
-        if cache_fit:
+        # A 3-D layout is gauged head-on: its (x,y) is an arbitrary frame of the
+        # same lens's 2-D layout, so it is fitted onto that layout (the reference)
+        # with the z sign pinned per family. Without a reference it stays ungauged.
+        if cache_fit and dims == 2:
             coords = gauge_layout(
                 f"{_source_versions_token(feature_cache)}|{track_set_key(inp.paths)}",
                 inp.paths,
                 coords,
             )
+        elif cache_fit and dims == 3 and align_ref is not None:
+            coords = gauge_layout_3d(
+                f"{_source_versions_token(feature_cache)}|{track_set_key(inp.paths)}",
+                inp.paths,
+                coords,
+                ref_paths,
+                ref_xy,
+            )
         normed = _normalise_coords(coords)
         result = [
-            {"path": inp.paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
+            {
+                "path": inp.paths[i],
+                "x": float(normed[i, 0]),
+                "y": float(normed[i, 1]),
+                **({"z": float(normed[i, 2])} if dims == 3 else {}),
+            }
             for i in range(len(inp.paths))
         ]
         return result, normed, inp.spans

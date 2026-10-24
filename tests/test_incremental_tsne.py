@@ -134,6 +134,47 @@ def test_no_paths_or_key_uses_fallback():
     assert len(pb._tsne_fit_cache) == 0
 
 
+def test_dims3_fit_returns_3d_coords():
+    mat = _matrix(120)
+    out = pb._project_tsne(mat, paths=_paths(120), config_key="cfg", dims=3)
+    assert out.shape == (120, 3)
+    assert np.isfinite(out).all()
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+
+def test_dims2_and_dims3_fits_share_no_cache_key():
+    """A 2-D and a 3-D embedding for the same vector config must not reuse each
+    other: the fit cache key carries ``|dims=3`` for 3-D."""
+    mat = _matrix(120)
+    pb._project_tsne(mat, paths=_paths(120), config_key="cfg")
+    out3 = pb._project_tsne(mat, paths=_paths(120), config_key="cfg", dims=3)
+    assert out3.shape == (120, 3)
+    assert pb.tsne_fit_stats()["fit"] == 2
+    # The 2-D fit is still cached under its own (unchanged) key.
+    out2 = pb._project_tsne(mat, paths=_paths(120), config_key="cfg")
+    assert out2.shape == (120, 2)
+    assert pb.tsne_fit_stats()["reuse"] == 1
+
+
+def test_dims3_transform_places_new_tracks():
+    mat = _matrix(120)
+    full = pb._project_tsne(mat, paths=_paths(120), config_key="cfg", dims=3)
+    assert full.shape == (120, 3)
+
+    added = _matrix(10, seed=7)
+    sup_paths = _paths(120) + _paths(10, offset=1000)
+    extended = pb._project_tsne(
+        np.vstack([mat, added]), paths=sup_paths, config_key="cfg", dims=3,
+    )
+
+    assert extended.shape == (130, 3)
+    assert np.isfinite(extended).all()
+    # Known tracks are sliced from the cached embedding — they must not move.
+    assert np.array_equal(extended[:120], full)
+    assert pb.tsne_fit_stats()["transform"] == 1
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+
 class _FakeFitStore:
     """Minimal stand-in for FeatureCache's fit-blob sidecar."""
 

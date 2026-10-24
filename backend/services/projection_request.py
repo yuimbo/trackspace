@@ -44,6 +44,10 @@ class ProjectionParams:
     #: Client-supplied source weights (complete vector), or ``None`` for the frozen
     #: defaults. Part of ``layout_revision`` so a re-weighting refits the layout.
     source_weights: dict[str, float] | None = None
+    #: Output dimensionality of the projection: 2 (default) or opt-in 3. Part of
+    #: ``layout_revision`` and the fit-cache key, so 2-D and 3-D layouts never
+    #: share cached positions or fitted embeddings.
+    dims: int = 2
 
 
 def embedding_projection_query_fingerprint(req: Any) -> str:
@@ -126,12 +130,13 @@ def parse_projection_params(
     *,
     default_when_no_method: bool = False,
 ) -> ProjectionParams:
-    """Parse method (``pca`` preview vs ``tsne``), sources, and optional weights.
+    """Parse method (``pca`` preview vs ``tsne``), sources, optional weights, dims.
 
     All other fields are frozen. An unknown ``method`` is rejected with a structured
     400 rather than silently falling back to t-SNE, so client bugs surface instead of
     being masked. Weights, when present, are validated against the canonical sources
-    and completed from the frozen defaults.
+    and completed from the frozen defaults. ``dims`` is ``2`` unless ``3`` is asked
+    for explicitly (an unknown value is a structured 400).
     """
     del default_when_no_method
     raw_method = (req.args.get("method") or "").strip().lower()
@@ -140,6 +145,10 @@ def parse_projection_params(
     else:
         one_of(raw_method, _METHODS, field="method")
         method = "tsne" if raw_method == "umap" else raw_method
+
+    raw_dims = (req.args.get("dims") or "2").strip()
+    one_of(raw_dims, ("2", "3"), field="dims")
+    dims = int(raw_dims)
 
     raw_sources = (req.args.get(_SOURCES_PARAM) or "").strip()
     sources = _parse_sources(raw_sources) if raw_sources else FROZEN_SOURCES
@@ -157,6 +166,8 @@ def parse_projection_params(
     )
 
     params = projection_params_for_lens(sources, source_weights)
+    if dims != 2:
+        params = replace(params, dims=dims)
     return params if method == params.method else replace(params, method=method)
 
 

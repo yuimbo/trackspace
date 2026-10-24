@@ -22,6 +22,10 @@ from .projection_config import PROJECTION_RECIPE_VERSION
 # Bump when folder semantic *algorithm* changes (centroid + PCA extras, thresholds).
 FOLDER_SEMANTIC_BASIS_VERSION = 1
 
+# Bump when the 3-D alignment (head-on onto the lens's 2-D layout) changes; it
+# invalidates persisted 3-D layouts.
+GAUGE_3D_VERSION = 1
+
 
 def compute_layout_revision(
     *,
@@ -31,6 +35,8 @@ def compute_layout_revision(
     projection_recipe_version: int = PROJECTION_RECIPE_VERSION,
     weights: Mapping[str, float] | None = None,
     sources: Sequence[str] | None = None,
+    dims: int = 2,
+    gauge_3d_version: int = GAUGE_3D_VERSION,
 ) -> str:
     """Return a hex SHA-256 of the canonical payload (lexically sorted JSON keys)."""
     payload: dict[str, Any] = {
@@ -49,5 +55,11 @@ def compute_layout_revision(
             str(k): f"{float(v):.6g}" for k, v in sorted((weights or {}).items())
         },
     }
+    # Only the opt-in 3-D layout carries ``dims`` (and its gauge version), so 2-D
+    # hashes (and the persisted 2-D cache rows they key) are byte-identical to
+    # before these parameters existed.
+    if dims != 2:
+        payload["dims"] = int(dims)
+        payload["gauge3d"] = int(gauge_3d_version)
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(canonical).hexdigest()

@@ -5,6 +5,7 @@ import logging
 import queue
 import threading
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Protocol
 
 from flask import Blueprint, jsonify, request
@@ -141,7 +142,12 @@ def create_api_embeddings_blueprint(
         g = model.evaluate(weights0)
         first_placed = len(base_positions)
         return [
-            {"path": model.paths[i], "x": float(g[i, 0]), "y": float(g[i, 1])}
+            {
+                "path": model.paths[i],
+                "x": float(g[i, 0]),
+                "y": float(g[i, 1]),
+                **({"z": float(g[i, 2])} if g.shape[1] == 3 else {}),
+            }
             for i in range(first_placed, len(model.paths))
         ]
 
@@ -264,7 +270,9 @@ def create_api_embeddings_blueprint(
 
         running, progress = _analysis_progress()
 
-        def _scope_infos(all_infos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        def _scope_infos(
+            all_infos: list[dict[str, Any]], dims: int
+        ) -> list[dict[str, Any]]:
             """Infos in the projection *fit* scope.
 
             External roots are analysed (and covered) like library roots. By
@@ -273,9 +281,10 @@ def create_api_embeddings_blueprint(
             client would treat the library layout as stale and refetch it on every
             external toggle.
             """
-            if request.args.get("include_external") == "1" and _fit_scope(
-                request
-            ) == "all":
+            # A 3-D chart always fits every visible track (see the projection route).
+            if request.args.get("include_external") == "1" and (
+                _fit_scope(request) == "all" or dims == 3
+            ):
                 return all_infos
             ids = set(library_root_ids())
             return [t for t in all_infos if t["path"].split("/", 1)[0] in ids]
@@ -292,7 +301,7 @@ def create_api_embeddings_blueprint(
                     failed_by_source=_failed_fingerprints(infos),
                 ),
                 layout_revision_for_projection(
-                    _scope_infos(infos),
+                    _scope_infos(infos, proj.dims),
                     maps,
                     proj,
                     cache_versions=versions_tuple(versions),
@@ -402,7 +411,16 @@ def create_api_embeddings_blueprint(
         # requests them explicitly with include_external=1. fit_scope decides
         # whether they join the fit or are Nyström-placed onto the library chart.
         include_external = request.args.get("include_external") == "1"
-        fit_scope = _fit_scope(request)
+        proj = parse_projection_params_fn(request, default_when_no_method=True)
+
+        with_jacobian = request.args.get("jacobian", "") == "1"
+
+        # 3-D is a single always-fit-all chart: there is no per-lens switching to
+        # stabilise and no Nyström placement, so fit_scope is forced to "all"
+        # (the raw value is still validated by _fit_scope, so junk stays a 400).
+        # The 3-D layout's alignment reference below uses that raw value.
+        raw_fit_scope = _fit_scope(request)
+        fit_scope = "all" if proj.dims == 3 else raw_fit_scope
         infos = build_track_infos_fn(
             rel, recursive, include_external=include_external
         )
@@ -413,9 +431,6 @@ def create_api_embeddings_blueprint(
             fit_scope=fit_scope,
         )
 
-        proj = parse_projection_params_fn(request, default_when_no_method=True)
-
-        with_jacobian = request.args.get("jacobian", "") == "1"
         # The client keys its pending layout by its query string, so echo it here:
         # with two requests overlapping, a stale phase must not overwrite the newer
         # request's progress.
@@ -434,30 +449,84 @@ def create_api_embeddings_blueprint(
 
         pversions = _versions()
         weights0 = dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS)
-        fit_positions, revision = compute_lens_projection(
-            fit_infos,
-            feature_cache,
-            proj,
-            embeddings_mod=embeddings_mod,
-            batch_fetch_maps=batch_fetch_maps,
-            layout_revision_for_projection=layout_revision_for_projection,
-            source_versions=pversions,
-            embedding_version=embedding_version,
-            on_progress=_layout_progress,
-        )
-        placed_positions = (
-            _place_into_chart(
-                base_infos=fit_infos,
-                place_infos=place_infos,
-                base_positions=fit_positions,
-                proj=proj,
-                revision=revision,
-                weights0=weights0,
+
+        def _positions_for(
+            proj: Any,
+            fit_infos: list[dict[str, Any]],
+            place_infos: list[dict[str, Any]],
+            *,
+            align_ref: list[dict[str, Any]] | None = None,
+            report_progress: bool = True,
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None]:
+            """Fitted positions for *proj* plus any Nyström-placed tracks.
+
+            Shared by the plain 2-D path and the 3-D alignment reference, so the
+            reference is exactly the layout a ``dims=2`` request with the same
+            query would return.
+            """
+            fit_positions, revision = compute_lens_projection(
+                fit_infos,
+                feature_cache,
+                proj,
+                embeddings_mod=embeddings_mod,
+                batch_fetch_maps=batch_fetch_maps,
+                layout_revision_for_projection=layout_revision_for_projection,
+                source_versions=pversions,
+                embedding_version=embedding_version,
+                on_progress=_layout_progress if report_progress else None,
+                align_ref=align_ref,
             )
-            if place_infos
-            else []
+            placed_positions = (
+                _place_into_chart(
+                    base_infos=fit_infos,
+                    place_infos=place_infos,
+                    base_positions=fit_positions,
+                    proj=proj,
+                    revision=revision,
+                    weights0=weights0,
+                )
+                if place_infos
+                else []
+            )
+            return fit_positions + placed_positions, fit_positions, revision
+
+        # A 3-D layout's head-on (x,y) is an arbitrary rotation/reflection of the
+        # same lens's 2-D layout, so pin it to that layout — computed with the
+        # *requested* fit scope (3-D itself always fits everything and so cannot
+        # serve as its own reference). Run the reference before the 3-D fit: the
+        # projection slot is not re-entrant. A reference failure must never fail
+        # the 3-D request — an ungauged 3-D map is cosmetic, not an error.
+        align_ref = None
+        if proj.dims == 3:
+            ref_proj = replace(proj, dims=2)
+            ref_fit_infos, ref_place_infos = _split_fit_scope(
+                infos,
+                rel=rel,
+                include_external=include_external,
+                fit_scope=raw_fit_scope,
+            )
+            try:
+                ref_positions, _ref_fit, _ref_revision = _positions_for(
+                    ref_proj,
+                    ref_fit_infos,
+                    ref_place_infos,
+                    report_progress=False,
+                )
+                align_ref = [
+                    {"path": p["path"], "x": p["x"], "y": p["y"]}
+                    for p in ref_positions
+                ]
+            except Exception:
+                log.warning(
+                    "3-D projection: 2-D reference layout failed; leaving the 3-D "
+                    "layout ungauged",
+                    exc_info=True,
+                )
+                align_ref = None
+
+        positions, fit_positions, revision = _positions_for(
+            proj, fit_infos, place_infos, align_ref=align_ref,
         )
-        positions = fit_positions + placed_positions
 
         if not with_jacobian:
             return jsonify({"positions": positions, "revision": revision})
@@ -501,6 +570,7 @@ def create_api_embeddings_blueprint(
                 source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
                 required_sources=proj.required_sources,
                 with_jacobian=True,
+                dims=proj.dims,
             )
         else:
             _layout_progress("jacobian", 0, 0)
@@ -510,7 +580,7 @@ def create_api_embeddings_blueprint(
             "revision": revision,
             "weights": weights0,
             "jacobian": {
-                s: [[float(dx), float(dy)] for dx, dy in arr]
+                s: [[float(v) for v in row] for row in arr]
                 for s, arr in jacobian.items()
             },
         })

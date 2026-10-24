@@ -168,6 +168,37 @@ def test_layout_revision_changes_with_sources():
     assert r_combined != r_clap
 
 
+def test_layout_revision_dims3_differs_and_2d_matches_default():
+    """dims=3 must fork the revision (3-D caches must never serve 2-D coords);
+    dims=2 must be byte-identical to omitting the parameter, so existing 2-D
+    persisted cache rows stay valid."""
+    kw = _base_revision_kwargs()
+    r_default = compute_layout_revision(**kw)
+    r_2d = compute_layout_revision(**{**kw, "dims": 2})
+    r_3d = compute_layout_revision(**{**kw, "dims": 3})
+    assert r_default == r_2d
+    assert r_3d != r_default
+
+
+def test_layout_revision_3d_gauges_with_gauge3d_version():
+    """Bumping the 3-D alignment version invalidates persisted 3-D layouts
+    only: the 2-D revision must stay byte-identical."""
+    from backend.embeddings.layout_revision import GAUGE_3D_VERSION
+
+    kw = _base_revision_kwargs()
+    r_2d = compute_layout_revision(**{**kw, "dims": 2})
+    r_3d = compute_layout_revision(**{**kw, "dims": 3})
+    assert r_3d != r_2d
+    r_3d_new = compute_layout_revision(
+        **{**kw, "dims": 3, "gauge_3d_version": GAUGE_3D_VERSION + 1}
+    )
+    r_2d_new = compute_layout_revision(
+        **{**kw, "dims": 2, "gauge_3d_version": GAUGE_3D_VERSION + 1}
+    )
+    assert r_3d_new != r_3d
+    assert r_2d_new == r_2d
+
+
 def test_layout_revision_stable_for_equivalent_weights():
     kw = _base_revision_kwargs()
     r_a = compute_layout_revision(**{**kw, "weights": {"rhythm": 0.5, "maest": 0.25}})

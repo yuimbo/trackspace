@@ -1,4 +1,4 @@
-"""One lens's 2-D projection, shared by the HTTP route and the prefetch job.
+"""One lens's projection, shared by the HTTP route and the prefetch job.
 
 The route and the ``layout`` job must compute the *same* ``layout_revision`` so the
 job warms the exact cache entry the client later reads. Keeping the gather →
@@ -46,6 +46,7 @@ def compute_lens_projection(
     embedding_version: int,
     user: bool = True,
     on_progress: Callable[[str, int, int], None] | None = None,
+    align_ref: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], str | None]:
     """Return ``(positions, revision)`` for one projection lens.
 
@@ -53,6 +54,9 @@ def compute_lens_projection(
     (from the route or :func:`projection_params_for_lens`); everything else is the
     wired projection stack.  ``user=False`` marks the background prefetch, which yields
     the projection slot to any waiting user request (see ``projection_priority``).
+    ``align_ref`` is the same lens's 2-D layout: the 3-D gauge pins a 3-D layout's
+    head-on (x,y) onto it. Only forwarded when set — the test fakes may not accept
+    the keyword.
     """
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
     maps = batch_fetch_maps(feature_cache, fps, source_versions)
@@ -68,6 +72,9 @@ def compute_lens_projection(
             return hit, revision
     slot = user_projection() if user else prefetch_projection()
     with slot:
+        # `align_ref` is only forwarded when set: it exists for the 3-D gauge, and
+        # the route/job fakes in the tests do not accept it.
+        extra = {} if align_ref is None else {"align_ref": align_ref}
         positions = embeddings_mod.compute_projection(
             infos,
             feature_cache,
@@ -84,6 +91,8 @@ def compute_lens_projection(
             layout_revision=revision,
             source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
             required_sources=proj.required_sources,
+            dims=proj.dims,
             on_progress=on_progress,
+            **extra,
         )
     return positions, revision

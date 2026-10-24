@@ -712,3 +712,52 @@ def test_weight_jacobian_reports_layout_and_per_source_progress():
     # The base layout lands first, then the Jacobian reports per source.
     assert ("layout", 0, 0) in seen
     assert seen[-1] == ("jacobian", 2, 2)
+
+
+def _pearson(a: list[float], b: list[float]) -> float:
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    a, b = a - a.mean(), b - b.mean()
+    return float((a * b).sum()) / float(np.linalg.norm(a) * np.linalg.norm(b))
+
+
+def test_compute_projection_dims3_aligns_xy_to_reference():
+    """The 3-D layout's head-on (x,y) is an arbitrary frame of the same lens's
+    2-D layout; passing that 2-D layout as ``align_ref`` must pin it back, even
+    when the reference is deliberately rotated/reflected."""
+    from backend.embeddings import lens_gauge, projection_backends
+
+    lens_gauge.reset_gauge_cache()
+    projection_backends.reset_pca_ref_cache()
+    rng = np.random.default_rng(4)
+    n = 40
+    clap, infos = {}, []
+    # A dominant 2-D structure keeps the PCA plane (and the head-on fit) exact.
+    core = rng.standard_normal((n, 2))
+    noise = 0.05 * rng.standard_normal((n, 3))
+    rows = np.hstack([core, noise]).astype(np.float32)
+    for i in range(n):
+        fp = f"g{i}"
+        clap[fp] = rows[i]
+        infos.append({"path": f"a/t{i}.mp3", "fingerprint": fp})
+    cache = _StubFeatureCache(clap=clap)
+
+    ref = compute_projection(
+        infos, cache, method="pca", sources=("clap",), dims=2,
+    )
+    # Rotate + reflect the 2-D layout into a deliberately different frame.
+    c, s = np.cos(np.radians(37.0)), np.sin(np.radians(37.0))
+    rot = np.array([[c, -s], [s, c]]) @ np.array([[1.0, 0.0], [0.0, -1.0]])
+    align_ref = []
+    for p in ref:
+        xy = rot @ np.array([p["x"], p["y"]])
+        align_ref.append({"path": p["path"], "x": float(xy[0]), "y": float(xy[1])})
+
+    out = compute_projection(
+        infos, cache, method="pca", sources=("clap",), dims=3, align_ref=align_ref,
+    )
+    by_path = {p["path"]: p for p in out}
+    assert len(out) == n
+    xs = [by_path[p["path"]]["x"] for p in align_ref]
+    ys = [by_path[p["path"]]["y"] for p in align_ref]
+    assert _pearson(xs, [p["x"] for p in align_ref]) > 0.99
+    assert _pearson(ys, [p["y"] for p in align_ref]) > 0.99

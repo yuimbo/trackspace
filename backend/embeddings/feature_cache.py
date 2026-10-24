@@ -44,7 +44,7 @@ from backend.sqlite_conn import ClosingConnection, chunked
 
 log = logging.getLogger(__name__)
 
-#: Persisted 2-D layouts kept on disk, keyed by layout revision.
+#: Persisted layouts (2-D or 3-D) kept on disk, keyed by layout revision.
 _LAYOUT_KEEP = 32
 
 #: Persisted fitted t-SNE embeddings kept on disk, keyed by vector config. The
@@ -441,12 +441,16 @@ class FeatureCache:
         return out
 
     # ── Revision-keyed layout persistence ────────────────────────
-    # 2-D layouts live only in an in-process LRU, so a server restart re-fits
+    # Layouts live only in an in-process LRU, so a server restart re-fits
     # every lens (~20 s each). The layout revision is a deterministic digest of
     # the exact configuration, so it is a stable key across restarts.
 
     def get_layout(self, revision: str) -> list[dict] | None:
-        """Persisted 2-D positions for *revision*, or ``None``."""
+        """Persisted positions for *revision*, or ``None``.
+
+        The blob is row-major float32 with one row per path; its width (2 or 3)
+        is inferred from the byte length, so 2-D and 3-D layouts share the table.
+        """
         if not revision:
             return None
         try:
@@ -461,11 +465,30 @@ class FeatureCache:
             return None
         try:
             paths = json.loads(row[0])
-            xy = np.frombuffer(row[1], dtype=np.float32).reshape(-1, 2)
+            blob = np.frombuffer(row[1], dtype=np.float32)
         except Exception:
             return None
-        if not isinstance(paths, list) or len(paths) != xy.shape[0]:
+        if not isinstance(paths, list):
             return None
+        n = len(paths)
+        if n == 0:
+            return [] if blob.size == 0 else None
+        if blob.size % n != 0:
+            return None
+        width = blob.size // n
+        if width not in (2, 3):
+            return None
+        xy = blob.reshape(n, width)
+        if width == 3:
+            return [
+                {
+                    "path": str(p),
+                    "x": float(xy[i, 0]),
+                    "y": float(xy[i, 1]),
+                    "z": float(xy[i, 2]),
+                }
+                for i, p in enumerate(paths)
+            ]
         return [
             {"path": str(p), "x": float(xy[i, 0]), "y": float(xy[i, 1])}
             for i, p in enumerate(paths)
@@ -505,13 +528,24 @@ class FeatureCache:
             return
 
     def put_layout(self, revision: str, positions: list[dict]) -> None:
-        """Persist *positions* under *revision* (best-effort)."""
+        """Persist *positions* under *revision* (best-effort).
+
+        The blob is row-major float32 with width 3 when every position carries
+        ``z`` (a 3-D layout) and width 2 otherwise, so the read side can infer
+        the dimensionality from the byte length.
+        """
         if not revision or not positions:
             return
         paths = [str(p["path"]) for p in positions]
-        xy = np.asarray(
-            [[float(p["x"]), float(p["y"])] for p in positions], dtype=np.float32
-        )
+        if all("z" in p for p in positions):
+            xy = np.asarray(
+                [[float(p["x"]), float(p["y"]), float(p["z"])] for p in positions],
+                dtype=np.float32,
+            )
+        else:
+            xy = np.asarray(
+                [[float(p["x"]), float(p["y"])] for p in positions], dtype=np.float32
+            )
         self._put_keyed(
             "layout_cache",
             "revision",

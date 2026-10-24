@@ -22,6 +22,14 @@ The reference is whichever layout is registered first for a given track-set
 "family"; which lens that is barely matters (mean RMSE 0.299-0.316 across all five
 choices), so it is deliberately not configurable. Fitting is robust to partial
 overlap: a fit on 5% of the tracks scored 0.3756 vs 0.3723 on all of them.
+
+3-D layouts follow the same rule, head-on: a 3-D t-SNE layout is also invariant to
+rotation/reflection, so its (x,y) is an arbitrary frame of the same lens's 2-D
+layout. `gauge_layout_3d` fits the 3-D layout so its x,y match that 2-D layout (a
+Procrustes similarity fit onto the head-on projection, which pins the rotation up
+to the sign of z), then fixes the z sign against the family's first-registered 3-D
+layout so "up" is consistent across lenses. A 3-D layout without a 2-D reference
+is left ungauged.
 """
 
 from __future__ import annotations
@@ -32,7 +40,12 @@ from collections import OrderedDict
 
 import numpy as np
 
-from .linalg_utils import apply_procrustes, matched_indices, procrustes
+from .linalg_utils import (
+    apply_procrustes,
+    matched_indices,
+    procrustes,
+    svd_singular,
+)
 
 log = logging.getLogger(__name__)
 
@@ -82,6 +95,126 @@ def align_to_reference(
     if not np.all(np.isfinite(aligned)):
         return None
     return aligned, bool(np.linalg.det(rot) < 0)
+
+
+def head_on_fit(
+    paths: list[str],
+    coords3: np.ndarray,
+    ref_paths: list[str],
+    ref_xy: np.ndarray,
+) -> np.ndarray | None:
+    """Similarity fit of a 3-D layout so its x,y match a 2-D reference.
+
+    The fit uses only the tracks both layouts contain, then applies the resulting
+    transform to every point of *coords3*: its x,y land on the reference and its
+    z is the out-of-plane direction that completes the proper rotation. Returns
+    ``None`` when the shared tracks are too few or the layout is degenerate
+    (collinear, or a non-finite layout).
+
+    The plane and scale come from the polar part of the least-squares map of the
+    reference on the cloud (``b.T a (a.T a)⁻¹``): when the two layouts are exactly
+    consistent this map is already ``scale × orthonormal``, so the polar part
+    recovers the true similarity exactly. (The naive SVD of ``a.T b`` alone
+    optimises the *unscaled* fit and is exact only for isotropic clouds.)
+    """
+    P = np.asarray(coords3, dtype=np.float64)
+    Q = np.asarray(ref_xy, dtype=np.float64)
+    if (
+        P.ndim != 2
+        or P.shape[1] != 3
+        or Q.ndim != 2
+        or Q.shape[1] != 2
+        or len(paths) != P.shape[0]
+        or len(ref_paths) != Q.shape[0]
+    ):
+        return None
+    mine, theirs = matched_indices(paths, ref_paths)
+    if len(mine) < MIN_SHARED:
+        return None
+    pm = P[mine]
+    qm = Q[theirs]
+    a = pm - pm.mean(0)  # n×3, the matched rows of the 3-D cloud
+    b = qm - qm.mean(0)  # n×2, the matched rows of the 2-D reference
+    U, S, Vt = svd_singular(a.T @ b)  # U 3×2, S (2,), Vt 2×2 (degeneracy probe)
+    if S[0] <= 1e-12 or S[1] < 1e-9 * S[0] or not np.all(np.isfinite(S)):
+        return None
+    W = b.T @ a @ np.linalg.pinv(a.T @ a)  # 2×3 least-squares map
+    U2, S2, Vt2 = svd_singular(W)  # U2 2×2, S2 (2,), Vt2 2×3
+    A = U2 @ Vt2  # 2×3 orthonormal rows: the head-on rotation
+    r3 = np.cross(A[0], A[1])  # out-of-plane direction completing the frame
+    proj = a @ A.T
+    denom = float((proj**2).sum())
+    if (
+        denom <= 1e-12
+        or not np.all(np.isfinite(A))
+        or not np.all(np.isfinite(r3))
+    ):
+        return None
+    scale = float((proj * b).sum() / denom)
+    if not np.isfinite(scale) or scale <= 0:
+        return None
+    c = P - pm.mean(0)  # every row of the 3-D cloud, same origin as the fit
+    out_xy = scale * (c @ A.T) + qm.mean(0)
+    out_z = scale * (c @ r3)
+    out = np.column_stack([out_xy, out_z])
+    if not np.all(np.isfinite(out)):
+        return None
+    return out
+
+
+def gauge_layout_3d(
+    family: str,
+    paths: list[str],
+    coords3: np.ndarray,
+    ref_paths: list[str],
+    ref_xy: np.ndarray,
+) -> np.ndarray:
+    """Return *coords3* with x,y pinned to the lens's own 2-D layout.
+
+    *family* is the same track-set family the 2-D gauge uses; the head-on fit
+    fixes the rotation up to the sign of z, which is then pinned against the
+    family's first-registered 3-D layout (a mirrored but equally valid view is
+    flipped back). Any failure returns *coords3* unchanged — an unaligned map is
+    a cosmetic regression, never an error.
+    """
+    if coords3.ndim != 2 or coords3.shape[1] != 3 or len(paths) != coords3.shape[0]:
+        return coords3
+    try:
+        aligned = head_on_fit(paths, coords3, ref_paths, ref_xy)
+    except Exception:
+        log.debug("3-D lens gauge head-on fit failed; leaving layout unaligned", exc_info=True)
+        aligned = None
+    if aligned is None:
+        with _gauge_lock:
+            _gauge_stats["skipped"] += 1
+        return coords3
+    key = f"{family}|3d"
+    with _gauge_lock:
+        entry = _gauge_cache.get(key)
+        if entry is None:
+            _gauge_cache[key] = (list(paths), aligned)
+            _gauge_cache.move_to_end(key)
+            while len(_gauge_cache) > _GAUGE_CACHE_MAX:
+                _gauge_cache.popitem(last=False)
+            _gauge_stats["anchor"] += 1
+            return aligned
+        _gauge_cache.move_to_end(key)
+        anchor_paths, anchor_coords = entry
+    mine, theirs = matched_indices(paths, anchor_paths)
+    reflected = False
+    if len(mine) >= MIN_SHARED:
+        z = aligned[mine, 2]
+        za = anchor_coords[theirs, 2]
+        s = float(((z - z.mean()) * (za - za.mean())).sum())
+        if s < 0:
+            aligned = aligned.copy()
+            aligned[:, 2] = -aligned[:, 2]
+            reflected = True
+    with _gauge_lock:
+        _gauge_stats["aligned"] += 1
+        if reflected:
+            _gauge_stats["reflected"] += 1
+    return aligned
 
 
 def gauge_layout(

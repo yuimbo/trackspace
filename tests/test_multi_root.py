@@ -14,10 +14,12 @@ leak tracks from another.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pytest
 from flask import Flask
 
@@ -27,6 +29,7 @@ from backend.embeddings.coverage import (
     coverage_payload,
 )
 from backend.embeddings.feature_cache import FeatureCache
+from backend.embeddings.layout import compute_projection as real_compute_projection
 from backend.embeddings.librosa_audio_features import audio_features_display_bpm_key
 from backend.factory import _register_error_handlers
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
@@ -51,13 +54,44 @@ class _FakeQueue:
 
 
 class _FakeEmbeddings:
+    def __init__(self, *, fail_on_dims2: bool = False):
+        #: Recorded ``compute_projection`` kwargs, for asserting the 3-D route
+        #: computes the 2-D reference first and passes it as ``align_ref``.
+        self.calls: list[dict] = []
+        self.fail_on_dims2 = fail_on_dims2
+
     def is_model_ready(self) -> bool:
         return False
 
-    def compute_projection(self, infos, *_a, **_k) -> list:
+    def compute_projection(self, infos, *_a, **_k):
+        # Binding against the real signature makes every route test fail on a
+        # wrong or renamed argument, which an accept-anything fake would hide.
+        inspect.signature(real_compute_projection).bind(infos, *_a, **_k)
+        dims = _k.get("dims", 2)
+        self.calls.append({
+            "dims": dims,
+            "paths": [t["path"] for t in infos],
+            "has_align_ref": "align_ref" in _k,
+            "align_ref": _k.get("align_ref"),
+        })
+        if self.fail_on_dims2 and dims == 2:
+            raise RuntimeError("reference projection failed")
         # Echo the infos the route scoped for us, so a test can assert which
-        # roots made it into the layout.
-        return [{"path": t["path"], "x": 0.0, "y": 0.0} for t in infos]
+        # roots made it into the layout. dims=3 asks for a z coordinate.
+        positions = [
+            {
+                "path": t["path"],
+                "x": 0.0,
+                "y": 0.0,
+                **({"z": 0.0} if dims == 3 else {}),
+            }
+            for t in infos
+        ]
+        if _k.get("with_jacobian"):
+            # Mirrors the real signature: (positions, per-source jacobian).
+            jacobian = {"clap": np.zeros((len(infos), dims), dtype=np.float32)}
+            return positions, jacobian
+        return positions
 
 
 class _FakeMaest:
@@ -105,7 +139,12 @@ def roots(tmp_path):
 
 
 @pytest.fixture
-def client(roots, tmp_path):
+def fake_embeddings():
+    return _FakeEmbeddings()
+
+
+@pytest.fixture
+def client(roots, tmp_path, fake_embeddings):
     roots_map = roots
     executor = ThreadPoolExecutor(max_workers=2)
 
@@ -173,7 +212,7 @@ def client(roots, tmp_path):
     )
 
     embeddings_bp = create_api_embeddings_blueprint(
-        embeddings_mod=_FakeEmbeddings(),
+        embeddings_mod=fake_embeddings,
         embedding_version=1,
         features_version=1,
         feature_cache=feature_cache,
@@ -351,3 +390,129 @@ def test_projection_with_empty_folder_is_empty_not_error(client):
     r = client.get("/api/embeddings/projection?folder=a/empty")
     assert r.status_code == 200
     assert r.get_json()["positions"] == []
+
+
+def test_projection_dims3_returns_z_per_position(client):
+    r = client.get("/api/embeddings/projection?dims=3")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["positions"]
+    assert all("z" in p for p in body["positions"])
+    # dims=3 owns its own revision, distinct from the 2-D default.
+    default_rev = client.get("/api/embeddings/projection").get_json()["revision"]
+    assert body["revision"] != default_rev
+
+
+def test_projection_dims3_fits_all_visible_tracks(client):
+    """dims=3 treats fit_scope as all: externals join the fit, not Nyström."""
+    r = client.get("/api/embeddings/projection?dims=3&include_external=1")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert {p["path"] for p in body["positions"]} == {
+        "a/one.mp3",
+        "a/sub/deep.mp3",
+        "a/shared/a_only.mp3",
+        "b/two.mp3",
+        "b/shared/three.mp3",
+        "b/shared/b_only.mp3",
+    }
+    assert all("z" in p for p in body["positions"])
+
+
+def test_projection_dims_bogus_is_400(client):
+    r = client.get("/api/embeddings/projection?dims=bogus")
+    assert r.status_code == 400
+    assert r.get_json()["error"]
+
+
+def test_projection_dims3_jacobian_returns_z_and_3d_rows(client):
+    """dims=3 serves the weight Jacobian: z positions and 3-component rows."""
+    r = client.get("/api/embeddings/projection?dims=3&jacobian=1")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["positions"]
+    assert all("z" in p for p in body["positions"])
+    assert body["jacobian"]
+    for rows in body["jacobian"].values():
+        assert all(len(row) == 3 for row in rows)
+        assert len(rows) == len(body["positions"])
+
+
+# ─── 3-D gauge reference ─────────────────────────────────────
+
+
+def _library_paths():
+    return ["a/one.mp3", "a/shared/a_only.mp3", "a/sub/deep.mp3"]
+
+
+def _all_paths():
+    return _library_paths() + ["b/shared/b_only.mp3", "b/shared/three.mp3", "b/two.mp3"]
+
+
+def test_projection_dims3_computes_2d_reference_first(fake_embeddings, client):
+    """A dims=3 request runs the same-lens 2-D layout first and passes it as
+    the alignment reference for the 3-D call."""
+    fake_embeddings.calls.clear()
+    r = client.get("/api/embeddings/projection?dims=3")
+    assert r.status_code == 200
+    assert r.get_json()["positions"]
+    assert len(fake_embeddings.calls) == 2
+    ref_call, main_call = fake_embeddings.calls
+    assert ref_call["dims"] == 2
+    assert not ref_call["has_align_ref"]
+    # The reference uses the requested fit scope (default library): library only.
+    assert ref_call["paths"] == _library_paths()
+    assert main_call["dims"] == 3
+    assert main_call["has_align_ref"]
+    # The 3-D call always fits everything, and receives the 2-D positions.
+    assert main_call["paths"] == _library_paths()
+    assert [p["path"] for p in main_call["align_ref"]] == ref_call["paths"]
+    assert all(set(p) == {"path", "x", "y"} for p in main_call["align_ref"])
+
+
+def test_projection_dims3_reference_uses_raw_fit_scope(fake_embeddings, client):
+    """The reference honours the requested fit_scope (library → external tracks
+    placed, not fitted), while the 3-D call itself still fits everything."""
+    fake_embeddings.calls.clear()
+    r = client.get("/api/embeddings/projection?dims=3&include_external=1")
+    assert r.status_code == 200
+    assert r.get_json()["positions"]
+    ref_call, main_call = fake_embeddings.calls
+    # fit_scope=library: the fake cache cannot place the externals, so the
+    # reference fit sees only the library tracks.
+    assert ref_call["paths"] == _library_paths()
+    assert main_call["paths"] == _all_paths()
+    assert [p["path"] for p in main_call["align_ref"]] == ref_call["paths"]
+
+
+def test_projection_dims3_reference_failure_still_returns_positions(
+    fake_embeddings, client
+):
+    """A failed reference must never fail the 3-D request: it is logged and the
+    3-D layout is served ungauged."""
+    fake_embeddings.calls.clear()
+    fake_embeddings.fail_on_dims2 = True
+    r = client.get("/api/embeddings/projection?dims=3")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["positions"]
+    assert all("z" in p for p in body["positions"])
+    assert len(fake_embeddings.calls) == 2
+    ref_call, main_call = fake_embeddings.calls
+    assert ref_call["dims"] == 2
+    assert main_call["dims"] == 3
+    assert not main_call["has_align_ref"]
+    assert main_call["align_ref"] is None
+
+
+def test_projection_2d_makes_exactly_one_call(fake_embeddings, client):
+    """The plain 2-D path is unchanged: a single projection, no reference."""
+    fake_embeddings.calls.clear()
+    r = client.get("/api/embeddings/projection")
+    assert r.status_code == 200
+    assert r.get_json()["positions"]
+    assert len(fake_embeddings.calls) == 1
+    call = fake_embeddings.calls[0]
+    assert call["dims"] == 2
+    assert not call["has_align_ref"]
+    assert call["paths"] == _library_paths()

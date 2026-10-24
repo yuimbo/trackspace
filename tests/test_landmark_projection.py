@@ -9,6 +9,7 @@ refit-based finite difference does not.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from backend.embeddings.landmark_projection import (
     LandmarkModel,
@@ -17,7 +18,7 @@ from backend.embeddings.landmark_projection import (
 )
 
 
-def _model(seed: int = 0, n: int = 80, m: int = 8) -> LandmarkModel:
+def _model(seed: int = 0, n: int = 80, m: int = 8, dims: int = 2) -> LandmarkModel:
     rng = np.random.default_rng(seed)
     sources = ("a", "b", "c")
     delta = {
@@ -27,16 +28,17 @@ def _model(seed: int = 0, n: int = 80, m: int = 8) -> LandmarkModel:
         paths=[f"t{i}.mp3" for i in range(n)],
         sources=sources,
         delta=delta,
-        coeffs=rng.normal(size=(m, 2)),
-        base=rng.random((n, 2)).astype(np.float32),
+        coeffs=rng.normal(size=(m, dims)),
+        base=rng.random((n, dims)).astype(np.float32),
         tau=1.0,
         weights0={"a": 0.4, "b": 0.35, "c": 0.25},
     )
 
 
-def test_raw_jacobian_matches_central_differences_of_g():
+@pytest.mark.parametrize("dims", [2, 3])
+def test_raw_jacobian_matches_central_differences_of_g(dims):
     """The closed form must equal a central difference of the *same* g."""
-    model = _model()
+    model = _model(dims=dims)
     w0 = dict(model.weights0)
     jac = model.raw_jacobian(w0)
     assert set(jac) == set(model.sources)
@@ -49,16 +51,18 @@ def test_raw_jacobian_matches_central_differences_of_g():
         assert np.abs(jac[s] - fd).max() / (np.abs(fd).max() + 1e-12) < 1e-3
 
 
-def test_remove_gauge_kills_translation_and_zoom():
+@pytest.mark.parametrize("dims", [2, 3])
+def test_remove_gauge_kills_translation_and_zoom(dims):
     """A pure offset/zoom field carries no shape change and must vanish."""
     rng = np.random.default_rng(0)
-    base = rng.random((50, 2))
+    base = rng.random((50, dims))
     r = base - base.mean(axis=0)
-    # alpha + beta * r  ==  translation + uniform zoom about the centroid.
+    # alpha + beta * r  ==  per-axis translation + one shared zoom about the
+    # centroid (the gauge the projector removes).
     gauge = 0.7 + 0.4 * r
     assert np.abs(_remove_gauge(gauge, base)).max() < 1e-6
     # A genuine shape change survives.
-    shape = rng.normal(size=(50, 2))
+    shape = rng.normal(size=(50, dims))
     kept = _remove_gauge(gauge + shape, base)
     assert np.abs(kept).max() > 0
 
@@ -98,9 +102,10 @@ def test_first_order_residual_shrinks_with_the_step():
     assert errs[2] < 1e-4
 
 
-def test_preview_reproduces_the_base_layout_at_w0():
+@pytest.mark.parametrize("dims", [2, 3])
+def test_preview_reproduces_the_base_layout_at_w0(dims):
     """The residual form gives y~_i(w0) = y_i^0 exactly."""
-    model = _model(seed=2)
+    model = _model(seed=2, dims=dims)
     p = model.preview(model.weights0)
     g0 = model.evaluate(model.weights0)
     np.testing.assert_allclose(p["g0"], g0, atol=1e-6)
@@ -155,17 +160,19 @@ def test_build_returns_none_without_enough_tracks():
     )
 
 
-def test_build_fits_against_the_base_layout():
+@pytest.mark.parametrize("dims", [2, 3])
+def test_build_fits_against_the_base_layout(dims):
     cache, infos = _infos(n=40)
     # A chart is a smooth function of the composite, so make the synthetic base
-    # layout one too: two normalised composite coordinates.
+    # layout one too: normalised composite coordinates (z only for dims=3).
     clap = np.array([cache._maps["clap"][t["fingerprint"]] for t in infos])
     clap = clap / (np.linalg.norm(clap, axis=1, keepdims=True) + 1e-9)
+    keys = ("x", "y", "z")[:dims]
     base = [
-        {"path": t["path"], "x": float(clap[i, 0]), "y": float(clap[i, 1])}
+        {"path": t["path"], **{k: float(clap[i, j]) for j, k in enumerate(keys)}}
         for i, t in enumerate(infos)
     ]
-    y0 = np.array([[p["x"], p["y"]] for p in base])
+    y0 = np.array([[p[k] for k in keys] for p in base])
     baseline = float(np.abs(y0 - y0.mean(axis=0)).mean())
 
     model = build_landmark_model(
@@ -179,7 +186,8 @@ def test_build_fits_against_the_base_layout():
     )
     assert model is not None
     assert model.delta["clap"].shape == (40, 20)
-    assert model.coeffs.shape == (20, 2)
+    assert model.coeffs.shape == (20, dims)
+    assert model.base.shape == (40, dims)
     assert model.tau > 0
 
     # The fitted extension reproduces the base chart better than the mean does.
