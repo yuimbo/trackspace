@@ -23,7 +23,11 @@ import numpy as np
 from .librosa_audio_features import AUDIO_FEATURE_DIM
 
 # Bump in layout_revision.compute_layout_revision payload when this recipe changes.
-PROJECTION_RECIPE_VERSION = 6
+PROJECTION_RECIPE_VERSION = 8
+
+#: openTSNE full-fit budget; evaluation recipes specify their own frozen budgets.
+OPENTSNE_N_ITER = 100
+OPENTSNE_EARLY_EXAGGERATION_ITER = 100
 
 FROZEN_SOURCES: tuple[str, ...] = (
     "maest_logits",

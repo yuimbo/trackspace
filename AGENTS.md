@@ -15,6 +15,7 @@ you are touching.
 | `ui_conventions.md` | Frontend interaction rules: canvas, tags, batch, selection, folder tree, commands, hotkeys |
 | `design-patterns.md` | Shared interaction patterns: navigation targets, hover state, coordinators, input controls |
 | `audio_pipeline.md` | Fingerprinting → embeddings → projection → clustering, and the analysis job queue |
+| `trackspace-projection-methods.md` | Research notes on parametric/kernel projection candidates; background, not normative |
 | `TODO.md` | Actionable tasks, deferred work, product roadmap |
 | `README.md` | Setup and running |
 
@@ -50,6 +51,10 @@ The detailed file tree and line-count snapshot are in `architecture.md`.
 **Dev mode:**  from `frontend/`: `ROOT=/path/to/music npm run dev:all`
   (`concurrently` runs Flask + Vite; `/api` and `/partials` are proxied to Flask
   on port 5111).
+
+**Layout-evaluation CLI + gallery:** `python -m backend.precompute_layout_evaluation`
+  generates the offline eval maps; open the app with `?layout_eval=1` for the browser
+  gallery. Usage, the named sets and the gallery: README.md → *Layout evaluation*.
 
 ---
 

@@ -142,7 +142,7 @@ def test_features_block_uses_the_perceptual_encoding():
     from backend.embeddings import layout as layout_mod
     from backend.embeddings.librosa_audio_features import AUDIO_FEATURE_DIM
 
-    layout_mod._source_row_cache.clear()
+    layout_mod._source_row_cache_clear()
     mask = np.ones(AUDIO_FEATURE_DIM, dtype=np.float32)
 
     def row(key_cos: float, key_sin: float, mode: float, fp: str) -> np.ndarray:

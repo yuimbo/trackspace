@@ -473,16 +473,28 @@ lens's `sources=` subset and optional `w=` weights; both are part of
 **Incremental t-SNE (openTSNE).** On by default (`TRACKSPACE_OPENTSNE=0`
 disables it), `_project_tsne` routes to `_project_tsne_incremental`, which fits
 an embedding once per *vector config* and then places only newly added tracks into
-it via `TSNEEmbedding.transform` instead of refitting the library. Measured on
-the real library (n=14,163, 50-D): a cold fit is 23.8 s, a `.transform` of 708 new
-tracks is **1.28 s (19× faster)**, and placed-point neighbourhood recall@10 is
-0.313 vs the base layout's own 0.360 — a ~9% fidelity cost. Its cold fit matches
-scikit-learn's and its full-fit recall is slightly *better* (0.360 vs 0.342), so it is
-also the better-quality backend. Key facts:
+it via `TSNEEmbedding.transform` instead of refitting the library. The production
+fit uses the openTSNE-only iteration budget in `projection_config`
+(`OPENTSNE_N_ITER=100`, `OPENTSNE_EARLY_EXAGGERATION_ITER=100`); the fallback
+cuML / mlx-vis / sklearn backends keep their own iteration defaults and are
+untouched. Measured on this machine (7,153 tracks, warm OS cache, single runs),
+the production 100/100 fit is **~3.5 s** (6.0 s at 100/250, 12.4 s at 500/250).
+The transform-vs-refit evidence below was measured on the real library
+(n=14,163, 50-D) under the old 500/250 iteration budget: a cold fit is 23.8 s, a
+`.transform` of 708 new tracks is **1.28 s (19× faster)**, and placed-point
+neighbourhood recall@10 is 0.313 vs the base layout's own 0.360 — a ~9% fidelity
+cost. Its cold fit matches scikit-learn's and its full-fit recall is slightly
+*better* (0.360 vs 0.342), so it is also the better-quality backend. Key facts:
 
 - The fit cache keys on `_composite_config_token` (sources, mask, blend, weights,
   versions) plus the semantic-basis params — **not the track set**, so adding tracks
   reuses the fit. Changing sources/mask/blend/weights/context refits.
+- The cache key is namespaced with the projection recipe version
+  (`|opentsne_recipe=<PROJECTION_RECIPE_VERSION>`), so bumping
+  `PROJECTION_RECIPE_VERSION` (e.g. when the production iteration budget changes)
+  invalidates every fitted embedding — in memory and persisted — and refits rather
+  than reusing a stale one. Direct callers always pass the original config key, so
+  the namespace is added exactly once.
 - The semantic-basis param key (`_semantic_basis_param_key`) keys on the folder
   *set*, not the full path set, so a track added to an existing folder reuses the
   chart (and is transformed into it) while a new *folder* is a new direction and
@@ -566,7 +578,8 @@ Projection results are cached at three levels:
 (capped at 32 entries); on a miss it reads the persisted copy from the
 `layout_cache` table in `audio_features.db` (`FeatureCache.get_layout` /
 `put_layout`, capped at 32 revisions). The in-process LRU dies with the process, so
-without the disk tier every restart re-fits all five lenses (~20 s each); the disk
+without the disk tier every restart re-fits all five lenses (seconds each —
+measured; see *Projection methods*); the disk
 tier turns that into a ~5 ms read (~356 KB for 14k tracks). The key is
 `layout_revision` — a deterministic SHA-256 computed by
 `compute_layout_revision()` from sorted eligible paths, method, sources, feature
@@ -579,7 +592,21 @@ is stable across restarts.
 `FeatureCache.presence()` — one query with a boolean column per source — rather
 than decoding every blob (~328 MB per status request). Only
 `_gather_composite_vecs` reads the vectors themselves, through its own
-`_fetch_source_map`.
+`_fetch_source_map`. `presence()` results are memoised in-process keyed on the
+cache's write epoch plus the source versions and a fingerprint-set digest, so
+repeated status polls and projection requests within one epoch skip the scan.
+
+**Measured cache work (this machine, 7,153 tracks).** The full six-source
+`FeatureCache.get_all` read is 401 ms cold → 28 ms on a warm repeat, bounded by
+the in-memory LRU's byte budget (`LIBRARY_MEMORY_BYTES` = 384 MiB, entry cap
+`LIBRARY_MEMORY_ENTRIES`; both in `feature_cache.py`, applied by
+`trackspace_state.py` and the eval CLI). The `presence()` memo above is
+92.8 ms → 0.7 ms. A composite cold re-gather fell from 43.7 s to ~0.35 s
+(cache-warm measurement) when the per-row supervised-version SQLite read was
+replaced by one snapshot per gather — `layout.py` reads `supervised_version`
+once and reuses it for every source row and key. The prepared source-row LRU in
+`layout.py` is bounded by bytes (`_SOURCE_ROW_CACHE_BYTES_MAX` = 256 MiB)
+rather than an entry count.
 
 **Client-side (query-string → {revision, positions} map):**
 `_layoutCache` in `coordinators/embedding-coordinator.ts` maps
@@ -597,6 +624,9 @@ embeddings keyed by vector config (not track set), with a disk tier behind it
 changes when tracks are added, so the LRU misses, and the fit cache turns that miss
 into a `transform` of only the new rows. The two caches answer different
 questions — revision = "same exact view?", fit config = "same vector space?".
+Both the in-memory and persisted keys are namespaced with the projection recipe
+version, so a recipe change (e.g. the production `n_iter` budget) makes every old
+fit a miss and refits it under the new key.
 The fit cache is guarded by `_fit_cache_lock` (it is mutated from request threads
 and the prefetch worker) and is only written for cached fits, so the Jacobian's
 throwaway perturbation fits never evict or persist the live fit.
@@ -710,7 +740,11 @@ training run holding that lock would stall all embedding generation for no benef
 place, so rows are stored under `version = run_id` (a monotonic counter persisted in
 the head sidecar and mirrored into the `feature_meta` table). Layout and cluster
 revisions include the run id, so a retrain invalidates cached coordinates; the
-openTSNE fit and composite caches include it via `_source_versions_token`.
+openTSNE fit and composite caches include it via `_source_versions_token`. The run
+id is read from the cache **once per gather** (never per source row) and that single
+snapshot drives the composite/row keys and the versions token, so a retrain still
+invalidates everything coherently on the next gather without a metadata read for
+every row.
 
 **A changed input space needs a retrain.** The head's `input_sources` and `in_dim`
 are recorded at training time; `project_supervised_missing` refuses to project new
@@ -902,6 +936,11 @@ global "running" flag. The change matters for correctness, not just tidiness:
 | A transient decode error lost the track | Retry budget (`max_attempts`, default 3) |
 | Counts were hand-maintained counters that could drift | `stats()` aggregates the table — cannot drift |
 
+`stats()` / `stats_by_kind()` / `failed_keys_by_kind()` are memoised per queue
+epoch with a 1 s TTL (`_STATS_MEMO_TTL`): the epoch only advances for this
+process's own mutations, and the TTL caps the staleness when another process
+writes the same queue.
+
 ### Job kinds (pipeline order)
 
 ```
@@ -923,8 +962,9 @@ renders while the CLAP backfill continues; its drain triggers a re-cluster like 
 other per-track stage. (CLAP is not the long pole: measured ~0.14 s/track, one of the
 fastest stages — see *Per-stage throughput*.)
 
-**Layouts are pre-warmed behind the scenes.** A t-SNE fit is ~12–20 s at library
-scale, and the UI's lenses (combined + one per source) each have their own
+**Layouts are pre-warmed behind the scenes.** A t-SNE fit is seconds long at library
+scale (measured; see *Projection methods*), and the UI's lenses (combined + one per
+source) each have their own
 `layout_revision`, so the first switch to a lens would otherwise wait for a fit. Once
 the `cluster` pass drains — the last consumer of the cached vectors — the queue
 enqueues one low-priority `layout` job per lens (`PROJECTION_LENSES` in
@@ -1112,6 +1152,11 @@ and every resolution returned the same 9 clusters.
 deliberately: a 2-D map that disagreed with the cluster assignments would be
 actively misleading. **Keep them in sync.**
 
+**Source ablation: keep the full blend.** In the user's blind ratings (single
+rater, eval `ablation` set), the full default blend ranked first, MAEST + logits
++ supervised second, and MAEST + logits alone third — dropping rhythm/CLAP, and
+then the supervised head, did not win.
+
 ### Interactive weights
 
 The defaults above are overridable per request. The Options panel exposes one slider
@@ -1131,7 +1176,8 @@ keep describing the same space:
   configurations would hash identically and the revision-keyed position caches would
   serve one configuration's coordinates for the other. The `w=` param is omitted when
   the weights equal the defaults, so default query keys stay stable.
-- Applying a new vector costs a full t-SNE refit (~12–20 s at 9.5k tracks), so the UI
+- Applying a new vector costs a full t-SNE refit (seconds — measured; see
+  *Projection methods*), so the UI
   commits on an explicit Apply rather than on every slider release; the cluster
   re-run itself is a few seconds.
 

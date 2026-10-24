@@ -46,6 +46,11 @@ RESETTABLE = (DONE, FAILED)
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_MAX_ATTEMPTS = 3
 
+#: Stats are memoised keyed on the in-process epoch; a second process mutating
+#: the same DB would not bump it, so results also expire after this many seconds
+#: (PRAGMA data_version is per-connection, so there is no cheap SQLite signal).
+_STATS_MEMO_TTL = 1.0
+
 
 @dataclass(frozen=True)
 class Job:
@@ -145,6 +150,9 @@ class JobQueue:
         self._worker_id = f"{os.getpid()}:{uuid.uuid4().hex[:8]}"
         #: Bumps on every state transition so status caches can invalidate.
         self._epoch = 0
+        #: ``stats()`` / ``stats_by_kind()`` / ``failed_keys_by_kind()`` memo:
+        #: key → (epoch, monotonic time, result). See ``_STATS_MEMO_TTL``.
+        self._stats_memo: dict[tuple, tuple[int, float, object]] = {}
         self._progress: dict[str, _Progress] = {}
         self._stage: dict[str, _StageProgress] = {}
         self._init_db()
@@ -196,6 +204,26 @@ class JobQueue:
         """Monotonic counter; changes whenever any job changes state."""
         with self._lock:
             return self._epoch
+
+    def _stats_memoized(self, key: tuple, compute: Any) -> Any:
+        """Return *compute()*'s result, memoised per queue epoch.
+
+        The epoch only advances for this process's own state changes; another
+        process claiming/completing jobs on the same DB would not bump it, so
+        ``_STATS_MEMO_TTL`` caps that staleness. The epoch is read before
+        *compute()* runs, so a concurrent change only makes the stored entry
+        stale-keyed, never wrong.
+        """
+        with self._lock:
+            epoch = self._epoch
+            now = time.monotonic()
+            hit = self._stats_memo.get(key)
+            if hit is not None and hit[0] == epoch and now - hit[1] < _STATS_MEMO_TTL:
+                return hit[2]
+        result = compute()
+        with self._lock:
+            self._stats_memo[key] = (epoch, time.monotonic(), result)
+        return result
 
     # ── enqueue ───────────────────────────────────────────────
 
@@ -473,47 +501,54 @@ class JobQueue:
     # ── introspection ─────────────────────────────────────────
 
     def stats(self, kind: str | None = None) -> QueueStats:
-        try:
-            with self._conn() as conn:
-                if kind is None:
-                    rows = conn.execute(
-                        "SELECT state, COUNT(*) FROM jobs GROUP BY state"
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT state, COUNT(*) FROM jobs WHERE kind=? GROUP BY state",
-                        (kind,),
-                    ).fetchall()
-        except Exception:
-            return QueueStats()
-        counts = {state: int(n) for state, n in rows}
-        return QueueStats(
-            pending=counts.get(PENDING, 0),
-            running=counts.get(RUNNING, 0),
-            done=counts.get(DONE, 0),
-            failed=counts.get(FAILED, 0),
-        )
+        def compute() -> QueueStats:
+            try:
+                with self._conn() as conn:
+                    if kind is None:
+                        rows = conn.execute(
+                            "SELECT state, COUNT(*) FROM jobs GROUP BY state"
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT state, COUNT(*) FROM jobs WHERE kind=? GROUP BY state",
+                            (kind,),
+                        ).fetchall()
+            except Exception:
+                return QueueStats()
+            counts = {state: int(n) for state, n in rows}
+            return QueueStats(
+                pending=counts.get(PENDING, 0),
+                running=counts.get(RUNNING, 0),
+                done=counts.get(DONE, 0),
+                failed=counts.get(FAILED, 0),
+            )
+
+        return self._stats_memoized(("stats", kind), compute)
 
     def stats_by_kind(self) -> dict[str, QueueStats]:
-        try:
-            with self._conn() as conn:
-                rows = conn.execute(
-                    "SELECT kind, state, COUNT(*) FROM jobs GROUP BY kind, state"
-                ).fetchall()
-        except Exception:
-            return {}
-        acc: dict[str, dict[str, int]] = {}
-        for kind, state, n in rows:
-            acc.setdefault(kind, {})[state] = int(n)
-        return {
-            kind: QueueStats(
-                pending=c.get(PENDING, 0),
-                running=c.get(RUNNING, 0),
-                done=c.get(DONE, 0),
-                failed=c.get(FAILED, 0),
-            )
-            for kind, c in acc.items()
-        }
+        def compute() -> dict[str, QueueStats]:
+            try:
+                with self._conn() as conn:
+                    rows = conn.execute(
+                        "SELECT kind, state, COUNT(*) FROM jobs GROUP BY kind, state"
+                    ).fetchall()
+            except Exception:
+                return {}
+            acc: dict[str, dict[str, int]] = {}
+            for kind, state, n in rows:
+                acc.setdefault(kind, {})[state] = int(n)
+            return {
+                kind: QueueStats(
+                    pending=c.get(PENDING, 0),
+                    running=c.get(RUNNING, 0),
+                    done=c.get(DONE, 0),
+                    failed=c.get(FAILED, 0),
+                )
+                for kind, c in acc.items()
+            }
+
+        # Copy the outer dict; the QueueStats values are frozen.
+        return dict(self._stats_memoized(("by_kind",), compute))
 
     def failures(self, kind: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         """Recent permanently-failed jobs, for surfacing in the UI."""
@@ -552,17 +587,24 @@ class JobQueue:
         job that exhausted its retries will not run again without an explicit
         retrigger, so it is not outstanding work.
         """
-        try:
-            with self._conn() as conn:
-                rows = conn.execute(
-                    "SELECT kind, dedupe_key FROM jobs WHERE state='failed'"
-                ).fetchall()
-        except Exception:
-            return {}
-        out: dict[str, set[str]] = {}
-        for kind, key in rows:
-            out.setdefault(kind, set()).add(key)
-        return out
+        def compute() -> dict[str, set[str]]:
+            try:
+                with self._conn() as conn:
+                    rows = conn.execute(
+                        "SELECT kind, dedupe_key FROM jobs WHERE state='failed'"
+                    ).fetchall()
+            except Exception:
+                return {}
+            out: dict[str, set[str]] = {}
+            for kind, key in rows:
+                out.setdefault(kind, set()).add(key)
+            return out
+
+        # Copy the outer dict and each inner set: callers may mutate either.
+        return {
+            kind: set(keys)
+            for kind, keys in self._stats_memoized(("failed_keys",), compute).items()
+        }
 
     def _note_progress(
         self, kind: str, *, path: str | None, ok: bool, detail: dict[str, Any]

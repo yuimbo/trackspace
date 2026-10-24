@@ -1,5 +1,8 @@
 // ─── API helpers ─────────────────────────────────────────────
 import { toast } from "./toast";
+import { isEvalReadOnly } from "./eval-readonly";
+
+const READ_METHODS = new Set(["GET", "HEAD"]);
 
 /**
  * Fetch JSON and surface backend errors as a toast.
@@ -10,6 +13,16 @@ import { toast } from "./toast";
  * manager already reports "action failed — reverted").
  */
 async function request<T>(url: string, init: RequestInit | undefined, silent: boolean): Promise<T> {
+  // Read-only eval gallery: a write (POST/PATCH/DELETE/PUT) must never reach the
+  // server here. Central and owned — not a fetch monkey-patch — so every command,
+  // coordinator and panel write is gated by one check.
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (!READ_METHODS.has(method) && isEvalReadOnly()) {
+    throw new Error(
+      "Read-only layout evaluation is active — writes are disabled. " +
+        "Exit the gallery (remove ?layout_eval=1) to edit.",
+    );
+  }
   const res = await fetch(url, init);
   if (!res.ok) {
     let detail = `${res.status} ${res.statusText}`;

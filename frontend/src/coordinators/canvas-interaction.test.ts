@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Model, type HoverTarget, type Track } from "../model";
+import { setEvalReadOnly } from "../lib/eval-readonly";
 import type { CanvasView } from "../components";
 import {
   CanvasInteractionController,
@@ -186,6 +187,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  setEvalReadOnly(false);
 });
 
 // ─── Selection ──────────────────────────────────────────────
@@ -956,5 +958,22 @@ describe("CanvasInteractionController solo", () => {
     const outcome = coord.solo();
     expect(outcome?.rule?.value).toBe("House, Techno");
     expect(model.isTrackHidden(model.trackByPath("Disco/c.mp3")!)).toBe(true);
+  });
+});
+
+// ─── Read-only eval mode keeps hover playback ────────────────
+
+describe("read-only eval mode keeps hover playback", () => {
+  it("still drives the hover → audio chain under ?layout_eval=1", () => {
+    const { model, canvas, deps, coord } = makeHarness();
+    model.setEvalMode(true);
+    setEvalReadOnly(true);
+    model.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    canvas.hitTest.mockReturnValue(0);
+    // Moving over a rendered dot must keep calling onHoverPreview → _handlePreview
+    // → _startPreview → /api/audio, exactly as in normal mode. Read-only gating
+    // must not disable hover to enforce itself.
+    move(canvas, 20, 20);
+    expect(deps.onHoverPreview).toHaveBeenCalled();
   });
 });

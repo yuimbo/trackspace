@@ -199,6 +199,53 @@ def test_unreadable_persisted_fit_refits():
     assert pb.tsne_fit_stats()["fit"] == 1
 
 
+def test_stale_persisted_fit_ignored_after_recipe_change():
+    """A blob written before the recipe bump (old, un-namespaced key) is a miss.
+
+    The fit cache key carries the ``|opentsne_recipe=…`` namespace, so an
+    embedding fitted under an older iteration budget must never be loaded after a
+    ``PROJECTION_RECIPE_VERSION`` bump — it refits and persists under the new key
+    without touching the stale blob.
+    """
+    store = _FakeFitStore()
+    stale_key = "cfg"  # the pre-namespace key
+    store.blobs[stale_key] = b"stale blob from an older recipe"
+    mat = _matrix(120)
+    out = pb._project_tsne(
+        mat, paths=_paths(120), config_key="cfg", feature_cache=store
+    )
+    assert out.shape == (120, 2)
+    assert pb.tsne_fit_stats()["fit"] == 1
+    # The stale blob is left untouched; the fresh fit lives under the namespaced key.
+    assert store.blobs[stale_key] == b"stale blob from an older recipe"
+    ns_key = f"cfg|opentsne_recipe={pb.PROJECTION_RECIPE_VERSION}"
+    assert ns_key in store.blobs
+
+
+def test_fit_uses_production_iter_budget(monkeypatch):
+    """The production openTSNE fit passes the configured iteration budget."""
+    import openTSNE
+
+    from backend.embeddings.projection_config import (
+        OPENTSNE_EARLY_EXAGGERATION_ITER,
+        OPENTSNE_N_ITER,
+    )
+
+    calls: dict = {}
+
+    class _RecordingTSNE:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def fit(self, x):
+            return np.zeros((len(x), 2), dtype=np.float32)
+
+    monkeypatch.setattr(openTSNE, "TSNE", _RecordingTSNE)
+    pb._fit_tsne(_matrix(120))
+    assert calls["n_iter"] == OPENTSNE_N_ITER
+    assert calls["early_exaggeration_iter"] == OPENTSNE_EARLY_EXAGGERATION_ITER
+
+
 def test_disk_fit_not_written_for_jacobian_fits():
     """The Jacobian's throwaway fits must not touch the persisted blob."""
     store = _FakeFitStore()

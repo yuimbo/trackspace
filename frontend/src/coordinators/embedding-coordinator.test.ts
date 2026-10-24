@@ -737,3 +737,39 @@ describe("EmbeddingCoordinator position animations", () => {
     expect(raf.pending.size).toBe(0);
   });
 });
+
+// ─── Read-only eval compute gates ─────────────────────────────
+
+describe("EmbeddingCoordinator is compute-inert during eval", () => {
+  it("does not fetch a projection on lens cycle / scope while evalMode is on", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.setAllTracks([{ path: "a.mp3", filename: "a.mp3", folder: "", tags: {}, artist: "", title: "" }]);
+    // Eval gallery is active: positions come from precomputed artifacts, never
+    // from the projection endpoint.
+    model.setEvalMode(true);
+    await coord.cycleLens(1);
+    await coord.switchToLens("combined");
+    await coord.openScope(
+      { shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "camelot" },
+      "camelot",
+    );
+    await flush();
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(0);
+    expect(fetchCalls(fetchSpy, "/api/embeddings/status")).toBe(0);
+    // The lens id must not have been changed by the inert cycleLens.
+    expect(model.lensId).toBe("tags");
+  });
+
+  it("still applies precomputed positions on the shared frame in eval mode", async () => {
+    const { model, coord, canvas, fetchSpy } = makeHarness(projectionRoute);
+    model.setEvalMode(true);
+    const positions = new Map([
+      ["a.mp3", { x: 0.1, y: 0.2 }],
+      ["b.mp3", { x: 0.8, y: 0.9 }],
+    ]);
+    coord.applyPrecomputedPositions(positions);
+    // No projection fetch is issued by the eval apply path.
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(0);
+    expect(model.embeddingPositions.size).toBe(2);
+  });
+});

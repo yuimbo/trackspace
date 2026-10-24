@@ -5,16 +5,8 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 `design-patterns.md`.
 
 ## User feedback
-- [ ] Don't re-home when pressing "solo" in a card, feels a bit jumpy
-  make the "solo thing" more like a sort of "proximity slider"; so you can drag the size of the neighborhood you want to see (instea of top-N)
-  (If the slider starts from 100%, then we could actually re-home as we narrow it down; as the jump will be less sudden)
-
 - [ ] Whacko idea? Add a 3d view for the embedding space?
 
-- [ ] When projecting my library onto external tracks; those who don't fit into my paylists, can still end up in an Generic/${name}/ subdirectories; where "name" equals what that genre name that generic discogs model would give to them
-- [ ] If i want to project onto an external root which contains a bunch of subdirectories; allow me to just gather all of the nested files to reproject [[maybe stoer some metadata on the old relative folder structure?dd]]
-- [ ] How to remove a root folder from the analysis library? 
-      Though i might want tracks analyzed, but not be "my" tracks; i.e. a separate section for tracks which are in the system but not "My library" (folders which probably also contain things where i will project my learned folder structure on)
 - [ ] **Undo leaves empty fan-out folders.** The move journal restores every
   file but does not remove the subfolders a fan-out created (they are often empty
   afterwards). Sweep empty directories on undo, bounded to the fan-out root so it can
@@ -37,8 +29,9 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 - [ ] **Frozen reference normalisation.** Fit the per-source transform once on a
   **frozen reference set** and cache it in a chart artifact, then apply it
   statelessly. That gives distribution matching without the drift. This is the same
-  `chart_revision` split the landmark extension needs — do both together, and bump
-  `PROJECTION_RECIPE_VERSION`.
+  `chart_revision` split the landmark extension needs — do both together.
+  (`PROJECTION_RECIPE_VERSION` is already 8, bumped for the openTSNE 100/100
+  iteration budget; a normalisation change would bump it again.)
 - [ ] **Pick the technique and measure it.** Cheapest first: per-source z-score
   (`clustering._standardize`); **whitening** (ZCA/PCA) to equalise covariance;
   **CORAL** to align second-order statistics; **CCA / Deep CCA** for a shared
@@ -314,11 +307,11 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
       "Computing layout…". The base `layout` phase itself is still one opaque step:
       neither the sklearn fallback nor mlx-vis exposes iteration callbacks, so a percent
       needs a custom optimize loop (openTSNE's `optimize` is a generator).
-- [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1040 lines, the
-      largest frontend file). The ~200 lines of fit-view math (`_vpFromWorldBounds`,
-      `_computeFitVP`, `_p80Radius`, `_fitViewToFolderPercentile`, `_fitViewToTracks`,
-      `fitView`, `effectiveHoveredFolderPrefix`) are the natural seam into a
-      `canvas-fit-view.ts`.
+- [ ] **Optional: split `coordinators/canvas-interaction.ts`** (~1460 lines, the
+      second-largest frontend file after `canvas-view.ts` at ~2110). The ~200 lines of
+      fit-view math (`_vpFromWorldBounds`, `_computeFitVP`, `_p80Radius`,
+      `_fitViewToTracksPercentile`, `_fitViewToTracks`, `fitView`) are the natural
+      seam into a `canvas-fit-view.ts`.
 - [ ] **Optional: `lib/event-bus.ts`, `model/persistence.ts`, `api/types.ts`.**
       Extract the EventBus base, localStorage persistence, and shared API response
       types out of `model.ts` / `lib/api.ts`.
@@ -475,7 +468,10 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       conservative but correct — raising it would regress. Note mlx-vis raises
       `UnboundLocalError` on a pre-reduced float32 matrix (its PCA branch expects the
       raw input); `_project_tsne_fallback` passes the raw composite, so this is latent —
-      do not "optimise" by pre-reducing there. Files:
+      do not "optimise" by pre-reducing there. Also: the fallback chain does not pass
+      the production 100/100 iteration budget through, so the map differs by backend —
+      decide whether to thread `OPENTSNE_N_ITER` / `OPENTSNE_EARLY_EXAGGERATION_ITER`
+      through or accept and document the difference. Files:
       `backend/embeddings/projection_backends.py`.
 
 ### Dependencies
@@ -537,3 +533,49 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       allocation per stage before adding workers or batches.
 - [ ] **Cluster/projection timing at scale.** `DEFAULT_RESOLUTIONS` and k=20 were
       calibrated at ~9.5k tracks; re-measure once the library doubles.
+- [ ] **Layout-evaluation gallery: fidelity + cold/warm benchmarking.** The first
+      gallery (eight precomputed maps in `backend/embeddings/layout_evaluation.py`)
+      is generation-only — it records timings but no neighbourhood-recall or
+      cold/warm/insertion comparison. Extend it to score each recipe's layout with
+      the existing fidelity harness (`backend/embeddings/layout_fidelity.py`) and
+      measure a warm re-run (the per-recipe PCA is currently recomputed; the
+      manifest notes the UMAP JIT cost on a fresh process). Files:
+      `backend/embeddings/layout_evaluation.py`.
+
+## Projection speed and quality follow-ups
+
+Open questions from the projection work. Settled experiments (the early-phase and
+neighbourhood sweeps) are not re-listed; measured conclusions live in
+`audio_pipeline.md` → *Projection methods*.
+
+- [ ] **Small-library t-SNE guard.** `compute_projection` only guards `< 2` tracks;
+      for 2–5 tracks openTSNE silently clamps perplexity to ~1–1.33 (a degenerate
+      fit) and the sklearn fallback raises "perplexity must be less than n_samples".
+      The eval module rejects `n < MIN_TRACKS` (6). Add a production floor or an
+      explicit PCA fallback for tiny libraries. Files:
+      `backend/embeddings/layout.py` (`compute_projection`),
+      `backend/embeddings/projection_backends.py` (`_tsne_perplexity`).
+- [ ] **Perplexity 120 as the production default?** In the user's blind ratings
+      (single rater, `scale` gallery) perplexity 120 tied for top overall —
+      neighbours 5, organisation 5, crowding 3 — against the production
+      perplexity-30 control (4/4/3, overall 5), at ~+3 s per fit (9.3 s vs 6.0 s
+      at the gallery's 100/250 budget); multiscale 30&120 and p60 did not win. If
+      adopted: change `_tsne_perplexity` and bump `PROJECTION_RECIPE_VERSION`.
+      These ratings live only in the user's local exports under
+      `data/layout-evaluation/ratings-exports/` plus browser localStorage.
+- [ ] **Original-space neighbour comparison.** A hover-play view of nearest
+      neighbours in the *unprojected* composite space would separate representation
+      limits from projection limits — the user observed CLAP/rhythm-only maps are
+      diffuse. Existing harness: `backend/embeddings/layout_fidelity.py`.
+- [ ] **Measure end-to-end first projection after a restart** on the real library;
+      the cache wins in `audio_pipeline.md` → *Projection caching* are measured per
+      call only.
+- [ ] **Per-track `has()` / per-job SQLite connection churn in analysis workers**
+      (`services/analysis_pipeline.py`, `embeddings/feature_cache.py`,
+      `jobs/queue.py`) is deliberately unchanged: invariant 11 closes the handle
+      per call for FD-leak reasons, and the gain would be ~0.1 ms/call. Accepted
+      unless profiling shows analysis throughput is connection-bound; do not hold
+      connections across rows.
+- [ ] **Split `backend/embeddings/layout_evaluation.py`** (1250 lines): the seams
+      are recipes + registry / fit primitives + alignment / generation + manifest
+      IO.

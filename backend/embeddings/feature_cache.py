@@ -28,6 +28,7 @@ because a single model pass produces the pooled embedding, the logits and the
 excerpts together, and the reader owns the dimension (the blob carries no header).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,17 @@ _TSNE_FIT_KEEP = 8
 #: Blob magic + format version. An unreadable or older blob reads as a miss, so a
 #: library upgrade simply refits instead of loading an incompatible pickle.
 _TSNE_FIT_MAGIC = b"TSF1"
+
+#: Bounded memo for :meth:`FeatureCache.presence`. Keyed on the write epoch plus
+#: the source versions and a fingerprint-set digest, so any row mutation or
+#: version change is a miss; 8 entries cover the few status/projection shapes.
+_PRESENCE_MEMO_MAX = 8
+
+#: Library-wide in-memory budgets for the production FeatureCache, shared by the
+#: server and the layout-evaluation CLI. The six hot projection sources decode
+#: to ~112 MB; the byte budget leaves room for the excerpt/segment sources.
+LIBRARY_MEMORY_ENTRIES = 1_000_000
+LIBRARY_MEMORY_BYTES = 384 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -126,19 +138,44 @@ _CLAP_PAD = b""
 
 
 class FeatureCache:
-    def __init__(self, db_path: str, max_memory: int = 2000) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        max_memory: int = 2000,
+        *,
+        max_memory_bytes: int | None = None,
+    ) -> None:
         self._db_path = db_path
         self._max_memory = max_memory
+        #: Byte budget for the in-memory LRU. ``None`` keeps the historical
+        #: entry-cap-only behaviour (bytes are still tracked, never evicted on).
+        self._max_memory_bytes = max_memory_bytes
         self._mem: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._mem_bytes = 0
         self._lock = threading.RLock()
         #: Bumps on successful writes — invalidates embedding status caches.
         self._write_epoch = 0
+        #: ``presence()`` memo: key → result, bounded by ``_PRESENCE_MEMO_MAX``.
+        self._presence_memo: OrderedDict[tuple, dict[str, dict[str, bool]]] = (
+            OrderedDict()
+        )
         self._init_db()
 
     def write_epoch(self) -> int:
         """Monotonic counter; increases when cached embedding rows change."""
         with self._lock:
             return self._write_epoch
+
+    def memory_bytes(self) -> int:
+        """Total bytes currently held by the in-memory LRU (read-only)."""
+        with self._lock:
+            return self._mem_bytes
+
+    def clear_memory(self) -> None:
+        """Empty the in-memory LRU and reset its byte counter."""
+        with self._lock:
+            self._mem.clear()
+            self._mem_bytes = 0
 
     def _init_db(self) -> None:
         with ClosingConnection(sqlite3.connect(self._db_path)) as conn:
@@ -532,15 +569,34 @@ class FeatureCache:
     # Keys are prefixed per source: "clap:fp", "feat:fp",
     # "maest:fp", "maestlog:fp", "rhythm:fp".
 
+    @staticmethod
+    def _nbytes(arr: np.ndarray) -> int:
+        return int(arr.nbytes)
+
     def _lru_put(self, key: str, data: np.ndarray) -> None:
+        old = self._mem.get(key)
+        if old is not None:
+            self._mem_bytes -= self._nbytes(old)
         self._mem[key] = data
         self._mem.move_to_end(key)
-        if len(self._mem) > self._max_memory:
-            self._mem.popitem(last=False)
+        self._mem_bytes += self._nbytes(data)
+        # Evict least-recently-used entries until both the entry cap and the
+        # byte budget hold; either limit may trigger. The ``len > 1`` guard
+        # mirrors ``_composite_cache_put``: a single entry larger than the
+        # budget must not be evicted by its own put in a loop that empties
+        # the cache.
+        while len(self._mem) > self._max_memory or (
+            self._max_memory_bytes is not None
+            and self._mem_bytes > self._max_memory_bytes
+            and len(self._mem) > 1
+        ):
+            _k, popped = self._mem.popitem(last=False)
+            self._mem_bytes -= self._nbytes(popped)
 
     def _evict_mem_keys_with_prefix_unlocked(self, prefix: str) -> None:
         dead = [k for k in self._mem if k.startswith(prefix)]
         for k in dead:
+            self._mem_bytes -= self._nbytes(self._mem[k])
             del self._mem[k]
 
     # ------------------------------------------------------------------
@@ -660,10 +716,30 @@ class FeatureCache:
         only ever test ``fp in map``; decoding the blobs to answer that moved
         ~328 MB per status request. The composite gather still reads the vectors
         it needs through its own path.
+
+        Results are memoised keyed on the write epoch, the source versions and a
+        digest of the fingerprint set, so status polls and projection requests
+        stop re-scanning every fingerprint. Every row mutation bumps the write
+        epoch and the supervised run id is part of ``source_versions``.
         """
         out: dict[str, dict[str, bool]] = {s: {} for s in source_versions}
         if not source_versions or not fingerprints:
             return out
+        digest = hashlib.sha1(
+            "\n".join(sorted(fingerprints)).encode("utf-8")
+        ).hexdigest()
+        with self._lock:
+            # Read the epoch before the query: a put racing the query can only
+            # make the stored entry stale-keyed, never wrong.
+            key = (
+                self._write_epoch,
+                tuple(sorted(source_versions.items())),
+                digest,
+            )
+            hit = self._presence_memo.get(key)
+            if hit is not None:
+                self._presence_memo.move_to_end(key)
+                return {s: dict(m) for s, m in hit.items()}
         specs = list(source_versions.items())
         cols = ", ".join(
             f"(length({self._spec(s).blob_col}) > 0 AND "
@@ -686,7 +762,12 @@ class FeatureCache:
                                 out[s][fp] = True
         except Exception:
             return out
-        return out
+        with self._lock:
+            self._presence_memo[key] = out
+            if len(self._presence_memo) > _PRESENCE_MEMO_MAX:
+                self._presence_memo.popitem(last=False)
+        # Callers may mutate the returned maps; hand back a copy, never the memo.
+        return {s: dict(m) for s, m in out.items()}
 
     def count(self, source: str, version: int | None = None) -> int:
         spec = self._spec(source)

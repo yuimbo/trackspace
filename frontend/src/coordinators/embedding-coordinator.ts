@@ -139,6 +139,11 @@ export class EmbeddingCoordinator {
 
   constructor(private deps: EmbeddingDeps) {}
 
+  /** Eval-gallery compute gate: no projection/lens/scope/weight work while active. */
+  private get _evalInert(): boolean {
+    return this.deps.model.evalMode;
+  }
+
   /** Cancel the in-flight position animation, if any (shared overlay invariant). */
   cancelAnimation(): void {
     cancelAnimationFrame(this._animFrame);
@@ -193,6 +198,21 @@ export class EmbeddingCoordinator {
     this._layoutCache.clear();
   }
 
+  /**
+   * Apply a precomputed eval-artifact position map (the layout-evaluation
+   * gallery), animating from the current positions on the one shared animation
+   * frame. Intentionally independent of lens/weights: the map is read-only and
+   * never triggers a projection fetch. Switching maps animates the transition the
+   * same way a lens switch does, so selection/colour/filters stay stable.
+   */
+  applyPrecomputedPositions(positions: Map<string, { x: number; y: number }>): void {
+    const m = this.deps.model;
+    m.embeddingsReady = true;
+    // `_animatePositionUpdate` snapshots the current positions first, then sets
+    // the new map and lerps between them on the shared frame.
+    this._animatePositionUpdate(positions);
+  }
+
   /** Refetch the layout after a weight change (the query string carries them).
    *
    *  Safe to call from any view mode: when the map has never been drawn there is
@@ -200,6 +220,7 @@ export class EmbeddingCoordinator {
    *  has, the new positions are stored so switching to the map animates to them.
    */
   refreshProjection(): Promise<void> {
+    if (this._evalInert) return Promise.resolve();
     const m = this.deps.model;
     if (!m.embeddingsReady || m.lens().kind !== "projection")
       return Promise.resolve();
@@ -216,6 +237,7 @@ export class EmbeddingCoordinator {
    *  recompute.
    */
   async fetchWeightJacobian(): Promise<void> {
+    if (this._evalInert) return;
     const m = this.deps.model;
     if (!m.embeddingsReady || m.lens().kind !== "projection") return;
     const qs = this._projectionQueryString();
@@ -241,6 +263,7 @@ export class EmbeddingCoordinator {
    *  drag events each step from that same base rather than compounding.
    */
   applyApproximateWeights(weights: Record<string, number>): boolean {
+    if (this._evalInert) return false;
     const m = this.deps.model;
     if (!this._weightJacobian || m.embeddingPositions.size === 0) return false;
     m.embeddingPositions = approximatePositions(this._weightJacobian, weights);
@@ -261,6 +284,7 @@ export class EmbeddingCoordinator {
   /** Entry point: check status, then generate embeddings or fetch a layout. */
   async ensureAndProject(): Promise<void> {
     const m = this.deps.model;
+    if (this._evalInert) return;
     const lens = m.lens();
     if (lens.kind === "tags") return;
     if (lens.kind === "deterministic") {
@@ -851,6 +875,7 @@ export class EmbeddingCoordinator {
 
   /** Advance the lens cycle; *dir* is +1 for **E**, -1 for **Shift+E**. */
   async cycleLens(dir: 1 | -1 = 1): Promise<void> {
+    if (this._evalInert) return;
     const m = this.deps.model;
     await this.switchToLens(dir === 1 ? m.nextLens() : m.prevLens());
   }
@@ -864,6 +889,7 @@ export class EmbeddingCoordinator {
    */
   async switchToLens(target: string): Promise<void> {
     const m = this.deps.model;
+    if (this._evalInert) return;
     if (m.lensId === target) return;
     // A scope re-lays out its tracks over the *outer* lens; switching that lens
     // would leave the scope's positions describing a space that is no longer shown.
@@ -902,6 +928,7 @@ export class EmbeddingCoordinator {
 
   /** Switch to a specific view mode (tags ↔ the last map lens). */
   async switchToMode(target: "tags" | "embeddings"): Promise<void> {
+    if (this._evalInert) return;
     if (this.deps.model.viewMode === target) return;
     await this.switchToLens(target === "tags" ? "tags" : "combined");
   }
@@ -930,6 +957,7 @@ export class EmbeddingCoordinator {
     lensId: string,
     allowEmpty = false,
   ): Promise<void> {
+    if (this._evalInert) return;
     const m = this.deps.model;
     const active = { ...scope, lensId };
     const seq = this._scopeSeq.next();
@@ -981,6 +1009,7 @@ export class EmbeddingCoordinator {
    * positions.
    */
   async setScopeLens(lensId: string): Promise<void> {
+    if (this._evalInert) return;
     const m = this.deps.model;
     const scope = m.scope;
     if (!scope || scope.lensId === lensId) return;
@@ -1009,6 +1038,7 @@ export class EmbeddingCoordinator {
    * while the positions follow in the same tick.
    */
   resizeScope(factor: number): Promise<void> {
+    if (this._evalInert) return Promise.resolve();
     const m = this.deps.model;
     const scope = m.scope;
     if (!scope) return Promise.resolve();

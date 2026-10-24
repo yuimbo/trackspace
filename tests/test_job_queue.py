@@ -14,6 +14,7 @@ import pytest
 
 from backend.jobs import DONE, FAILED, PENDING, JobQueue
 from backend.jobs.worker import JobResult, JobWorker
+from tests.conftest import install_counting_conn
 
 
 @pytest.fixture()
@@ -192,6 +193,165 @@ def test_epoch_advances_on_state_change(q: JobQueue) -> None:
     before = q.epoch()
     _enqueue(q, "maest", 1)
     assert q.epoch() > before
+
+
+# ── stats memo ────────────────────────────────────────────────
+
+
+def test_stats_memo_avoids_repeated_sql(q: JobQueue) -> None:
+    _enqueue(q, "maest", 3)
+    counter = [0]
+    install_counting_conn(q, counter)
+
+    st = q.stats("maest")
+    assert st.total == 3
+    n0 = counter[0]
+    assert n0 == 1  # one GROUP BY query
+
+    assert q.stats("maest") == st
+    assert counter[0] == n0  # memo hit
+
+    by_kind = q.stats_by_kind()
+    assert by_kind["maest"].total == 3
+    n1 = counter[0]
+    assert n1 == n0 + 1
+
+    assert q.stats_by_kind() == by_kind
+    assert counter[0] == n1  # memo hit
+
+    failed = q.failed_keys_by_kind()
+    assert failed == {}
+    n2 = counter[0]
+    assert n2 == n1 + 1
+
+    assert q.failed_keys_by_kind() == failed
+    assert counter[0] == n2  # memo hit
+
+
+def test_stats_memo_invalidates_on_state_changes() -> None:
+    with tempfile.TemporaryDirectory() as d:
+        queue = JobQueue(os.path.join(d, "jobs.db"), lease_seconds=-1.0)
+        counter = [0]
+        install_counting_conn(queue, counter)
+
+        _enqueue(queue, "maest", 3)
+        base = counter[0]
+        assert queue.stats("maest").pending == 3
+        assert counter[0] == base + 1
+
+        jobs = queue.claim("maest", limit=2)
+        base = counter[0]
+        assert queue.stats("maest").running == 2
+        assert counter[0] == base + 1
+
+        queue.complete(jobs[0])
+        base = counter[0]
+        st = queue.stats("maest")
+        assert st.done == 1 and st.running == 1
+        assert counter[0] == base + 1
+
+        queue.fail(jobs[1], "boom", retry=False)
+        base = counter[0]
+        st = queue.stats("maest")
+        assert st.failed == 1 and st.running == 0
+        assert counter[0] == base + 1
+
+        last = queue.claim("maest", limit=1)[0]
+        base = counter[0]
+        assert queue.stats("maest").running == 1
+        assert counter[0] == base + 1
+
+        assert queue.reclaim_expired() == 1  # the expired lease on *last*
+        base = counter[0]
+        st = queue.stats("maest")
+        assert st.pending == 1 and st.running == 0
+        assert counter[0] == base + 1
+
+        queue.complete(last)  # done: jobs[0] and last
+        assert queue.purge_done() == 2
+        base = counter[0]
+        st = queue.stats("maest")
+        assert st.done == 0 and st.failed == 1 and st.pending == 0
+        assert counter[0] == base + 1
+
+        # Warm again: consecutive polls stay on the memo.
+        assert queue.stats("maest").total == 1
+        n = counter[0]
+        assert queue.stats("maest").total == 1
+        assert counter[0] == n
+
+
+def test_stats_memo_ttl_serves_stale_then_recomputes(monkeypatch) -> None:
+    clock = {"t": 0.0}
+    monkeypatch.setattr(
+        "backend.jobs.queue.time.monotonic", lambda: clock["t"]
+    )
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "jobs.db")
+        ours = JobQueue(path)
+        _enqueue(ours, "maest", 1)  # k0
+        counter = [0]
+        install_counting_conn(ours, counter)
+
+        assert ours.stats("maest").pending == 1
+        base = counter[0]
+
+        # A second process (fresh instance, its own epoch) writes to the same DB.
+        other = JobQueue(path)
+        other.enqueue_many("maest", [("other-k0", {"path": "/m/o.mp3"})])
+
+        # Within the TTL the stale memo is served...
+        clock["t"] += 0.5
+        assert ours.stats("maest").pending == 1
+        assert counter[0] == base
+
+        # ...and past it the query runs again and sees the new row.
+        clock["t"] += 1.0
+        assert ours.stats("maest").pending == 2
+        assert counter[0] == base + 1
+
+        # An in-process change invalidates immediately, TTL or not.
+        _enqueue(ours, "maest", 2)  # k1 inserts; k0 conflicts
+        n = counter[0]
+        assert ours.stats("maest").pending == 3
+        assert counter[0] == n + 1
+
+
+def test_stats_memo_survives_lease_renewal(q: JobQueue) -> None:
+    """renew() only extends lease_expires — invisible to the memoised stats."""
+    _enqueue(q, "maest", 1)
+    job = q.claim("maest")[0]
+    counter = [0]
+    install_counting_conn(q, counter)
+
+    assert q.stats("maest").running == 1
+    base = counter[0]
+
+    q.renew([job.id])  # its own UPDATE is counted...
+    assert q.stats("maest").running == 1
+    # ...but no stats query: the memo is still warm (base + 1, not + 2).
+    assert counter[0] == base + 1
+
+
+def test_stats_memo_results_are_isolated_from_memo(q: JobQueue) -> None:
+    one_shot = JobQueue(q._db_path, max_attempts=1)
+    _enqueue(one_shot, "maest", 2)
+    one_shot.fail(one_shot.claim("maest")[0], "boom")
+    counter = [0]
+    install_counting_conn(one_shot, counter)
+
+    failed = one_shot.failed_keys_by_kind()
+    assert failed["maest"] == {"k0"}
+    failed["maest"].add("k1")  # mutate the inner set
+    failed["features"] = {"k0"}  # mutate the outer dict
+
+    by_kind = one_shot.stats_by_kind()
+    by_kind.pop("maest", None)  # mutate the outer dict
+
+    assert one_shot.failed_keys_by_kind() == {"maest": {"k0"}}
+    assert "maest" in one_shot.stats_by_kind()
+    assert one_shot.stats_by_kind()["maest"].total == 2
 
 
 def test_worker_drains_queue_and_records_results() -> None:

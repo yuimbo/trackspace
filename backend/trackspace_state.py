@@ -10,7 +10,11 @@ from dataclasses import dataclass, field
 from watchdog.observers import Observer
 
 from backend.cache import TrackCache
-from backend.embeddings.feature_cache import FeatureCache
+from backend.embeddings.feature_cache import (
+    LIBRARY_MEMORY_BYTES,
+    LIBRARY_MEMORY_ENTRIES,
+    FeatureCache,
+)
 from backend.jobs import JobQueue, WorkerPool
 from backend.services.analysis_pipeline import ClusterStore
 from backend.services.embedding_broadcaster import EmbeddingBroadcaster
@@ -75,7 +79,11 @@ class TrackspaceState:
             track_cache=TrackCache(
                 os.path.join(data_dir, "track_cache.db"), max_memory=20000
             ),
-            feature_cache=FeatureCache(os.path.join(data_dir, "audio_features.db")),
+            feature_cache=FeatureCache(
+                os.path.join(data_dir, "audio_features.db"),
+                max_memory=LIBRARY_MEMORY_ENTRIES,
+                max_memory_bytes=LIBRARY_MEMORY_BYTES,
+            ),
             embed_broadcaster=EmbeddingBroadcaster(),
             status_cache=EmbeddingStatusCache(
                 track_infos_max=8,

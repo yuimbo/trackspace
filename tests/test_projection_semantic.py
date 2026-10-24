@@ -3,6 +3,7 @@ folder hierarchy, parsers).  Avoids CLAP model load.
 """
 
 import numpy as np
+import pytest
 
 import backend.embeddings.layout as layout
 from backend.embeddings.layout import (
@@ -68,12 +69,288 @@ def test_parse_numeric_helpers_clip():
 
 
 def test_prepared_source_row_cache_hits_on_repeat():
-    layout._source_row_cache.clear()
+    layout._source_row_cache_clear()
     raw = np.array([3.0, 4.0], dtype=np.float32)
     mask = np.ones(6, dtype=np.float32)
     a = _get_prepared_source_row("clap", "fp-row", raw, mask, 0.42)
     b = _get_prepared_source_row("clap", "fp-row", raw, mask, 0.42)
     assert a is b
+
+
+# ── prepared-row cache byte accounting ───────────────────────────────
+
+
+def _row_cost(v: np.ndarray) -> int:
+    return int(v.nbytes) + layout._SOURCE_ROW_ENTRY_OVERHEAD
+
+
+def test_source_row_cache_accounts_bytes_after_puts():
+    layout._source_row_cache_clear()
+    layout._source_row_cache_put(("clap", "fp1", 1), np.ones(32, dtype=np.float32))
+    assert layout._source_row_cache_bytes == _row_cost(np.ones(32, dtype=np.float32))
+    layout._source_row_cache_put(("clap", "fp2", 1), np.ones(64, dtype=np.float32))
+    assert layout._source_row_cache_bytes == _row_cost(
+        np.ones(32, dtype=np.float32)
+    ) + _row_cost(np.ones(64, dtype=np.float32))
+
+
+def test_source_row_cache_overwrite_does_not_double_count():
+    layout._source_row_cache_clear()
+    key = ("clap", "fp1", 1)
+    layout._source_row_cache_put(key, np.ones(32, dtype=np.float32))
+    layout._source_row_cache_put(key, np.ones(64, dtype=np.float32))
+    assert len(layout._source_row_cache) == 1
+    assert layout._source_row_cache_bytes == _row_cost(np.ones(64, dtype=np.float32))
+
+
+def test_source_row_cache_evicts_lru_by_bytes(monkeypatch):
+    layout._source_row_cache_clear()
+    # Budget sized for exactly two entries: the third put evicts the oldest.
+    budget = 2 * _row_cost(np.ones(64, dtype=np.float32))
+    monkeypatch.setattr(layout, "_SOURCE_ROW_CACHE_BYTES_MAX", budget)
+    layout._source_row_cache_put(("a", "fp", 1), np.ones(32, dtype=np.float32))
+    layout._source_row_cache_put(("b", "fp", 1), np.ones(64, dtype=np.float32))
+    layout._source_row_cache_put(("c", "fp", 1), np.ones(64, dtype=np.float32))
+    assert set(layout._source_row_cache) == {("b", "fp", 1), ("c", "fp", 1)}
+    assert layout._source_row_cache_bytes == budget
+
+
+def test_source_row_cache_get_refreshes_recency(monkeypatch):
+    layout._source_row_cache_clear()
+    budget = 2 * _row_cost(np.ones(64, dtype=np.float32))
+    monkeypatch.setattr(layout, "_SOURCE_ROW_CACHE_BYTES_MAX", budget)
+    k_a = ("a", "fp", 1)
+    k_b = ("b", "fp", 1)
+    layout._source_row_cache_put(k_a, np.ones(64, dtype=np.float32))
+    layout._source_row_cache_put(k_b, np.ones(32, dtype=np.float32))
+    # Touching A demotes B to least-recently-used, so the next put evicts B.
+    assert layout._source_row_cache_get(k_a) is not None
+    layout._source_row_cache_put(("c", "fp", 1), np.ones(64, dtype=np.float32))
+    assert k_a in layout._source_row_cache
+    assert k_b not in layout._source_row_cache
+
+
+def test_source_row_cache_clear_resets_bytes():
+    layout._source_row_cache_put(("clap", "fp1", 1), np.ones(32, dtype=np.float32))
+    assert layout._source_row_cache_bytes > 0
+    layout._source_row_cache_clear()
+    assert len(layout._source_row_cache) == 0
+    assert layout._source_row_cache_bytes == 0
+
+
+# ── per-source version snapshot (the cold-regather overhead fix) ───────
+
+
+class _CountingSupervisedCache:
+    """Stub cache with supervised rows plus a count of ``get_meta`` reads.
+
+    Mirrors the real FeatureCache surface used by ``supervised.cache_version``
+    and the composite gather's generic ``get_all`` lookup.
+
+    The supervised rows are *version-aware*: the map ``get_all`` returns depends
+    on the requested version (the training-run id), so a retrain
+    (``set_run_id``) yields observably different rows the moment the version
+    bumps — it is never the same stale map under a new key.
+    """
+
+    def __init__(self, run_id: int = 5) -> None:
+        self._run_id = run_id
+        self.get_meta_count = 0
+        self._maps: dict[str, dict[str, np.ndarray]] = {}
+
+    def set_run_id(self, run_id: int) -> None:
+        self._run_id = run_id
+
+    def get_meta(self, key: str):
+        self.get_meta_count += 1
+        return self._run_id if key == "supervised_run_id" else None
+
+    def _supervised_map(self, version: int) -> dict[str, np.ndarray]:
+        # Each training run writes its own supervised rows: shift the cached raw
+        # rows by the run id so a version bump changes the *direction*, not just
+        # a scale (a scalar scale would survive row normalisation).
+        run = self._maps.get("supervised", {})
+        shift = float(version)
+        return {fp: v + shift for fp, v in run.items()}
+
+    def get_all(
+        self, source: str, fingerprints: list[str], version: int = 0,
+    ) -> dict[str, np.ndarray]:
+        if source == "supervised":
+            m = self._supervised_map(version)
+            return {fp: m[fp] for fp in fingerprints if fp in m}
+        m = self._maps.get(source, {})
+        return {fp: m[fp] for fp in fingerprints if fp in m}
+
+
+def test_source_version_static_branch_makes_no_metadata_read():
+    cache = _CountingSupervisedCache(run_id=9)
+    assert layout._source_version("clap", cache) == layout.EMBEDDING_VERSION
+    assert layout._source_version("features", cache) == layout._static_source_version(
+        "features"
+    )
+    assert cache.get_meta_count == 0
+    # The supervised branch is the only one that reads metadata.
+    layout._source_version("supervised", cache)
+    assert cache.get_meta_count == 1
+
+
+def test_gather_reads_supervised_version_once_not_per_row():
+    """A many-row mixed-source gather must snapshot the supervised run id exactly
+    once: one metadata read regardless of row count."""
+    layout._composite_cache.clear()
+    n = 200
+    cache = _CountingSupervisedCache(run_id=7)
+    clap, maest, sup, infos = {}, {}, {}, []
+    for i in range(n):
+        fp = f"f{i}"
+        clap[fp] = np.array([1.0, float(i)], dtype=np.float32)
+        maest[fp] = np.ones(4, dtype=np.float32)
+        sup[fp] = np.array([0.0, 1.0], dtype=np.float32)
+        infos.append({"path": f"p/t{i}.mp3", "fingerprint": fp})
+    cache._maps = {"clap": clap, "maest": maest, "supervised": sup}
+    cache.get_meta_count = 0
+
+    _, m, _, _, _, _, _ = _gather_composite_vecs(
+        infos, cache, sources=("clap", "maest", "supervised"),
+    )
+    assert m.shape[0] == n
+    assert cache.get_meta_count == 1
+
+    # A second gather re-reads the (now possibly changed) version: the version is
+    # never permanently cached, so a retrain invalidates the next gather.
+    _gather_composite_vecs(infos, cache, sources=("clap", "maest", "supervised"))
+    assert cache.get_meta_count == 2
+
+
+def test_gather_invalidates_composite_cache_on_retrain():
+    """A retrain changes the supervised version, so cache keys change and the
+    composite matrix is recomputed — and holds the *new* supervised rows, not a
+    stale reuse of the pre-retrain values."""
+    layout._composite_cache.clear()
+    layout._source_row_cache_clear()
+    cache = _CountingSupervisedCache(run_id=1)
+    fp = "fp"
+    clap = np.array([3.0, 4.0], dtype=np.float32)
+    sup = np.array([1.0, 2.0], dtype=np.float32)
+    infos = [{"path": "a/t.mp3", "fingerprint": fp}]
+    cache._maps = {"clap": {fp: clap}, "supervised": {fp: sup}}
+
+    def gather():
+        return _gather_composite_vecs(
+            infos, cache, sources=("clap", "supervised"),
+        )
+
+    _, m1, _, _, k1, _, _ = gather()
+    # Same version again → composite cache hit, identical matrix object.
+    _, m2, _, _, k2, _, _ = gather()
+    assert k1 == k2
+    assert m1 is m2
+
+    # Retrain → version bumps → key and matrix change, no stale reuse.
+    cache.set_run_id(2)
+    _, m3, _, _, k3, _, _ = gather()
+    assert k3 != k1
+    assert m3 is not m1
+
+    # The recomputed matrix holds the *new* supervised rows (version 2), not the
+    # stale version-1 values from before the retrain. The composite row is
+    # re-derived from the freshly gathered map and matches the expected new
+    # vector exactly, while the pre-retrain matrix holds a different direction.
+    new_sup = (sup + 2.0) / np.linalg.norm(sup + 2.0)
+    stale_sup = (sup + 1.0) / np.linalg.norm(sup + 1.0)
+    assert np.allclose(m3[0][2:], new_sup, atol=1e-6)      # supervised block = new values
+    assert not np.allclose(m3[0][2:], stale_sup)           # ...not the stale ones
+    expected_row = np.concatenate([clap / np.linalg.norm(clap), new_sup])
+    assert np.allclose(m3[0], expected_row, atol=1e-6)
+    # The matrix norm is *not* stale either: re-fit from the new rows reproduces
+    # the recomputed norm, proving it was rebuilt rather than reused.
+    assert abs(float(np.linalg.norm(m3)) - float(np.linalg.norm(expected_row))) < 1e-6
+
+    # And the new version is now the cached one.
+    _, m4, _, _, k4, _, _ = gather()
+    assert k3 == k4
+    assert m3 is m4
+
+
+def test_prepared_supervised_row_explicit_zero_version_bypasses_meta():
+    """``source_version=0`` is a real version (no trained head), so a direct
+    prepared-row call must use it as-is without a metadata read."""
+    layout._source_row_cache_clear()
+    cache = _CountingSupervisedCache(run_id=3)
+    raw = np.array([1.0, 2.0], dtype=np.float32)
+    mask = np.ones(6, dtype=np.float32)
+    v = _get_prepared_source_row(
+        "supervised", "fp-zero", raw, mask, 0.42, cache, source_version=0,
+    )
+    assert cache.get_meta_count == 0
+    assert np.allclose(v, raw / np.linalg.norm(raw))
+
+
+def test_fetch_source_map_explicit_zero_version_is_not_reresolved():
+    """``source_version=0`` is a real version (no trained head), not the None
+    sentinel — it must be passed straight to the getter with no metadata read."""
+    cache = _CountingSupervisedCache(run_id=3)
+    seen: list[int] = []
+
+    def _get_all(source, fingerprints, version=0):
+        del source, fingerprints
+        seen.append(version)
+        return {}
+
+    cache.get_all = _get_all
+    layout._fetch_source_map("supervised", cache, ["fp"], source_version=0)
+    assert seen == [0]
+    assert cache.get_meta_count == 0
+
+
+def test_fetch_source_map_unknown_source_raises():
+    cache = _StubFeatureCache()
+    with pytest.raises(ValueError):
+        layout._fetch_source_map("bogus", cache, [])
+
+
+def test_gather_unknown_source_raises():
+    cache = _StubFeatureCache()
+    with pytest.raises(ValueError):
+        _gather_composite_vecs([], cache, sources=("bogus",))
+
+
+def test_prepared_source_row_exact_normalisation():
+    layout._source_row_cache_clear()
+    raw = np.array([3.0, 4.0], dtype=np.float32)
+    mask = np.ones(6, dtype=np.float32)
+    v = _get_prepared_source_row("clap", "fp-norm", raw, mask, 0.42)
+    assert np.allclose(v, np.array([0.6, 0.8], dtype=np.float32))
+    assert abs(float(np.linalg.norm(v)) - 1.0) < 1e-6
+
+
+def test_gather_zero_rows_for_missing_optional_source():
+    """An optional source a track lacks contributes a zero row; partial libraries
+    still render instead of hiding the track until every model has run."""
+    layout._composite_cache.clear()
+    fp_present = "present"
+    fp_missing = "missing"
+    clap = np.array([3.0, 4.0], dtype=np.float32)
+    feat = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=np.float32)
+    infos = [
+        {"path": "a/t_present.mp3", "fingerprint": fp_present},
+        {"path": "b/t_missing.mp3", "fingerprint": fp_missing},
+    ]
+    cache = _StubFeatureCache(
+        clap={fp_present: clap, fp_missing: clap}, feats={fp_present: feat}
+    )
+    _, mat, _, _, _, _, _ = _gather_composite_vecs(
+        infos,
+        cache,
+        sources=("clap", "features"),
+        required_sources=("clap",),
+        feature_mask=parse_audio_feature_mask("111111"),
+        features_blend=1.0,
+    )
+    assert mat.shape == (2, 2 + AUDIO_FEATURE_DIM)
+    assert not np.all(mat[0, 2:] == 0.0)   # present track has a features row
+    assert np.all(mat[1, 2:] == 0.0)       # missing track contributes a zero row
 
 
 def test_composite_tier_cache_reuses_matrix():

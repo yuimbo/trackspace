@@ -32,7 +32,7 @@ from collections import OrderedDict
 
 import numpy as np
 
-from .linalg_utils import apply_procrustes, procrustes
+from .linalg_utils import apply_procrustes, matched_indices, procrustes
 
 log = logging.getLogger(__name__)
 
@@ -72,14 +72,7 @@ def align_to_reference(
     The fit uses only the tracks both layouts contain, then applies the resulting
     transform to every point. Returns ``(aligned, reflected)``.
     """
-    ref_index = {p: i for i, p in enumerate(ref_paths)}
-    mine: list[int] = []
-    theirs: list[int] = []
-    for i, p in enumerate(paths):
-        j = ref_index.get(p)
-        if j is not None:
-            mine.append(i)
-            theirs.append(j)
+    mine, theirs = matched_indices(paths, ref_paths)
     if len(mine) < MIN_SHARED:
         return None
     rot, scale, src_mu, dst_mu = procrustes(coords[mine], ref_coords[theirs])

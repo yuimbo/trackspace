@@ -12,6 +12,7 @@ import logging
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 import numpy as np
 
 from .clap import (
@@ -57,8 +58,15 @@ _semantic_basis_cache: OrderedDict[str, tuple[np.ndarray, np.ndarray]] = (
 _revision_layout_cache: OrderedDict[str, list[dict]] = OrderedDict()
 _composite_cache_bytes = 0
 
-_SOURCE_ROW_CACHE_MAX = 24_000
+#: Byte budget for the prepared source-row LRU. The working set is ~42k rows
+#: (7.1k tracks × 6 sources), so an entry cap thrashes a full pass and a weight
+#: change recomputes every row; a byte budget keeps the whole set resident.
+_SOURCE_ROW_CACHE_BYTES_MAX = 256 * 1024 * 1024
+#: Per-entry Python/ndarray object overhead, so tiny rows (rhythm 56 B,
+#: features 24 B) cannot grow the entry count without bound.
+_SOURCE_ROW_ENTRY_OVERHEAD = 112
 _source_row_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
+_source_row_cache_bytes = 0
 
 #: Guards the module-level tier caches. They are mutated from Flask request
 #: threads *and* the layout-prefetch worker, so an unguarded OrderedDict could
@@ -75,11 +83,29 @@ def _source_row_cache_get(key: tuple) -> np.ndarray | None:
 
 
 def _source_row_cache_put(key: tuple, value: np.ndarray) -> None:
+    """Byte-budgeted put for the prepared source-row LRU."""
+    global _source_row_cache_bytes
     with _cache_lock:
+        old = _source_row_cache.get(key)
+        if old is not None:
+            _source_row_cache_bytes -= int(old.nbytes) + _SOURCE_ROW_ENTRY_OVERHEAD
         _source_row_cache[key] = value
         _source_row_cache.move_to_end(key)
-        while len(_source_row_cache) > _SOURCE_ROW_CACHE_MAX:
-            _source_row_cache.popitem(last=False)
+        _source_row_cache_bytes += int(value.nbytes) + _SOURCE_ROW_ENTRY_OVERHEAD
+        while (
+            _source_row_cache_bytes > _SOURCE_ROW_CACHE_BYTES_MAX
+            and len(_source_row_cache) > 1
+        ):
+            _k, old_v = _source_row_cache.popitem(last=False)
+            _source_row_cache_bytes -= int(old_v.nbytes) + _SOURCE_ROW_ENTRY_OVERHEAD
+
+
+def _source_row_cache_clear() -> None:
+    """Empty the prepared-row cache and reset its byte counter."""
+    global _source_row_cache_bytes
+    with _cache_lock:
+        _source_row_cache.clear()
+        _source_row_cache_bytes = 0
 
 
 def _tier_cache_get(cache: OrderedDict, key: str):
@@ -160,15 +186,18 @@ def _supervised_cache_version(feature_cache) -> int:
     return cache_version(feature_cache)
 
 
-def _source_versions_token(feature_cache=None) -> str:
+def _source_versions_token(feature_cache=None, *, supervised_version: int | None = None) -> str:
     from .librosa_audio_features import FEATURES_VERSION
     from .maest import MAEST_VERSION
     from .rhythm_features import RHYTHM_VERSION
 
+    if supervised_version is None:
+        supervised_version = _supervised_cache_version(feature_cache)
+
     return (
         f"C{EMBEDDING_VERSION}F{FEATURES_VERSION}"
         f"M{MAEST_VERSION}R{RHYTHM_VERSION}"
-        f"S{_supervised_cache_version(feature_cache)}"
+        f"S{supervised_version}"
     )
 
 
@@ -219,11 +248,11 @@ def _composite_param_key(
     return f"{ph}|{_composite_config_token(sources, mask, blend, weights, versions_token)}"
 
 
-def _source_version(source: str, feature_cache=None) -> int:
-    """Cache version for one source (used in row-cache keys and reads).
+def _static_source_version(source: str) -> int:
+    """Cache version for a source with a fixed recipe constant.
 
-    For ``supervised`` this is the current training-run id, so a retrain
-    invalidates the in-process composite and row caches.
+    ``supervised`` is excluded: its version is the *training-run id*, which is
+    dynamic and therefore resolved separately (see :func:`_source_version`).
     """
     from .librosa_audio_features import FEATURES_VERSION
     from .maest import MAEST_VERSION
@@ -235,8 +264,19 @@ def _source_version(source: str, feature_cache=None) -> int:
         "maest": MAEST_VERSION,
         "maest_logits": MAEST_VERSION,
         "rhythm": RHYTHM_VERSION,
-        "supervised": _supervised_cache_version(feature_cache),
     }[source]
+
+
+def _source_version(source: str, feature_cache=None) -> int:
+    """Cache version for one source (used in row-cache keys and reads).
+
+    For ``supervised`` this is the current training-run id, so a retrain
+    invalidates the in-process composite and row caches. Only the supervised
+    branch reads the cache (a metadata query); static sources never do.
+    """
+    if source == "supervised":
+        return _supervised_cache_version(feature_cache)
+    return _static_source_version(source)
 
 
 def _get_prepared_source_row(
@@ -246,6 +286,8 @@ def _get_prepared_source_row(
     feature_mask: np.ndarray,
     features_blend: float,
     feature_cache=None,
+    *,
+    source_version: int | None = None,
 ) -> np.ndarray:
     """Return one track row for *source* with the same preprocessing as composite gather.
 
@@ -253,15 +295,20 @@ def _get_prepared_source_row(
     cannot dominate a low-dimensional one (14-D rhythm) through sheer length.
     Relative influence is then set explicitly by the per-source weights applied
     in :func:`_gather_composite_vecs`, not by dimensionality.
+
+    ``source_version`` is the already-snapped cache version for *source*; when
+    omitted it is resolved here (the direct-call path).
     """
     raw = np.asarray(raw, dtype=np.float32).reshape(-1)
 
     if source == "features":
         b = float(np.clip(features_blend, 0.05, 1.0))
+        if source_version is None:
+            source_version = _source_version(source, feature_cache)
         key = (
             "features",
             fp,
-            _source_version(source, feature_cache),
+            source_version,
             feature_mask.tobytes(),
             round(b, 9),
             FEATURE_ENCODING_VERSION,
@@ -282,12 +329,13 @@ def _get_prepared_source_row(
         _source_row_cache_put(key, v)
         return v
 
-    try:
-        version = _source_version(source, feature_cache)
-    except KeyError:
-        raise ValueError(f"unknown source {source!r}") from None
+    if source_version is None:
+        try:
+            source_version = _source_version(source, feature_cache)
+        except KeyError:
+            raise ValueError(f"unknown source {source!r}") from None
 
-    key = (source, fp, version)
+    key = (source, fp, source_version)
     hit = _source_row_cache_get(key)
     if hit is not None:
         return hit
@@ -299,42 +347,25 @@ def _get_prepared_source_row(
     return v
 
 
-def _gather_vecs(
-    track_infos: list[dict],
-    feature_cache,
-    version: int,
-) -> tuple[list[str], list[np.ndarray]]:
-    fps = [t.get("fingerprint") for t in track_infos]
-    fp_set = [fp for fp in fps if fp]
-    embeddings_map = feature_cache.get_all("clap", fp_set, version=version)
-
-    paths: list[str] = []
-    vecs: list[np.ndarray] = []
-    for t in track_infos:
-        fp = t.get("fingerprint")
-        if fp and fp in embeddings_map:
-            paths.append(t["path"])
-            vecs.append(embeddings_map[fp])
-    return paths, vecs
-
-
 def _fetch_source_map(
-    source: str, feature_cache, fp_set: list[str]
+    source: str, feature_cache, fp_set: list[str], *, source_version: int | None = None
 ) -> dict[str, np.ndarray]:
     """One batched cache read for *source*, keyed by its own version constant.
 
     A cache object without the generic getter (older cache, or a test stub) yields
     an empty map rather than raising — that source is simply absent for this
-    projection.
+    projection. ``source_version`` is the already-snapped version for *source*;
+    when omitted it is resolved here (the direct-call path).
     """
-    try:
-        version = _source_version(source, feature_cache)
-    except KeyError:
-        raise ValueError(f"unknown source {source!r}") from None
+    if source_version is None:
+        try:
+            source_version = _source_version(source, feature_cache)
+        except KeyError:
+            raise ValueError(f"unknown source {source!r}") from None
     getter = getattr(feature_cache, "get_all", None)
     if getter is None:
         return {}
-    return getter(source, fp_set, version=version)
+    return getter(source, fp_set, version=source_version)
 
 
 def _gather_composite_vecs(
@@ -364,9 +395,25 @@ def _gather_composite_vecs(
     fps = [t.get("fingerprint") for t in track_infos]
     fp_set = [fp for fp in fps if fp]
 
-    source_maps: dict[str, dict[str, np.ndarray]] = {
-        s: _fetch_source_map(s, feature_cache, fp_set) for s in sources
-    }
+    # Snapshot the supervised training-run id exactly once per gather. The token,
+    # every supervised fetch and every row key reuse this same value, so a retrain
+    # invalidates all composite/row caches coherently and every part of this
+    # gather stays version-consistent under that single snapshot.
+    supervised_version = _supervised_cache_version(feature_cache)
+    source_versions: dict[str, int] = {}
+    source_maps: dict[str, dict[str, np.ndarray]] = {}
+    for s in sources:
+        if s == "supervised":
+            v = supervised_version
+        else:
+            try:
+                v = _static_source_version(s)
+            except KeyError:
+                raise ValueError(f"unknown source {s!r}") from None
+        source_versions[s] = v
+        source_maps[s] = _fetch_source_map(
+            s, feature_cache, fp_set, source_version=v
+        )
 
     required = tuple(required_sources) if required_sources else tuple(sources)
     # Only require sources that are actually enabled for this projection.
@@ -394,7 +441,9 @@ def _gather_composite_vecs(
 
     blend = float(np.clip(features_blend, 0.05, 1.0))
     weights = dict(source_weights or {})
-    versions_token = _source_versions_token(feature_cache)
+    versions_token = _source_versions_token(
+        feature_cache, supervised_version=supervised_version
+    )
     comp_key = _composite_param_key(
         paths, sources, mask, blend, weights, versions_token
     )
@@ -432,7 +481,8 @@ def _gather_composite_vecs(
             else:
                 rows.append(
                     _get_prepared_source_row(
-                        s, fp, raw, mask, blend, feature_cache
+                        s, fp, raw, mask, blend, feature_cache,
+                        source_version=source_versions[s],
                     )
                 )
         block = np.stack(rows, axis=0)
@@ -454,6 +504,128 @@ def _gather_composite_vecs(
         comp_key, (list(paths), mat, clap_dim, clap_col_lo, spans)
     )
     return paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans
+
+
+@dataclass
+class ProjectionInput:
+    """Composite matrix plus the semantic weighting applied to it.
+
+    Produced by :func:`prepare_projection_input` and consumed by both the
+    interactive projection and the offline layout-evaluation generator, so the
+    two derive their projection input from exactly the same rules.
+    """
+
+    paths: list[str]
+    mat: np.ndarray
+    clap_dim: int
+    clap_col_lo: int
+    comp_key: str
+    comp_config: str
+    spans: dict[str, tuple[int, int]]
+    mat_proj: np.ndarray
+    tsne_config: str
+
+
+def prepare_projection_input(
+    track_infos: list[dict],
+    feature_cache,
+    *,
+    sources: tuple[str, ...] = ("clap",),
+    feature_mask: np.ndarray | None = None,
+    features_blend: float = 0.42,
+    source_weights: dict[str, float] | None = None,
+    required_sources: tuple[str, ...] | None = None,
+    scale_folders: bool = False,
+    context_tags: list[str] | None = None,
+    context_folders: list[str] | None = None,
+    folder_boost: float = 3.0,
+    folder_depth_boost: float = 1.5,
+) -> ProjectionInput:
+    """Gather the composite matrix and apply any semantic weighting.
+
+    Builds the same composite matrix (per-source weighted blocks, required-source
+    gating) and then re-projects the CLAP column span along semantic folder/tag
+    directions when a model is ready and supervision is supplied. ``scale_folders``
+    derives the folder seeds from the track paths when no explicit context folders
+    are given. The defaults mirror the interactive projection; ``scale_folders=False``
+    and empty context mean no supervision, which is the evaluation default.
+
+    ``tsne_config`` is the effective vector-config key the production t-SNE fit
+    cache keys on (``comp_config`` plus the semantic-basis params when weighting
+    is active). The evaluation generator ignores it for its own uncached fits but
+    it is returned so callers that do use the production cache key identically.
+
+    A degenerate input — fewer than two tracks, or a matrix with fewer than two
+    rows — returns the unweighted bundle with no semantic inference, since there
+    is nothing meaningful to project or re-weight.
+    """
+    paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans = (
+        _gather_composite_vecs(
+            track_infos,
+            feature_cache,
+            sources=sources,
+            feature_mask=feature_mask,
+            features_blend=features_blend,
+            source_weights=source_weights,
+            required_sources=required_sources,
+        )
+    )
+
+    if len(paths) < 2 or mat.shape[0] < 2:
+        return ProjectionInput(
+            paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans,
+            mat, comp_config,
+        )
+
+    if scale_folders:
+        folder_seeds = (
+            list(context_folders)
+            if context_folders
+            else _folder_seeds_from_track_paths(paths)
+        )
+    else:
+        folder_seeds = None
+
+    needs_weight = is_model_ready() and (bool(context_tags) or bool(folder_seeds))
+    mat_proj = mat
+    basis_key = ""
+    if needs_weight:
+        # Key the semantic basis on the vector *config* and the folder *set*, never
+        # the full path set: the frame is defined by the folders, so a track added
+        # to an existing folder must reuse the fitted chart (and be transformed into
+        # it) rather than refit the whole map. A new folder is a genuinely new
+        # direction, so it does refit.
+        basis_key = (
+            f"{comp_config}"
+            f"|{_semantic_basis_param_key(context_tags, folder_seeds)}"
+        )
+        basis = _tier_cache_get(_semantic_basis_cache, basis_key)
+        if basis is None:
+            clap_hi = clap_col_lo + clap_dim
+            tags_for_weight = context_tags if clap_dim > 0 else None
+            T_n, exp = _build_semantic_basis(
+                mat, paths, tags_for_weight, folder_seeds, clap_col_lo, clap_hi,
+            )
+            _tier_cache_put(
+                _semantic_basis_cache, basis_key, (T_n, exp),
+                _SEMANTIC_BASIS_CACHE_MAX,
+            )
+        else:
+            T_n, exp = basis
+        mat_proj = _apply_low_rank_semantic_weight(
+            mat, T_n, exp, folder_boost, folder_depth_boost,
+        )
+
+    tsne_config = comp_config
+    if needs_weight:
+        tsne_config = (
+            f"{comp_config}|{basis_key}"
+            f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
+        )
+    return ProjectionInput(
+        paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans,
+        mat_proj, tsne_config,
+    )
 
 
 def _source_block_dim(source: str, smap: dict[str, np.ndarray]) -> int:
@@ -589,81 +761,39 @@ def compute_projection(
         Returns ``(result, normed, spans)``. The composite gather is keyed on
         the weights, so a perturbation re-runs only the projection.
         """
-        paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans = (
-            _gather_composite_vecs(
-                track_infos,
-                feature_cache,
-                sources=sources,
-                feature_mask=feature_mask,
-                features_blend=features_blend,
-                source_weights=w,
-                required_sources=required_sources,
-            )
+        inp = prepare_projection_input(
+            track_infos,
+            feature_cache,
+            sources=sources,
+            feature_mask=feature_mask,
+            features_blend=features_blend,
+            source_weights=w,
+            required_sources=required_sources,
+            scale_folders=scale_folders,
+            context_tags=context_tags,
+            context_folders=context_folders,
+            folder_boost=folder_boost,
+            folder_depth_boost=folder_depth_boost,
         )
         # `mat.shape[0] < 2` guards the degenerate all-zero-weight case, where
         # every block is dropped. The HTTP routes reject that vector before
         # reaching here; this keeps the function safe regardless.
-        if len(paths) < 2 or mat.shape[0] < 2:
-            flat = [{"path": p, "x": 0.5, "y": 0.5} for p in paths]
-            return flat, np.empty((0, 2), dtype=np.float32), spans
-
-        if scale_folders:
-            folder_seeds = (
-                list(context_folders)
-                if context_folders
-                else _folder_seeds_from_track_paths(paths)
-            )
-        else:
-            folder_seeds = None
-
-        needs_weight = is_model_ready() and (bool(context_tags) or bool(folder_seeds))
-        mat_proj = mat
-        basis_key = ""
-        if needs_weight:
-            # Key the semantic basis on the vector *config* and the folder *set*,
-            # never the full path set: the frame is defined by the folders, so a
-            # track added to an existing folder must reuse the fitted chart (and
-            # be transformed into it) rather than refit the whole map. A new
-            # folder is a genuinely new direction, so it does refit.
-            basis_key = (
-                f"{comp_config}"
-                f"|{_semantic_basis_param_key(context_tags, folder_seeds)}"
-            )
-            basis = _tier_cache_get(_semantic_basis_cache, basis_key)
-            if basis is None:
-                clap_hi = clap_col_lo + clap_dim
-                tags_for_weight = context_tags if clap_dim > 0 else None
-                T_n, exp = _build_semantic_basis(
-                    mat, paths, tags_for_weight, folder_seeds, clap_col_lo, clap_hi,
-                )
-                _tier_cache_put(
-                    _semantic_basis_cache, basis_key, (T_n, exp),
-                    _SEMANTIC_BASIS_CACHE_MAX,
-                )
-            else:
-                T_n, exp = basis
-            mat_proj = _apply_low_rank_semantic_weight(
-                mat, T_n, exp, folder_boost, folder_depth_boost,
-            )
+        if len(inp.paths) < 2 or inp.mat.shape[0] < 2:
+            flat = [{"path": p, "x": 0.5, "y": 0.5} for p in inp.paths]
+            return flat, np.empty((0, 2), dtype=np.float32), inp.spans
 
         if method == "pca":
-            coords = _project_pca(mat_proj, paths)
+            coords = _project_pca(inp.mat_proj, inp.paths)
         else:
             if method != "tsne":
                 log.debug("unknown projection method %r; using t-SNE", method)
             # The fit cache keys on the vector config (not the track set), so an
             # openTSNE embedding fitted for the same sources/mask/weighting is
             # reused and only newly added tracks are transformed into it.
-            tsne_config = comp_config
-            if needs_weight:
-                tsne_config = (
-                    f"{comp_config}|{basis_key}"
-                    f"|{folder_boost:.6g}|{folder_depth_boost:.6g}"
-                )
             coords = _project_tsne(
-                mat_proj,
-                paths=paths,
-                config_key=tsne_config,
+                inp.mat_proj,
+                paths=inp.paths,
+                config_key=inp.tsne_config,
                 cache_fit=cache_fit,
                 feature_cache=feature_cache,
             )
@@ -675,16 +805,16 @@ def compute_projection(
         # excluded — they must stay in their own frame to difference correctly.
         if cache_fit:
             coords = gauge_layout(
-                f"{_source_versions_token(feature_cache)}|{track_set_key(paths)}",
-                paths,
+                f"{_source_versions_token(feature_cache)}|{track_set_key(inp.paths)}",
+                inp.paths,
                 coords,
             )
         normed = _normalise_coords(coords)
         result = [
-            {"path": paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
-            for i in range(len(paths))
+            {"path": inp.paths[i], "x": float(normed[i, 0]), "y": float(normed[i, 1])}
+            for i in range(len(inp.paths))
         ]
-        return result, normed, spans
+        return result, normed, inp.spans
 
     # The base layout is the whole of the *visible* work, so it is reported
     # first and on its own; the Jacobian that follows is a separate, slower pass

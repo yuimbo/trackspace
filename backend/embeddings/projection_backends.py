@@ -21,6 +21,11 @@ import numpy as np
 
 from .clap import inference_lock as _inference_lock
 from .linalg_utils import apply_procrustes, procrustes, svd_singular
+from .projection_config import (
+    OPENTSNE_EARLY_EXAGGERATION_ITER,
+    OPENTSNE_N_ITER,
+    PROJECTION_RECIPE_VERSION,
+)
 
 log = logging.getLogger(__name__)
 
@@ -269,11 +274,10 @@ def _project_tsne_fallback(mat: np.ndarray) -> np.ndarray:
 # tracks are new — cost seconds rather than a full refit.
 #
 # On by default: it is the only backend that can *place* new tracks into an
-# already-fitted chart, and measured on the real library its cold fit is equal to
-# sklearn's while its neighbourhood recall is slightly better (0.360 vs 0.342 at
-# k=10, n=14k). Falls back to the cuML / mlx-vis / sklearn chain when
-# unavailable, above the point cap, or on any error. CPU-only, so it needs no
-# ``inference_lock`` (unlike mlx-vis).
+# already-fitted chart; see the projection section of ``audio_pipeline.md`` for
+# the neighbourhood-recall measurements. Falls back to the cuML / mlx-vis /
+# sklearn chain when unavailable, above the point cap, or on any error.
+# CPU-only, so it needs no ``inference_lock`` (unlike mlx-vis).
 
 #: Fitted embeddings kept in memory, one per vector config. Five projection
 #: lenses share one config per lens, so the cap must exceed the lens count
@@ -410,9 +414,21 @@ def _fit_tsne(reduced: np.ndarray) -> tuple[object, np.ndarray]:
         random_state=42,
         n_jobs=-1,
         verbose=False,
+        n_iter=OPENTSNE_N_ITER,
+        early_exaggeration_iter=OPENTSNE_EARLY_EXAGGERATION_ITER,
     )
     embedding = tsne.fit(reduced)
     return embedding, np.asarray(embedding, dtype=np.float32)
+
+
+def _fit_cache_key(config_key: str) -> str:
+    """Namespace the fit cache so a recipe change cannot reuse a stale fit.
+
+    Bumping ``PROJECTION_RECIPE_VERSION`` changes this suffix, so an embedding
+    fitted under an older recipe — in memory or persisted on disk — is a miss
+    and refits instead of being reused.
+    """
+    return f"{config_key}|opentsne_recipe={PROJECTION_RECIPE_VERSION}"
 
 
 def _fit_cache_get(key: str) -> "_TsneFit | None":
@@ -448,11 +464,12 @@ def _project_tsne_incremental(
     transform rather than refit; only the config decides that key, so adding tracks
     still reuses it.
     """
-    fit = _fit_cache_get(config_key)
+    fit_key = _fit_cache_key(config_key)
+    fit = _fit_cache_get(fit_key)
     if fit is None and cache_fit:
-        fit = _load_persisted_fit(feature_cache, config_key)
+        fit = _load_persisted_fit(feature_cache, fit_key)
         if fit is not None:
-            _fit_cache_put(config_key, fit)
+            _fit_cache_put(fit_key, fit)
     if fit is not None:
         index = {p: i for i, p in enumerate(fit.paths)}
         new_rows = [i for i, p in enumerate(paths) if p not in index]
@@ -480,8 +497,8 @@ def _project_tsne_incremental(
     embedding, coords = _fit_tsne(reduced)
     if cache_fit:
         fit = _TsneFit(list(paths), coords, pca, embedding)
-        _fit_cache_put(config_key, fit)
-        _store_persisted_fit(feature_cache, config_key, fit)
+        _fit_cache_put(fit_key, fit)
+        _store_persisted_fit(feature_cache, fit_key, fit)
     _tsne_fit_stats["fit"] += 1
     return coords
 

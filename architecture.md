@@ -13,7 +13,8 @@ backend/
   app.py                  CLI entry + wiring (helpers, ANALYSIS_DEPS, worker registration)
   factory.py              create_app() + blueprint registration
   trackspace_state.py     TrackspaceState: caches, roots, queue, workers, clusters
-  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, describe, supervised, imprint, static_audio)
+  precompute_layout_evaluation.py  CLI: offline eval maps (read-only over caches)
+  routes/                 one blueprint per surface (embeddings, jobs, library, folders, tags, search, similar, describe, structure, supervised, imprint, layout_evaluation, static_audio)
   tags.py                 ID3 tag read/write via mutagen
   cache.py                TrackCache (path+mtime → metadata, LRU + SQLite)
   fingerprint.py          Chromaprint audio fingerprinting (fpcalc)
@@ -31,6 +32,7 @@ backend/
     maest.py              primary genre model: 519 logits + 768-D embedding
     clustering.py         weighted blocks → PCA → cosine kNN → multi-resolution Leiden
     supervised.py         folder-supervised 128-D projection head (weak supervision)
+    layout_evaluation.py  precomputed eval maps + manifest (read-only over caches)
     rhythm_features.py    14-D rhythm/DSP descriptors
     clap.py               CLAP audio + text encoder
     clap_describe.py      zero-shot phrase bank + contrastive semantic coordinates
@@ -50,14 +52,18 @@ frontend/src/
                             canvas-interaction     pointer gestures + transforms + fit view
                             options-panel          status-bar hover-preview control
                             search-coordinator     semantic search: fetch, selection, results panel
+                            evaluation-coordinator read-only eval gallery: manifest + artifacts + ratings
                             view-modifier-coordinator  active-view-modifier stack + chips
-  components/             one view per file (canvas, tags, properties, batch, status, search)
+  components/             one view per file (canvas, tags, properties, batch, status, search, eval-toolbar)
   lib/toast.ts            shared DOM helpers
   lib/api.ts              shared fetch / postJSON
   lib/util.ts             shared clamp / escape / confirm / cycle helpers
   lib/async.ts            shared debounce / throttle / seq / in-flight / SSE helpers
   lib/dom.ts              shared el / modal / popover / tab-strip / kbd seams
   lib/lenses.ts           lens registry + deterministic feature geometry
+  lib/layout-eval.ts      eval manifest/artifact parsing + schema version check
+  lib/eval-ratings.ts     eval gallery ratings (localStorage, keyed by fingerprint + revision)
+  lib/eval-readonly.ts    read-only eval gate (lib/api.ts write refusal)
   lib/cluster-weights.json  shared FE/BE clustering + layout weights
   lib/feature-geometry.json shared FE/BE BPM / Camelot / spiral geometry
 tests/                    pytest suite (backend); vitest lives beside frontend sources
@@ -66,35 +72,40 @@ data/                     SQLite caches (gitignored, created at runtime)
 
 ---
 
-## Scale snapshot (indicative)
+## Scale snapshot
 
 | Area | File | Lines | Notes |
 |------|------|-------|-------|
-| Backend entry + wiring | `backend/app.py` | ~640 | Helpers, deps assembly, `main()` |
-| Process state | `backend/trackspace_state.py` | ~75 | `TrackspaceState.create()` |
-| App factory | `backend/factory.py` | ~170 | `create_app()` + blueprints |
-| Analysis seam | `backend/services/analysis_pipeline.py` | ~1630 | Job handlers + `ClusterStore` + supervised training/projection/undo |
-| Queue | `backend/jobs/` | ~900 | `queue.py` + `worker.py` + `kinds.py` |
-| ML / layout | `backend/embeddings/layout.py` | ~565 | Composite gather + orchestration |
-| Semantic weighting | `backend/embeddings/semantic_weighting.py` | ~265 | Folder/text directions |
-| Weak supervision | `backend/embeddings/supervised.py` | ~1075 | Folder-labelled projection head, match floors, excerpt dispersion |
-| Track structure | `backend/embeddings/structure.py` | ~275 | Intro/drop/break from a loudness envelope |
-| Projection backends | `backend/embeddings/projection_backends.py` | ~230 | PCA + cuML/mlx-vis/sklearn t-SNE |
-| Feature cache | `backend/embeddings/feature_cache.py` | ~560 | One generic `_SOURCES` registry + fan-out journal + origin memory |
-| Clustering | `backend/embeddings/clustering.py` | ~560 | |
-| Layout fidelity (bench) | `backend/embeddings/layout_fidelity.py` | ~60 | Neighbourhood recall; imported only by tests, not production |
-| Frontend orchestration | `frontend/src/controller.ts` | ~840 | Wiring, data loading, tag-write queue, preview, keyboard |
-| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | ~1040 | Queue SSE + cluster panel + source weights |
-| Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | ~750 | Head info + train/export/import/compare, imprint, fan-out undo |
-| Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | ~1080 | Layout cache + SSE + animations + lenses + scopes |
-| Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | ~675 | HTMX tree + roots + highlights |
-| Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | ~1200 | Pointer gestures + transforms + scope gesture |
-| Options panel | `frontend/src/coordinators/options-panel.ts` | ~130 | Lens select + presets + hover preview |
-| Canvas view | `frontend/src/components/canvas-view.ts` | ~1350 | |
-| State | `frontend/src/model.ts` | ~1190 | Optional persistence / EventBus split |
+| Backend entry + wiring | `backend/app.py` | 1048 | Helpers, deps assembly, `main()` |
+| Process state | `backend/trackspace_state.py` | 98 | `TrackspaceState.create()` |
+| App factory | `backend/factory.py` | 293 | `create_app()` + blueprints |
+| Eval CLI | `backend/precompute_layout_evaluation.py` | 257 | Offline eval maps (read-only over caches) |
+| Analysis seam | `backend/services/analysis_pipeline.py` | 1931 | Job handlers + `ClusterStore` + supervised training/projection/undo |
+| Queue | `backend/jobs/` | 999 | `queue.py` + `worker.py` + `kinds.py` |
+| ML / layout | `backend/embeddings/layout.py` | 846 | Composite gather + orchestration |
+| Semantic weighting | `backend/embeddings/semantic_weighting.py` | 270 | Folder/text directions |
+| Weak supervision | `backend/embeddings/supervised.py` | 1125 | Folder-labelled projection head, match floors, excerpt dispersion |
+| Track structure | `backend/embeddings/structure.py` | 304 | Intro/drop/break from a loudness envelope |
+| Projection backends | `backend/embeddings/projection_backends.py` | 527 | PCA + cuML/mlx-vis/sklearn t-SNE |
+| Feature cache | `backend/embeddings/feature_cache.py` | 883 | One generic `_SOURCES` registry + fan-out journal + origin memory |
+| Clustering | `backend/embeddings/clustering.py` | 578 | |
+| Layout fidelity (bench) | `backend/embeddings/layout_fidelity.py` | 61 | Neighbourhood recall; imported only by tests, not production |
+| Layout evaluation | `backend/embeddings/layout_evaluation.py` | 1250 | Eval recipes + fitting + manifest/artifact IO (read-only) |
+| Frontend orchestration | `frontend/src/controller.ts` | 1231 | Wiring, data loading, tag-write queue, preview, keyboard |
+| Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | 1108 | Queue SSE + cluster panel + source weights |
+| Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | 730 | Head info + train/export/import/compare, imprint, fan-out undo |
+| Embedding coordinator | `frontend/src/coordinators/embedding-coordinator.ts` | 1226 | Layout cache + SSE + animations + lenses + scopes |
+| Folder-tree coordinator | `frontend/src/coordinators/folder-tree-coordinator.ts` | 1321 | HTMX tree + roots + highlights |
+| Canvas interaction | `frontend/src/coordinators/canvas-interaction.ts` | 1458 | Pointer gestures + transforms + scope gesture |
+| Evaluation coordinator | `frontend/src/coordinators/evaluation-coordinator.ts` | 359 | Eval gallery: manifest + artifacts + ratings |
+| Options panel | `frontend/src/coordinators/options-panel.ts` | 79 | Status-bar hover-preview control (volume) |
+| Canvas view | `frontend/src/components/canvas-view.ts` | 2113 | |
+| Eval toolbar | `frontend/src/components/eval-toolbar-view.ts` | 199 | Compact gallery toolbar overlay |
+| State | `frontend/src/model.ts` | 1785 | Optional persistence / EventBus split |
 
-`canvas-interaction.ts` is the largest frontend file; the fit-view math is the
-natural next split if it needs to shrink (see `TODO.md`).
+Line counts are `wc -l` on the frozen tree. `canvas-view.ts` is the largest
+frontend file; the fit-view math in `canvas-interaction.ts` is the natural next
+split if it needs to shrink (see `TODO.md`).
 
 ---
 
@@ -131,6 +142,12 @@ controller.ts               – wires events, view callbacks, API calls, keyboar
 call API endpoints** (except Alpine handling for purely local UI like the F1 shortcuts
 modal). Each coordinator owns one concern and takes a structural `deps` object, so it
 is unit-testable without the DOM-heavy views — see `coordinators/*.test.ts`.
+
+**Eval gallery mode makes the frontend read-only.** With `?layout_eval=1`,
+`model.evalMode` is set for the session: `lib/api.ts` refuses every non-GET
+request (`isEvalReadOnly`), `Model.saveLS` is a no-op, and no lens/scope/weight
+compute runs — so the write invariants above hold even while the gallery is open.
+See README.md → *Layout evaluation*.
 
 ### Event bus: two granularities of change
 
@@ -305,6 +322,16 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   signature + roots + roles, and embedded in the folder-tree partial for the
   client. The build runs off the request thread so the library load never waits
   on it — see `ui_conventions.md` → *Folder colours*.
+- **`/api/layout-evaluation` is a read-only GET surface over precomputed
+  artifacts.** `GET /api/layout-evaluation[?set=]` returns the eval manifest
+  (dataset fingerprint, source weights, versions, per-recipe status/timing);
+  `GET /api/layout-evaluation/<id>[?set=]` returns one recipe's positions
+  (`{path, x, y}`), revision and timing. Only recipes the current manifest marks
+  `complete` are served; ids are validated (`[A-Za-z0-9_-]+`) and
+  missing/corrupt/non-finite artifacts are a JSON error. `?set=` selects one of
+  the fixed named sets (`base`, `budget`, `scale`, `early`, `mixes`, `ablation`).
+  Usage and the set recipes live in README.md → *Layout evaluation*; this file
+  only inventories the surface.
 - **`/api/analysis/problems` is the actionable counterpart to the coverage counts.**
   It lists tracks fpcalc cannot fingerprint at all plus per-path terminal job failures
   (aggregated across kinds), so the UI can surface the damaged files behind a short
@@ -358,7 +385,7 @@ with vitest coverage:
 - ✅ `CanvasInteractionController` — pointer gestures (click/box/lasso select, tag drag,
   transform handles, pan/zoom, folder-drop), scope gesture, fit view. Owns the mouse state;
   exposes `isPointerBusy()` (consumed by the folder coordinator), `cancelActiveGesture()`,
-  `fitView()`, `effectiveHoveredFolderPrefix()`. The debounced tag-write queue stays in the
+  `fitView()`, `effectiveHoverTarget()`. The debounced tag-write queue stays in the
   controller (shared with `BatchView.onApply`) behind `queueTagWrite` / `flushTagWrites` deps.
 - ✅ `OptionsPanelBinder` — the status-bar hover-preview control (toggle +
   volume) with `bind()` / `sync()` / `syncPreviewVolume()`. The lens and colour
@@ -366,6 +393,11 @@ with vitest coverage:
 - ✅ `ViewModifierCoordinator` — the active-view-modifier stack (search, proximity, scope,
   exclusions, filters, external) with `push`/`update`/`dismiss`/`remove`/`popNewest`, plus
   the corner chip view. See `design-patterns.md` → *Active view modifiers*.
+- ✅ `EvaluationCoordinator` — the read-only eval gallery (`?layout_eval=1`):
+  manifest fetch + schema-version check, per-recipe artifact load, blind-letter
+  map ordering, ratings persistence/export, and the read-only session wiring
+  (`setEvalReadOnly` / `model.evalMode`). It owns no write path — `lib/api.ts`
+  refuses non-GET while eval is active. Usage: README.md → *Layout evaluation*.
 
 **Cross-cutting unification** — the recurring UI/async/data shapes were pulled into shared
 modules so a concept has one definition:

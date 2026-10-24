@@ -19,6 +19,7 @@ import type {
 } from "./components";
 import { toast, showLoad, hideLoad, setLoadBar, clearLoadBar } from "./lib/toast";
 import { api, postJSON } from "./lib/api";
+import { isEvalReadOnly } from "./lib/eval-readonly";
 import { previewStartSeconds, sectionStartSeconds } from "./lib/structure";
 import { cycle, clamp01 } from "./lib/util";
 import { debounce, keyedInFlight } from "./lib/async";
@@ -51,6 +52,8 @@ import {
   type DescribeResponse,
   type SimilarResponse,
 } from "./coordinators/inspect-coordinator";
+import { EvaluationCoordinator } from "./coordinators/evaluation-coordinator";
+import { EvalToolbarView } from "./components/eval-toolbar-view";
 
 // ─── Constants ───────────────────────────────────────────────
 const FLUSH_MS = 500;
@@ -120,6 +123,13 @@ export class Controller {
 
   /** Pinned inspect card: anti-track / nearest / solo-neighbourhood. */
   private inspect: InspectCoordinator;
+
+  /** Read-only layout-evaluation gallery toolbar + coordinator (`?layout_eval=1`). */
+  private evalToolbar: EvalToolbarView;
+  private eval: EvaluationCoordinator;
+  private readonly _params: URLSearchParams;
+  private readonly _evalOn: boolean;
+  private readonly _evalSet: string | null;
 
   constructor(
     model: Model,
@@ -207,6 +217,33 @@ export class Controller {
       viewMods: this.viewMods,
     });
 
+    // Read-only layout-evaluation gallery (`?layout_eval=1`). It reuses the
+    // shared canvas + embedding coordinator's single apply/anim entry point and
+    // never reaches the compute/analysis surface. When the query param is absent
+    // the toolbar stays hidden and this coordinator is inert.
+    this._params = new URLSearchParams(window.location.search);
+    this._evalOn = this._params.get("layout_eval") === "1";
+    // Named eval gallery set (`?set=budget`). Forwarded verbatim to the
+    // layout-evaluation API; absent means the default (root) gallery.
+    this._evalSet = this._params.get("set");
+    this.evalToolbar = new EvalToolbarView(document.getElementById("eval-toolbar")!);
+    const setQs = () => {
+      const params = new URLSearchParams();
+      if (this._evalSet) params.set("set", this._evalSet);
+      const s = params.toString();
+      return s ? `?${s}` : "";
+    };
+    this.eval = new EvaluationCoordinator({
+      model,
+      view: this.evalToolbar,
+      applyPositions: (positions) =>
+        this.embedding.applyPrecomputedPositions(positions),
+      resetCamera: () => this.embedding.tweenViewport({ ox: 0, oy: 0, zoom: 1 }),
+      fetchManifest: () => api<unknown>(`/api/layout-evaluation${setQs()}`),
+      fetchArtifact: (id) =>
+        api<unknown>(`/api/layout-evaluation/${encodeURIComponent(id)}${setQs()}`),
+    });
+
     this.interaction = new CanvasInteractionController({
       model,
       canvas: canvasView,
@@ -214,10 +251,15 @@ export class Controller {
       props: propsView,
       batch: batchView,
       renderTagPanels: () => this._renderTagPanels(),
-      queueTagWrite: (path, tag, value) =>
-        this.pending.set(`${path}|${tag}`, { path, tag, value }),
+      queueTagWrite: (path, tag, value) => {
+        // Read-only eval gallery: never queue a write.
+        if (isEvalReadOnly()) return;
+        this.pending.set(`${path}|${tag}`, { path, tag, value });
+      },
       flushTagWrites: () => this._flushPending(),
       moveSelectionToFolder: (dest) => {
+        // Read-only eval gallery: never run a mutation command.
+        if (isEvalReadOnly()) return;
         const paths = [...model.selected];
         if (!paths.length) return;
         void this.cmdMgr.run(new MoveTracksCommand(paths, dest), model);
@@ -470,6 +512,8 @@ export class Controller {
     };
 
     this.batch.onApply = (tag, updates) => {
+      // Read-only eval gallery: never mutate or queue tag writes.
+      if (isEvalReadOnly()) return;
       for (const [path, value] of updates) {
         const t = m.trackByPath(path);
         if (t) {
@@ -646,20 +690,28 @@ export class Controller {
         setLoadBar(data.total > 0 ? data.done / data.total : null);
       }) as EventListener);
 
-      es.addEventListener("done", (() => {
+      // One finish step for both endings: close the stream, flush the final
+      // batch and recompute the eval universe against the full track set. The
+      // stream emits paths in sorted order, so artifact tracks may not appear
+      // until later batches — without this, an errored stream would leave the
+      // eval view showing the whole library instead of the map's tracks.
+      const finish = () => {
         es.close();
         streamDone = true;
         flush(true);
+        if (this._evalOn) this.eval.onLibraryLoaded();
+      };
+
+      es.addEventListener("done", (() => {
+        finish();
         // The colour anchors are computed off the request thread; refetch the
         // tree once the scan is done so its swatches pick them up.
         void this.folders.refresh();
       }) as EventListener);
 
       es.onerror = () => {
-        es.close();
-        streamDone = true;
         if ($progress) $progress.textContent = "";
-        flush(true);
+        finish();
       };
     });
   }
@@ -667,8 +719,11 @@ export class Controller {
   async init(): Promise<void> {
     showLoad();
     setLoadBar(null);
+    const evalPromise = this._evalOn
+      ? this.eval.start(this._params.get("layout") ?? undefined)
+      : Promise.resolve();
     try {
-      await Promise.all([this.folders.refresh(), this._loadLibrary()]);
+      await Promise.all([this.folders.refresh(), this._loadLibrary(), evalPromise]);
     } finally {
       hideLoad();
     }
@@ -678,6 +733,12 @@ export class Controller {
     this.canvas.resize();
     this.canvas.scheduleDraw();
     this.status.update(this.model);
+
+    // Read-only eval gallery: restrict the view to the artifact tracks and skip
+    // every analysis/head/projection start — no generation, no SSE, no compute.
+    // The eval universe is computed when the library stream actually completes
+    // (see `_loadLibrary`'s "done" handler), not here on the first flush.
+    if (this._evalOn) return;
 
     // Queue stream + clusters are independent of view mode: analysis runs in
     // the background regardless of what the user is currently looking at.
@@ -713,6 +774,8 @@ export class Controller {
   private async _clearTagFromSelection(tag: string): Promise<void> {
     const m = this.model;
     if (isAudioFeatureAxisId(tag)) return;
+    // Read-only eval gallery: never mutate or queue a tag removal.
+    if (isEvalReadOnly()) return;
     const updates: PendingUpdate[] = [];
     for (const path of m.selected) {
       const t = m.trackByPath(path);
@@ -730,12 +793,14 @@ export class Controller {
       await postJSON("/api/tracks/tags", { updates });
       toast(`Removed "${tag}" from ${updates.length} track(s)`, "ok");
     } catch {
-      /* postJSON already toasted */
+      /* Only transport/HTTP failures land here; postJSON already toasted them. */
     }
     m.emit("change");
   }
 
   private _flushPending = debounce(async () => {
+    // Read-only eval gallery: nothing may reach the server from the tag queue.
+    if (isEvalReadOnly()) return;
     const updates = [...this.pending.values()];
     this.pending.clear();
     if (!updates.length) return;
@@ -753,7 +818,7 @@ export class Controller {
         toast(`Saved ${updates.length} tag values`, "ok");
       }
     } catch {
-      /* postJSON already toasted */
+      /* Only transport/HTTP failures land here; postJSON already toasted them. */
     }
   }, FLUSH_MS);
 

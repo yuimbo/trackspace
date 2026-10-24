@@ -455,6 +455,19 @@ export function previewGain(volume: number): number {
 export class Model extends EventBus {
   allTracks: Track[] = [];
   /**
+   * True while the read-only layout-evaluation gallery is active
+   * (``?layout_eval=1``). Session-only, never persisted. Forces the view into the
+   * embedding map and lets the canvas suppress lens chrome that would not make
+   * sense for precomputed maps.
+   */
+  evalMode = false;
+  /**
+   * When set (eval gallery), the only paths eligible for the view: the artifact's
+   * own paths that exist in the loaded library. Non-artifact library tracks are
+   * filtered out so the eval universe is exactly the map's tracks.
+   */
+  evalUniverse: Set<string> | null = null;
+  /**
    * Sidebar focus: highlighted tree row and default parent for “+ Folder”.
    * Does **not** filter the canvas — the full loaded library is always in scope
    * (only per-session hides apply). Persisted as ``folder`` in localStorage.
@@ -503,8 +516,13 @@ export class Model extends EventBus {
    * "embeddings" for every map/feature lens. Keeping this as the *read* surface
    * means all the existing embedding-mode gating (transform handles, tag drag,
    * hiding unanalysed tracks) needs no per-lens branch.
+   *
+   * During the read-only eval gallery the view is forced to the embedding map
+   * *without* touching ``_lensId`` — so the user's normal mode is never persisted
+   * or clobbered by a ``saveLS`` that happens mid-eval.
    */
   get viewMode(): ViewMode {
+    if (this.evalMode) return "embeddings";
     return getLens(this._lensId).kind === "tags" ? "tags" : "embeddings";
   }
 
@@ -834,6 +852,7 @@ export class Model extends EventBus {
   get tracks(): Track[] {
     if (this._cache) return this._cache;
     const result = this.allTracks.filter((t) => {
+      if (this.evalUniverse && !this.evalUniverse.has(t.path)) return false;
       if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) return false;
       return true;
     });
@@ -946,6 +965,27 @@ export class Model extends EventBus {
   }
 
   /* ── Mutators ─────────────────────────────────────────────── */
+
+  /** Enter/leave the read-only layout-evaluation gallery (session-only). */
+  setEvalMode(on: boolean): void {
+    if (this.evalMode === on) return;
+    this.evalMode = on;
+    // Deliberately does NOT touch `_lensId`: the view-mode getter reports the
+    // embedding map while eval is on, so a mid-eval `saveLS` still persists the
+    // user's normal lens rather than overwriting it.
+    this._invalidateView();
+    this.emit("change");
+  }
+
+  /**
+   * Restrict the eval-view universe to *paths* (the artifact paths present in the
+   * loaded library), or clear the restriction with ``null``. Invalidates the view.
+   */
+  setEvalUniverse(paths: Set<string> | null): void {
+    this.evalUniverse = paths;
+    this._invalidateView();
+    this.emit("change");
+  }
 
   setAllTracks(tracks: Track[]): void {
     this.allTracks = tracks;
@@ -1631,6 +1671,10 @@ export class Model extends EventBus {
   /* ── Persistence ──────────────────────────────────────────── */
 
   saveLS(): void {
+    // Eval mode is session-only: a mid-gallery save must never rewrite the
+    // user's normal-mode preferences. In-memory state still changes for the
+    // session; the next non-eval save persists the real values again.
+    if (this.evalMode) return;
     localStorage.setItem(
       LS_KEY,
       JSON.stringify({

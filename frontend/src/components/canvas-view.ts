@@ -462,7 +462,8 @@ export class CanvasView {
   private _drawLensGuide(): void {
     const m = this.model;
     const lens = m.lens();
-    if (m.viewMode !== "embeddings" || !lens.guide) return;
+    // Eval maps are arbitrary precomputed layouts, so no lens guide fits.
+    if (m.viewMode !== "embeddings" || m.evalMode || !lens.guide) return;
     const ctx = this.ctx;
     ctx.save();
     ctx.strokeStyle = "rgba(255,255,255,0.16)";
@@ -714,7 +715,7 @@ export class CanvasView {
     ctx.font = "10px monospace";
     ctx.textAlign = "center";
     ctx.textBaseline = "alphabetic";
-    if (m.viewMode === "embeddings") {
+    if (m.viewMode === "embeddings" && !m.evalMode) {
       ctx.fillText(m.lens().label, w / 2, h - 2);
     }
 
@@ -1510,6 +1511,8 @@ export class CanvasView {
    */
   private _drawTopTabs(w: number): void {
     const m = this.model;
+    // Eval maps have no lenses or colour modes; the toolbar owns the controls.
+    if (m.evalMode) return;
     this.lensTabs = this._drawTabs(
       BUILTIN_LENSES,
       m.activeBaseLensId(),

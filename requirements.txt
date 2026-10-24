@@ -29,3 +29,7 @@ mlx-vis>=0.7.0; sys_platform == "darwin" and platform_machine == "arm64"
 # Optional incremental t-SNE (``TRACKSPACE_OPENTSNE=1``): fit once per vector
 # config, then transform newly added tracks instead of refitting the library.
 opentsne>=1.0
+
+# Optional offline layout-evaluation: only needed for
+# ``python -m backend.precompute_layout_evaluation`` UMAP recipes; imported lazily.
+umap-learn>=0.5

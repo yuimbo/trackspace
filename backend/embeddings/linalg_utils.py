@@ -27,6 +27,26 @@ def l2_normalize(mat: np.ndarray, axis: int = -1) -> np.ndarray:
     return mat / norms
 
 
+def matched_indices(
+    paths: list[str], ref_paths: list[str]
+) -> tuple[list[int], list[int]]:
+    """Index pairs of tracks present in both lists, in *paths* order.
+
+    ``mine[i]`` indexes *paths* and ``theirs[i]`` the matching track in
+    *ref_paths*, so ``coords[mine]`` and ``ref_coords[theirs]`` are the matched
+    rows a Procrustes fit uses.
+    """
+    ref_index = {p: i for i, p in enumerate(ref_paths)}
+    mine: list[int] = []
+    theirs: list[int] = []
+    for i, p in enumerate(paths):
+        j = ref_index.get(p)
+        if j is not None:
+            mine.append(i)
+            theirs.append(j)
+    return mine, theirs
+
+
 def procrustes(
     src: np.ndarray, dst: np.ndarray
 ) -> tuple[np.ndarray, float, np.ndarray, np.ndarray]:

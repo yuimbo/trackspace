@@ -19,6 +19,7 @@ from backend.routes.api_folders import create_api_folders_blueprint
 from backend.routes.api_imprint import create_api_imprint_blueprint
 from backend.routes.api_jobs import create_api_jobs_blueprint
 from backend.routes.api_library import create_api_library_blueprint
+from backend.routes.api_layout_evaluation import create_api_layout_evaluation_blueprint
 from backend.routes.api_supervised import create_api_supervised_blueprint
 from backend.routes.api_search import create_api_search_blueprint
 from backend.routes.api_similar import create_api_similar_blueprint
@@ -111,6 +112,8 @@ class TrackspaceBlueprintDeps:
     virtual_from_abs: Callable[[str], str]
     # Static / audio
     dist_dir: str
+    # Offline layout-evaluation artifacts (read-only GET surface)
+    layout_evaluation_dir: str
     # Analysis queue / clustering
     job_queue: Any
     workers: Any
@@ -283,5 +286,8 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             dist_dir=deps.dist_dir,
             resolve_virtual_path=deps.resolve_virtual_path,
         )
+    )
+    app.register_blueprint(
+        create_api_layout_evaluation_blueprint(deps.layout_evaluation_dir)
     )
     return app

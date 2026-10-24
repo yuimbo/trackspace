@@ -641,3 +641,33 @@ describe("Model rule readouts", () => {
     expect(rule.colors).toHaveLength(0);
   });
 });
+
+describe("Model eval-mode persistence", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("writes nothing to localStorage while eval mode is on", () => {
+    const m = new Model();
+    m.hoverPreview = true;
+    m.showExternal = true;
+    m.setEvalMode(true);
+    m.saveLS();
+    // The in-memory state still changed for the session…
+    expect(m.hoverPreview).toBe(true);
+    // …but a fresh model reads the untouched normal-mode storage.
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.hoverPreview).toBe(false);
+    expect(m2.showExternal).toBe(false);
+  });
+
+  it("persists normally outside eval mode", () => {
+    const m = new Model();
+    m.hoverPreview = true;
+    m.showExternal = true;
+    m.saveLS();
+    const m2 = new Model();
+    m2.loadLS();
+    expect(m2.hoverPreview).toBe(true);
+    expect(m2.showExternal).toBe(true);
+  });
+});

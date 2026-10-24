@@ -864,6 +864,7 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             resolve_virtual_path=_resolve,
             virtual_from_abs=_virtual_from_abs,
             dist_dir=state.dist_dir,
+            layout_evaluation_dir=os.path.join(state.data_dir, "layout-evaluation"),
             job_queue=state.job_queue,
             workers=state.workers,
             clusters=state.clusters,

@@ -68,6 +68,9 @@ enqueue in `pending` map → debounced POST to `/api/tracks/tags`**.
 The debounce collapses rapid drag updates into one network round-trip.
 Never write to disk synchronously inside an event handler.
 
+Gallery mode (`?layout_eval=1`) blocks every write client-side and never persists
+view settings; see README.md → *Layout evaluation*. Hover-to-play works unchanged in it.
+
 ---
 
 ## BatchView snapshots
@@ -431,7 +434,8 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   `layout_revision`, so each lens caches its own coordinates.
 - Layouts are **pre-warmed in the background**: after the cluster pass drains, the
   durable queue runs one low-priority `layout` job per built-in projection lens, so the
-  first switch to a lens is a cache hit instead of a ~12–20 s fit. A **user request
+  first switch to a lens is a cache hit instead of a seconds-long fit (measured;
+  see `audio_pipeline.md` → *Projection methods*). A **user request
   preempts the prefetch** (`services/projection_priority.py`), so a switch never queues
   behind several prefetched fits. The status bar shows it as **Preparing views**; a lens
   whose revision is unchanged is a no-op.
