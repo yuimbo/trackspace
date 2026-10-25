@@ -348,3 +348,44 @@ describe("Controller eval read-only tag-write guard", () => {
     expect(a.folder).toBe("House");
   });
 });
+
+describe("Controller F select hotkey", () => {
+  it("selects the hovered dot's bloom class on F and appends on Shift+F", () => {
+    const h = makeHarness();
+    const { model, canvas } = h;
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3", bpm: 128 }),
+      makeTrack({ path: "b.mp3", bpm: 128 }),
+      makeTrack({ path: "c.mp3", bpm: 150 }),
+    ]);
+    model.selectionBloom = "tempo";
+    canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
+
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "f", bubbles: true }),
+    );
+    expect(model.selected).toEqual(new Set(["a.mp3", "b.mp3"]));
+
+    // Shift+F appends the other bloomed family instead of replacing.
+    canvas.hoveredBloomTrack = model.trackByPath("c.mp3")!;
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "f", shiftKey: true, bubbles: true }),
+    );
+    expect(model.selected).toEqual(new Set(["a.mp3", "b.mp3", "c.mp3"]));
+  });
+
+  it("opens a focused folder in the left browser", () => {
+    const h = makeHarness();
+    const { model, canvas } = h;
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "Techno/b.mp3", folder: "Techno" }),
+    ]);
+    canvas.hoverTarget = { kind: "folder", prefix: "House" };
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "f", bubbles: true }),
+    );
+    expect(model.selected).toEqual(new Set(["House/a.mp3"]));
+    expect(model.folder).toBe("House");
+  });
+});

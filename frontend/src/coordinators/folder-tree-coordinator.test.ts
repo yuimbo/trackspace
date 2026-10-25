@@ -411,6 +411,20 @@ describe("FolderTreeCoordinator highlights", () => {
     expect(row("House").classList.contains("folder-fully-excluded")).toBe(true);
     expect(row("Techno").classList.contains("folder-fully-excluded")).toBe(false);
   });
+
+  it("reveals a focused folder in the tree", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "House/a.mp3", folder: "House" })]);
+    childrenOf("House").style.display = "none";
+    coord.revealFolder("House");
+    expect(childrenOf("House").style.display).toBe("block");
+    // Manually revealed, so auto-close leaves it alone even without selection.
+    model.selected.add("House/a.mp3");
+    coord.updateHighlights();
+    model.selected.clear();
+    coord.updateHighlights();
+    expect(childrenOf("House").style.display).toBe("block");
+  });
 });
 
 // ─── Active labels + overlay ─────────────────────────────

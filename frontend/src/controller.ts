@@ -1092,6 +1092,13 @@ export class Controller {
     return `${n} track${n === 1 ? "" : "s"}`;
   }
 
+  /** F resolved a folder: make it the active folder and open it in the left browser. */
+  private _openFolderInBrowser(folder: string): void {
+    this.model.folder = folder;
+    this.folders.revealFolder(folder);
+    this.folders.syncActiveLabels();
+  }
+
   private _runCanvasAction(action: FolderCanvasAction): void {
     const m = this.model;
     if (action === "fit-view") {
@@ -1116,12 +1123,16 @@ export class Controller {
       }
       return;
     }
-    if (!target) return;
     if (action === "focus-folder") {
-      m.selectOnlyHoverTarget(target);
+      // F follows S's target resolution: a hovered dot selects its bloom class
+      // at the current range, else the hovered navigation element. A folder
+      // resolution also opens that folder in the left browser.
+      const folder = this.interaction.selectFromHover(false);
+      if (folder !== null) this._openFolderInBrowser(folder);
       m.saveLS();
       return;
     }
+    if (!target) return;
     // exclude-selection
     // A folder keeps its prefix-based exclusion so newly discovered files
     // under it are hidden too; the other kinds are path sets.
@@ -1169,6 +1180,12 @@ export class Controller {
     hk.on("fit-view", () => this._runCanvasAction("fit-view"));
 
     hk.on("focus-folder", () => this._runCanvasAction("focus-folder"));
+
+    hk.on("focus-folder-append", () => {
+      const folder = this.interaction.selectFromHover(true);
+      if (folder !== null) this._openFolderInBrowser(folder);
+      this.model.saveLS();
+    });
 
     hk.on("exclude-selection", () => this._runCanvasAction("exclude-selection"));
 

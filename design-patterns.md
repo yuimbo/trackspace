@@ -45,13 +45,13 @@ type HoverTarget =
 | Glow | `CanvasView._inHoverGlow` / `_hoverGlowColor` | matching dots halo (folder colour, cluster swatch, a bloom cluster's own colour, or the neutral accent) |
 | **S** solo | `CanvasInteractionController.solo()` → `Model.focusPaths` / `Model.bloomPaths` | over a bloomed dot: isolate its bloom class (folder subtree for folder colour); else the target's tracks; press again to show all |
 | **H** fit | `CanvasInteractionController.fitView()` | 80th-percentile disc around the target's visible tracks |
-| **F** select | `Model.selectOnlyHoverTarget` | replace the selection with the target's visible tracks |
+| **F** select | `CanvasInteractionController.selectFromHover()` → `Model.selectPaths` | over a bloomed dot: select its bloom class (folder subtree for folder colour), else the target's tracks; again on the same selection clears; **Shift+F** appends; a folder resolution opens in the left browser |
 | **Shift+S** exclude | folder: `hideFolderTree`; others: `hidePaths` | hide the target; press again on a fully hidden target to reveal it |
 
-`solo()` resolves a hovered **bloomed dot** first (`Model.bloomPaths`), then the target
-through `CanvasInteractionController.effectiveHoverTarget()`: a hovered target wins, otherwise
-the hovered canvas dot's folder. That fallback is why **S**/**H** over a bare dot still
-mean "this dot's folder".
+`solo()` and `selectFromHover()` resolve a hovered **bloomed dot** first (`Model.bloomPaths`),
+then the target through `CanvasInteractionController.effectiveHoverTarget()`: a hovered target
+wins, otherwise the hovered canvas dot's folder. That fallback is why **S**/**H**/**F** over a
+bare dot still mean "this dot's folder".
 
 **Adding a new navigation target kind.** Four steps, no new branches:
 

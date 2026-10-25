@@ -963,6 +963,30 @@ export class FolderTreeCoordinator {
     if (arrow) arrow.textContent = open ? "▾" : "▸";
   }
 
+  /**
+   * Expand *folderPath* and its ancestors in the tree so the focused folder is
+   * visible in the left browser. The rows count as manually opened, so the
+   * selection-driven auto-close leaves them alone. Used by **F** when it
+   * focuses a folder.
+   */
+  revealFolder(folderPath: string): void {
+    const chain: string[] = [];
+    if (folderPath) {
+      const parts = folderPath.split("/");
+      let acc = "";
+      for (const p of parts) {
+        acc = acc ? `${acc}/${p}` : p;
+        chain.push(acc);
+      }
+    }
+    for (const path of chain) {
+      if (this._manuallyOpenedFolders.has(path)) continue;
+      this._setFolderOpen(path, true);
+      this._manuallyOpenedFolders.add(path);
+      this._autoOpenedFolders.delete(path);
+    }
+  }
+
   /** Returns the set of data-folder-path values (including ancestors) that
    *  contain at least one selected or hovered track. Root is represented
    *  as ".". */

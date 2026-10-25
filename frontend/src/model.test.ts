@@ -440,6 +440,78 @@ describe("Model selection bloom", () => {
   });
 });
 
+describe("Model selectPaths", () => {
+  function makeTrack(over: Partial<Track> = {}): Track {
+    return {
+      path: "a.mp3",
+      filename: "a.mp3",
+      folder: "",
+      tags: {},
+      artist: "",
+      title: "",
+      ...over,
+    };
+  }
+
+  it("replaces the selection with the in-view paths", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    m.selected.add("c.mp3");
+    m.selectPaths(["a.mp3", "b.mp3"], false);
+    expect(m.selected).toEqual(new Set(["a.mp3", "b.mp3"]));
+  });
+
+  it("appends to the current selection instead of replacing", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    m.selected.add("c.mp3");
+    m.selectPaths(["a.mp3"], true);
+    expect(m.selected).toEqual(new Set(["a.mp3", "c.mp3"]));
+  });
+
+  it("skips hidden tracks", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    m.hidePaths(["b.mp3"]);
+    m.selectPaths(["a.mp3", "b.mp3"], false);
+    expect(m.selected).toEqual(new Set(["a.mp3"]));
+  });
+
+  it("clears the selection when a bare call re-selects the same target", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    m.selected.add("a.mp3");
+    m.selectPaths(["a.mp3"], false);
+    expect(m.selected.size).toBe(0);
+    // An append over the same target is a no-op, not a toggle.
+    m.selected.add("a.mp3");
+    m.selectPaths(["a.mp3"], true);
+    expect(m.selected).toEqual(new Set(["a.mp3"]));
+  });
+
+  it("no-ops when nothing would change", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    const events: unknown[] = [];
+    m.on("change", () => events.push("change"));
+    // Empty target with an empty selection: nothing to select or clear.
+    m.selectPaths([], false);
+    expect(events.length).toBe(0);
+  });
+});
+
 describe("Model view rules", () => {
   beforeEach(() => localStorage.clear());
 

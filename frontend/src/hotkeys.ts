@@ -77,7 +77,8 @@ export const HOTKEY_MAP: HotkeyBinding[] = [
   { action: "toggle-preview",  key: "m",      mod: false, shift: false, alt: false, label: "M",                      title: "Hover preview",   description: "Toggle the hover preview", dispatch: false },
   { action: "preview-volume",  key: "m",      mod: false, shift: false, alt: false, gesture: "scroll", label: "M+scroll", title: "Preview volume", description: "Adjust the hover-preview volume", dispatch: false },
   { action: "fit-view",        key: "h",      mod: false, shift: false, alt: false, label: "H",                      title: "Fit view",        description: "Fit the view to the hovered element or track's folder, else the full map" },
-  { action: "focus-folder",    key: "f",      mod: false, shift: false, alt: false, label: "F",                      title: "Focus folder",    description: "Select all tracks of the hovered element or the track's folder, including subfolders" },
+  { action: "focus-folder",    key: "f",      mod: false, shift: false, alt: false, label: "F",                      title: "Focus folder",    description: "Select the hovered element's tracks, or the hovered dot's bloom class at the current range; again to clear" },
+  { action: "focus-folder-append", key: "f", mod: false, shift: true,  alt: false, label: "Shift+F",                title: "Append selection", description: "Add the tracks of the hovered element or bloom class to the current selection" },
   { action: "isolate-selection", key: "s",  mod: false, shift: false, alt: false, label: "s",                      title: "Isolate",         description: "Isolate the hovered class, element or selection; again to show all" },
   { action: "exclude-selection", key: "s",  mod: false, shift: true, alt: false, label: `Shift+s`,                title: "Exclude",         description: "Exclude the hovered element or selection; again to restore it" },
   { action: "show-all-tracks",   key: "s",  mod: false, shift: false, alt: true,  label: "Alt+s",                 title: "Show all tracks", description: "Clear all exclusions" },
@@ -200,6 +201,7 @@ export const SHORTCUT_ZONES: ShortcutZone[] = [
       {
         items: [
           act("focus-folder"),
+          act("focus-folder-append"),
           mouse("click-folder"),
           mouse("mod-click-folder"),
           mouse("shift-click-folder"),

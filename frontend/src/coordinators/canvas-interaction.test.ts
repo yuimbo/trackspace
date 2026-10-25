@@ -1190,6 +1190,137 @@ describe("CanvasInteractionController solo", () => {
   });
 });
 
+// ─── Select from hover (F) ────────────────────────────────────
+
+describe("CanvasInteractionController select from hover (F)", () => {
+  it("selects the hovered dot's bloom class following the range", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3", bpm: 128 }),
+      makeTrack({ path: "b.mp3", bpm: 128 }),
+      makeTrack({ path: "c.mp3", bpm: 150 }),
+    ]);
+    model.selectionBloom = "tempo";
+    canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
+    coord.selectFromHover(false);
+    expect(model.selected).toEqual(new Set(["a.mp3", "b.mp3"]));
+  });
+
+  it("selects the whole bloomed subtree for folder colour", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "House/sub/b.mp3", folder: "House/sub" }),
+      makeTrack({ path: "Techno/c.mp3", folder: "Techno" }),
+    ]);
+    model.selectionBloom = "folder";
+    canvas.hoveredBloomTrack = model.trackByPath("House/a.mp3")!;
+    coord.selectFromHover(false);
+    expect(model.selected).toEqual(new Set(["House/a.mp3", "House/sub/b.mp3"]));
+  });
+
+  it("selects the hovered navigation element", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+      makeTrack({ path: "c.mp3" }),
+    ]);
+    model.clusterAssignments = new Map([
+      ["a.mp3", 1],
+      ["b.mp3", 1],
+      ["c.mp3", 2],
+    ]);
+    canvas.hoverTarget = { kind: "cluster", id: 1 };
+    coord.selectFromHover(false);
+    expect(model.selected).toEqual(new Set(["a.mp3", "b.mp3"]));
+  });
+
+  it("appends to the current selection with append", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3", bpm: 128 }),
+      makeTrack({ path: "b.mp3", bpm: 128 }),
+      makeTrack({ path: "c.mp3", bpm: 150 }),
+    ]);
+    model.selectionBloom = "tempo";
+    model.selected.add("c.mp3");
+    canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
+    coord.selectFromHover(true);
+    expect(model.selected).toEqual(new Set(["a.mp3", "b.mp3", "c.mp3"]));
+  });
+
+  it("leaves the selection alone when nothing is hovered", () => {
+    const { model, coord } = makeHarness();
+    model.setAllTracks([makeTrack({ path: "a.mp3" }), makeTrack({ path: "b.mp3" })]);
+    model.selected.add("b.mp3");
+    coord.selectFromHover(false);
+    expect(model.selected).toEqual(new Set(["b.mp3"]));
+  });
+
+  it("does not select hidden tracks", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3", bpm: 128 }),
+      makeTrack({ path: "b.mp3", bpm: 128 }),
+      makeTrack({ path: "c.mp3", bpm: 150 }),
+    ]);
+    model.selectionBloom = "tempo";
+    model.hidePaths(["b.mp3"]);
+    canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
+    coord.selectFromHover(false);
+    expect(model.selected).toEqual(new Set(["a.mp3"]));
+  });
+
+  it("clears the selection when F hits the already-selected target", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3", bpm: 128 }),
+      makeTrack({ path: "b.mp3", bpm: 128 }),
+      makeTrack({ path: "c.mp3", bpm: 150 }),
+    ]);
+    model.selectionBloom = "tempo";
+    canvas.hoveredBloomTrack = model.trackByPath("a.mp3")!;
+    coord.selectFromHover(false);
+    expect(model.selected).toEqual(new Set(["a.mp3", "b.mp3"]));
+    coord.selectFromHover(false);
+    expect(model.selected.size).toBe(0);
+  });
+
+  it("returns the bloom ancestor in folder colour, for the left browser", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/Deep/a.mp3", folder: "House/Deep" }),
+      makeTrack({ path: "House/Deep/sub/b.mp3", folder: "House/Deep/sub" }),
+      makeTrack({ path: "Techno/c.mp3", folder: "Techno" }),
+    ]);
+    model.selectionBloom = "folder";
+    model.setBloomRange(0.25); // climb one level: House/Deep → House
+    canvas.hoveredBloomTrack = model.trackByPath("House/Deep/a.mp3")!;
+    expect(coord.selectFromHover(false)).toBe("House");
+    expect(model.selected).toEqual(
+      new Set(["House/Deep/a.mp3", "House/Deep/sub/b.mp3"]),
+    );
+  });
+
+  it("returns the hovered folder target and null for other resolutions", () => {
+    const { model, canvas, coord } = makeHarness();
+    model.setAllTracks([
+      makeTrack({ path: "House/a.mp3", folder: "House" }),
+      makeTrack({ path: "Techno/b.mp3", folder: "Techno" }),
+    ]);
+    canvas.hoverTarget = { kind: "folder", prefix: "House" };
+    expect(coord.selectFromHover(false)).toBe("House");
+
+    model.clusterAssignments = new Map([["House/a.mp3", 1]]);
+    canvas.hoverTarget = { kind: "cluster", id: 1 };
+    expect(coord.selectFromHover(false)).toBeNull();
+
+    canvas.hoverTarget = null;
+    expect(coord.selectFromHover(false)).toBeNull();
+  });
+});
+
 // ─── Read-only eval mode keeps hover playback ────────────────
 
 describe("read-only eval mode keeps hover playback", () => {

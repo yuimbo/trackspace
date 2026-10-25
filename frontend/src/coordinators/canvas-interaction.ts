@@ -24,6 +24,7 @@ import { hotkeyCode, hotkeyKey, isTextEntryTarget } from "../hotkeys";
 import { scopeLenses, type ColorMode } from "../lib/lenses";
 import { orbitDrag } from "../lib/camera3d";
 import { clamp } from "../lib/util";
+import { bloomFolderLevels, folderAncestor } from "../lib/bloom";
 
 /** What an **S** press isolated: the rule it filtered with and its keep-set. */
 export interface SoloOutcome {
@@ -1299,6 +1300,43 @@ export class CanvasInteractionController {
 
     m.clearExclusions();
     m.saveLS();
+    return null;
+  }
+
+  /**
+   * Select hotkey (F): a hovered dot selects its bloom class — the range-aware
+   * family **S** isolates — else the hovered navigation element, else nothing.
+   * With ``append`` (Shift+F) the tracks join the current selection instead of
+   * replacing it; a bare press over the already-selected target clears it.
+   * Returns the folder the resolution pinned — a hovered folder, or the bloom
+   * ancestor in folder colour — so the caller can open it in the left browser;
+   * ``null`` when no folder is in play.
+   */
+  selectFromHover(append: boolean): string | null {
+    const m = this.deps.model;
+    const cv = this.deps.canvas;
+
+    // A hovered dot selects its bloom class, exactly as S isolates it.
+    if (cv.hoverTarget === null && cv.hoveredBloomTrack) {
+      const keep = m.bloomPaths(cv.hoveredBloomTrack);
+      if (keep.size === 0) return null;
+      m.selectPaths(keep, append);
+      if (m.selectionBloom === "folder") {
+        return folderAncestor(
+          cv.hoveredBloomTrack.folder ?? "",
+          bloomFolderLevels(m.bloomRange()),
+        );
+      }
+      return null;
+    }
+
+    const target = this.effectiveHoverTarget();
+    if (target) {
+      const keep = m.hoverTargetPaths(target);
+      if (keep.size === 0) return null;
+      m.selectPaths(keep, append);
+      return target.kind === "folder" ? target.prefix : null;
+    }
     return null;
   }
 

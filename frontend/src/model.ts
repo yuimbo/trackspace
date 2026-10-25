@@ -1483,6 +1483,33 @@ export class Model extends EventBus {
   }
 
   /**
+   * Select the in-view tracks among *paths*: replace the current selection, or
+   * (with ``append``) add them to it. A bare call over the target whose tracks
+   * are already the whole selection clears it instead — mirroring how **S**
+   * toggles an already-isolated target back to show-all. No-ops when the
+   * selection would not change, so a redundant **F** press does not re-render.
+   */
+  selectPaths(paths: Iterable<string>, append: boolean): void {
+    const wanted = new Set(paths);
+    const next = append ? new Set(this.selected) : new Set<string>();
+    for (const t of this.tracks) {
+      if (wanted.has(t.path)) next.add(t.path);
+    }
+    const same =
+      next.size === this.selected.size &&
+      [...next].every((p) => this.selected.has(p));
+    if (!append && this.selected.size > 0 && same) {
+      this.selected.clear();
+      this.emit("change");
+      return;
+    }
+    if (same) return;
+    this.selected.clear();
+    for (const p of next) this.selected.add(p);
+    this.emit("change");
+  }
+
+  /**
    * At least one track in the view union lies under ``prefixNorm``, and every such
    * track is excluded from the canvas.
    */
