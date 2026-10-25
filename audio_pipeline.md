@@ -322,6 +322,85 @@ is steady state):
     --sample 48 --stages maest --repeat 3
 ```
 
+**Offline genre benchmark.** MAEST's microgenre value is judged offline, outside the
+server: a frozen, labelled cohort split by artist/release identity (release needs the
+artist+album pair, which the real cache does not store — on a real run only artist
+identity is available), re-decoded window-for-window from the manifest (production
+caches are never used), scored as heldout retrieval across MAEST logits / layer-7 and
+MERT L19/L23. The workflow, recipes and licences: `README.md` → *Offline genre
+benchmark*. The **recorded findings** from the first scale-500 run: *Genre-space
+evaluation conclusions (October 2026)* below. The **implementation plans** for wiring
+the selected recipe into production live in `embedding-next-steps.md` → *WS 1*.
+
+---
+
+## Genre-space evaluation conclusions (October 2026)
+
+Recorded findings from the offline microgenre experiment. `genre_full` is the
+**user-selected** preferred recipe, but it is **not wired into production**: production
+weights are unchanged and no new encoder weights were deployed. CLAP/rhythm live outside
+this isolated genre experiment and are unaffected. The plan to adopt `genre_full` (opt-in
+recipe id, single-pass L7/MERT extraction, cache versions) is `embedding-next-steps.md`
+→ *WS 1*. Source analysis files:
+`data/genre-space/first/directed-analysis.json` / `.md`, `layer7-performance.json`,
+`logits-ab-report/report.json`; the galleries under
+`data/layout-evaluation/genre-directed` / `genre-logits-ab`.
+
+**Setup & caveats.** A frozen 500-track cohort (499 valid, 21 broad labels) split by
+identity 70/30 (356 dev / 143 held); every heldout artist is a singleton and releases are
+absent, so related-exclusion ≡ unrestricted on heldout. Heldout was already inspected, so
+the exploratory scores are a comparison, not an untouched heldout-selection test. Labels
+are the weak folder structure — some depth-2 folders are mood/collection packs, not exact
+genres. Microgenre scoring uses 33 eligible depth-2 parents (≥5 total / ≥2 dev / ≥1 held)
+covering 222 tracks with 73 heldout queries; candidates are all same-topgenre tracks
+(ineligible subfolders included), the parent filter restricts **queries only**.
+
+**Genre-block presets** (ids match the CLI). `genre_full` is the **user-selected** recipe;
+the two lean variants are the fallbacks if the full set is not worth its extraction cost:
+
+| id | logits | maest | layer7 | mert19 | note |
+|----|--------|-------|--------|--------|------|
+| `genre_full` | .40 | .20 | .25 | .15 | **selected by the user** (preferred visually); best subfolder point estimate; **not yet in production** |
+| `genre_without_layer7` (lean expressive) | .65 | .20 | – | .15 | layer-7 visually negligible; no extraction savings from weights alone |
+| `genre_without_mert` (MAEST-only) | .55 | .20 | .25 | – | drops MERT: fewer encoder dependencies, strong broad score |
+
+The MAEST genre-only 65/35 `baseline` is the context for comparison, **not a ranked
+candidate**.
+
+**Findings.**
+
+- **Broad retrieval** (macro P@10, heldout, post-PCA dev-fit): control 46.38 %,
+  structure 43.41 %, without-L7 46.73 %, without-MERT 47.51 %, genre_full 47.44 %.
+  **Micro P@5** (depth-2): 44.8 % / 43.1 % / 45.8 % / 46.6 % / 47.6 % (chance 25.2 %). No
+  single stable winner across k — rankings shift by P@k — but the layer-7/MERT blends sit
+  at the top.
+- **L7 and MERT each add no statistically clear advantage** (paired bootstrap, heldout,
+  post-PCA, k=10, 2000 draws): L7 +0.70 pp (95 % CI [−0.58, +1.89], 86 % positive); MERT
+  −0.07 pp (CI [−1.09, +0.96]). Point differences only; the CIs span zero.
+- **Keep the logits.** User A/B (genre_full vs genre_without_logits, broad P@10) is
+  47.44 % vs 47.32 % — ~0.12 pp, negligible as a *local* metric — but visually the logits
+  keep diffuse genres connected (map continuity), and local purity does not capture the
+  global arrangement. That continuity is the reason to keep them.
+- **Human read:** `genre_full` is the most expressive map; the layer-7 toggle is visually
+  negligible; MERT19 produces fewer genre islands than MERT23; logits preserve diffuse
+  genre continuity.
+
+**Layer-7 cost** (why `genre_full` is expensive). Native layer-7 is 2304-D
+(cls + dist + patch-mean; one-based layer 7 → block 6) — **not** the Essentia
+tokenpool-768 (`[Ntokens, 768]`, a different pooling). MAEST has 12 blocks; block 6 is
+layer-7, so the final embedding is five further blocks on, then a cheap classifier head.
+Cached MPS, same 3-excerpt benchmark, 7 alternating runs (median): final-only 164.1 ms vs
+final+L7 262.9 ms — layer-7 adds ~60 % (98.8 ms) of **MAEST inference only**, not
+end-to-end pipeline cost. Extraction today runs two passes; capturing layer-7 during the
+full forward (single-pass) is the unimplemented priority that removes the overhead. Cache
+footprint: full compose 4615-D vs 2311-D without layer-7; layer-7 is ~9 KB pooled + 27 KB
+for 3 excerpts per track, ≈0.5 GB for 14k tracks before compression. PCA50 fit on 499 is
+9 vs 6 ms; map warm ≈0.5 s for both (a 6.25 s cold control is not comparable). Real-run
+extract wall-clock (499/500, both models concurrent) was MAEST 277 s / MERT 375.5 s — not
+an isolated throughput benchmark.
+
+**Licences.** MERT weights ~2.53 GB, CC-BY-NC 4.0; the `maest-infer` package is AGPL.
+
 ---
 
 ## Audio feature extraction (`librosa` + optional `madmom`)

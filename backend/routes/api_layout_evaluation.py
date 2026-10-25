@@ -35,6 +35,12 @@ SET_SUBDIRS: dict[str, str | None] = {
     "early": "early",
     "mixes": "mixes",
     "ablation": "ablation",
+    #: Offline genre-space representation comparison.
+    "genre": "genre",
+    #: Fixed directed 5-option contrastive genre preset (logits/hidden/layer7/MERT19).
+    "genre-directed": "genre-directed",
+    #: Fixed 2-option logits on/off genre ablation (genre_full vs genre_without_logits).
+    "genre-logits-ab": "genre-logits-ab",
 }
 
 

@@ -15,6 +15,7 @@ you are touching.
 | `ui_conventions.md` | Frontend interaction rules: canvas, tags, batch, selection, folder tree, commands, hotkeys |
 | `design-patterns.md` | Shared interaction patterns: navigation targets, hover state, coordinators, input controls |
 | `audio_pipeline.md` | Fingerprinting → embeddings → projection → clustering, and the analysis job queue |
+| `embedding-next-steps.md` | The implementation plans for embedding/analysis work (selected `genre_full` adoption, optimization, MuQ evaluation, validation) |
 | `trackspace-projection-methods.md` | Research notes on parametric/kernel projection candidates; background, not normative |
 | `TODO.md` | Actionable tasks, deferred work, product roadmap |
 | `README.md` | Setup and running |

@@ -60,6 +60,8 @@ python -m backend.app --host 0.0.0.0 # expose on LAN
 - `architecture.md` — system structure, frontend MVC, backend packages, HTTP API.
 - `ui_conventions.md` — frontend interaction rules (canvas, tags, folders, hotkeys).
 - `audio_pipeline.md` — fingerprinting → embeddings → projection → clustering, and the job queue.
+- `embedding-next-steps.md` — the embedding/analysis implementation plans (selected
+  `genre_full` adoption, optimization, MuQ evaluation, validation).
 - `design-patterns.md` — shared interaction patterns (navigation targets, hover state, coordinators, input controls).
 - `trackspace-projection-methods.md` — research notes on parametric/kernel projection candidates (background, not normative).
 - `TODO.md` — deferred work and the product roadmap.
@@ -91,7 +93,7 @@ an orthogonal rotation/reflection only (no warp). Each output artifact holds the
 
 **The sets.** A set is a directory of artifacts generated with one recipe list;
 the gallery serves only allowlisted names (`base`, `budget`, `scale`, `early`,
-`mixes`, `ablation`):
+`mixes`, `ablation`, `genre`):
 
 | Set | Recipes | Tests |
 |-----|---------|-------|
@@ -101,6 +103,7 @@ the gallery serves only allowlisted names (`base`, `budget`, `scale`, `early`,
 | `early` | tsne_budget100 (control) + tsne_early150, tsne_early100 | early-exaggeration phase length at production's n_iter=100 |
 | `mixes` | tsne_budget100 (control) + tsne_rhythm_forward, tsne_texture_style | source weights: rhythm-led vs timbre/semantics-led |
 | `ablation` | tsne_budget100 (control) + tsne_maest_supervised, tsne_maest_only | dropping whole blocks (rhythm+CLAP, then supervised) |
+| `genre` | genre-space maps (`maps --gallery-output …/genre`, `--recipes …`) | genre representations over the offline cohort (schema-1, virtual paths) |
 
 Each non-base set's control (`tsne_budget100`) is its alignment reference, so no
 500-iteration baseline map is fitted for them. Recipe parameters (weights,
@@ -170,9 +173,13 @@ Read-only GET routes (no write/upload surface):
   `scale` → `<data-dir>/layout-evaluation/scale`,
   `early` → `<data-dir>/layout-evaluation/early`,
   `mixes` → `<data-dir>/layout-evaluation/mixes`,
-  `ablation` → `<data-dir>/layout-evaluation/ablation`). Without it, the base
+  `ablation` → `<data-dir>/layout-evaluation/ablation`,
+  `genre` → `<data-dir>/layout-evaluation/genre`,
+  `genre-directed` → `<data-dir>/layout-evaluation/genre-directed`,
+  `genre-logits-ab` → `<data-dir>/layout-evaluation/genre-logits-ab`). Without it, the base
   (eight-map) gallery is served. Only allowlisted names (`base`, `budget`,
-  `scale`, `early`, `mixes`, `ablation`) are accepted — anything else is a 400.
+  `scale`, `early`, `mixes`, `ablation`, `genre`, `genre-directed`, `genre-logits-ab`) are
+  accepted — anything else is a 400.
 
 ### Browser gallery (blind eval)
 
@@ -187,6 +194,7 @@ http://localhost:5173/?layout_eval=1&set=scale     # the four-map scale set
 http://localhost:5173/?layout_eval=1&set=early     # the three-map early-phase set
 http://localhost:5173/?layout_eval=1&set=mixes     # the three-map source-weight set
 http://localhost:5173/?layout_eval=1&set=ablation  # the three-map dropped-block set
+http://localhost:5173/?layout_eval=1&set=genre     # the genre-space maps gallery
 ```
 
 The gallery is a **read-only, single-bundle** mode: the same controller, canvas and
@@ -230,3 +238,114 @@ entry point is inert while it is active, so no write can reach the server.
 > below — the gallery reads whatever `<data-dir>/layout-evaluation` currently holds.
 > Ratings are keyed by fingerprint + revision, so a regenerated dataset gets a fresh
 > rating sheet even under the same maps.
+
+## Offline genre benchmark (`data/genre-space/`)
+
+Reproducible, read-only comparison of genre representations — MAEST versus MERT — over a
+**frozen, labelled cohort** split by artist/release identity. It exists because broad-genre
+purity cannot measure microgenre separation (see `TODO.md` → *Offline genre benchmark*).
+All artifacts live under `data/genre-space/<set>/` (gitignored): `cohort.json`,
+`vectors/`, `report/`, plus `directed-analysis.json`/`.md`, `layer7-performance.json`,
+`logits-ab-report/`.
+
+**Design (read before trusting a number):**
+
+- **Folders are the weak labels.** A track's label is the first `--label-depth` path
+  components under `--root` (depth 1 = broad genres; point `--root` at a subgenre folder
+  for subgenre labels). The benchmark can only claim distinctions the labels encode.
+- **Identity-disjoint 70/30 split** by artist / `artist::album`; no artist or release
+  spans a split. Release needs the artist+album pair, which the real cache does not
+  store, so on a real run only artist identity is available.
+- **Frozen windows, deliberately different from production.** Extraction re-decodes the
+  manifest's exact windows — **production cache outputs are never used** — so every model
+  hears identical audio.
+- **Complete-case scoring** on the intersection of tracks every recipe extracted; no
+  zero-filling. Partial extraction coverage is reported; invalid provenance/checksums are
+  rejected.
+- **Dev-only tuning, retrieval eval.** PCA fitted / recipes selected on `dev` only;
+  heldout tracks are the *queries*, candidates the whole cohort — retrieval, not a heldout
+  classifier. A same-artist/release exclusion variant is scored for sanity.
+- **`--limit 20` is compatibility-only** — a smoke check of plumbing, not quality; a real
+  comparison uses a fresh scale-500 cohort and fresh directories.
+
+```bash
+# 1. Cohort — frozen manifest; read-only over the track cache (tracks must already be
+#    scanned into data/track_cache.db and unchanged since; the cache is opened read-only)
+python -m backend.experiments.genre_space cohort \
+  --root /path/to/GENRES \
+  --track-db data/track_cache.db \
+  --output data/genre-space/smoke/cohort.json \
+  --limit 20 --seed 42 --label-depth 1
+
+# 2. Extract — re-decodes the manifest's exact windows, per model
+python -m backend.experiments.genre_space extract \
+  --manifest data/genre-space/smoke/cohort.json \
+  --output data/genre-space/smoke/vectors \
+  --model maest
+
+# 2b. MERT — downloads/executes the pinned remote modeling code only with explicit flags
+#     (trust_remote_code). Weights ~2.53 GB, CC-BY-NC 4.0; never auto-downloaded.
+python -m backend.experiments.genre_space extract \
+  --manifest data/genre-space/smoke/cohort.json \
+  --output data/genre-space/smoke/vectors \
+  --model mert --revision 0c0c8c6f6e04dcc39d96f94e0be9978a74848906 \
+  --trust-remote-code --allow-download
+
+# 3. Score — retrieval metrics over the complete-case intersection
+python -m backend.experiments.genre_space score \
+  --manifest data/genre-space/smoke/cohort.json \
+  --artifacts data/genre-space/smoke/vectors \
+  --output data/genre-space/smoke/report
+
+# 4. (optional) Maps — one PCA50 -> openTSNE chart per --recipes id, for visual
+#    inspection only. Transductive PCA fits ALL cohort rows (unlike score, which fits
+#    PCA on dev rows only), so maps are display-only, not another scoring signal.
+#    Writes coords_<id>.json; pass --gallery-output for a schema-1 blind-eval gallery
+#    under data/layout-evaluation/genre (paths via --roots-file, default data/roots.json).
+python -m backend.experiments.genre_space maps \
+  --manifest data/genre-space/smoke/cohort.json \
+  --artifacts data/genre-space/smoke/vectors \
+  --output data/genre-space/smoke/maps \
+  --gallery-output data/layout-evaluation/genre \
+  --recipes 'maest_logits,maest_logits+maest@643-357'
+
+#    Then open the gallery (production build):
+#    http://127.0.0.1:5111/?layout_eval=1&set=genre
+```
+
+**Recipe sets.** `score` and `maps` take `--recipe-set baseline|directed|logits-ab`
+(default `baseline`). `baseline` is the fixed 13-recipe sweep above. The two fixed presets
+reuse existing cached vectors (no new inference), require every source and never produce a
+partial set:
+
+```bash
+# Directed — all five contrastive options (logits vs final hidden vs layer-7 vs MERT19),
+# one PCA50 -> openTSNE map each; fits all five ids when --recipes is omitted.
+# Blind-eval UI: set=genre-directed.
+python -m backend.experiments.genre_space maps \
+  --manifest data/genre-space/first/cohort.json \
+  --artifacts data/genre-space/first/vectors \
+  --output data/genre-space/first/directed-maps \
+  --gallery-output data/layout-evaluation/genre-directed \
+  --recipe-set directed
+
+# Logits A/B — genre_full vs the same recipe with the logits removed; reuses the
+# genre_full id/weights from the directed set (one source of truth). set=genre-logits-ab.
+python -m backend.experiments.genre_space maps \
+  --manifest data/genre-space/first/cohort.json \
+  --artifacts data/genre-space/first/vectors \
+  --output data/genre-space/first/logits-ab-maps \
+  --gallery-output data/layout-evaluation/genre-logits-ab \
+  --recipe-set logits-ab
+```
+
+The recipe weights/tables, quantitative results and recommended presets are single-sourced
+in `audio_pipeline.md` → *Genre-space evaluation conclusions (October 2026)*. **A map is a
+qualitative view of the chosen representation, not an equivalent of the quantitative
+neighbourhood-retrieval scores** — for the numbers use `score --recipe-set directed` and
+`data/genre-space/first/directed-analysis.json` / `.md`.
+
+**Operational notes.** MAEST runs on MPS as in production; **MERT ran on MPS too** — both
+models completed the 499/500 extract on MPS — CPU/CUDA remain the alternative. Licenses:
+`maest-infer` is AGPL; MERT weights are CC-BY-NC 4.0 (non-commercial). Offline tools do
+not change production embedding defaults.

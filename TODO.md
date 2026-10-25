@@ -421,11 +421,37 @@ none require re-running an encoder over the library.
   `build_track_infos_fn` (`backend/routes/api_search.py`), so every query re-reads the
   whole library — use `track_infos_cached` (with `library_mtime_signature`) or resolve only
   the candidate paths, as `/api/tracks/structure` now does.
-- [ ] **MERT-v2.** Deliberately deferred until MAEST shows a measured blind spot — on the
-  6-genre validation it reached 96.6% purity.
 - [ ] **Persist cluster results.** `ClusterStore` is in-memory; a restart now
   self-heals one re-cluster at startup (`app.main`), which recomputes in seconds at
   current library size. Persist only if that startup cost stops being negligible.
+
+## Offline genre benchmark (heldout microgenre evaluation)
+
+The benchmark itself is a README section: *Offline genre benchmark*; findings and presets
+are single-sourced in `audio_pipeline.md` → *Genre-space evaluation conclusions (October
+2026)*. Code: `backend/experiments/genre_space/`. The scale-500 run and listening pass are
+done. The detailed, sliced plans for the work below live in `embedding-next-steps.md`:
+
+- [ ] **WS 1 — Wire the user-selected `genre_full` into production (opt-in).**
+  `genre_full` (logits .40, maest .20, layer7 .25, mert19 .15) is **selected by the
+  user** but **not yet in production** (no app-wide source-weight change). Adopt it as
+  an **opt-in recipe id only**: a genre-block weight recipe that must not overwrite the
+  app-wide weights and clobber CLAP/rhythm; decide the total genre-block budget relative
+  to the existing sources, and give each new block (layer-7, MERT19) an independent cache
+  version, queue jobs, and an inference GPU guard under `clap.inference_lock`. Lean
+  fallbacks: `genre_without_layer7` / `genre_without_mert`. Plan, slices and acceptance:
+  `embedding-next-steps.md` → *WS 1*.
+- [ ] **WS 1 — Single-pass layer-7 extraction (priority).** Extraction currently runs two
+  passes; capturing layer-7 during the MAEST full forward removes the ~99 ms per 3-excerpt
+  batch measured in the benchmark. Plan: `embedding-next-steps.md` → *WS 1* (slice 1).
+- [ ] **WS 4 — Larger real microgenre validation, if viable.** The 33 eligible depth-2
+  parents gave tiny per-parent query counts (often nq=1), so confidence is low; a bigger
+  real cohort would firm it up. `genre_full` is recorded and selected, not proven at scale —
+  no further model grid is planned. Plan: `embedding-next-steps.md` → *WS 4*.
+- [ ] **WS 4 — Confidence intervals as generic scoring code.** The L7/MERT pair bootstrap
+  is done; generalise `scoring.py` so any recipe comparison reports CIs without a bespoke
+  analysis pass. No further speculative model tests are planned. Plan:
+  `embedding-next-steps.md` → *WS 4*.
 
 ## Analysis performance
 
@@ -578,10 +604,11 @@ neighbourhood sweeps) are not re-listed; measured conclusions live in
       adopted: change `_tsne_perplexity` and bump `PROJECTION_RECIPE_VERSION`.
       These ratings live only in the user's local exports under
       `data/layout-evaluation/ratings-exports/` plus browser localStorage.
-- [ ] **Original-space neighbour comparison.** A hover-play view of nearest
-      neighbours in the *unprojected* composite space would separate representation
-      limits from projection limits — the user observed CLAP/rhythm-only maps are
-      diffuse. Existing harness: `backend/embeddings/layout_fidelity.py`.
+- [ ] **Original-space neighbour audition.** Add playable kNN results independent of
+      2-D positions — a hover-play view of nearest neighbours in the *unprojected*
+      composite space would separate representation limits from projection limits (the
+      user observed CLAP/rhythm-only maps are diffuse). Reuse the experimental score
+      CSV/ranking; the metric harness is done, the UI is not.
 - [ ] **Measure end-to-end first projection after a restart** on the real library;
       the cache wins in `audio_pipeline.md` → *Projection caching* are measured per
       call only.

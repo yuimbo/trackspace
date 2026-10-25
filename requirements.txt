@@ -5,6 +5,9 @@ numpy>=1.24
 torch>=2.0
 torchaudio>=2.0
 transformers>=4.40
+# Imported directly by ``backend/experiments/genre_space/extractors.py``
+# (huggingface_hub.constants.HF_HUB_CACHE); transformers depends on it.
+huggingface-hub
 librosa>=0.10
 # Imported directly by ``backend/decode_stderr.py`` for the locked native open
 # (libsndfile is not thread-safe on MP3); librosa also depends on it.
