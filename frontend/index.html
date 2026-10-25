@@ -54,6 +54,58 @@
         <input type="checkbox" id="head-color-confident" /> Confident only
       </label>
     </div>
+    <!-- t-SNE iteration budget: presets + explicit numeric fields. Shown only for
+         a projection lens (a map fit). -->
+    <div id="tsne-iteration-fold" class="view-option hidden">
+      <label title="openTSNE fit budget: iterations and early-exaggeration phase">
+        Iterations
+        <select id="tsne-iteration-preset">
+          <option value="default">Default · 100 / 100</option>
+          <option value="fast">Fast · 100 / 100</option>
+          <option value="balanced">Balanced · 250 / 150</option>
+          <option value="gallery">Gallery · 500 / 250</option>
+        </select>
+      </label>
+      <span class="view-option-inline">
+        <label>Iter
+          <input type="number" id="tsne-n-iter" min="100" max="2000" step="10" />
+        </label>
+        <label>Early
+          <input type="number" id="tsne-early-iter" min="0" max="1000" step="10" />
+        </label>
+      </span>
+    </div>
+    <!-- Genre map weight preview. Shown only for the genre map: seven tunable
+         sources preview through the Jacobian while dragging; Apply commits the
+         vector (cluster rebuild + exact refit). -->
+    <div id="genre-weights-fold" class="view-option hidden">
+      <div class="view-options-heading" aria-hidden="true">Genre map weights</div>
+      <div id="genre-weights"></div>
+      <p id="genre-weights-note" class="cluster-weights-note"></p>
+      <div class="cluster-weight-actions">
+        <button
+          id="btn-genre-apply"
+          type="button"
+          title="Apply these genre weights: rebuild clusters and re-layout exactly"
+        >
+          Apply
+        </button>
+        <button
+          id="btn-genre-reset"
+          type="button"
+          title="Cancel the draft: back to the weights currently applied"
+        >
+          Reset
+        </button>
+        <button
+          id="btn-genre-defaults"
+          type="button"
+          title="Load the recipe defaults as a draft, then Apply to commit"
+        >
+          Defaults
+        </button>
+      </div>
+    </div>
   </div>
 
   <footer id="statusbar">

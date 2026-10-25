@@ -245,10 +245,10 @@ class JobQueue:
         resets ``attempts`` so a previously exhausted job gets a clean budget.
 
         *requeue_failed* additionally revives ``failed`` rows. Leave it off for
-        automatic keep-warm enqueues: a genuinely broken file would otherwise be
-        retried on every enqueue, forever, and its permanent failure would keep
-        reading as outstanding work. Explicit user retriggers (a stage, a track, or
-        force) and the startup version-purge backfill set it.
+        automatic keep-warm enqueues and the version-purge backfill: a genuinely
+        broken file would otherwise be retried on every enqueue, forever, and its
+        permanent failure would keep reading as outstanding work. Explicit user
+        retriggers (a stage, a track, or force) set it.
         """
         now = time.time()
         attempts_cap = self._max_attempts if max_attempts is None else int(max_attempts)

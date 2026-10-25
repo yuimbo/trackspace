@@ -17,6 +17,7 @@ from backend.jobs import (
     KIND_CLAP,
     KIND_FEATURES,
     KIND_MAEST,
+    KIND_MERT,
     KIND_STRUCTURE,
 )
 from backend.services.embedding_status_cache import EmbeddingStatusCache
@@ -33,10 +34,13 @@ log = logging.getLogger(__name__)
 
 #: Per-track stages the coverage panel may retrigger individually. The
 #: library-wide tail stages (supervise/cluster) are triggered by their own routes.
+#: ``mert`` is only enqueued when the server opted into genre_full; a retrigger
+#: for it on a disabled server simply enqueues nothing.
 RETRIGGER_STAGES: tuple[str, ...] = (
     KIND_FEATURES,
     KIND_STRUCTURE,
     KIND_MAEST,
+    KIND_MERT,
     KIND_CLAP,
 )
 
@@ -78,6 +82,9 @@ def create_api_embeddings_blueprint(
     enqueue_analysis: Callable[..., dict[str, int]],
     job_queue: Any,
     maest_mod: Any,
+    mert_mod: Any,
+    genre_full_enabled: bool,
+    mert_enabled: bool,
     rhythm_version: int,
     structure_version: int,
 ) -> Blueprint:
@@ -196,6 +203,8 @@ def create_api_embeddings_blueprint(
             rhythm_version,
             supervised_mod.cache_version(feature_cache),
             structure_version,
+            maest_layer7=maest_mod.MAEST_LAYER7_VERSION,
+            mert_l19=mert_mod.MERT_VERSION,
         )
 
     def _analysis_progress() -> tuple[bool, dict[str, int] | None]:
@@ -207,7 +216,7 @@ def create_api_embeddings_blueprint(
         by_kind = job_queue.stats_by_kind()
         done = 0
         total = 0
-        for kind in (KIND_FEATURES, KIND_MAEST, KIND_CLAP):
+        for kind in (KIND_FEATURES, KIND_MAEST, KIND_MERT, KIND_CLAP):
             st = by_kind.get(kind)
             if st is None:
                 continue
@@ -215,7 +224,7 @@ def create_api_embeddings_blueprint(
             total += st.total
         running = any(
             (by_kind.get(k).outstanding if by_kind.get(k) else 0) > 0
-            for k in (KIND_FEATURES, KIND_MAEST, KIND_CLAP)
+            for k in (KIND_FEATURES, KIND_MAEST, KIND_MERT, KIND_CLAP)
         )
         return running, ({"done": done, "total": total} if total else None)
 
@@ -234,7 +243,8 @@ def create_api_embeddings_blueprint(
         }
         sources_by_kind = {
             KIND_FEATURES: ("features", "rhythm"),
-            KIND_MAEST: ("maest",),
+            KIND_MAEST: ("maest", "maest_layer7"),
+            KIND_MERT: ("mert_l19",),
             KIND_CLAP: ("clap",),
             KIND_STRUCTURE: ("structure",),
         }
@@ -292,19 +302,26 @@ def create_api_embeddings_blueprint(
         def _compute() -> tuple[dict[str, Any], str | None]:
             fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
             maps = batch_fetch_maps(feature_cache, fps, versions)
-            proj = parse_projection_params_fn(request, default_when_no_method=False)
+            # ``for_status`` lets the capability bootstrap query a genre recipe on
+            # a disabled server without a 400, so the client can learn
+            # ``genre_full_enabled`` (absent in the payload) and reconcile away.
+            proj = parse_projection_params_fn(
+                request, default_when_no_method=False, for_status=True
+            )
             return (
                 coverage_payload(
                     infos,
                     maps,
                     versions,
                     failed_by_source=_failed_fingerprints(infos),
+                    genre_full_enabled=genre_full_enabled,
+                    mert_enabled=mert_enabled,
                 ),
                 layout_revision_for_projection(
                     _scope_infos(infos, proj.dims),
                     maps,
                     proj,
-                    cache_versions=versions_tuple(versions),
+                    cache_versions=versions_tuple(versions, getattr(proj, "recipe_id", None)),
                 ),
             )
 
@@ -332,6 +349,12 @@ def create_api_embeddings_blueprint(
             "generating": running,
             "progress": progress if running else None,
         }
+        # MERT status is only surfaced when the server opted into genre_full; a
+        # disabled server's payload is byte-identical to before this slice.
+        if genre_full_enabled:
+            payload["genre_full_enabled"] = True
+            payload["mert_model_ready"] = mert_mod.is_model_ready()
+            payload["mert_error"] = mert_mod.load_error()
         if layout_revision is not None:
             payload["layout_revision"] = layout_revision
         return jsonify(payload)
@@ -551,8 +574,19 @@ def create_api_embeddings_blueprint(
             place_infos=place_infos,
         )
         if model is None:
-            # Too few tracks to fit a chart: fall back to the refit finite
-            # difference (correct for PCA, noisy for t-SNE).
+            # Too few tracks to fit a chart. For 2-D, fall back to the refit finite
+            # difference (correct for PCA, noisy for t-SNE). For 3-D that refit is
+            # the 7 per-source full fits of the expensive Jacobian pass, so instead
+            # the exact base layout is returned with an empty Jacobian: the frontend
+            # holds the exact positions and weight-drag preview is unavailable (a
+            # release still recomputes exactly).
+            if proj.dims == 3:
+                return jsonify({
+                    "positions": positions,
+                    "revision": revision,
+                    "weights": weights0,
+                    "jacobian": {},
+                })
             _positions, jacobian = embeddings_mod.compute_projection(
                 fit_infos,
                 feature_cache,
@@ -571,6 +605,9 @@ def create_api_embeddings_blueprint(
                 required_sources=proj.required_sources,
                 with_jacobian=True,
                 dims=proj.dims,
+                recipe_id=getattr(proj, "recipe_id", None),
+                tsne_n_iter=getattr(proj, "tsne_n_iter", None),
+                tsne_early_exaggeration_iter=getattr(proj, "tsne_early_exaggeration_iter", None),
             )
         else:
             _layout_progress("jacobian", 0, 0)

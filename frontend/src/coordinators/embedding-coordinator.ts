@@ -22,7 +22,7 @@
 // coordinator is unit-testable without the DOM-heavy component classes.
 
 import { type Billboard, type MapPos, type Model, type Scope, type Track, DEFAULT_CLUSTER_WEIGHTS, formatSourceWeight, scopeContains, scopeHalfExtents } from "../model";
-import { type Lens, getLens, lensWaitSources, lensWeights } from "../lib/lenses";
+import { type Lens, GENRE_FULL_LENS, GENRE_FULL_SOURCES, GENRE_FULL_WEIGHTS, getLens, lensWaitSources, lensWeights } from "../lib/lenses";
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 import { clamp } from "../lib/util";
@@ -63,6 +63,8 @@ interface CoverageSource {
 const COVERAGE_SOURCE: Record<string, string> = {
   maest_logits: "maest",
   maest: "maest",
+  maest_layer7: "maest_layer7",
+  mert_l19: "mert_l19",
   clap: "clap",
   rhythm: "rhythm",
   features: "features",
@@ -82,6 +84,41 @@ function _encodeWeights(w: Record<string, number>): string {
   return Object.keys(DEFAULT_CLUSTER_WEIGHTS)
     .map((k) => `${k}:${formatSourceWeight(w[k] ?? 0)}`)
     .join(",");
+}
+
+/** True when *w* equals the genre recipe's frozen defaults (the ``w=`` is omitted). */
+function _genreWeightsAreDefault(w: Record<string, number>): boolean {
+  for (const k of GENRE_FULL_SOURCES) {
+    if (Math.abs((w[k] ?? NaN) - (GENRE_FULL_WEIGHTS[k] ?? NaN)) > 1e-9) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Genre recipe ``w=`` override, in the canonical 7-key order. */
+function _encodeGenreWeights(w: Record<string, number>): string {
+  return GENRE_FULL_SOURCES.map((k) => `${k}:${formatSourceWeight(w[k] ?? 0)}`).join(
+    ",",
+  );
+}
+
+/** Parse a numeric override field into an integer within ``[min, max]``.
+ *
+ *  Returns ``null`` for an empty field (clear the override), ``undefined`` for an
+ *  out-of-range / non-integer / non-finite value (ignored), or the validated int.
+ *  Both fields share this so the bound rule lives in one place. ``early`` may be
+ *  ``0`` (0 disables early exaggeration); ``nIter`` starts at 100.
+ */
+function _parseBoundedOverride(
+  text: string,
+  min: number,
+  max: number,
+): number | null | undefined {
+  if (text === "") return null;
+  const n = Number(text);
+  if (!Number.isInteger(n) || n < min || n > max) return undefined;
+  return n;
 }
 
 interface CachedLayout {
@@ -210,6 +247,12 @@ export class EmbeddingCoordinator {
    *  gates application: the key carries ``dims=3``, so a Jacobian fetched for
    *  the other dimensionality is never applied to the current view. */
   private _jacobianKey = "";
+  /** Monotonic id so a slow Jacobian fetch cannot overwrite a newer one. */
+  private _jacobianSeq = latestSeq();
+  /** Re-reads the iteration control from the model's per-dimensionality override; set by
+   *  ``bindTsneIterationControl`` and invoked on lens/dims switch so the control
+   *  always reflects the active dimensionality's stored budget. */
+  private _resyncTsneControl: (() => void) | null = null;
 
   private _animFrame = 0;
   /**
@@ -291,9 +334,15 @@ export class EmbeddingCoordinator {
     this.cancelAnimation();
   }
 
-  /** Drop all cached layouts (e.g. after a full library reload). */
+  /** Drop all cached layouts (e.g. after a full library reload).
+   *
+   *  A layout revision change also invalidates the weight Jacobian: its base
+   *  positions are tied to the *old* layout, so it must be re-fetched at the new
+   *  revision or a live drag would approximate around a stale frame.
+   */
   invalidateLayoutCache(): void {
     this._layoutCache.clear();
+    this.invalidateWeightJacobian();
   }
 
   /**
@@ -326,6 +375,86 @@ export class EmbeddingCoordinator {
   }
 
   /**
+   * Set the openTSNE iteration-budget override for the *active* dimensionality
+   * (``d2``/``d3``) and refetch the layout. ``nIter`` / ``early`` of ``null``
+   * restores the recipe default (no override sent). Persisted through the model
+   * per-dimensionality, so all 2-D map lenses share the 2-D budget and 3-D keeps
+   * its own. Only the coordinator mutates projection state.
+   */
+  setTsneIteration(nIter: number | null, early: number | null): void {
+    const m = this.deps.model;
+    const cur = m.tsneIterationFor();
+    if (cur.nIter === nIter && cur.early === early) return;
+    m.setTsneIterationForActiveView(nIter, early);
+    m.saveLS();
+    if (this._evalInert) return;
+    this.invalidateLayoutCache();
+    void this.refreshProjection();
+  }
+
+  /** Named presets for the openTSNE iteration control (Fast / Balanced / Gallery). */
+  private static readonly TSNE_PRESETS: Record<
+    string,
+    { nIter: number; early: number } | null
+  > = {
+    default: null,
+    fast: { nIter: 100, early: 100 },
+    balanced: { nIter: 250, early: 150 },
+    gallery: { nIter: 500, early: 250 },
+  };
+
+  /**
+   * Bind the openTSNE iteration control in the view-options panel. The select
+   * applies a named preset; the numeric fields allow an explicit budget. Both
+   * mutate only via :meth:`setTsneIteration` (the single projection-owning seam).
+   */
+  bindTsneIterationControl(): void {
+    const $preset = document.getElementById(
+      "tsne-iteration-preset",
+    ) as HTMLSelectElement | null;
+    const $nIter = document.getElementById(
+      "tsne-n-iter",
+    ) as HTMLInputElement | null;
+    const $early = document.getElementById(
+      "tsne-early-iter",
+    ) as HTMLInputElement | null;
+    if (!$preset || !$nIter || !$early) return;
+
+    const readModel = () => {
+      const ti = this.deps.model.tsneIterationFor();
+      $nIter.value = ti.nIter == null ? "" : String(ti.nIter);
+      $early.value = ti.early == null ? "" : String(ti.early);
+      const presetId = Object.entries(EmbeddingCoordinator.TSNE_PRESETS).find(
+        ([, v]) =>
+          (v == null && ti.nIter == null && ti.early == null) ||
+          (v != null && v.nIter === ti.nIter && v.early === ti.early),
+      )?.[0];
+      $preset.value = presetId ?? "default";
+    };
+    this._resyncTsneControl = readModel;
+    readModel();
+
+    $preset.addEventListener("change", () => {
+      const p = EmbeddingCoordinator.TSNE_PRESETS[$preset.value];
+      if (!p) return;
+      this.setTsneIteration(p.nIter, p.early);
+      readModel();
+    });
+    $nIter.addEventListener("change", () => {
+      const nIter = _parseBoundedOverride($nIter.value.trim(), 100, 2000);
+      if (nIter === undefined) return;
+      this.setTsneIteration(nIter, this.deps.model.tsneIterationFor().early);
+      readModel();
+    });
+    $early.addEventListener("change", () => {
+      const early = _parseBoundedOverride($early.value.trim(), 0, 1000);
+      if (early === undefined) return;
+      this.setTsneIteration(this.deps.model.tsneIterationFor().nIter, early);
+      readModel();
+    });
+  }
+
+  /**
    * Toggle the 3-D orbit view. A projection lens is refetched so the positions
    * carry z; tags/deterministic lenses stay 2-D and the flag just flips without
    * a fetch. Layouts are cached by query string (with vs. without `dims=3`), so
@@ -348,6 +477,9 @@ export class EmbeddingCoordinator {
     m.saveLS();
     this.deps.status.update(m);
     this.deps.canvas.scheduleDraw();
+    // The iteration control is keyed by dimensionality too: re-read it so the
+    // 2-D↔3-D toggle shows the other view's own stored budget.
+    this._resyncTsneControl?.();
     if (m.lens().kind === "projection") {
       // Hold the blend target until the toggled layout is in hand: the camera
       // tween and the position lerp then start together (see `_applyPositions`),
@@ -434,19 +566,42 @@ export class EmbeddingCoordinator {
     if (!m.embeddingsReady || m.lens().kind !== "projection") return;
     const qs = this._projectionQueryString();
     if (this._weightJacobian && this._jacobianKey === qs) return;
+    // Capture the query key at request start: by response time the view may have
+    // changed dimensionality/sources/iteration/scope, or the baseline weights may
+    // have been re-applied. A response for a stale key must not be cached.
+    const seq = this._jacobianSeq.next();
     try {
       const raw = await api<unknown>(
         `/api/embeddings/projection?${qs}&jacobian=1`,
       );
+      // A newer fetch started (a re-apply while this was in flight), or the view
+      // moved on (dims/sources/iteration/scope/baseline): drop this response.
+      if (!this._jacobianSeq.isCurrent(seq)) return;
+      if (qs !== this._projectionQueryString()) return;
       const jac = parseWeightJacobian(raw);
-      if (jac) {
+      // Guard the response's baseline: the Jacobian's base positions step from a
+      // specific layout revision, so a response computed at an older revision than
+      // the layout currently in hand must not be cached (a drag would approximate
+      // around a stale frame).
+      if (jac && this._jacobianBaselineCurrent(jac)) {
         this._weightJacobian = jac;
         this._jacobianKey = qs;
       }
     } catch {
-      this._weightJacobian = null;
-      this._jacobianKey = "";
+      // Only clear the cache for the fetch that is still current — a stale
+      // failure must not wipe a newer, valid Jacobian.
+      if (this._jacobianSeq.isCurrent(seq)) {
+        this._weightJacobian = null;
+        this._jacobianKey = "";
+      }
     }
+  }
+
+  /** Drop the cached Jacobian (the applied weights changed, so its base is stale). */
+  invalidateWeightJacobian(): void {
+    this._jacobianSeq.next();
+    this._weightJacobian = null;
+    this._jacobianKey = "";
   }
 
   /** Approximate positions for a live slider drag; false when unavailable.
@@ -466,11 +621,61 @@ export class EmbeddingCoordinator {
       // be applied: the key carries ``dims=3``, so it only matches the current
       // projection query.
       this._jacobianKey !== this._projectionQueryString() ||
+      // The layout moved on (a revision change with the same query, e.g. new
+      // analysis work): a Jacobian whose base is the old layout must not steer
+      // the new one.
+      !this._jacobianBaselineCurrent(this._weightJacobian) ||
       m.embeddingPositions.size === 0
     )
       return false;
     m.embeddingPositions = approximatePositions(this._weightJacobian, weights);
     this.deps.canvas.scheduleDraw();
+    return true;
+  }
+
+  /**
+   * Restore the map to the exact positions at the currently-applied weights,
+   * without a server round-trip.
+   *
+   * Used by the genre-weight Reset: when a live drag could not be approximated
+   * (no Jacobian, or a stale one), the dots would otherwise stay at the dragged
+   * positions even after Reset. Pulls the applied baseline straight from the
+   * layout cache (cheap); returns false on a cache miss so the caller can fall
+   * back to a refetch.
+   */
+  restoreExactWeightBaseline(): boolean {
+    if (this._evalInert) return false;
+    const cached = this._layoutCache.get(this._projectionQueryString());
+    if (!cached) return false;
+    this._applyPositions(new Map(cached.positions));
+    return true;
+  }
+
+  /** Whether a Jacobian's base still describes the layout currently on screen.
+   *
+   *  The base positions step from one exact layout revision; a drag must never
+   *  approximate around a stale frame. When both the cached layout and the
+   *  Jacobian carry a revision, they must match. When a revision is missing on
+   *  either side, fall back to comparing the base positions with the applied
+   *  layout (x/y, which define the shape frame) — a missing revision with
+   *  matching positions is a robust invalidation fallback.
+   */
+  private _jacobianBaselineCurrent(jac: WeightJacobian): boolean {
+    const cached = this._layoutCache.get(this._projectionQueryString());
+    // Prefer the revision when both sides carry one.
+    if (cached?.revision && jac.revision) {
+      return jac.revision === cached.revision;
+    }
+    // No reliable revision on one side: the base positions are the only check. If
+    // they match the applied layout exactly, the baseline is still good.
+    const cur = cached?.positions ?? this.deps.model.embeddingPositions;
+    if (cur.size === 0) return true;
+    for (let i = 0; i < jac.paths.length; i++) {
+      const p = jac.base[i];
+      const c = cur.get(jac.paths[i]);
+      if (!p || !c) continue;
+      if (p.x !== c.x || p.y !== c.y) return false;
+    }
     return true;
   }
 
@@ -502,8 +707,36 @@ export class EmbeddingCoordinator {
         generating: boolean;
         embedding_version?: number;
         layout_revision?: string;
+        genre_full_enabled?: boolean;
         sources?: CoverageSource[];
       }>(`/api/embeddings/status?${this._projectionQueryString()}`);
+
+      // Learn the server's genre_full gate from status so the genre_full lens
+      // (and its coverage rows) only surface when the server enabled it. A
+      // status request with ``recipe=genre_full`` is tolerated by the backend on
+      // a disabled server (it omits ``genre_full_enabled``), so the gate is
+      // always learnable — no 400 short-circuits the fallback.
+      const genreOn = status.genre_full_enabled === true;
+      // MERT is only reported (as a ``mert_l19`` coverage row) when the server
+      // enabled it; derive the gate from that row's presence, simplest form.
+      m.mertEnabled = (status.sources ?? []).some((s) => s.id === "mert_l19");
+      const genreChanged = m.genreFullEnabled !== genreOn;
+      m.genreFullEnabled = genreOn;
+      // Reconcile the active lens with the learned gate in BOTH directions: a
+      // genre map on a disabled server falls back to combined; a legacy map lens
+      // on an enabled server converts to the genre map. Returns whether the lens
+      // changed (so the coverage gate and fetch below use the reconciled lens).
+      const lensChanged = this._reconcileLensWithGenre(genreOn);
+      if (genreChanged || lensChanged) {
+        this.syncLensChrome();
+        this.deps.canvas.scheduleDraw();
+      }
+      if (lensChanged) {
+        // The active lens moved (e.g. genre_full → combined on a disabled
+        // server); restart so the wait-sources gate and projection use it.
+        await this.ensureAndProject();
+        return;
+      }
 
       // Only a lens that needs MAEST waits on the MAEST model: a CLAP/rhythm
       // lens must still render on a server where MAEST is loading or disabled —
@@ -609,6 +842,31 @@ export class EmbeddingCoordinator {
     return status.sources?.find((s) => s.id === id);
   }
 
+  /** Reconcile the active lens with the learned genre gate; true when it changed.
+   *
+   *  Mirrors the symmetric migration: a genre map lens on a disabled server falls
+   *  back to the legacy combined map, and an active legacy map lens
+   *  (``combined``/``maest``/``supervised``) on an enabled server converts to the
+   *  genre map. Presets resolve through their base lens.
+   */
+  private _reconcileLensWithGenre(genreOn: boolean): boolean {
+    const m = this.deps.model;
+    const base = m.activeBaseLensId();
+    if (!genreOn && base === GENRE_FULL_LENS.id) {
+      // The genre map is unavailable: fall back to the legacy combined map.
+      m.lensId = "combined";
+      return true;
+    }
+    if (
+      genreOn &&
+      (base === "combined" || base === "maest" || base === "supervised")
+    ) {
+      m.lensId = GENRE_FULL_LENS.id;
+      return true;
+    }
+    return false;
+  }
+
   private _pollModelReady(): void {
     clearTimeout(this._embedPollTimer);
     this._embedPollTimer = setTimeout(async () => {
@@ -702,13 +960,36 @@ export class EmbeddingCoordinator {
     const ext = m.externalRootIds.size > 0 ? "&include_external=1" : "";
     const fit =
       m.showExternal && m.externalInProjection ? "&fit_scope=all" : "";
+    // The opt-in genre_full lens is a canonical recipe: the backend fixes its
+    // sources, weights and 500/250 budget, so the query names the recipe id and
+    // omits the per-request sources/weights. When the applied genre weights
+    // deviate from the recipe defaults, the override rides as ``w=<7 keys>`` in
+    // canonical order; the default key stays recipe-only.
+    const recipe =
+      lens.id === GENRE_FULL_LENS.id ? "&recipe=genre_full" : "";
     // A per-source lens projects only its own blocks; the combined lens omits the
     // param so its default query key stays stable.
-    const src = lens.sources ? `&sources=${lens.sources.join(",")}` : "";
+    const src =
+      !recipe && lens.sources ? `&sources=${lens.sources.join(",")}` : "";
     // Only append weights when they differ from the defaults: the default query
     // key must stay stable so existing cached layouts remain valid.
     const w = lensWeights(lens, m.clusterWeights);
-    const wq = _weightsAreDefault(w) ? "" : `&w=${_encodeWeights(w)}`;
+    const wq = recipe
+      ? !_genreWeightsAreDefault(m.genreWeights)
+        ? `&w=${_encodeGenreWeights(m.genreWeights)}`
+        : ""
+      : !_weightsAreDefault(w)
+        ? `&w=${_encodeWeights(w)}`
+        : "";
+    // The openTSNE iteration-budget override for the *active* dimensionality, sent
+    // only when set (the backend otherwise uses the recipe's default, keeping the
+    // default query key). Reads the per-dimensionality (d2/d3) override so 2-D and
+    // 3-D carry their own budget in the query.
+    const ti = m.tsneIterationFor();
+    const ts =
+      ti.nIter != null ? `&tsne_n_iter=${ti.nIter}` : "";
+    const te =
+      ti.early != null ? `&tsne_early_exaggeration_iter=${ti.early}` : "";
     // 3-D is a client-side toggle with a server z axis, so it gets its own
     // query key: 2-D and 3-D layouts cache separately. A scope lens layout is
     // always 2-D — a sphere's contents are a flat map, and the 2-D key is the
@@ -716,7 +997,7 @@ export class EmbeddingCoordinator {
     // dimensionality; everything else follows the view.
     const dim = dimsOverride ?? (m.is3d ? 3 : 2);
     const dims = dim === 3 ? "&dims=3" : "";
-    return `${base}${src}${wq}${ext}${fit}${dims}`;
+    return `${base}${src}${wq}${ts}${te}${recipe}${ext}${fit}${dims}`;
   }
 
   /** Fetch PCA positions during ongoing generation, animating the transition.
@@ -1141,22 +1422,50 @@ export class EmbeddingCoordinator {
     }
   }
 
-  /** Switch to a specific view mode (tags ↔ the last map lens). */
+  /** Switch to a specific view mode (tags ↔ the default map lens). */
   async switchToMode(target: "tags" | "embeddings"): Promise<void> {
     if (this._evalInert) return;
     if (this.deps.model.viewMode === target) return;
-    await this.switchToLens(target === "tags" ? "tags" : "combined");
+    await this.switchToLens(
+      target === "tags" ? "tags" : this.deps.model.defaultMapLensId(),
+    );
   }
 
-  /** Sync the source-weight panel visibility to the active lens. */
+  /** Sync lens-dependent chrome: the combined-map weight panel and the genre
+   *  map weight preview in view-options, plus the panel's own visibility. */
   syncLensChrome(): void {
+    const m = this.deps.model;
+    const lens = m.lens();
     // Source weights only re-weight the combined lens; a per-source lens fixes
     // them, so hide the sliders where they would do nothing.
-    const lens = this.deps.model.lens();
     const details = document.getElementById(
       "cluster-weights-details",
     ) as HTMLDetailsElement | null;
     if (details) details.hidden = lens.kind !== "projection" || !!lens.sources;
+    // The genre map weight preview lives in view-options, shown only for the
+    // genre lens when the server enabled it.
+    const genre = document.getElementById("genre-weights-fold");
+    if (genre) {
+      genre.classList.toggle(
+        "hidden",
+        !(m.genreFullEnabled && lens.id === GENRE_FULL_LENS.id),
+      );
+    }
+    this._syncViewOptionsVisibility();
+    // The iteration control reflects the active dimensionality's per-dimension
+    // budget; re-read it when the lens (or a model change) shifts which
+    // dimensionality is active.
+    this._resyncTsneControl?.();
+  }
+
+  /** Show the view-options panel while any of its options is relevant. */
+  private _syncViewOptionsVisibility(): void {
+    const opts = document.getElementById("view-options");
+    if (!opts) return;
+    const anyVisible = [...opts.querySelectorAll(".view-option")].some(
+      (el) => !el.classList.contains("hidden"),
+    );
+    opts.classList.toggle("hidden", !anyVisible);
   }
 
   /**

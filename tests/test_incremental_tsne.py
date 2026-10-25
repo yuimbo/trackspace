@@ -287,6 +287,49 @@ def test_fit_uses_production_iter_budget(monkeypatch):
     assert calls["early_exaggeration_iter"] == OPENTSNE_EARLY_EXAGGERATION_ITER
 
 
+def test_fit_receives_requested_iter_budget(monkeypatch):
+    """A requested budget flows through ``_project_tsne`` to the openTSNE fit."""
+    import openTSNE
+
+    calls: dict = {}
+
+    class _RecordingTSNE:
+        def __init__(self, **kwargs):
+            calls.update(kwargs)
+
+        def fit(self, x):
+            return np.zeros((len(x), 2), dtype=np.float32)
+
+    monkeypatch.setattr(openTSNE, "TSNE", _RecordingTSNE)
+    pb._project_tsne(
+        _matrix(60), paths=_paths(60), config_key="cfg",
+        tsne_n_iter=250, tsne_early_exaggeration_iter=150,
+    )
+    assert calls["n_iter"] == 250
+    assert calls["early_exaggeration_iter"] == 150
+
+
+def test_budget_override_refits_instead_of_reusing():
+    """A non-default budget must never reuse the default-budget fit (incremental
+    eligibility: the fit key carries the budget deviation)."""
+    mat = _matrix(60)
+    pb._project_tsne(mat, paths=_paths(60), config_key="cfg")
+    assert pb.tsne_fit_stats()["fit"] == 1
+
+    pb._project_tsne(
+        mat, paths=_paths(60), config_key="cfg",
+        tsne_n_iter=250, tsne_early_exaggeration_iter=150,
+        tsne_key_suffix="n250|e150",
+    )
+    stats = pb.tsne_fit_stats()
+    assert stats["fit"] == 2
+    assert stats["reuse"] == 0
+
+    # The default budget still reuses the original fit.
+    pb._project_tsne(mat, paths=_paths(60), config_key="cfg")
+    assert pb.tsne_fit_stats()["reuse"] == 1
+
+
 def test_disk_fit_not_written_for_jacobian_fits():
     """The Jacobian's throwaway fits must not touch the persisted blob."""
     store = _FakeFitStore()

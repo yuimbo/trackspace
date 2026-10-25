@@ -20,7 +20,13 @@ import {
 import { toast } from "../lib/toast";
 import { clusterColor } from "../lib/colors";
 import { phaseLabel } from "../lib/pipeline";
-import { stepColorMode, type ColorMode } from "../lib/lenses";
+import {
+  stepColorMode,
+  type ColorMode,
+  GENRE_FULL_LENS,
+  GENRE_FULL_SOURCES,
+  GENRE_FULL_WEIGHTS,
+} from "../lib/lenses";
 import { api, postJSON } from "../lib/api";
 import { clamp, confirmAction } from "../lib/util";
 import { CoalescedTask, SseSubscription } from "../lib/async";
@@ -43,6 +49,12 @@ export interface AnalysisDeps {
   applyApproximateWeights?(weights: Record<string, number>): boolean;
   /** Fetch the source-weight Jacobian the approximation needs (optional). */
   fetchWeightJacobian?(): void;
+  /** Drop the cached Jacobian (the applied baseline changed) (optional). */
+  invalidateWeightJacobian?(): void;
+  /** Restore the exact applied-baseline layout from the local cache, no HTTP
+   *  round-trip (optional). Returns false on a cache miss so the caller can
+   *  fall back to a refetch. */
+  restoreExactWeightBaseline?(): boolean;
   /** The head panel, so the queue can disable Train while a run is queued. */
   head?: {
     syncTrainEnabled(disabled: boolean): void;
@@ -71,6 +83,12 @@ interface ClusterResponse {
   modularity?: number | null;
   /** Sources that actually contributed vectors (nonzero weight + cached rows). */
   sources_used?: string[];
+  /**
+   * The source weights the server actually clustered with. This reflects the
+   * active recipe (a genre_full profile zeroes the non-genre sources), so the
+   * note must trust it rather than the default slider vector.
+   */
+  weights?: Record<string, number>;
 }
 
 /** Shape of ``GET /api/supervised/predictions``. */
@@ -148,6 +166,21 @@ export class AnalysisCoordinator {
   private _predictionsFetch = new CoalescedTask(() => this._fetchFolderPredictions());
   /** Supervise jobs outstanding at the previous status poll, to spot a finish. */
   private _prevSuperviseOutstanding: number | null = null;
+  /** True while the on-screen positions are an approximate genre-draft preview.
+   *  Reset/applying restores the exact baseline, clearing it. Used to keep the
+   *  draft note truthful: when a preview is already held, a later failed
+   *  approximation must not claim the positions are exact. */
+  private _genrePreviewHeld = false;
+  /** True while a genre Apply's cluster rebuild is in flight. Disables the genre
+   *  controls for the duration so no second Apply can race it (the queue's single
+   *  ``"library"`` dedupe key would coalesce, and a late response could otherwise
+   *  overwrite a newer Apply's committed vector). */
+  private _genreApplying = false;
+  /** True when the server applied a genre vector but the exact refit failed: the
+   *  applied vector is retained (never rolled back), but the map is not known to
+   *  be exact until a later refresh lands. Keeps the note truthful and Apply armed
+   *  for a retry. */
+  private _genreRefitFailed = false;
 
   constructor(private deps: AnalysisDeps) {}
 
@@ -223,6 +256,8 @@ export class AnalysisCoordinator {
     }
 
     this._renderWeightSliders();
+    this._renderGenreWeightSliders();
+    this._bindGenreWeightActions();
 
     // Fetch the Jacobian when the panel is opened, not on every drag: it costs
     // one projection per source, so it must be computed once and then applied
@@ -312,6 +347,18 @@ export class AnalysisCoordinator {
         "/api/embeddings/status?folder=&recursive=1",
       );
       this._renderCoverage(d);
+      // Remember per-source coverage so the genre weight sliders can flag a
+      // source the server has off (or with no cached vectors), then re-render
+      // them with that availability. MERT's gate is the same row's presence.
+      this.deps.model.coverageSources = (d.sources ?? []).map((s) => ({
+        id: s.id,
+        done: s.done,
+        pending: s.pending,
+      }));
+      this.deps.model.mertEnabled = (d.sources ?? []).some(
+        (s) => s.id === "mert_l19",
+      );
+      this._renderGenreWeightSliders();
     } catch {
       /* transient; the next drain refreshes it */
     }
@@ -559,8 +606,33 @@ export class AnalysisCoordinator {
   private _renderWeightSliders(): void {
     const host = document.getElementById("cluster-weights");
     if (!host) return;
+    const m = this.deps.model;
+    this._buildWeightSliders(host, Object.keys(DEFAULT_CLUSTER_WEIGHTS), {
+      read: (source) => m.clusterWeights[source] ?? 0,
+      onInput: (weights) => this.deps.applyApproximateWeights?.(weights),
+    });
+  }
+
+  /**
+   * Build a source-weight slider block (rows + readout + drag handler). The single
+   * implementation shared by the legacy Combined-map panel (`#cluster-weights`)
+   * and the Genre map preview (`#genre-weights`), so the widget logic lives once.
+   * ``read`` supplies each slider's starting value; ``onInput`` receives the full
+   * clamped vector whenever a handle moves.
+   */
+  private _buildWeightSliders(
+    host: HTMLElement,
+    sources: readonly string[],
+    opts: {
+      read(source: string): number;
+      onInput(weights: Record<string, number>): void;
+      /** Optional per-source availability; an unavailable source's slider is
+       *  disabled (the server has its stage off, or no cached vectors yet). */
+      available?(source: string): boolean;
+    },
+  ): void {
     host.replaceChildren();
-    for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
+    for (const source of sources) {
       const row = document.createElement("label");
       row.className = "cluster-weight-row";
 
@@ -574,7 +646,7 @@ export class AnalysisCoordinator {
       input.max = "1";
       input.step = "0.05";
       input.dataset.source = source;
-      input.value = String(this.deps.model.clusterWeights[source] ?? 0);
+      input.value = String(opts.read(source));
       input.title =
         CLUSTER_WEIGHT_DESCRIPTIONS[source] ??
         `Relative influence of the ${source} source`;
@@ -583,44 +655,83 @@ export class AnalysisCoordinator {
       value.className = "cluster-weight-value";
       value.textContent = formatSourceWeight(input.valueAsNumber);
 
-      input.addEventListener("input", () => {
-        value.textContent = formatSourceWeight(input.valueAsNumber);
-        // Approximate the layout live; the full re-cluster + refit waits for
-        // Apply, so dragging never blocks on the expensive path.
-        this.deps.applyApproximateWeights?.(this._readWeightSliders());
-      });
-
-      row.append(name, input, value);
+      if (opts.available && !opts.available(source)) {
+        // Unavailable: the source cannot contribute right now (server stage off,
+        // or no cached vectors yet). Keep its canonical weight — never silently
+        // rewrite it — but disable the slider so a drag cannot imply it works.
+        input.disabled = true;
+        input.title = `${name.textContent} is unavailable — its stage is off or it has no cached vectors yet`;
+        row.classList.add("unavailable");
+        const note = document.createElement("span");
+        note.className = "cluster-weight-unavailable";
+        note.textContent = "pending";
+        row.append(name, input, value, note);
+      } else {
+        input.addEventListener("input", () => {
+          value.textContent = formatSourceWeight(input.valueAsNumber);
+          // Approximate the layout live; the full re-cluster + refit waits for
+          // Apply, so dragging never blocks on the expensive path.
+          opts.onInput(this._readSliderHost(host, sources, opts));
+        });
+        row.append(name, input, value);
+      }
       host.appendChild(row);
+    }
+  }
+
+  /** Read a slider block's live values into a complete weight map. */
+  private _readSliderHost(
+    host: HTMLElement,
+    sources: readonly string[],
+    opts: { read(source: string): number },
+  ): Record<string, number> {
+    const weights: Record<string, number> = {};
+    for (const source of sources) {
+      const input = host.querySelector<HTMLInputElement>(
+        `input[data-source="${source}"]`,
+      );
+      weights[source] = input
+        ? clamp(input.valueAsNumber, 0, 1)
+        : opts.read(source);
+    }
+    return weights;
+  }
+
+  /** Mirror a weight vector onto a slider block's inputs (e.g. after Reset). */
+  private _syncSliderHost(
+    host: HTMLElement | null,
+    sources: readonly string[],
+    vector: Record<string, number>,
+  ): void {
+    if (!host) return;
+    for (const source of sources) {
+      const input = host.querySelector<HTMLInputElement>(
+        `input[data-source="${source}"]`,
+      );
+      if (input) input.value = String(vector[source] ?? 0);
+      const readout = input?.nextElementSibling;
+      if (readout) readout.textContent = formatSourceWeight(vector[source] ?? 0);
     }
   }
 
   /** Mirror the model's weight vector onto the sliders (e.g. after Reset). */
   private _syncWeightSliders(): void {
-    const w = this.deps.model.clusterWeights;
-    for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
-      const input = document.querySelector<HTMLInputElement>(
-        `#cluster-weights input[data-source="${source}"]`,
-      );
-      if (input) input.value = String(w[source] ?? 0);
-      const readout = input?.nextElementSibling;
-      if (readout) readout.textContent = formatSourceWeight(w[source] ?? 0);
-    }
+    this._syncSliderHost(
+      document.getElementById("cluster-weights"),
+      Object.keys(DEFAULT_CLUSTER_WEIGHTS),
+      this.deps.model.clusterWeights,
+    );
   }
 
   /** Read the live slider values into a complete weight map. */
   private _readWeightSliders(): Record<string, number> {
     const m = this.deps.model;
-    const weights: Record<string, number> = {};
-    for (const source of Object.keys(DEFAULT_CLUSTER_WEIGHTS)) {
-      const input = document.querySelector<HTMLInputElement>(
-        `#cluster-weights input[data-source="${source}"]`,
-      );
-      weights[source] = input
-        ? clamp(input.valueAsNumber, 0, 1)
-        : m.clusterWeights[source] ?? 0;
-    }
-    return weights;
+    const host = document.getElementById("cluster-weights");
+    return this._readSliderHost(
+      host ?? document.body,
+      Object.keys(DEFAULT_CLUSTER_WEIGHTS),
+      { read: (s) => m.clusterWeights[s] ?? 0 },
+    );
   }
 
   /** Read the live slider values into the model and re-cluster + re-layout. */
@@ -643,6 +754,254 @@ export class AnalysisCoordinator {
     } catch {
       /* api() already toasted */
     }
+  }
+
+  /* ── Genre map weights (view-options draft/apply) ──────────
+   * The genre recipe's seven tunable sources preview through the Jacobian while
+   * dragging; only Apply commits the vector (persist + cluster rebuild + exact
+   * refit). A draft is never written to disk and never triggers a request on its
+   * own — it is a live preview anchored at the applied baseline. */
+
+  private _genreSliderHost(): HTMLElement | null {
+    return document.getElementById("genre-weights");
+  }
+
+  private _currentGenreWeights(): Record<string, number> {
+    const m = this.deps.model;
+    return m.genreDraft ?? m.genreWeights;
+  }
+
+  /** Build the genre weight sliders in view-options (reuses the shared builder). */
+  private _renderGenreWeightSliders(): void {
+    const host = this._genreSliderHost();
+    if (!host) return;
+    this._buildWeightSliders(host, GENRE_FULL_SOURCES, {
+      read: (source) => this._currentGenreWeights()[source] ?? 0,
+      onInput: (weights) => this._onGenreDraft(weights),
+      available: (source) => this._genreSourceAvailable(source),
+    });
+  }
+
+  /** Whether a genre contributor's slider should be enabled.
+   *
+   *  A slider is disabled only when the server explicitly has that source's stage
+   *  off (MERT, layer-7) or there are no cached vectors for it yet — dragging an
+   *  unavailable source could not change the map. A source at weight 0 is NOT
+   *  disabled: with a Jacobian available it can always be dragged up.
+   */
+  private _genreSourceAvailable(source: string): boolean {
+    const m = this.deps.model;
+    if (source === "mert_l19") return m.mertEnabled;
+    if (source === "maest_layer7") return m.genreFullEnabled;
+    // maest_logits and maest share one cache source ("maest").
+    const rowId = source === "maest_logits" ? "maest" : source;
+    const row = m.coverageSources.find((s) => s.id === rowId);
+    // No coverage polled yet: stay optimistic rather than disabling on a guess.
+    if (!row) return true;
+    return row.done > 0;
+  }
+
+  /** Wire the genre Apply / Reset / Defaults actions. */
+  private _bindGenreWeightActions(): void {
+    const $apply = document.getElementById("btn-genre-apply");
+    if ($apply) {
+      $apply.addEventListener("click", () => void this._applyGenreWeights());
+    }
+    const $reset = document.getElementById("btn-genre-reset");
+    if ($reset) {
+      $reset.addEventListener("click", () => this._resetGenreWeights());
+    }
+    const $defaults = document.getElementById("btn-genre-defaults");
+    if ($defaults) {
+      $defaults.addEventListener("click", () => this._defaultsGenreDraft());
+    }
+    this._syncGenreDraftUI(false);
+  }
+
+  /** Mirror the current applied/draft vector onto the genre sliders. */
+  private _syncGenreSliders(): void {
+    this._syncSliderHost(
+      this._genreSliderHost(),
+      GENRE_FULL_SOURCES,
+      this._currentGenreWeights(),
+    );
+  }
+
+  /** A genre slider moved: preview via the Jacobian, never save or request. */
+  private _onGenreDraft(weights: Record<string, number>): void {
+    const m = this.deps.model;
+    m.genreDraft = { ...weights };
+    // A fresh preview supersedes any earlier refit-failed state.
+    this._genreRefitFailed = false;
+    // Only a real Jacobian preview moves the dots; without one the exact applied
+    // positions are held (never faked).
+    const previewed = this.deps.applyApproximateWeights?.(weights) ?? false;
+    // A held preview makes the on-screen positions approximate; record it so a
+    // later failed approximation cannot claim the map is still exact.
+    if (previewed) this._genrePreviewHeld = true;
+    this._syncGenreDraftUI(previewed);
+  }
+
+  /** Commit a normalized genre vector: persist, rebuild clusters, exact refit.
+   *
+   *  Coherence: the cluster rebuild is awaited BEFORE anything is committed
+   *  locally, so a failed post leaves the applied vector, the draft and its
+   *  preview exactly as they were (nothing was applied server-side). Only a
+   *  successful rebuild commits the vector, persists it, and clears the draft. If
+   *  the subsequent exact refit fails, the committed vector is retained (the
+   *  server did apply it) but the map is labelled refit-pending rather than
+   *  claimed exact. The controls are disabled for the duration, serialising Apply
+   *  against the queue's single dedupe key. */
+  private async _applyGenreWeights(): Promise<void> {
+    const m = this.deps.model;
+    if (this._genreApplying) return;
+    const applied = this._normalizeGenreWeights(this._currentGenreWeights());
+    if (!applied) {
+      toast("Genre weights must include a nonzero source", "warn");
+      return;
+    }
+    this._genreApplying = true;
+    this._setGenreControlsDisabled(true);
+    try {
+      await postJSON("/api/clusters/rebuild", {
+        recipe: "genre_full",
+        weights: applied,
+      });
+      // The server applied the vector — commit it locally now.
+      m.genreWeights = { ...applied };
+      m.genreDraft = null;
+      this._genrePreviewHeld = false;
+      this._genreRefitFailed = false;
+      m.saveLS();
+      // The applied baseline moved, so any cached Jacobian is stale; the exact
+      // refit below then re-bases it.
+      this.deps.invalidateWeightJacobian?.();
+      this._syncGenreSliders();
+      this._syncGenreDraftUI(false);
+      toast("Re-clustering with new genre weights…", "ok");
+      try {
+        // Exact refit at the new vector, then re-base the Jacobian there.
+        await this.deps.refreshProjection?.();
+        this.deps.fetchWeightJacobian?.();
+      } catch {
+        // The server applied the vector but the exact refit failed: retain the
+        // applied vector (never roll the server back), but never claim the map is
+        // exact — label it pending and make retry actionable.
+        this._genreRefitFailed = true;
+        this._syncGenreSliders();
+        this._syncGenreDraftUI(false);
+        toast(
+          "Genre weights applied, but the map refit failed — press Apply to retry",
+          "error",
+        );
+      }
+    } catch {
+      // The cluster rebuild failed server-side: the applied vector, the draft and
+      // its preview are left intact, and the note keeps reading "not applied".
+      // postJSON already toasted the underlying error; add a clear state message
+      // so it is obvious nothing was applied.
+      toast("Genre weights not applied — cluster rebuild failed", "error");
+    } finally {
+      this._genreApplying = false;
+      this._setGenreControlsDisabled(false);
+      this._syncGenreDraftUI(this._genrePreviewHeld);
+    }
+  }
+
+  /** Disable/enable every genre control while an Apply is in flight (serial). */
+  private _setGenreControlsDisabled(disabled: boolean): void {
+    for (const id of [
+      "btn-genre-apply",
+      "btn-genre-reset",
+      "btn-genre-defaults",
+    ]) {
+      const el = document.getElementById(id) as HTMLButtonElement | null;
+      if (el) el.disabled = disabled;
+    }
+    const host = this._genreSliderHost();
+    if (host) {
+      for (const input of host.querySelectorAll<HTMLInputElement>(
+        "input[type='range']",
+      )) {
+        input.disabled = disabled;
+      }
+    }
+  }
+
+  /** Cancel a draft: snap the sliders back to the applied vector and restore the
+   *  baseline exact layout. No server round-trip: the applied layout is already
+   *  cached, so ``restoreExactWeightBaseline`` restores it locally; only a cache
+   *  miss falls back to a refetch (still cheap). */
+  private _resetGenreWeights(): void {
+    const m = this.deps.model;
+    m.genreDraft = null;
+    this._genrePreviewHeld = false;
+    this._genreRefitFailed = false;
+    this._syncGenreSliders();
+    const previewed = this.deps.applyApproximateWeights?.(m.genreWeights) ?? false;
+    if (!previewed) {
+      // No Jacobian to step back to the baseline: the exact applied positions are
+      // the applied layout, cached locally (no HTTP). A cache miss refetches.
+      if (!(this.deps.restoreExactWeightBaseline?.() ?? false)) {
+        void this.deps.refreshProjection?.();
+      }
+    }
+    this._syncGenreDraftUI(false);
+  }
+
+  /** Load the recipe defaults as a draft (shows as draft until Apply commits). */
+  private _defaultsGenreDraft(): void {
+    const m = this.deps.model;
+    m.genreDraft = { ...GENRE_FULL_WEIGHTS };
+    this._genreRefitFailed = false;
+    this._syncGenreSliders();
+    const previewed = this.deps.applyApproximateWeights?.(m.genreDraft) ?? false;
+    if (previewed) this._genrePreviewHeld = true;
+    this._syncGenreDraftUI(previewed);
+  }
+
+  /** Normalise a draft to a finite, nonnegative, nonzero vector (or null if all-zero). */
+  private _normalizeGenreWeights(
+    raw: Record<string, number>,
+  ): Record<string, number> | null {
+    let sum = 0;
+    const out: Record<string, number> = {};
+    for (const key of GENRE_FULL_SOURCES) {
+      const n = Number(raw[key]);
+      const v = Number.isFinite(n) ? clamp(n, 0, 1) : 0;
+      out[key] = v;
+      sum += v;
+    }
+    return sum > 1e-9 ? out : null;
+  }
+
+  /** Reflect draft state on the genre controls: draft note + Apply/Cancel enabled. */
+  private _syncGenreDraftUI(previewed = true): void {
+    const m = this.deps.model;
+    const draft = m.genreDraft != null;
+    const note = document.getElementById("genre-weights-note");
+    if (note) {
+      note.textContent = this._genreRefitFailed
+        ? "Applied — refit pending; positions not exact yet. Press Apply to retry."
+        : draft
+          ? previewed
+            ? "Draft — not applied yet"
+            : // A preview is already held on screen: the positions are NOT exact, so
+              // do not claim they are. Only say "exact positions held" when the map
+              // really is still the applied baseline.
+              this._genrePreviewHeld
+              ? "Draft — preview unavailable"
+              : "Draft — preview unavailable; exact positions held"
+          : "";
+    }
+    const setDisabled = (id: string, disabled: boolean) => {
+      const el = document.getElementById(id) as HTMLButtonElement | null;
+      if (el) el.disabled = disabled;
+    };
+    // A pending refit keeps Apply armed so the user can retry; the vector is
+    // committed (no draft to cancel), so Reset stays off.
+    setDisabled("btn-genre-apply", this._genreRefitFailed ? false : !draft);
+    setDisabled("btn-genre-reset", !draft);
   }
 
   /** Disable Apply while a cluster job is outstanding: the queue's single
@@ -772,11 +1131,24 @@ export class AnalysisCoordinator {
       "cluster-resolution-range",
     ) as HTMLInputElement | null;
     if ($cr) $cr.disabled = !available;
+    // The genre weight preview is a view option shown only for the genre map.
+    const $genre = document.getElementById("genre-weights-fold");
+    if ($genre) {
+      $genre.classList.toggle(
+        "hidden",
+        !(m.genreFullEnabled && m.lens().id === GENRE_FULL_LENS.id),
+      );
+    }
     // The confident-only gate is a view option: it only exists while the
     // predicted-folder colour mode is active. The panel shows whenever it has at
     // least one visible option, so future options need no extra wiring here.
     const $fold = document.getElementById("head-confident-fold");
     if ($fold) $fold.classList.toggle("hidden", m.colorMode !== "head");
+    // The t-SNE iteration budget is a view option shown only for a projection lens.
+    const $tsneFold = document.getElementById("tsne-iteration-fold");
+    if ($tsneFold) {
+      $tsneFold.classList.toggle("hidden", m.lens().kind !== "projection");
+    }
     const $opts = document.getElementById("view-options");
     if ($opts) {
       const anyVisible = [...$opts.querySelectorAll(".view-option")].some(
@@ -1016,8 +1388,12 @@ export class AnalysisCoordinator {
       return;
     }
     const used = new Set(d.sources_used ?? []);
-    const requested = this.deps.model.clusterWeights;
-    const dropped = Object.keys(DEFAULT_CLUSTER_WEIGHTS).filter(
+    // Trust the server's actual weights, falling back to the requested slider
+    // vector when the payload omits them. A genre_full profile zeroes the
+    // non-genre sources, so the note must not claim "Rhythm has no cached
+    // vectors" for a cluster that deliberately ignored rhythm.
+    const requested = d.weights ?? this.deps.model.clusterWeights;
+    const dropped = Object.keys(requested).filter(
       (s) => (requested[s] ?? 0) > 0 && !used.has(s),
     );
     note.textContent = dropped.length

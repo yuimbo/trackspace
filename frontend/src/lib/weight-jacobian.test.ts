@@ -26,6 +26,7 @@ const jac = (): WeightJacobian => ({
       { dx: 0.0, dy: 0.0 },
     ],
   },
+  revision: "rev-1",
 });
 
 // A 3-D fixture: base positions carry z and the deltas a dz component.
@@ -48,6 +49,7 @@ const jac3d = (): WeightJacobian => ({
       { dx: 0.0, dy: 0.0, dz: 0.0 },
     ],
   },
+  revision: "rev-1",
 });
 
 describe("parseWeightJacobian", () => {
@@ -56,11 +58,22 @@ describe("parseWeightJacobian", () => {
       positions: [{ path: "a.mp3", x: 0.2, y: 0.3 }],
       weights: { maest: 0.5 },
       jacobian: { maest: [[0.1, -0.1]] },
+      revision: "rev-9",
     });
     expect(parsed).not.toBeNull();
     expect(parsed!.paths).toEqual(["a.mp3"]);
     expect(parsed!.base).toEqual([{ x: 0.2, y: 0.3 }]);
     expect(parsed!.jacobian.maest[0]).toEqual({ dx: 0.1, dy: -0.1 });
+    expect(parsed!.revision).toBe("rev-9");
+  });
+
+  it("defaults an absent revision to empty", () => {
+    const parsed = parseWeightJacobian({
+      positions: [{ path: "a.mp3", x: 0.2, y: 0.3 }],
+      weights: { maest: 0.5 },
+      jacobian: { maest: [[0.1, -0.1]] },
+    });
+    expect(parsed!.revision).toBe("");
   });
 
   it("keeps z and dz for a 3-D payload", () => {
@@ -88,6 +101,27 @@ describe("parseWeightJacobian", () => {
     expect(parseWeightJacobian(null)).toBeNull();
     expect(parseWeightJacobian({ positions: [] })).toBeNull();
     expect(parseWeightJacobian({ jacobian: {} })).toBeNull();
+  });
+
+  it("accepts an empty Jacobian (preview unavailable) and holds the exact base", () => {
+    // The 3-D no-landmark path returns the exact base layout with an empty
+    // per-source Jacobian: parsing succeeds and a drag holds the base positions.
+    const parsed = parseWeightJacobian({
+      positions: [
+        { path: "a.mp3", x: 0.0, y: 0.0, z: 0.0 },
+        { path: "b.mp3", x: 1.0, y: 1.0, z: 1.0 },
+      ],
+      weights: { maest: 0.5 },
+      jacobian: {},
+      revision: "rev-1",
+    });
+    expect(parsed).not.toBeNull();
+    expect(parsed!.jacobian).toEqual({});
+    // The base already spans the [0,1] frame, so renormalisation is a no-op and
+    // a drag leaves every track exactly where the server placed it.
+    const out = approximatePositions(parsed!, { maest: 0.7 });
+    expect(out.get("a.mp3")).toEqual({ x: 0, y: 0, z: 0 });
+    expect(out.get("b.mp3")).toEqual({ x: 1, y: 1, z: 1 });
   });
 });
 

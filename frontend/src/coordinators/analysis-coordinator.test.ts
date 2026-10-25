@@ -84,6 +84,13 @@ const PANEL_HTML = `
     <div id="head-confident-fold" class="view-option hidden">
       <input type="checkbox" id="head-color-confident" />
     </div>
+    <div id="genre-weights-fold" class="view-option hidden">
+      <div id="genre-weights"></div>
+      <p id="genre-weights-note"></p>
+      <button id="btn-genre-apply"></button>
+      <button id="btn-genre-reset"></button>
+      <button id="btn-genre-defaults"></button>
+    </div>
   </div>
   <input id="cluster-resolution-range" type="range" />
   <div id="cluster-weights"></div>
@@ -112,6 +119,8 @@ interface Harness {
   scheduleDraw: ReturnType<typeof vi.fn>;
   refreshProjection: ReturnType<typeof vi.fn>;
   applyApproximateWeights: ReturnType<typeof vi.fn>;
+  invalidateWeightJacobian: ReturnType<typeof vi.fn>;
+  restoreExactWeightBaseline: ReturnType<typeof vi.fn>;
   canvas: {
     hoverTarget: HoverTarget | null;
   };
@@ -129,6 +138,8 @@ function makeHarness(
   const scheduleDraw = vi.fn();
   const refreshProjection = vi.fn();
   const applyApproximateWeights = vi.fn(() => true);
+  const invalidateWeightJacobian = vi.fn();
+  const restoreExactWeightBaseline = vi.fn(() => true);
   const canvas = {
     hoverTarget: null as HoverTarget | null,
   };
@@ -139,6 +150,8 @@ function makeHarness(
     canvas,
     refreshProjection,
     applyApproximateWeights,
+    invalidateWeightJacobian,
+    restoreExactWeightBaseline,
     head,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
@@ -151,9 +164,11 @@ function makeHarness(
     scheduleDraw,
     refreshProjection,
     applyApproximateWeights,
+    invalidateWeightJacobian,
     canvas,
     coord,
     fetchSpy,
+    restoreExactWeightBaseline,
   };
 }
 
@@ -816,6 +831,282 @@ describe("AnalysisCoordinator panel bindings", () => {
     );
     expect(post).toBeDefined();
   });
+
+  it("is hidden until the server enables genre_full", () => {
+    const { model, coord } = makeHarness();
+    coord.bindPanel();
+    const $fold = document.getElementById("genre-weights-fold")!;
+    expect($fold.classList.contains("hidden")).toBe(true);
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    coord["_syncColorControls"]();
+    expect($fold.classList.contains("hidden")).toBe(false);
+  });
+
+  it("applies genre weights as a draft, posting the recipe + vector on Apply", async () => {
+    const {
+      model,
+      coord,
+      fetchSpy,
+      refreshProjection,
+      invalidateWeightJacobian,
+    } = makeHarness();
+    coord.bindPanel();
+    const $rhythm = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='rhythm']",
+    )!;
+    $rhythm.value = "0.3";
+    $rhythm.dispatchEvent(new Event("input"));
+    // A live drag only drafts + previews — it never writes disk or the server.
+    expect(model.genreDraft?.rhythm).toBe(0.3);
+    expect(model.genreWeights.rhythm).toBe(0);
+    expect(didRebuild(fetchSpy)).toBe(false);
+
+    document.getElementById("btn-genre-apply")!.click();
+    await flush();
+
+    const expected = { ...model.genreWeights, rhythm: 0.3 };
+    expect(rebuildBody(fetchSpy)).toEqual({
+      recipe: "genre_full",
+      weights: expected,
+    });
+    expect(model.genreWeights.rhythm).toBe(0.3);
+    expect(model.genreDraft).toBeNull();
+    expect(refreshProjection).toHaveBeenCalled();
+    // The applied baseline moved, so the cached Jacobian was invalidated.
+    expect(invalidateWeightJacobian).toHaveBeenCalled();
+  });
+
+  it("leaves the applied vector and draft intact when the cluster rebuild fails", async () => {
+    const { model, coord, fetchSpy, refreshProjection, invalidateWeightJacobian } =
+      makeHarness((url) => {
+        // The harness always marks responses ok, so a network failure is a throw.
+        if (url === "/api/clusters/rebuild") throw new Error("boom");
+        return {};
+      });
+    const original = { ...model.genreWeights };
+    coord.bindPanel();
+    const $rhythm = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='rhythm']",
+    )!;
+    $rhythm.value = "0.3";
+    $rhythm.dispatchEvent(new Event("input"));
+    document.getElementById("btn-genre-apply")!.click();
+    await flush();
+
+    // Nothing was applied server-side, so nothing is committed locally or
+    // persisted: the applied vector and the live draft are both unchanged.
+    expect(model.genreWeights).toEqual(original);
+    expect(model.genreDraft?.rhythm).toBe(0.3);
+    expect(invalidateWeightJacobian).not.toHaveBeenCalled();
+    expect(refreshProjection).not.toHaveBeenCalled();
+    // The draft note still reads "not applied".
+    expect(document.getElementById("genre-weights-note")!.textContent).toContain(
+      "not applied",
+    );
+    expect(toast).toHaveBeenCalledWith(
+      expect.stringMatching(/not applied/i),
+      "error",
+    );
+  });
+
+  it("surfaces an exact-refit failure after the vector was applied server-side", async () => {
+    const { model, coord, refreshProjection, invalidateWeightJacobian } = makeHarness();
+    // The cluster rebuild succeeds; the exact projection refit fails.
+    refreshProjection.mockRejectedValue(new Error("projection down"));
+    coord.bindPanel();
+    const $rhythm = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='rhythm']",
+    )!;
+    $rhythm.value = "0.3";
+    $rhythm.dispatchEvent(new Event("input"));
+    document.getElementById("btn-genre-apply")!.click();
+    await flush();
+
+    // The server applied the vector, so it is committed and persisted...
+    expect(model.genreWeights.rhythm).toBe(0.3);
+    expect(model.genreDraft).toBeNull();
+    expect(invalidateWeightJacobian).toHaveBeenCalled();
+    // ...but the refit failure is surfaced (toast + note), not silently swallowed,
+    // and the note never claims the positions are exact.
+    expect(toast).toHaveBeenCalledWith(
+      expect.stringMatching(/refit/i),
+      "error",
+    );
+    const note = document.getElementById("genre-weights-note")!.textContent;
+    expect(note).toContain("refit");
+    expect(note).toContain("not exact");
+  });
+
+  it("rejects an all-zero genre vector and keeps the draft", async () => {
+    const { model, coord, fetchSpy } = makeHarness();
+    coord.bindPanel();
+    const inputs = document.querySelectorAll<HTMLInputElement>(
+      "#genre-weights input[type='range']",
+    );
+    for (const i of inputs) {
+      i.value = "0";
+      i.dispatchEvent(new Event("input"));
+    }
+    document.getElementById("btn-genre-apply")!.click();
+    await flush();
+    expect(didRebuild(fetchSpy)).toBe(false);
+    expect(model.genreWeights).not.toBeNull();
+  });
+
+  it("Reset cancels a genre draft back to the applied weights without a request", async () => {
+    const { model, coord, fetchSpy, applyApproximateWeights } = makeHarness();
+    model.genreWeights = { ...model.genreWeights, maest_logits: 0.5 };
+    coord.bindPanel();
+    const $maest = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='maest_logits']",
+    )!;
+    $maest.value = "0.1";
+    $maest.dispatchEvent(new Event("input"));
+    expect(model.genreDraft).not.toBeNull();
+
+    document.getElementById("btn-genre-reset")!.click();
+    await flush();
+    expect($maest.valueAsNumber).toBeCloseTo(0.5);
+    expect(model.genreDraft).toBeNull();
+    expect(applyApproximateWeights).toHaveBeenCalledWith(model.genreWeights);
+    expect(didRebuild(fetchSpy)).toBe(false);
+  });
+
+  it("Defaults loads the recipe defaults as a draft, not applied", async () => {
+    const { model, coord, fetchSpy } = makeHarness();
+    model.genreWeights = { ...model.genreWeights, rhythm: 0.5 };
+    coord.bindPanel();
+    document.getElementById("btn-genre-defaults")!.click();
+    expect(model.genreDraft?.rhythm).toBe(0);
+    expect(model.genreWeights.rhythm).toBe(0.5); // still the applied vector
+    expect(didRebuild(fetchSpy)).toBe(false);
+  });
+
+  it("Reset restores the exact baseline from the local cache when the Jacobian is unavailable", async () => {
+    const { model, coord, applyApproximateWeights, restoreExactWeightBaseline, fetchSpy } =
+      makeHarness();
+    model.genreWeights = { ...model.genreWeights, maest_logits: 0.5 };
+    coord.bindPanel();
+    const $maest = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='maest_logits']",
+    )!;
+    $maest.value = "0.1";
+    $maest.dispatchEvent(new Event("input"));
+    // The drag could not be previewed (no Jacobian): the dots never moved, but a
+    // Reset must still restore the exact applied baseline — from the cache, no HTTP.
+    applyApproximateWeights.mockReturnValue(false);
+    restoreExactWeightBaseline.mockReturnValue(true);
+    document.getElementById("btn-genre-reset")!.click();
+    expect($maest.valueAsNumber).toBeCloseTo(0.5);
+    expect(model.genreDraft).toBeNull();
+    expect(restoreExactWeightBaseline).toHaveBeenCalled();
+    expect(didRebuild(fetchSpy)).toBe(false);
+  });
+
+  it("Reset refetches when neither the Jacobian nor the cache can restore the baseline", async () => {
+    const { model, coord, applyApproximateWeights, restoreExactWeightBaseline, refreshProjection } =
+      makeHarness();
+    model.genreWeights = { ...model.genreWeights, maest_logits: 0.5 };
+    coord.bindPanel();
+    const $maest = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='maest_logits']",
+    )!;
+    $maest.value = "0.1";
+    $maest.dispatchEvent(new Event("input"));
+    applyApproximateWeights.mockReturnValue(false);
+    restoreExactWeightBaseline.mockReturnValue(false);
+    document.getElementById("btn-genre-reset")!.click();
+    expect($maest.valueAsNumber).toBeCloseTo(0.5);
+    expect(refreshProjection).toHaveBeenCalled();
+  });
+
+  it("does not claim the positions are exact when a preview is held and a drag cannot approximate", async () => {
+    const { model, coord, applyApproximateWeights } = makeHarness();
+    model.genreWeights = { ...model.genreWeights, maest_logits: 0.5 };
+    coord.bindPanel();
+    const $maest = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='maest_logits']",
+    )!;
+    // First drag previews via the Jacobian → a preview is now held on screen.
+    applyApproximateWeights.mockReturnValue(true);
+    $maest.value = "0.1";
+    $maest.dispatchEvent(new Event("input"));
+    const note = document.getElementById("genre-weights-note")!;
+    expect(note.textContent).toContain("not applied yet");
+    // A second drag cannot approximate (Jacobian lost): the note must NOT claim
+    // the (approximate) positions are exact.
+    applyApproximateWeights.mockReturnValue(false);
+    $maest.value = "0.2";
+    $maest.dispatchEvent(new Event("input"));
+    expect(note.textContent).toContain("preview unavailable");
+    expect(note.textContent).not.toContain("exact");
+  });
+
+  it("disables a genre contributor the server has off, keeping its canonical weight", async () => {
+    const { model, coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status")
+        ? {
+            tracks_total: 10,
+            tracks_with_fingerprint: 10,
+            sources: [
+              { id: "maest", label: "MAEST", done: 10, pending: 0, failed: 0 },
+              { id: "rhythm", label: "Rhythm", done: 10, pending: 0, failed: 0 },
+              { id: "clap", label: "CLAP", done: 10, pending: 0, failed: 0 },
+              { id: "supervised", label: "Supervised", done: 10, pending: 0, failed: 0 },
+              // No mert_l19 row → MERT is not enabled on this server.
+            ],
+          }
+        : {},
+    );
+    model.mertEnabled = false;
+    coord.bindPanel();
+    await coord.fetchCoverage();
+    const mert = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='mert_l19']",
+    )!;
+    expect(mert.disabled).toBe(true);
+    // The canonical weight is kept — never silently rewritten to zero.
+    expect(mert.valueAsNumber).toBeCloseTo(0.15);
+    expect(document.querySelector<HTMLElement>(".cluster-weight-unavailable")).toBeTruthy();
+    // A source with cached vectors stays enabled.
+    const maest = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='maest']",
+    )!;
+    expect(maest.disabled).toBe(false);
+  });
+
+  it("disables a contributor with no cached vectors, but not a zero-weight one that is available", async () => {
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/embeddings/status")
+        ? {
+            tracks_total: 10,
+            tracks_with_fingerprint: 10,
+            sources: [
+              { id: "maest", label: "MAEST", done: 10, pending: 0, failed: 0 },
+              { id: "rhythm", label: "Rhythm", done: 0, pending: 10, failed: 0 },
+              { id: "clap", label: "CLAP", done: 10, pending: 0, failed: 0 },
+              { id: "supervised", label: "Supervised", done: 10, pending: 0, failed: 0 },
+              { id: "mert_l19", label: "MERT L19", done: 10, pending: 0, failed: 0 },
+            ],
+          }
+        : {},
+    );
+    coord.bindPanel();
+    await coord.fetchCoverage();
+    // Rhythm has no cached vectors yet → disabled (dragging it would do nothing).
+    const rhythm = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='rhythm']",
+    )!;
+    expect(rhythm.disabled).toBe(true);
+    // clap is at its canonical zero weight but IS available → stays enabled, so a
+    // Jacobian can drag it up.
+    const clap = document.querySelector<HTMLInputElement>(
+      "#genre-weights input[data-source='clap']",
+    )!;
+    expect(clap.valueAsNumber).toBe(0);
+    expect(clap.disabled).toBe(false);
+  });
 });
 
 // ─── Source weights ────────────────────────────────────────
@@ -938,6 +1229,40 @@ describe("AnalysisCoordinator source weights", () => {
     const note = document.getElementById("cluster-weights-note")!.textContent!;
     expect(note).toContain("Rhythm");
     expect(note).not.toContain("Genre");
+  });
+
+  it("reflects the actual server weights, not the default sliders", async () => {
+    // A genre_full cluster zeroes rhythm on the server, so the note must not
+    // claim "Rhythm has no cached vectors" even though the default slider shows 0.15.
+    const { coord } = makeHarness((url) =>
+      url.startsWith("/api/clusters")
+        ? {
+            available: true,
+            revision: "r",
+            resolution: 1.5,
+            resolutions: [1.5],
+            assignments: {},
+            names: {},
+            sizes: {},
+            sources_used: ["maest_logits", "maest", "maest_layer7"],
+            weights: {
+              maest_logits: 0.4,
+              maest: 0.2,
+              maest_layer7: 0.25,
+              mert_l19: 0.15,
+              rhythm: 0,
+              clap: 0,
+              supervised: 0,
+              features: 0,
+            },
+          }
+        : {},
+    );
+    await coord.fetchClusters();
+    const note = document.getElementById("cluster-weights-note")!.textContent!;
+    expect(note).not.toContain("Rhythm");
+    // A genre source with no cached rows IS still flagged.
+    expect(note).toContain("MERT L19");
   });
 });
 

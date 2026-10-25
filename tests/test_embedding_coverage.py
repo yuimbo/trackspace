@@ -30,6 +30,52 @@ def test_coverage_payload_lists_sources_in_display_order():
     assert _source(p, "clap")["label"] == "CLAP"
 
 
+def test_coverage_genre_full_rows_gated_by_enablement():
+    """genre_full blocks appear only when their stage is wired.
+
+    maest_layer7 when genre_full is enabled; mert_l19 only when the MERT worker is
+    actually enabled (genre_full AND not --no-mert). A disabled block must not show
+    as permanently-pending.
+    """
+    maps = CachedSourceMaps(clap={"fp1": object()}, features={})
+    infos = [{"path": "a.mp3", "fingerprint": "fp1"}]
+
+    # Disabled: neither row appears.
+    p = coverage_payload(infos, maps, SourceVersions(2, 1, 1))
+    ids = [s["id"] for s in p["sources"]]
+    assert "maest_layer7" not in ids and "mert_l19" not in ids
+
+    # genre_full on but --no-mert: layer-7 shown, MERT hidden.
+    p = coverage_payload(
+        infos,
+        maps,
+        SourceVersions(2, 1, 1, maest_layer7=1, mert_l19=1),
+        genre_full_enabled=True,
+        mert_enabled=False,
+    )
+    ids = [s["id"] for s in p["sources"]]
+    assert "maest_layer7" in ids
+    assert "mert_l19" not in ids
+
+    # Both on: both shown, with presence counted.
+    maps2 = CachedSourceMaps(
+        clap={"fp1": object()},
+        features={},
+        maest_layer7={"fp1": object()},
+        mert_l19={},
+    )
+    p = coverage_payload(
+        infos,
+        maps2,
+        SourceVersions(2, 1, 1, maest_layer7=1, mert_l19=1),
+        genre_full_enabled=True,
+        mert_enabled=True,
+    )
+    assert _source(p, "maest_layer7")["done"] == 1
+    assert _source(p, "mert_l19")["done"] == 0
+    assert _source(p, "mert_l19")["pending"] == 1
+
+
 def test_coverage_payload_counts_tracks_with_duplicate_fingerprints():
     maps = CachedSourceMaps(
         clap={"fp1": object()},

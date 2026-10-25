@@ -47,6 +47,16 @@ class _FakeQueue:
         return self.stats
 
 
+class _MertStub:
+    MERT_VERSION = 1
+
+    def is_model_ready(self):
+        return False
+
+    def load_error(self):
+        return None
+
+
 def _stats(features_done: int, maest_done: int) -> dict:
     """Two jobs per kind; ``done`` grows until the kind drains."""
     return {
@@ -81,6 +91,9 @@ def _stream(client_queue: _FakeQueue, broadcaster: _FakeBroadcaster):
         enqueue_analysis=lambda **_k: {},
         job_queue=client_queue,
         maest_mod=None,
+        mert_mod=_MertStub(),
+        genre_full_enabled=False,
+        mert_enabled=False,
         rhythm_version=1,
         structure_version=1,
     )

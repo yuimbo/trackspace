@@ -286,6 +286,17 @@ Per-excerpt vectors are stored alongside the pooled pair (the `maest_excerpts`
 blob) so weak supervision can mine hard negatives and detect genre-spanning
 tracks without re-running inference.
 
+**Layer-7 is captured single-pass.** `analyze_batch` also returns a pooled
+native 2304-D `layer7` (`cat(cls, dist, patch-mean)` of block 6, one-based layer 7)
+in `MaestAnalysis`, captured by a scoped forward hook on the same full forward that
+yields embedding/logits — no second model pass. Verified against the reference
+two-pass `transformer_block=6` path: bit-exact on MPS (`tests/test_maest_rhythm.py`,
+`test_maest_layer7_parity_singlepass_vs_twopass`). This is wired into production:
+`maest_layer7` has its own cache version (written by the same MAEST job) and the
+`genre_full` recipe — now the default — consumes it. Genre is the default, so layer-7
+is captured by default; `--no-genre-full` disables it (see README → *Genre lens &
+Genre-full rebuild*).
+
 **Inference mode, and why MAEST is not compiled.** Every inference forward
 (MAEST, CLAP audio/text, the supervised head's validation and projection) runs
 under `torch.inference_mode()`, not `no_grad()`: the outputs go straight to numpy,
@@ -337,11 +348,15 @@ the selected recipe into production live in `embedding-next-steps.md` → *WS 1*
 ## Genre-space evaluation conclusions (October 2026)
 
 Recorded findings from the offline microgenre experiment. `genre_full` is the
-**user-selected** preferred recipe, but it is **not wired into production**: production
-weights are unchanged and no new encoder weights were deployed. CLAP/rhythm live outside
-this isolated genre experiment and are unaffected. The plan to adopt `genre_full` (opt-in
-recipe id, single-pass L7/MERT extraction, cache versions) is `embedding-next-steps.md`
-→ *WS 1*. Source analysis files:
+**user-selected** preferred recipe and is now the **default production recipe**: the
+frontend opens on the Genre map, layer-7 is captured single-pass, and MERT runs as an
+independent worker (see README → *Genre lens & Genre-full rebuild*). MERT stays gated:
+it needs `--trust-remote-code` (the CC-BY-NC licence is accepted by default for this
+personal project) and its weights are fetched only with `--allow-download`; the wiring
+deployed no new encoder weights and ran no MERT inference. CLAP/rhythm live outside this
+isolated genre experiment and are unaffected. The plan that adopted it is
+`embedding-next-steps.md` → *WS 1*. Source
+analysis files:
 `data/genre-space/first/directed-analysis.json` / `.md`, `layer7-performance.json`,
 `logits-ab-report/report.json`; the galleries under
 `data/layout-evaluation/genre-directed` / `genre-logits-ab`.
@@ -360,7 +375,7 @@ the two lean variants are the fallbacks if the full set is not worth its extract
 
 | id | logits | maest | layer7 | mert19 | note |
 |----|--------|-------|--------|--------|------|
-| `genre_full` | .40 | .20 | .25 | .15 | **selected by the user** (preferred visually); best subfolder point estimate; **not yet in production** |
+| `genre_full` | .40 | .20 | .25 | .15 | **selected by the user** (preferred visually); best subfolder point estimate; **now the default production recipe** |
 | `genre_without_layer7` (lean expressive) | .65 | .20 | – | .15 | layer-7 visually negligible; no extraction savings from weights alone |
 | `genre_without_mert` (MAEST-only) | .55 | .20 | .25 | – | drops MERT: fewer encoder dependencies, strong broad score |
 
@@ -391,8 +406,8 @@ tokenpool-768 (`[Ntokens, 768]`, a different pooling). MAEST has 12 blocks; bloc
 layer-7, so the final embedding is five further blocks on, then a cheap classifier head.
 Cached MPS, same 3-excerpt benchmark, 7 alternating runs (median): final-only 164.1 ms vs
 final+L7 262.9 ms — layer-7 adds ~60 % (98.8 ms) of **MAEST inference only**, not
-end-to-end pipeline cost. Extraction today runs two passes; capturing layer-7 during the
-full forward (single-pass) is the unimplemented priority that removes the overhead. Cache
+end-to-end pipeline cost. Layer-7 is captured during the full forward (single-pass), so
+that overhead no longer forces a second pass. Cache
 footprint: full compose 4615-D vs 2311-D without layer-7; layer-7 is ~9 KB pooled + 27 KB
 for 3 excerpts per track, ≈0.5 GB for 14k tracks before compression. PCA50 fit on 499 is
 9 vs 6 ms; map warm ≈0.5 s for both (a 6.25 s cold control is not comparable). Real-run

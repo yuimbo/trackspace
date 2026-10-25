@@ -5,10 +5,16 @@ the offline genre benchmark. Findings and *why* live in `audio_pipeline.md`; the
 benchmark recipe/CLI live in the README (*Offline genre benchmark*) and
 `backend/experiments/genre_space/`; **this file is where the *plans* live**.
 
-Status: the user has **selected `genre_full`** as the preferred genre-block recipe, but
-**nothing is wired into production yet** — no app-wide source-weight change has been
-made and no new encoder weights were deployed. The four plans below are ranked by
-expected value and are deliberately decoupled so WS3 can run in parallel with WS2.
+Status: the user has **selected `genre_full`** as the preferred genre-block recipe, and
+it is now the **default production recipe**. The frontend opens on the Genre map,
+layer-7 is captured single-pass in the MAEST job, and MERT runs as an independent worker,
+both default-on (README → *Genre lens & Genre-full rebuild*). `--no-genre-full` disables
+the layer-7/MERT blocks and `--no-mert` disables MERT alone; the legacy frozen recipe is
+retained internally as the `default` recipe for compatibility. **No live deployment and
+no encoder-weight download happened as part of the wiring**, and WS 1's own measurements
+(real-MERT-live parity, timing, peak RSS) are **outstanding** — see the WS 1 follow-up at
+the end of that section. The four plans below are ranked by expected value and are
+deliberately decoupled so WS3 can run in parallel with WS2.
 
 ---
 
@@ -16,22 +22,26 @@ expected value and are deliberately decoupled so WS3 can run in parallel with WS
 
 | # | Workstream | Why now | Est. (engineering) |
 |---|-----------|---------|--------------------|
-| 1 | Selected `genre_full` production adoption + single-pass L7 | User selected it; currently the only path is a two-pass, non-production extract | 2–3 days |
+| 1 | Selected `genre_full` production adoption + single-pass L7 | Now the **default** recipe (layer-7 single-pass, MERT as a gated worker); **measurements outstanding** (real-MERT-live parity, timing, peak RSS) | 2–3 days |
 | 2 | Optimize analysis / model-centric scheduler + progressive draft map | MAEST is the per-track bottleneck; coordinated-scheduler latency/fairness is unmeasured | ~3 days |
 | 3 | MuQ-MuLan audio+text evaluation vs CLAP (needs semantic UI) | Read-only research; can run in parallel with WS2 | 2–3 days |
 | 4 | Validation and reproducibility (quality/safety/performance) | Only viable where the harness already exists; **no new model grid**; playlists deferred until the product has them | 1–2 days |
 
-Estimates are engineering effort, **not** runtime-throughput promises. No plan changes
-the app-wide default source weights without explicit user approval.
+Estimates are engineering effort, **not** runtime-throughput promises. No plan changes the
+frozen legacy default source weights (`FROZEN_SOURCE_WEIGHTS` / `DEFAULT_WEIGHTS`, the
+`default` recipe) without explicit user approval.
 
 ---
 
 ## Global constraints (apply to every plan)
 
-- **No app-wide source-weight change.** The genre-block recipe is a separate,
-  opt-in recipe id; `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT_WEIGHTS` are the
-  app defaults and stay put. A genre-block budget is decided *relative to* the
-  existing sources (rhythm, CLAP, supervised), never by overwriting them.
+- **The genre recipe is the default; the frozen weights are the legacy default.**
+  `genre_full` is the app's default map recipe (logits .40 / maest .20 / layer-7 .25 /
+  MERT-L19 .15, the tunable rhythm/clap/supervised at 0, 7 contributors). The legacy
+  `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT_WEIGHTS` stay untouched and are the
+  `default` recipe (combined map) used for compatibility and when `--no-genre-full` is
+  set. A genre-block budget is decided *relative to* the genre recipe, never by
+  overwriting the frozen constants.
 - **One accelerator lock.** `clap.inference_lock` is the single process-wide
   serialisation point for every PyTorch/MLX dispatch. Do **not** define a second
   accelerator lock and do **not** add concurrent GPU dispatch from separate threads —
@@ -55,7 +65,7 @@ the app-wide default source weights without explicit user approval.
 - **Durable queue.** Per-track work returns `JobResult.failure(...)` (never raises);
   permanent errors use `retry=False`; model readiness gates on the worker, not the
   handler. Version purges revive `done` rows; only explicit retriggers revive `failed`.
-  The queue **already runs one worker per model kind** (MAEST, CLAP), each with its
+  The queue **already runs one worker per model kind** (MAEST, CLAP, MERT), each with its
   model **loaded once at startup and warmed** — resident-once is current behaviour to
   preserve, not a plan assumption.
 - **Real data stays local.** No cloud upload of audio, embeddings, or queries. Model
@@ -69,26 +79,38 @@ the app-wide default source weights without explicit user approval.
 
 # WS 1 — Selected `genre_full` production adoption + single-pass L7
 
-## Goal
+## Goal (achieved — see *Rollout status* below)
 Wire the user-selected `genre_full` recipe (logits .40 / maest .20 / layer7 .25 /
-mert19 .15) into production as an **opt-in recipe id** with each new block (layer-7,
-MERT-L19) having its own cache version, queue jobs, and GPU guard — **without changing
-the app-wide default recipe** — and make layer-7 / MERT-L19 extraction **single-pass** so
-`genre_full` stops being the ~99 ms/3-excerpt two-pass cost recorded in the benchmark.
+mert19 .15) into production as the **default recipe** with each new block (layer-7,
+MERT-L19) having its own cache version, queue jobs, and GPU guard, and make layer-7
+extraction **single-pass** so it stops being the ~99 ms/3-excerpt two-pass cost recorded
+in the benchmark. The frozen `FROZEN_SOURCE_WEIGHTS` / `DEFAULT_WEIGHTS` stay as the
+legacy `default` recipe.
+
+## Rollout status
+`genre_full` is now the **default production recipe**: the frontend opens on the Genre
+map, `maest_layer7` has its own cache version written by the same MAEST job (single-pass
+L7, bit-exact on MPS), the genre recipe id is served by default, and MERT runs as an
+independent `mert` kind/worker gated on `--trust-remote-code` (the CC-BY-NC licence is
+accepted by default for this personal project; README → *Genre lens & Genre-full
+rebuild*). `--no-genre-full` disables the layer-7/MERT blocks and `--no-mert` disables
+MERT alone. **No live deployment and no encoder-weight download happened as part of the
+wiring, and real MERT inference has not been run** — the MERT extraction path is exercised
+only against a deterministic fake mirroring the pinned `modeling_mert2.py` (see the
+follow-up in *Measurements*).
 
 ## Current verified state
-- `genre_full` is **selected by the user** as preferred; production is **not wired**.
-  The benchmark presets and measured costs are in `audio_pipeline.md` →
-  *Genre-space evaluation conclusions*.
+- `genre_full` is **selected by the user** and is now the **default production recipe**
+  (see *Rollout status* above). The benchmark presets and measured costs are in
+  `audio_pipeline.md` → *Genre-space evaluation conclusions*.
 - The user-selected `genre_full` weights (logits .40 / maest .20 / layer7 .25 /
   mert19 .15) are exactly the `genre_full` recipe already tracked in
   `backend/experiments/genre_space/scoring.py` (`maest_logits` .40, `maest` .20,
-  `maest_layer7` .25, `mert_l19` .15) — the production opt-in recipe must mirror that
+  `maest_layer7` .25, `mert_l19` .15) — the production default recipe mirrors that
   existing config, not a new set of weights.
 - Layer-7 is native 2304-D `(cls + dist + patch-mean)` at **block 6** (= one-based
-  layer 7 of 12 blocks), **not** the Essentia tokenpool-768 variant. Today extraction
-  runs **two passes**; capturing layer-7 during the MAEST full forward is the
-  unimplemented priority.
+  layer 7 of 12 blocks), **not** the Essentia tokenpool-768 variant. It is captured
+  **single-pass** during the MAEST full forward (bit-exact on MPS).
 - MAEST produces `embedding` (768), `logits` (519), `excerpt_embeddings` in one pass
   (`backend/embeddings/maest.py`, `MaestAnalysis`), cached as `maest` /
   `maest_logits` / `maest_excerpts` sharing one version column via
@@ -98,17 +120,20 @@ the app-wide default recipe** — and make layer-7 / MERT-L19 extraction **singl
   (1024-dim, `hidden_states[18]` / `[22]`); layer-7 is `maest_layer7` (2304-dim).
   Extraction is pinned to a 40-hex revision and gated on explicit
   `--trust-remote-code` / `--allow-download`.
-- No layer-7 or MERT cache columns exist yet. MERT weights are CC-BY-NC 4.0 and are
-  never auto-downloaded (benchmark uses explicit `--trust-remote-code --allow-download`).
+- `maest_layer7` and `mert_l19` now have their own cache version columns. MERT weights
+  are CC-BY-NC 4.0 and are never auto-downloaded (benchmark uses explicit
+  `--trust-remote-code --allow-download`).
 - Layer-7 gets its **own cache version column** but is produced by the **same MAEST
   forward** as the embedding/logits, so its version is **paired with / dependent on the
   MAEST checkpoint version** via a checkpoint manifest fingerprint — a checkpoint change
   must invalidate layer-7 and maest together, never one alone.
 
-## Handoff scope (opt-in vs app defaults are separate goals)
-This plan wires `genre_full` as an **opt-in recipe id** only. Promoting it to the
-**app-wide default** is a distinct, later decision that needs explicit approval — it is
-out of scope here and would change `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT_WEIGHTS`.
+## Handoff scope (resolved)
+This slice previously scoped `genre_full` to an **opt-in recipe id** only. The user has
+since **approved promoting it to the app-wide default**, which is what this change
+implements: the frontend opens on the Genre map and layer-7/MERT are default-on. The
+frozen `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT_WEIGHTS` constants are left
+unchanged and remain the `default` recipe for compatibility.
 
 ## Concrete files / interfaces
 - `backend/embeddings/maest.py` — single-pass L7 capture inside `analyze_batch`'s
@@ -125,7 +150,7 @@ out of scope here and would change `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT
 - `backend/jobs/kinds.py` — add a **`mert` kind** (MERT is a separate worker; no
   reusing the `maest` kind).
 - `backend/app.py` — worker wiring + enqueue filter for the `mert` kind.
-- `backend/embeddings/projection_config.py` — add an **opt-in** `genre_full` recipe id;
+- `backend/embeddings/projection_config.py` — add the `genre_full` recipe id;
   `FROZEN_SOURCE_WEIGHTS` unchanged. `clustering.DEFAULT_WEIGHTS` untouched.
 - `backend/embeddings/layout.py` / `clustering.py` — optional-block handling for the new
   sources in the composite gather (zero-fill) and `REQUIRED_SOURCES`.
@@ -152,11 +177,12 @@ out of scope here and would change `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT
    only** (1024-dim, `hidden_states[18]`); do not retain the 24 hidden layers or an L23
    that nothing consumes, when a safe hook can derive L19. Pinned revision, CC-BY-NC
    gate, `inference_lock`-guarded, never auto-downloaded, `--trust-remote-code` gate.
-4. **`mert_l19` cache source (own version column) + opt-in `genre_full` recipe.**
-   Registry/migration/version; the `genre_full` recipe id in `projection_config` (not
-   the default); composite gather + clustering optional-block handling; supervised input
+4. **`mert_l19` cache source (own version column) + `genre_full` recipe.**
+   Registry/migration/version; the `genre_full` recipe id in `projection_config`;
+   composite gather + clustering optional-block handling; supervised input
    decision. Wire the separate `mert` kind + worker + enqueue filter.
-5. **Rollout.** Opt-in recipe id (no replacing old data), feature-gated, version +
+5. **Rollout.** The genre recipe becomes the default (no replacing old data — the
+   legacy `default` recipe is retained for compatibility), feature-gated, version +
    checkpoint-hash purge semantics, durable jobs returning `JobResult.failure(...)`,
    old artifacts preserved and reported.
 
@@ -165,8 +191,8 @@ out of scope here and would change `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT
 - `maest_layer7` and `mert_l19` rows read/write; a version bump makes old rows **absent**
   and they recompute at the new version (tests assert old absent; other sources
   unaffected).
-- `genre_full` projects and clusters as an opt-in recipe; the default recipe and
-  app-wide weights are byte-identical to before.
+- `genre_full` projects and clusters by default; the legacy `default` recipe and its
+  weights stay byte-identical to before.
 - Coverage/status shows the new blocks; a `--no-mert`-style flag skips the `mert` kind's
   enqueue (its own kind, not a maest-stage flag).
 - Old benchmark artifacts and gallery exports are untouched.
@@ -183,25 +209,34 @@ out of scope here and would change `FROZEN_SOURCE_WEIGHTS` / `clustering.DEFAULT
   prefer keeping the head's input unchanged until the genre recipe is stable.
 
 ## Constraints
-No app-wide weight change; one `inference_lock`; CC-BY-NC gate for MERT; opt-in recipe
-id only; new blocks independent cache versions; MERT is its own kind/worker, never a
-MAEST-stage flag.
+One `inference_lock`; CC-BY-NC gate for MERT (licence accepted by default for this
+personal project; `--trust-remote-code` still required); genre is the default recipe,
+the frozen weights stay the legacy `default` recipe; new blocks independent cache
+versions; MERT is its own kind/worker, never a MAEST-stage flag.
 
-## Measurements
-- Layer-7 single-pass vs two-pass wall-clock and GPU time (the ~99 ms/3-excerpt
-  removal).
+## Measurements (outstanding)
+The wiring is in; these numbers are **not yet measured** and are not claimed as done:
+
+- **Real-MERT-live parity (highest priority).** Run the production MERT worker against
+  real weights (needs `--allow-download`) and verify L19 extraction matches the
+  `modeling_mert2.py` pin. The L19 path is currently verified only against a
+  deterministic fake mirroring that pinned source — **real MERT inference has not been
+  run**.
+- **Single-pass L7 parity/timing.** Single-pass vs two-pass is bit-exact on MPS
+  (unit-tested); measure the wall-clock/GPU-time removal (~99 ms/3-excerpt) on a real
+  run, plus peak RSS / MPS memory for the `maest_layer7` and `mert_l19` sources.
 - Cache footprint (2304-D layer-7 ~9 KB pooled + ~27 KB for 3 excerpts **total**; MERT-L19
-  1024-D per vector), peak RSS/GPU memory.
+  1024-D per vector).
 - Coverage/failure counts for the new stages.
 
 ## Rollback / feature gates
-- Opt-in recipe id means old cached data and defaults are untouched; flip an env flag
-  to disable `genre_full` / MERT.
+- The legacy `default` recipe keeps old cached data and defaults; `--no-genre-full` and
+  `--no-mert` disable the genre blocks.
 - A version bump blanks only the new sources' old rows (other sources unaffected); MERT
   download requires explicit flags.
 
-**Estimate: ~2–3 days.** Implementation is deferred until explicitly started — this
-plan is the hand-off, not the wiring.
+**Estimate: ~2–3 days.** The wiring is done; the remaining work is the *Measurements*
+above (a real-MERT-live run plus timing/peak-RSS capture).
 
 ---
 
@@ -214,8 +249,8 @@ the user's batching/scheduling ideas (fixed microbatch, bounded decode prefetch,
 model-window priority scheduling) as **measured** candidates, never assertions.
 
 ## Current verified state
-- One worker thread per job kind, **8 kinds** (`scan`, `features`, `structure`,
-  `maest`, `clap`, `supervise`, `cluster`, `layout`). Batch sizes: scan 8; features =
+- One worker thread per job kind, **9 kinds** (`scan`, `features`, `structure`,
+  `maest`, `mert`, `clap`, `supervise`, `cluster`, `layout`). Batch sizes: scan 8; features =
   `max(2, features_workers)` (default 4-process pool); structure = `max(2,
   structure_workers)` (default 4-thread pool); **MAEST batch 4** (inference
   `max_batch=12` excerpts); **CLAP batch 8** (`max_batch=24` segments); supervise /
@@ -261,7 +296,7 @@ model-window priority scheduling) as **measured** candidates, never assertions.
    is comparable. This is the gate: scheduler/batching work is only justified if the
    harness shows a real gap.
 2. **Model-centric scheduler.** A homogeneous batch scheduler reserves **one shared
-   accelerator slot across all model kinds** (MAEST, CLAP, later MERT) and runs them as
+   accelerator slot across all model kinds** (MAEST, CLAP, MERT) and runs them as
    sequential time windows with priority + fairness — selection order **phase 1:
    MAEST**, then CLAP/MERT — so it does **not** drain an entire model and leave the
    library unresponsive. Interactive queries win via the existing priority path.

@@ -49,6 +49,190 @@ def test_get_all_ignores_version_in_mem_and_filters_in_sql(tmp_path):
     assert set(fc.get_all("clap", ["a", "b"], version=2)) == {"b"}
 
 
+def test_put_maest_writes_layer7_atomically(tmp_path):
+    fc = _mk(tmp_path)
+    emb = np.arange(8, dtype=np.float32)
+    logits = np.arange(519, dtype=np.float32)
+    layer7 = np.arange(2304, dtype=np.float32)
+    # One call writes the pooled pair AND the layer-7 vector in the same row,
+    # each under its own version column (layer-7 defaults to the maest version).
+    fc.put_maest("fp", emb, logits, version=3, layer7=layer7)
+    assert fc.has("maest", "fp", version=3)
+    assert fc.has("maest_layer7", "fp", version=3)
+    got = fc.get("maest_layer7", "fp", version=3)
+    assert got is not None and got.shape == (2304,)
+    np.testing.assert_allclose(got, layer7)
+    assert fc.count("maest_layer7") == 1
+    # A distinct layer-7 version is honoured (SQL reads filter by version; the
+    # memory LRU is version-blind, so drop it to exercise the SQL path).
+    fc.put_maest(
+        "fp2", emb, logits, version=3, layer7=layer7, layer7_version=7
+    )
+    assert fc.has("maest_layer7", "fp2", version=7)
+    fc.clear_memory()
+    assert fc.has("maest_layer7", "fp2", version=3) is False
+    assert fc.has("maest_layer7", "fp2", version=7)
+
+
+def test_put_maest_without_layer7_preserves_existing(tmp_path):
+    fc = _mk(tmp_path)
+    layer7 = np.arange(2304, dtype=np.float32)
+    fc.put_maest(
+        "fp", np.ones(8, np.float32), np.ones(519, np.float32),
+        version=1, layer7=layer7,
+    )
+    # A caller with only the pooled pair must not erase a stored layer-7 vector.
+    fc.put_maest(
+        "fp", np.full(8, 2.0, np.float32), np.ones(519, np.float32), version=1
+    )
+    assert fc.has("maest_layer7", "fp", version=1)
+    np.testing.assert_allclose(fc.get("maest_layer7", "fp", version=1), layer7)
+
+
+def test_mert_l19_roundtrip(tmp_path):
+    fc = _mk(tmp_path)
+    vec = np.arange(1024, dtype=np.float32)
+    fc.put("mert_l19", "fp", vec, version=2)
+    assert fc.has("mert_l19", "fp", version=2)
+    np.testing.assert_allclose(fc.get("mert_l19", "fp", version=2), vec)
+    fc.clear_memory()
+    assert fc.has("mert_l19", "fp", version=3) is False
+
+
+_FAMILY = ("maest", "maest_logits", "maest_excerpts", "maest_layer7")
+
+
+def test_reconcile_source_fingerprint_atomic_purge(tmp_path):
+    """A family reconcile blanks all family blobs AND records the fingerprint."""
+    fc = _mk(tmp_path)
+    fc.put_maest(
+        "m", np.ones(8, np.float32), np.ones(519, np.float32),
+        version=3, layer7=np.ones(2304, np.float32),
+    )
+    fc.put("clap", "c", np.ones(4, np.float32), version=9)
+    e0 = fc.write_epoch()
+
+    assert fc.reconcile_source_fingerprint("maest_checkpoint_sha256", "sha-AAA", _FAMILY) is True
+    assert fc.get_meta("maest_checkpoint_sha256") == "sha-AAA"
+    assert fc.has("maest", "m", version=3) is False
+    assert fc.has("maest_layer7", "m", version=3) is False
+    assert fc.has("maest_logits", "m", version=3) is False
+    assert fc.has("maest_excerpts", "m", version=3) is False
+    # Unrelated block preserved; LRU evicted; epoch bumped (invalidates presence).
+    assert fc.has("clap", "c", version=9) is True
+    assert not any(
+        k.startswith(("maest:", "maestlog:", "maestexc:", "maestl7:"))
+        for k in fc._mem
+    )
+    assert fc.write_epoch() > e0
+
+    # Already matching -> no-op (no purge, no epoch bump).
+    e1 = fc.write_epoch()
+    assert fc.reconcile_source_fingerprint("maest_checkpoint_sha256", "sha-AAA", _FAMILY) is False
+    assert fc.write_epoch() == e1
+
+
+def test_reconcile_source_fingerprint_rolls_back_on_failure(tmp_path, monkeypatch):
+    """A failed reconcile leaves old rows AND the old fingerprint, epoch intact."""
+    import sqlite3
+
+    from backend.sqlite_conn import ClosingConnection
+
+    fc = _mk(tmp_path)
+    fc.put_maest("m", np.ones(8, np.float32), np.ones(519, np.float32), version=3)
+    fc.set_meta("maest_checkpoint_sha256", "old")
+    e0 = fc.write_epoch()
+
+    class _FailOnUpdate(sqlite3.Connection):
+        def execute(self, sql, params=()):
+            if sql.strip().startswith("UPDATE"):
+                raise sqlite3.OperationalError("injected reconcile failure")
+            return super().execute(sql, params)
+
+    def _failing_conn():
+        conn = sqlite3.connect(fc._db_path, factory=_FailOnUpdate)
+        conn.execute("PRAGMA busy_timeout=30000")
+        return ClosingConnection(conn)
+
+    monkeypatch.setattr(fc, "_conn", _failing_conn)
+    assert fc.reconcile_source_fingerprint("maest_checkpoint_sha256", "new", _FAMILY) is False
+    # No fingerprint recorded and no rows blanked: the transaction rolled back.
+    assert fc.get_meta("maest_checkpoint_sha256") == "old"
+    assert fc.has("maest", "m", version=3) is True
+    assert fc.write_epoch() == e0
+
+
+def test_layer7_absent_on_old_row_while_other_sources_survive(tmp_path):
+    """A pre-layer7 row (migration version absent) reads absent, unrelated kept."""
+    fc = _mk(tmp_path)
+    # Write a maest row without layer-7 (the pre-this-slice shape).
+    fc.put_maest("fp", np.ones(8, np.float32), np.ones(519, np.float32), version=1)
+    fc.put("clap", "fp", np.ones(4, np.float32), version=1)
+    # layer-7 is absent (empty blob reads as a miss) while clap is untouched.
+    assert fc.has("maest", "fp", version=1)
+    assert fc.has("maest_layer7", "fp", version=1) is False
+    assert fc.has("clap", "fp", version=1)
+    np.testing.assert_allclose(fc.get("clap", "fp", version=1), np.ones(4, np.float32))
+
+
+def test_migration_old_schema_adds_new_columns_preserving_data(tmp_path):
+    """A DB created before the genre_full columns migrates via ALTER, data intact."""
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    # Simulate the pre-genre-full schema: no maest_layer7 / mert_l19 columns.
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE audio_features ("
+            " fingerprint TEXT PRIMARY KEY,"
+            " clap_embedding BLOB NOT NULL,"
+            " version INTEGER NOT NULL DEFAULT 0,"
+            " maest_embedding BLOB, maest_logits BLOB, maest_excerpts BLOB,"
+            " maest_version INTEGER NOT NULL DEFAULT 0,"
+            " rhythm BLOB, rhythm_version INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE feature_meta (key TEXT PRIMARY KEY, value TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE fanout_journal (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " batch_id INTEGER NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL,"
+            " created_at REAL NOT NULL, undone INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE origin_folders (fingerprint TEXT PRIMARY KEY,"
+            " origin TEXT NOT NULL, recorded_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE layout_cache (revision TEXT PRIMARY KEY,"
+            " paths TEXT NOT NULL, xy BLOB NOT NULL, created_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE tsne_fit_cache (config_key TEXT PRIMARY KEY,"
+            " blob BLOB NOT NULL, created_at REAL NOT NULL)"
+        )
+
+    fc = FeatureCache(str(db))  # __init__ runs the ALTER migration
+    # Old data is preserved, and the new columns exist and are writable.
+    with fc._conn() as conn:
+        conn.execute(
+            "INSERT INTO audio_features (fingerprint, clap_embedding, maest_embedding,"
+            " maest_version, rhythm, rhythm_version) VALUES (?, ?, ?, ?, ?, ?)",
+            ("old", b"", b"\x01" * 8, 1, b"\x02" * 3, 1),
+        )
+    assert fc.has("maest", "old", version=1)
+    assert fc.has("rhythm", "old", version=1)
+    assert fc.has("maest_layer7", "old", version=1) is False
+    # Writing the new sources works after migration.
+    fc.put("mert_l19", "old", np.ones(1024, np.float32), version=1)
+    fc.put_maest(
+        "old", np.ones(8, np.float32), np.ones(519, np.float32),
+        version=1, layer7=np.ones(2304, np.float32),
+    )
+    assert fc.has("maest_layer7", "old", version=1)
+    assert fc.has("mert_l19", "old", version=1)
+
+
 def test_put_maest_writes_pair_and_count(tmp_path):
     fc = _mk(tmp_path)
     emb = np.arange(8, dtype=np.float32)

@@ -51,6 +51,39 @@ def test_raw_jacobian_matches_central_differences_of_g(dims):
         assert np.abs(jac[s] - fd).max() / (np.abs(fd).max() + 1e-12) < 1e-3
 
 
+def test_analytic_jacobian_at_zero_for_a_new_source():
+    """A source at weight 0 (a genre override you can raise) still has a Jacobian.
+
+    The analytic derivative of the frozen ``g`` is defined at w_s = 0 — it is not
+    skipped like the finite-difference fallback used to. This is the column the
+    weight slider previews when dragging a zero-weighted genre source up.
+    """
+    rng = np.random.default_rng(11)
+    n, m, dims = 64, 10, 2
+    sources = ("genre", "maest", "layer7", "mert", "rhythm", "clap", "supervised")
+    delta = {s: (rng.random((n, m)).astype(np.float32) * 4.0) for s in sources}
+    model = LandmarkModel(
+        paths=[f"t{i}.mp3" for i in range(n)],
+        sources=sources,
+        delta=delta,
+        coeffs=rng.normal(size=(m, dims)),
+        base=rng.random((n, dims)).astype(np.float32),
+        tau=1.0,
+        weights0={
+            "genre": 0.40, "maest": 0.20, "layer7": 0.25, "mert": 0.15,
+            "rhythm": 0.0, "clap": 0.0, "supervised": 0.0,
+        },
+    )
+    jac = model.jacobian(dict(model.weights0))
+    # Every source — including the zero-weight ones — has a Jacobian column.
+    assert set(jac) == set(sources)
+    for s in ("rhythm", "clap", "supervised"):
+        assert jac[s].shape == (n, dims)
+        # A genuinely informative (non-gauge) field for a zero source: raising it
+        # re-shapes the map, so its gauge-projected field is not all zero.
+        assert np.abs(jac[s]).max() > 0
+
+
 @pytest.mark.parametrize("dims", [2, 3])
 def test_remove_gauge_kills_translation_and_zoom(dims):
     """A pure offset/zoom field carries no shape change and must vanish."""

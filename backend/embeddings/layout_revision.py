@@ -37,8 +37,17 @@ def compute_layout_revision(
     sources: Sequence[str] | None = None,
     dims: int = 2,
     gauge_3d_version: int = GAUGE_3D_VERSION,
+    recipe_id: str | None = None,
+    tsne_n_iter: int | None = None,
+    tsne_early_exaggeration_iter: int | None = None,
 ) -> str:
-    """Return a hex SHA-256 of the canonical payload (lexically sorted JSON keys)."""
+    """Return a hex SHA-256 of the canonical payload (lexically sorted JSON keys).
+
+    *recipe_id* and the openTSNE iteration budget are only included when they
+    represent an opt-in deviation from the default recipe — the default recipe at
+    its default 100/100 budget omits them, so its hash is byte-identical to before
+    these parameters existed.
+    """
     payload: dict[str, Any] = {
         "cache_versions": list(cache_versions),
         "eligible_paths": sorted(eligible_paths),
@@ -55,6 +64,12 @@ def compute_layout_revision(
             str(k): f"{float(v):.6g}" for k, v in sorted((weights or {}).items())
         },
     }
+    if recipe_id:
+        payload["recipe"] = str(recipe_id)
+    if tsne_n_iter is not None:
+        payload["tsne_n_iter"] = int(tsne_n_iter)
+    if tsne_early_exaggeration_iter is not None:
+        payload["tsne_early_exaggeration_iter"] = int(tsne_early_exaggeration_iter)
     # Only the opt-in 3-D layout carries ``dims`` (and its gauge version), so 2-D
     # hashes (and the persisted 2-D cache rows they key) are byte-identical to
     # before these parameters existed.

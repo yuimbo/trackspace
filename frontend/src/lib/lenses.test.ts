@@ -3,6 +3,7 @@ import type { Track } from "../model";
 import {
   BPM_HI,
   BPM_LO,
+  availableLenses,
   bpmSpiralXY,
   camelotGuide,
   camelotPosition,
@@ -15,6 +16,10 @@ import {
   scopeLenses,
   spiralGuide,
   tempoSpiralPosition,
+  BUILTIN_LENSES,
+  GENRE_FULL_LENS,
+  GENRE_FULL_SOURCES,
+  GENRE_FULL_WEIGHTS,
 } from "./lenses";
 
 function track(over: Partial<Track> = {}): Track {
@@ -107,6 +112,83 @@ describe("lens registry", () => {
     expect(lensWaitSources(getLens("clap"))).toEqual(["clap"]);
     expect(lensWaitSources(getLens("camelot"))).toEqual(["features"]);
     expect(lensWaitSources(getLens("combined"))).toContain("maest_logits");
+  });
+
+  it("genre_full lens is absent until the server enables it", () => {
+    // With genre disabled, the legacy combined map stays as the fallback default;
+    // the single-source MAEST / Folder-head probes are gone from the cycle.
+    expect(availableLenses(false).map((l) => l.id)).not.toContain("genre_full");
+    expect(availableLenses(false).map((l) => l.id)).toEqual([
+      "tags",
+      "combined",
+      "clap",
+      "rhythm",
+      "camelot",
+      "tempo",
+    ]);
+  });
+
+  it("genre_full replaces the redundant map tabs when enabled, and the cycle reaches it", () => {
+    // Combined / MAEST / Folder-head are gone; the genre map takes the map slot.
+    const ids = availableLenses(true).map((l) => l.id);
+    expect(ids).toEqual(["tags", "genre_full", "clap", "rhythm", "camelot", "tempo"]);
+    // E from the last feature lens wraps into the genre map; back out on Shift+E.
+    expect(nextLensId("tempo", undefined, availableLenses(true))).toBe("tags");
+    expect(prevLensId("genre_full", undefined, availableLenses(true))).toBe("tags");
+    expect(nextLensId("genre_full", undefined, availableLenses(true))).toBe("clap");
+    // Cycle unchanged (no genre map) when the lens is unavailable.
+    expect(nextLensId("tempo", undefined, availableLenses(false))).toBe("tags");
+  });
+
+  it("E from a hidden legacy lens resolves to the genre map, not tags", () => {
+    // With genre enabled, a legacy map id that is no longer on the cycle (a saved
+    // preset base, or a transient active id) steps from the genre map it maps to.
+    const available = availableLenses(true);
+    expect(nextLensId("maest", undefined, available)).toBe("clap");
+    expect(nextLensId("supervised", undefined, available)).toBe("clap");
+    expect(nextLensId("combined", undefined, available)).toBe("clap");
+    // A preset's legacy base lens resolves the same way.
+    expect(nextLensId("preset:1", "combined", available)).toBe("clap");
+  });
+
+  it("genre_full resolves to its own lens with the four genre analysis sources", () => {
+    expect(getLens("genre_full")).toBe(GENRE_FULL_LENS);
+    expect(GENRE_FULL_LENS.sources).toEqual([
+      "maest_logits",
+      "maest",
+      "maest_layer7",
+      "mert_l19",
+    ]);
+  });
+
+  it("exposes the seven tunable genre sources and the canonical defaults", () => {
+    // The weight UI and the recipe ``w=`` override iterate the 7-key list; the
+    // analysis ``sources`` above stay the four blocks the map actually requires.
+    expect(GENRE_FULL_SOURCES).toEqual([
+      "maest_logits",
+      "maest",
+      "maest_layer7",
+      "mert_l19",
+      "rhythm",
+      "clap",
+      "supervised",
+    ]);
+    expect(GENRE_FULL_WEIGHTS).toMatchObject({
+      maest_logits: 0.4,
+      maest: 0.2,
+      maest_layer7: 0.25,
+      mert_l19: 0.15,
+      rhythm: 0,
+      clap: 0,
+      supervised: 0,
+    });
+  });
+
+  it("scope lenses include the genre map when enabled and the combined fallback otherwise", () => {
+    expect(scopeLenses(true).map((l) => l.id)).toContain("genre_full");
+    expect(scopeLenses(true).map((l) => l.id)).not.toContain("tags");
+    expect(scopeLenses(false).map((l) => l.id)).toContain("combined");
+    expect(scopeLenses(true).map((l) => l.id)).toContain("camelot");
   });
 });
 

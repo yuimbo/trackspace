@@ -73,6 +73,7 @@ class _FakeEmbeddings:
             "paths": [t["path"] for t in infos],
             "has_align_ref": "align_ref" in _k,
             "align_ref": _k.get("align_ref"),
+            "with_jacobian": bool(_k.get("with_jacobian")),
         })
         if self.fail_on_dims2 and dims == 2:
             raise RuntimeError("reference projection failed")
@@ -96,6 +97,17 @@ class _FakeEmbeddings:
 
 class _FakeMaest:
     MAEST_VERSION = 1
+    MAEST_LAYER7_VERSION = 1
+
+    def is_model_ready(self) -> bool:
+        return False
+
+    def load_error(self) -> None:
+        return None
+
+
+class _FakeMert:
+    MERT_VERSION = 1
 
     def is_model_ready(self) -> bool:
         return False
@@ -236,6 +248,9 @@ def client(roots, tmp_path, fake_embeddings):
         enqueue_analysis=lambda **_k: {},
         job_queue=_FakeQueue(),
         maest_mod=_FakeMaest(),
+        mert_mod=_FakeMert(),
+        genre_full_enabled=False,
+        mert_enabled=False,
         rhythm_version=1,
         structure_version=1,
     )
@@ -301,6 +316,22 @@ def test_status_empty_folder_covers_all_roots(client):
     maest = next(s for s in body["sources"] if s["id"] == "maest")
     assert maest["done"] == 0
     assert maest["pending"] == 6
+
+
+def test_status_tolerates_disabled_genre_recipe(client):
+    """A disabled server's status still answers ``recipe=genre_full``.
+
+    The frontend capability bootstrap queries the recipe so it can learn
+    ``genre_full_enabled`` (absent in the payload) and reconcile away from a genre
+    map it cannot render. Unrelated invalid args are still a 400.
+    """
+    r = client.get("/api/embeddings/status?recipe=genre_full")
+    assert r.status_code == 200
+    assert "genre_full_enabled" not in r.get_json()
+    # The status tolerance must not mask a genuinely bad request (sources= with a
+    # recipe is still rejected).
+    r2 = client.get("/api/embeddings/status?recipe=genre_full&sources=clap")
+    assert r2.status_code == 400
 
 
 def test_status_scoped_to_one_root(client):
@@ -425,17 +456,29 @@ def test_projection_dims_bogus_is_400(client):
     assert r.get_json()["error"]
 
 
-def test_projection_dims3_jacobian_returns_z_and_3d_rows(client):
-    """dims=3 serves the weight Jacobian: z positions and 3-component rows."""
+def test_projection_dims3_no_landmark_jacobian_returns_exact_and_empty(
+    fake_embeddings, client, monkeypatch
+):
+    """3-D without a landmark chart returns the exact base layout with an empty
+    Jacobian (weight-drag preview unavailable) instead of the 7 per-source Jacobian
+    refits. The empty feature cache means no landmark chart can fit, so the route
+    must NOT fall back to the per-source compute_projection refit."""
+    from backend.embeddings import landmark_projection as landmark_mod
+
+    monkeypatch.setattr(landmark_mod, "landmark_model_for", lambda *a, **k: None)
+    fake_embeddings.calls.clear()
     r = client.get("/api/embeddings/projection?dims=3&jacobian=1")
     assert r.status_code == 200
     body = r.get_json()
     assert body["positions"]
     assert all("z" in p for p in body["positions"])
-    assert body["jacobian"]
-    for rows in body["jacobian"].values():
-        assert all(len(row) == 3 for row in rows)
-        assert len(rows) == len(body["positions"])
+    # Exact base positions, but no per-source Jacobian columns: preview is
+    # unavailable and the frontend holds the exact baseline.
+    assert body["jacobian"] == {}
+    assert set(body["positions"][0]) >= {"path", "x", "y", "z"}
+    # Only the 2-D reference + the main 3-D fit ran; neither was a Jacobian refit.
+    assert len(fake_embeddings.calls) == 2
+    assert not any(c.get("with_jacobian") for c in fake_embeddings.calls)
 
 
 # ─── 3-D gauge reference ─────────────────────────────────────

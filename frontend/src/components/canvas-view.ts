@@ -22,9 +22,9 @@ import {
   tempoColor,
 } from "../lib/colors";
 import {
-  BUILTIN_LENSES,
   CAMELOT_MAJOR_RADIUS,
   CAMELOT_MINOR_RADIUS,
+  availableLenses,
   camelotGuide,
   colorModeTabs,
   scopeLenses,
@@ -2310,7 +2310,7 @@ export class CanvasView {
     // Eval maps have no lenses or colour modes; the toolbar owns the controls.
     if (m.evalMode) return;
     this.lensTabs = this._drawTabs(
-      BUILTIN_LENSES,
+      availableLenses(m.genreFullEnabled),
       m.activeBaseLensId(),
       w / 2,
       16,

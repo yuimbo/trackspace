@@ -125,6 +125,9 @@ class TrackspaceBlueprintDeps:
     enqueue_analysis: Callable[..., dict[str, int]]
     analysis_deps: Any
     maest_mod: Any
+    mert_mod: Any
+    genre_full_enabled: bool
+    mert_enabled: bool
     rhythm_version: int
     structure_version: int
 
@@ -158,6 +161,9 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             enqueue_analysis=deps.enqueue_analysis,
             job_queue=deps.job_queue,
             maest_mod=deps.maest_mod,
+            mert_mod=deps.mert_mod,
+            genre_full_enabled=deps.genre_full_enabled,
+            mert_enabled=deps.mert_enabled,
             rhythm_version=deps.rhythm_version,
             structure_version=deps.structure_version,
         )
@@ -253,6 +259,7 @@ def create_app(*, template_folder: str, deps: TrackspaceBlueprintDeps) -> Flask:
             broadcaster=deps.broadcaster,
             sse_response=deps.sse_response,
             maest_mod=deps.maest_mod,
+            genre_full_enabled=deps.genre_full_enabled,
         )
     )
     app.register_blueprint(

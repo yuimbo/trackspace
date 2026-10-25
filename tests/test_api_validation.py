@@ -222,6 +222,16 @@ class _FakeMaest:
         return None
 
 
+class _MertStub:
+    MERT_VERSION = 1
+
+    def is_model_ready(self):
+        return False
+
+    def load_error(self):
+        return None
+
+
 @pytest.fixture
 def jobs_client():
     bp = create_api_jobs_blueprint(
@@ -360,6 +370,9 @@ def embeddings_client():
         enqueue_analysis=lambda **kw: {"maest": 0},
         job_queue=None,
         maest_mod=None,
+        mert_mod=_MertStub(),
+        genre_full_enabled=False,
+        mert_enabled=False,
         rhythm_version=1,
         structure_version=1,
     )
@@ -570,6 +583,172 @@ def test_projection_weight_spec_out_of_range_is_400():
         parse_projection_params(_Req({"w": "rhythm:2"}))
 
 
+# ─── projection recipe ids (opt-in genre_full) ───────────────
+
+
+def test_default_recipe_is_byte_identical():
+    """An omitted recipe parses to the frozen default (100/100, no recipe id)."""
+    from backend.embeddings.projection_config import FROZEN_SOURCES
+
+    p = parse_projection_params(_Req({}))
+    assert p.recipe_id is None
+    assert p.tsne_n_iter == 100
+    assert p.tsne_early_exaggeration_iter == 100
+    assert p.sources == FROZEN_SOURCES
+    assert p.source_weights is None
+
+
+def test_genre_full_recipe_requires_the_feature_gate():
+    """A disabled server rejects recipe=genre_full with a client-safe 400."""
+    with pytest.raises(ApiValidationError, match="not enabled"):
+        parse_projection_params(_Req({"recipe": "genre_full"}), genre_full_enabled=False)
+
+
+def test_genre_full_recipe_tolerated_for_status():
+    """The status capability bootstrap may query a disabled genre recipe.
+
+    ``/api/embeddings/status`` needs to learn ``genre_full_enabled`` even when a
+    disabled server would reject the recipe for an actual projection, so
+    ``for_status`` accepts it. Other invalid args are still rejected — the status
+    tolerance must not mask a genuinely bad request.
+    """
+    p = parse_projection_params(
+        _Req({"recipe": "genre_full"}), genre_full_enabled=False, for_status=True
+    )
+    assert p.recipe_id == "genre_full"
+    # An unrelated invalid arg (an unknown weight key) is still a 400.
+    with pytest.raises(ApiValidationError, match="unknown source"):
+        parse_projection_params(
+            _Req({"recipe": "genre_full", "w": "bogus:0.5"}),
+            genre_full_enabled=False,
+            for_status=True,
+        )
+
+
+def test_genre_full_recipe_enabled_sets_sources_weights_and_budget():
+    from backend.embeddings.projection_config import (
+        GENRE_FULL_RECIPE_WEIGHTS,
+        GENRE_FULL_SOURCES,
+    )
+
+    p = parse_projection_params(
+        _Req({"recipe": "genre_full"}), genre_full_enabled=True
+    )
+    assert p.recipe_id == "genre_full"
+    assert p.sources == GENRE_FULL_SOURCES
+    assert p.source_weights == GENRE_FULL_RECIPE_WEIGHTS
+    # The user-agreed 100/100 default.
+    assert p.tsne_n_iter == 100
+    assert p.tsne_early_exaggeration_iter == 100
+    assert p.required_sources == ("maest_logits", "maest")
+
+
+def test_genre_full_recipe_rejects_sources_but_allows_weight_override():
+    """``sources=`` stays forbidden with a canonical recipe, but ``w=`` is allowed.
+
+    ``recipe=genre_full + w`` is the tunable genre weight preview: only the seven
+    canonical recipe keys are valid overrides, completed from the genre defaults.
+    """
+    from backend.embeddings.projection_config import GENRE_FULL_RECIPE_WEIGHTS
+
+    # ``sources=`` is still forbidden (the recipe fixes its source blocks).
+    with pytest.raises(ApiValidationError, match="fixes its source"):
+        parse_projection_params(
+            _Req({"recipe": "genre_full", "sources": "clap"}),
+            genre_full_enabled=True,
+        )
+    # ``w=`` overrides one canonical key; the rest keep the genre defaults.
+    p = parse_projection_params(
+        _Req({"recipe": "genre_full", "w": "maest:0.3"}),
+        genre_full_enabled=True,
+    )
+    assert p.recipe_id == "genre_full"
+    assert p.source_weights["maest"] == 0.3
+    # Completed from the genre defaults, including the explicit zeros.
+    assert p.source_weights["maest_logits"] == GENRE_FULL_RECIPE_WEIGHTS["maest_logits"]
+    assert p.source_weights["maest_layer7"] == GENRE_FULL_RECIPE_WEIGHTS["maest_layer7"]
+    assert p.source_weights["features"] == 0.0
+
+
+def test_genre_full_weight_override_rejects_unknown_key():
+    """``features`` is not a canonical genre recipe key — it is a client-safe 400."""
+    with pytest.raises(ApiValidationError, match="unknown source"):
+        parse_projection_params(
+            _Req({"recipe": "genre_full", "w": "features:0.1"}),
+            genre_full_enabled=True,
+        )
+
+
+def test_genre_full_weight_override_rejects_all_zero():
+    with pytest.raises(ApiValidationError, match="positive weight"):
+        parse_projection_params(
+            _Req({"recipe": "genre_full", "w": "rhythm:0,clap:0,supervised:0,"
+                                            "maest_logits:0,maest:0,maest_layer7:0,mert_l19:0"}),
+            genre_full_enabled=True,
+        )
+
+
+def test_genre_full_weight_override_keeps_recipe_budget():
+    """An override retains the recipe identity and its 100/100 budget."""
+    p = parse_projection_params(
+        _Req({"recipe": "genre_full", "w": "rhythm:0.1"}), genre_full_enabled=True
+    )
+    assert p.recipe_id == "genre_full"
+    assert p.tsne_n_iter == 100
+    assert p.tsne_early_exaggeration_iter == 100
+
+
+def test_projection_recipe_unknown_is_400():
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"recipe": "bogus"}))
+
+
+def test_recipe_explicit_default_is_accepted():
+    from backend.embeddings.projection_config import FROZEN_SOURCES
+
+    p = parse_projection_params(_Req({"recipe": "default"}))
+    assert p.recipe_id is None  # "default" normalises to the frozen defaults
+    assert p.sources == FROZEN_SOURCES
+
+
+# ─── openTSNE iteration budget (quality fields) ─────────────
+
+
+def test_tsne_iteration_params_override_the_default_budget():
+    p = parse_projection_params(_Req({"tsne_n_iter": "250", "tsne_early_exaggeration_iter": "150"}))
+    assert p.tsne_n_iter == 250
+    assert p.tsne_early_exaggeration_iter == 150
+
+
+def test_tsne_iteration_params_apply_to_genre_recipe():
+    p = parse_projection_params(
+        _Req({"recipe": "genre_full", "tsne_n_iter": "250", "tsne_early_exaggeration_iter": "150"}),
+        genre_full_enabled=True,
+    )
+    assert p.tsne_n_iter == 250
+    assert p.tsne_early_exaggeration_iter == 150
+
+
+def test_tsne_n_iter_bounds_are_validated():
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"tsne_n_iter": "99"}))  # below 100
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"tsne_n_iter": "2001"}))  # above 2000
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"tsne_n_iter": "lots"}))
+
+
+def test_tsne_early_iter_bounds_are_validated():
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"tsne_early_exaggeration_iter": "-1"}))
+    with pytest.raises(ApiValidationError):
+        parse_projection_params(_Req({"tsne_early_exaggeration_iter": "1001"}))
+    # 0 (early exaggeration disabled) is accepted.
+    assert parse_projection_params(
+        _Req({"tsne_early_exaggeration_iter": "0"})
+    ).tsne_early_exaggeration_iter == 0
+
+
 # ─── clusters rebuild: source weights ──────────────────────
 
 
@@ -599,6 +778,18 @@ class _FakeClusters:
 def rebuild_client():
     from backend.embeddings.clustering import DEFAULT_WEIGHTS
 
+    return _rebuild_client(DEFAULT_WEIGHTS)
+
+
+@pytest.fixture
+def rebuild_client_genre():
+    """Like ``rebuild_client`` but on a server with genre_full enabled."""
+    from backend.embeddings.clustering import DEFAULT_WEIGHTS
+
+    return _rebuild_client(DEFAULT_WEIGHTS, genre_full_enabled=True)
+
+
+def _rebuild_client(DEFAULT_WEIGHTS, *, genre_full_enabled=False):
     clusters = _FakeClusters()
     enqueued: list[dict] = []
 
@@ -618,6 +809,7 @@ def rebuild_client():
         broadcaster=None,
         sse_response=None,
         maest_mod=None,
+        genre_full_enabled=genre_full_enabled,
     )
     return _app(bp).test_client(), clusters, enqueued, DEFAULT_WEIGHTS
 
@@ -668,3 +860,122 @@ def test_rebuild_all_zero_weights_is_400(rebuild_client):
     assert "positive weight" in r.get_json()["error"]
     assert enqueued == []
     assert clusters.weights() is None
+
+
+def test_rebuild_genre_full_recipe_rejected_when_gate_off(rebuild_client):
+    from backend.embeddings.clustering import CLUSTER_GENRE_FULL_WEIGHTS
+
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={"recipe": "genre_full"})
+    assert r.status_code == 400
+    assert "not enabled" in r.get_json()["error"]
+    assert enqueued == []
+    # Untouched: no partial weight application on a rejected recipe.
+    assert clusters.weights() is None
+    assert CLUSTER_GENRE_FULL_WEIGHTS["maest_layer7"] > 0
+
+
+def test_rebuild_genre_full_recipe_sets_canonical_weights_and_queues(rebuild_client_genre):
+    from backend.embeddings.clustering import CLUSTER_GENRE_FULL_WEIGHTS
+
+    client, clusters, enqueued, _ = rebuild_client_genre
+    r = client.post("/api/clusters/rebuild", json={"recipe": "genre_full"})
+    assert r.status_code == 200
+    stored = clusters.weights()
+    assert stored is not None
+    assert stored == CLUSTER_GENRE_FULL_WEIGHTS
+    # The canonical vector zeros the non-genre sources explicitly.
+    assert stored["rhythm"] == 0.0 and stored["clap"] == 0.0
+    assert stored["maest_layer7"] > 0 and stored["mert_l19"] > 0
+    assert r.get_json()["weights"] == stored
+    assert len(enqueued) == 1
+
+
+def test_rebuild_default_recipe_restores_frozen_defaults(rebuild_client):
+    client, clusters, enqueued, _ = rebuild_client
+    clusters.set_weights({"rhythm": 0.5})
+    r = client.post("/api/clusters/rebuild", json={"recipe": "default"})
+    assert r.status_code == 200
+    assert clusters.weights() is None
+    assert r.get_json()["weights"] is None
+    assert len(enqueued) == 1
+
+
+def test_rebuild_unknown_recipe_is_400(rebuild_client):
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={"recipe": "bogus"})
+    assert r.status_code == 400
+    assert "recipe" in r.get_json()["error"]
+    assert enqueued == []
+    assert clusters.weights() is None
+
+
+def test_rebuild_default_recipe_and_weights_is_ambiguous_400(rebuild_client):
+    """recipe=default is authoritative about the frozen defaults; weights rejected."""
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post(
+        "/api/clusters/rebuild", json={"recipe": "default", "weights": {"rhythm": 0.5}}
+    )
+    assert r.status_code == 400
+    assert "not both" in r.get_json()["error"]
+    assert enqueued == []
+    assert clusters.weights() is None
+
+
+def test_rebuild_genre_full_recipe_accepts_weight_override(rebuild_client_genre):
+    """recipe=genre_full + weights applies the validated genre override."""
+    from backend.embeddings.projection_config import GENRE_FULL_RECIPE_WEIGHTS
+
+    client, clusters, enqueued, _ = rebuild_client_genre
+    r = client.post(
+        "/api/clusters/rebuild",
+        json={"recipe": "genre_full", "weights": {"maest": 0.3}},
+    )
+    assert r.status_code == 200
+    stored = clusters.weights()
+    assert stored is not None
+    assert stored["maest"] == 0.3
+    # Completed from the genre defaults, including the explicit zeros.
+    assert stored["maest_logits"] == GENRE_FULL_RECIPE_WEIGHTS["maest_logits"]
+    assert stored["features"] == 0.0
+    assert len(enqueued) == 1
+
+
+def test_rebuild_genre_full_weight_override_rejects_unknown_key(rebuild_client_genre):
+    """features is not a canonical genre recipe key — client-safe 400, no enqueue."""
+    client, clusters, enqueued, _ = rebuild_client_genre
+    r = client.post(
+        "/api/clusters/rebuild",
+        json={"recipe": "genre_full", "weights": {"features": 0.1}},
+    )
+    assert r.status_code == 400
+    assert "unknown source" in r.get_json()["error"]
+    assert enqueued == []
+    assert clusters.weights() is None
+
+
+def test_rebuild_genre_full_weight_override_rejects_all_zero(rebuild_client_genre):
+    client, clusters, enqueued, _ = rebuild_client_genre
+    r = client.post(
+        "/api/clusters/rebuild",
+        json={
+            "recipe": "genre_full",
+            "weights": {
+                "maest_logits": 0, "maest": 0, "maest_layer7": 0, "mert_l19": 0,
+                "rhythm": 0, "clap": 0, "supervised": 0,
+            },
+        },
+    )
+    assert r.status_code == 400
+    assert "positive weight" in r.get_json()["error"]
+    assert enqueued == []
+    assert clusters.weights() is None
+
+
+def test_rebuild_custom_weights_still_allowed(rebuild_client):
+    """Custom weights over the default sources stay valid without a recipe."""
+    client, clusters, enqueued, _ = rebuild_client
+    r = client.post("/api/clusters/rebuild", json={"weights": {"rhythm": 0.5}})
+    assert r.status_code == 200
+    assert clusters.weights()["rhythm"] == 0.5
+    assert len(enqueued) == 1

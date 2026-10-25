@@ -274,6 +274,9 @@ class _FakeMaest:
     def load_error(self) -> None:
         return None
 
+    def reconcile_checkpoint(self, feature_cache) -> bool:
+        return False
+
     def discogs_style_labels(self) -> list[str]:
         return list(self._labels)
 

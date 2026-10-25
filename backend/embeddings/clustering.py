@@ -33,6 +33,7 @@ from typing import Any
 import numpy as np
 
 from .linalg_utils import l2_normalize, svd_singular
+from .projection_config import GENRE_FULL_RECIPE_WEIGHTS, PROJECTION_RECIPE_IDS
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +54,19 @@ DEFAULT_WEIGHTS: dict[str, float] = {
     "supervised": 0.15,
     "features": 0.00,
 }
+
+#: Canonical clustering recipe ids the ``POST /api/clusters/rebuild`` route accepts.
+#: ``default`` is the frozen app behaviour (``DEFAULT_WEIGHTS``); ``genre_full`` is
+#: the opt-in pure-genre lens, mirroring the projection recipe registry so the map
+#: and the clusters describe the same space. Aliased to the canonical
+#: ``projection_config`` registry (not copied) so the two never drift.
+CLUSTER_RECIPE_IDS: tuple[str, ...] = PROJECTION_RECIPE_IDS
+
+#: Weights the ``genre_full`` clustering recipe applies: the pure-genre canonical
+#: vector from ``projection_config`` (MAEST pair + layer-7 + MERT-L19, every other
+#: source explicitly zero). Aliased (not copied) to that single source of truth; no
+#: caller mutates it.
+CLUSTER_GENRE_FULL_WEIGHTS: dict[str, float] = GENRE_FULL_RECIPE_WEIGHTS
 
 #: Resolutions swept to build the hierarchy (coarse → fine).
 #:

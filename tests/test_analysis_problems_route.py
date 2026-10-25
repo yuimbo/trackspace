@@ -20,6 +20,16 @@ class _FakeQueue:
         return list(self._failures)
 
 
+class _MertStub:
+    MERT_VERSION = 1
+
+    def is_model_ready(self):
+        return False
+
+    def load_error(self):
+        return None
+
+
 def _client(*, infos, failures, enqueue=None):
     bp = create_api_embeddings_blueprint(
         embeddings_mod=None,
@@ -46,6 +56,9 @@ def _client(*, infos, failures, enqueue=None):
         enqueue_analysis=enqueue or (lambda **_k: {}),
         job_queue=_FakeQueue(failures),
         maest_mod=None,
+        mert_mod=_MertStub(),
+        genre_full_enabled=False,
+        mert_enabled=False,
         rhythm_version=1,
         structure_version=1,
     )

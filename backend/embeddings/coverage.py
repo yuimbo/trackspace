@@ -21,7 +21,9 @@ SOURCE_ROWS: tuple[tuple[str, str], ...] = (
     ("rhythm", "Rhythm"),
     ("structure", "Structure"),
     ("maest", "MAEST"),
+    ("maest_layer7", "MAEST layer-7"),
     ("clap", "CLAP"),
+    ("mert_l19", "MERT L19"),
     ("supervised", "Supervised"),
 )
 
@@ -37,6 +39,10 @@ class SourceVersions:
     #: Structure is metadata-only (not a projection source) but still a versioned
     #: cache row, so coverage reports it. It must never enter the layout revision.
     structure: int = 0
+    #: ``genre_full`` block versions. 0 (default) means the block is not enabled
+    #: and its rows are absent, so coverage naturally reports nothing for them.
+    maest_layer7: int = 0
+    mert_l19: int = 0
 
 
 @dataclass(frozen=True)
@@ -51,9 +57,11 @@ class CachedSourceMaps:
     features: Mapping[str, object]
     maest: Mapping[str, object] = field(default_factory=dict)
     maest_logits: Mapping[str, object] = field(default_factory=dict)
+    maest_layer7: Mapping[str, object] = field(default_factory=dict)
     rhythm: Mapping[str, object] = field(default_factory=dict)
     supervised: Mapping[str, object] = field(default_factory=dict)
     structure: Mapping[str, object] = field(default_factory=dict)
+    mert_l19: Mapping[str, object] = field(default_factory=dict)
 
     def for_source(self, source: str) -> Mapping[str, object]:
         return {
@@ -61,9 +69,11 @@ class CachedSourceMaps:
             "features": self.features,
             "maest": self.maest,
             "maest_logits": self.maest_logits,
+            "maest_layer7": self.maest_layer7,
             "rhythm": self.rhythm,
             "supervised": self.supervised,
             "structure": self.structure,
+            "mert_l19": self.mert_l19,
         }[source]
 
 
@@ -84,9 +94,11 @@ def batch_fetch_maps(
             "features": versions.features,
             "maest": versions.maest,
             "maest_logits": versions.maest,
+            "maest_layer7": versions.maest_layer7,
             "rhythm": versions.rhythm,
             "supervised": versions.supervised,
             "structure": versions.structure,
+            "mert_l19": versions.mert_l19,
         },
         list(fingerprints),
     )
@@ -95,9 +107,11 @@ def batch_fetch_maps(
         features=presence.get("features", {}),
         maest=presence.get("maest", {}),
         maest_logits=presence.get("maest_logits", {}),
+        maest_layer7=presence.get("maest_layer7", {}),
         rhythm=presence.get("rhythm", {}),
         supervised=presence.get("supervised", {}),
         structure=presence.get("structure", {}),
+        mert_l19=presence.get("mert_l19", {}),
     )
 
 
@@ -207,6 +221,8 @@ def coverage_payload(
     maps: CachedSourceMaps,
     versions: SourceVersions,
     failed_by_source: Mapping[str, set[str]] | None = None,
+    genre_full_enabled: bool = False,
+    mert_enabled: bool = False,
 ) -> dict:
     """Stats for ``/api/embeddings/status``.
 
@@ -216,13 +232,27 @@ def coverage_payload(
     change. *failed_by_source* maps a source name to the fingerprints whose stage
     job terminally failed (see :func:`failed_track_count`); those tracks are
     reported as failed, not pending.
+
+    The opt-in ``genre_full`` blocks are only reported when their stage is wired:
+    ``maest_layer7`` when *genre_full_enabled*, ``mert_l19`` only when
+    *mert_enabled* (genre_full AND not ``--no-mert``). A disabled block is never
+    computed, so showing it as permanently-pending would stall the frontend gate.
     """
     total = len(infos)
     fingerprinted = sum(1 for t in infos if t.get("fingerprint"))
     failed = failed_by_source or {}
 
+    def _enabled(source: str) -> bool:
+        if source == "mert_l19":
+            return mert_enabled
+        if source == "maest_layer7":
+            return genre_full_enabled
+        return True
+
+    rows = tuple(r for r in SOURCE_ROWS if _enabled(r[0]))
+
     sources: list[dict] = []
-    for source, label in SOURCE_ROWS:
+    for source, label in rows:
         done = tracks_with_fp_in_maps(infos, maps, source)
         failed_n = failed_track_count(infos, maps, source, failed.get(source))
         sources.append(

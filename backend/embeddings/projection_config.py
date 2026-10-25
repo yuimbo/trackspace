@@ -29,6 +29,106 @@ PROJECTION_RECIPE_VERSION = 8
 OPENTSNE_N_ITER = 100
 OPENTSNE_EARLY_EXAGGERATION_ITER = 100
 
+# ──────────────────────────────────────────────────────────────
+# Canonical projection recipes
+# ──────────────────────────────────────────────────────────────
+#
+# A recipe is a complete, named projection configuration: the source blocks, their
+# exact weights, and the openTSNE full-fit iteration budget. ``FROZEN_SOURCE_WEIGHTS``
+# / ``clustering.DEFAULT_WEIGHTS`` / ``SUPERVISED_INPUT_WEIGHTS`` and the shared
+# ``frontend/lib/cluster-weights.json`` are the app *defaults* and stay untouched;
+# these recipes are a separate, opt-in registry the frontend selects by id.
+#
+# ``default`` mirrors the pre-recipe behaviour byte-for-byte (frozen sources +
+# weights, openTSNE 100/100) so a default request hashes and caches identically.
+# ``genre_full`` is the pure-genre lens (logits .40 / maest .20 / layer-7 .25 /
+# MERT-L19 .15, the tunable rhythm/clap/supervised at 0, all other sources zero)
+# with its own 100/100 budget. Genre is the default, so the recipe is always
+# served; ``--no-genre-full`` disables the layer-7/MERT analysis blocks on the
+# server side (the recipe id itself is not gated). The gallery 500/250 profile is
+# an explicit client override, not the recipe default.
+
+#: Every source the projection layer can consume, including the opt-in genre_full
+#: blocks. ``FROZEN_SOURCES`` (the default recipe's set) is the combined/subset
+#: production set — the opt-in ``maest_layer7`` / ``mert_l19`` blocks appear only
+#: here (they are not a suffix of ``FROZEN_SOURCES``).
+AVAILABLE_SOURCES: tuple[str, ...] = (
+    "maest_logits",
+    "maest",
+    "maest_layer7",
+    "mert_l19",
+    "rhythm",
+    "clap",
+    "supervised",
+    "features",
+)
+
+#: The genre_full recipe's source set, in composite-gather order: the four genre
+#: blocks plus the tunable non-genre contributors (rhythm/clap/supervised) that a
+#: user can raise above zero in the weight preview. ``features`` stays excluded —
+#: it is the audio-feature block, not a genre signal, and is never a valid genre
+#: recipe override key.
+GENRE_FULL_SOURCES: tuple[str, ...] = (
+    "maest_logits",
+    "maest",
+    "maest_layer7",
+    "mert_l19",
+    "rhythm",
+    "clap",
+    "supervised",
+)
+
+#: Exact ``genre_full`` weights (mirrors ``backend/experiments/genre_space/scoring.py``).
+#: A pure genre lens: the non-genre sources are explicitly zero so no budget blending
+#: is invented. The MAEST pair is required; layer-7 and MERT are optional zero-fill.
+GENRE_FULL_RECIPE_WEIGHTS: dict[str, float] = {
+    "maest_logits": 0.40,
+    "maest": 0.20,
+    "maest_layer7": 0.25,
+    "mert_l19": 0.15,
+    "rhythm": 0.00,
+    "clap": 0.00,
+    "supervised": 0.00,
+    "features": 0.00,
+}
+
+#: openTSNE iteration budget bounds for the opt-in quality fields. ``tsne_n_iter``
+#: is the full-fit iteration count, ``tsne_early_exaggeration_iter`` the early
+#: exaggeration phase (openTSNE accepts 0 to disable it).
+TSNE_N_ITER_LO = 100
+TSNE_N_ITER_HI = 2000
+TSNE_EARLY_EXAGGERATION_ITER_LO = 0
+TSNE_EARLY_EXAGGERATION_ITER_HI = 1000
+
+#: Default recipe's openTSNE budget (unchanged from the pre-recipe constants).
+DEFAULT_RECIPE_TSNE_N_ITER = OPENTSNE_N_ITER
+DEFAULT_RECIPE_TSNE_EARLY_EXAGGERATION_ITER = OPENTSNE_EARLY_EXAGGERATION_ITER
+
+#: genre_full recipe's openTSNE budget. The recipe default is 100/100 (the
+#: user-agreed default); the gallery 500/250 profile is an explicit client
+#: override. Because the genre budget is encoded *absolutely* in its cache keys,
+#: this default can move without aliasing any earlier fit/layout.
+GENRE_FULL_TSNE_N_ITER = 100
+GENRE_FULL_TSNE_EARLY_EXAGGERATION_ITER = 100
+
+
+@dataclass(frozen=True)
+class ProjectionRecipe:
+    """A complete, named projection configuration.
+
+    ``weights`` is the complete vector over ``AVAILABLE_SOURCES`` so every source's
+    contribution is explicit (a pure genre recipe zeros the non-genre blocks).
+    ``tsne_n_iter`` / ``tsne_early_exaggeration_iter`` are the openTSNE full-fit
+    budget used when the request does not override them.
+    """
+
+    id: str
+    sources: tuple[str, ...]
+    weights: dict[str, float]
+    tsne_n_iter: int
+    tsne_early_exaggeration_iter: int
+
+
 FROZEN_SOURCES: tuple[str, ...] = (
     "maest_logits",
     "maest",
@@ -55,6 +155,64 @@ FROZEN_SOURCE_WEIGHTS: dict[str, float] = {
 SUPERVISED_INPUT_WEIGHTS: dict[str, float] = {
     k: v for k, v in FROZEN_SOURCE_WEIGHTS.items() if k != "supervised"
 }
+
+
+#: Canonical recipe registry. ``default`` is the frozen app behaviour; ``genre_full``
+#: is the opt-in pure-genre lens. ``PROJECTION_RECIPES["default"]`` must stay in
+#: lock-step with ``FROZEN_SOURCE_WEIGHTS`` / ``clustering.DEFAULT_WEIGHTS`` and the
+#: shared ``frontend/lib/cluster-weights.json``.
+PROJECTION_RECIPES: dict[str, ProjectionRecipe] = {
+    "default": ProjectionRecipe(
+        id="default",
+        sources=FROZEN_SOURCES,
+        weights=dict(FROZEN_SOURCE_WEIGHTS),
+        tsne_n_iter=DEFAULT_RECIPE_TSNE_N_ITER,
+        tsne_early_exaggeration_iter=DEFAULT_RECIPE_TSNE_EARLY_EXAGGERATION_ITER,
+    ),
+    "genre_full": ProjectionRecipe(
+        id="genre_full",
+        sources=GENRE_FULL_SOURCES,
+        weights=dict(GENRE_FULL_RECIPE_WEIGHTS),
+        tsne_n_iter=GENRE_FULL_TSNE_N_ITER,
+        tsne_early_exaggeration_iter=GENRE_FULL_TSNE_EARLY_EXAGGERATION_ITER,
+    ),
+}
+
+#: Recipe ids the projection request accepts.
+PROJECTION_RECIPE_IDS: tuple[str, ...] = tuple(PROJECTION_RECIPES.keys())
+
+
+def recipe_for(recipe_id: str | None) -> ProjectionRecipe:
+    """The recipe for an opt-in id (``None``/``"default"`` → the frozen default)."""
+    return PROJECTION_RECIPES.get(recipe_id or "default", PROJECTION_RECIPES["default"])
+
+
+def tsne_iteration_suffix(
+    tsne_n_iter: int, tsne_early_exaggeration_iter: int, recipe: ProjectionRecipe
+) -> str:
+    """Encode a deviation from *recipe*'s openTSNE budget for cache keys.
+
+    Only a *deviation* from the recipe's default budget is encoded, so the default
+    recipe at its default 100/100 produces an empty suffix (byte-identical cache
+    keys), while a user-chosen faster/slower budget changes the fit-cache key and
+    the layout revision so the two configurations never share a fit.
+
+    ``genre_full`` is the exception: its *effective* budget is always encoded
+    (absolute), because the recipe default moved from 500/250 to 100/100 and the
+    legacy 500/250 default fit was stored under a bare key. Encoding the genre
+    budget absolutely guarantees the 100/100 default never aliases that legacy
+    fit/layout under the same key, and that any future default change (or an
+    explicit override like the 500/250 gallery profile) refits rather than reusing
+    a stale fit. Every other recipe stays deviation-only so its default keys are
+    byte-identical.
+    """
+    absolute = recipe.id == "genre_full"
+    parts: list[str] = []
+    if absolute or tsne_n_iter != recipe.tsne_n_iter:
+        parts.append(f"n{int(tsne_n_iter)}")
+    if absolute or tsne_early_exaggeration_iter != recipe.tsne_early_exaggeration_iter:
+        parts.append(f"e{int(tsne_early_exaggeration_iter)}")
+    return "|".join(parts)
 
 
 def _single_lens_weights(sources: tuple[str, ...]) -> dict[str, float]:
@@ -94,6 +252,13 @@ PROJECTION_LENSES: tuple[ProjectionLens, ...] = (
 
 #: Lens ids the prefetch job warms, for enqueue/status convenience.
 PROJECTION_LENS_IDS: tuple[str, ...] = tuple(l.id for l in PROJECTION_LENSES)
+
+#: The opt-in genre_full projection lens, warmed only when the server enabled
+#: genre_full. Kept out of ``PROJECTION_LENSES`` so a disabled server's prefetch
+#: set is byte-identical to before (``PROJECTION_LENS_IDS`` is unchanged).
+GENRE_FULL_LENS: ProjectionLens = ProjectionLens(
+    "genre_full", GENRE_FULL_SOURCES, dict(GENRE_FULL_RECIPE_WEIGHTS)
+)
 
 #: Sources a track must have before it can be placed on the *combined* map.
 REQUIRED_SOURCES: tuple[str, ...] = ("maest_logits", "maest")

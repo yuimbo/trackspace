@@ -26,11 +26,13 @@ from backend import audio_features
 from backend import embeddings
 from backend.embeddings import clap as clap_mod
 from backend.embeddings import maest as maest_mod
+from backend.embeddings import mert as mert_mod
 from backend.embeddings import rhythm_features as rhythm_mod
 from backend.embeddings import supervised as supervised_mod
 from backend.embeddings.clap import EMBEDDING_VERSION
 from backend.embeddings.librosa_audio_features import FEATURES_VERSION
-from backend.embeddings.maest import MAEST_VERSION
+from backend.embeddings.maest import MAEST_LAYER7_VERSION, MAEST_VERSION
+from backend.embeddings.mert import MERT_VERSION
 from backend.embeddings.rhythm_features import RHYTHM_VERSION
 from backend.embeddings.structure import STRUCTURE_VERSION
 from backend.embeddings.coverage import (
@@ -45,11 +47,13 @@ from backend.jobs import (
     KIND_FEATURES,
     KIND_LAYOUT,
     KIND_MAEST,
+    KIND_MERT,
     KIND_SCAN,
     KIND_STRUCTURE,
     KIND_SUPERVISED,
 )
 from backend.embeddings.projection_config import (
+    GENRE_FULL_LENS,
     PROJECTION_LENS_IDS,
     PROJECTION_LENSES,
 )
@@ -64,6 +68,7 @@ from backend.services.analysis_pipeline import (
     make_features_handler,
     make_layout_handler,
     make_maest_handler,
+    make_mert_handler,
     make_scan_handler,
     make_structure_handler,
     make_supervised_handler,
@@ -90,6 +95,7 @@ from backend.services.projection_request import (
     embedding_projection_query_fingerprint,
     parse_projection_params,
     projection_params_for_lens,
+    projection_params_for_recipe,
 )
 from backend.services.track_payload import (
     build_track_list as build_track_list_service,
@@ -117,19 +123,24 @@ SOURCE_VERSIONS: dict[str, int] = {
     "clap_segment_pos": EMBEDDING_VERSION,
     "features": FEATURES_VERSION,
     "maest": MAEST_VERSION,
+    "maest_layer7": MAEST_LAYER7_VERSION,
+    "mert_l19": MERT_VERSION,
     "rhythm": RHYTHM_VERSION,
     "structure": STRUCTURE_VERSION,
 }
 
 #: Which job kind re-runs each versioned cache source, so a startup purge can
 #: enqueue exactly the backfill it created. Several sources share one stage (CLAP
-#: writes its pooled vector, segment vectors and positions in one pass).
+#: writes its pooled vector, segment vectors and positions in one pass; the
+#: MAEST stage also writes the layer-7 vector captured in the same forward).
 PURGED_SOURCE_KINDS: dict[str, str] = {
     "clap": KIND_CLAP,
     "clap_segments": KIND_CLAP,
     "clap_segment_pos": KIND_CLAP,
     "features": KIND_FEATURES,
     "maest": KIND_MAEST,
+    "maest_layer7": KIND_MAEST,
+    "mert_l19": KIND_MERT,
     "rhythm": KIND_FEATURES,
     "structure": KIND_STRUCTURE,
 }
@@ -218,7 +229,13 @@ def _kinds_for_purged_sources(purged: dict[str, int]) -> tuple[str, ...]:
     )
 
 
-def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
+def build_app(
+    state: TrackspaceState,
+    *,
+    clap_enabled: bool = True,
+    genre_full_enabled: bool = True,
+    mert_enabled: bool = False,
+) -> Flask:
     """Wire helpers, workers, and blueprints around *state*; return the app.
 
     ``main()`` builds the state after CLI parsing and calls this, so importing
@@ -227,6 +244,18 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
 
     *clap_enabled* mirrors ``--no-clap``: when False the CLAP stage is never
     enqueued, so a disabled server cannot accumulate jobs that will never run.
+
+    *genre_full_enabled* mirrors ``--no-genre-full`` (Genre is the default; the
+    flag disables it). When True the MAEST handler also requires/caches the
+    layer-7 vector, the genre_full recipe is served, and *mert_enabled*
+    (genre_full AND not ``--no-mert`` AND trusted) wires the independent MERT
+    worker. When False neither the layer-7 block nor MERT is queued, and the
+    MAEST stage behaves exactly as the legacy default recipe.
+
+    *mert_enabled* stays an explicit call (default False) even though Genre is now
+    the default: MERT additionally needs ``--trust-remote-code`` (and the licence
+    is accepted by the app for this personal project), so it must never run from a
+    bare ``build_app`` without that consent.
     """
     def _library_mtime_signature(folder_vpath: str, recursive: bool) -> str:
         """Cheap fingerprint of mp3 set under one virtual folder (or all roots)."""
@@ -460,8 +489,13 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         req,
         *,
         default_when_no_method: bool = False,
+        for_status: bool = False,
     ) -> ProjectionParams | None:
-        return parse_projection_params(req, default_when_no_method=default_when_no_method)
+        return parse_projection_params(
+            req,
+            default_when_no_method=default_when_no_method,
+            genre_full_enabled=genre_full_enabled or for_status,
+        )
 
 
     def _build_track_infos(
@@ -521,12 +555,18 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         Runs through the durable ``layout`` queue after the cluster pass. The
         revision is computed exactly as the HTTP route does, so the warmed entry is
         the one the client will request; an already-current lens is a cache hit
-        inside ``compute_projection`` and costs no fit.
+        inside ``compute_projection`` and costs no fit. The opt-in genre_full lens
+        is warmed with the genre recipe when the server enabled it.
         """
-        lens = next((l for l in PROJECTION_LENSES if l.id == lens_id), None)
-        if lens is None:
-            raise ValueError(f"unknown lens {lens_id!r}")
-        proj = projection_params_for_lens(lens.sources, lens.weights)
+        if lens_id == GENRE_FULL_LENS.id:
+            if not genre_full_enabled:
+                raise ValueError(f"lens {lens_id!r} not enabled on this server")
+            proj = projection_params_for_recipe("genre_full", genre_full_enabled=True)
+        else:
+            lens = next((l for l in PROJECTION_LENSES if l.id == lens_id), None)
+            if lens is None:
+                raise ValueError(f"unknown lens {lens_id!r}")
+            proj = projection_params_for_lens(lens.sources, lens.weights)
         positions, _revision = compute_lens_projection(
             _prefetch_infos(),
             state.feature_cache,
@@ -541,6 +581,8 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 rhythm=RHYTHM_VERSION,
                 supervised=supervised_mod.cache_version(state.feature_cache),
                 structure=STRUCTURE_VERSION,
+                maest_layer7=MAEST_LAYER7_VERSION,
+                mert_l19=MERT_VERSION,
             ),
             embedding_version=EMBEDDING_VERSION,
             user=False,
@@ -573,6 +615,11 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         emit_decode_warning=lambda rel, msg: _broadcast_embed_event(
             {"type": "decode_warning", "path": rel, "message": msg}
         ),
+        maest_layer7_version=MAEST_LAYER7_VERSION,
+        mert_mod=mert_mod,
+        mert_version=MERT_VERSION,
+        layer7_enabled=genre_full_enabled,
+        mert_enabled=mert_enabled,
     )
 
     # Folder colour anchors: the semantic (sub-genre) anchor per folder, so a
@@ -615,8 +662,13 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             return
         kind = event.get("kind")
         if kind == KIND_CLUSTER:
+            lens_ids = (
+                PROJECTION_LENS_IDS + (GENRE_FULL_LENS.id,)
+                if genre_full_enabled
+                else PROJECTION_LENS_IDS
+            )
             enqueue_layouts(
-                state.job_queue, PROJECTION_LENS_IDS, reason="cluster-drained"
+                state.job_queue, lens_ids, reason="cluster-drained"
             )
             state.workers.wake(KIND_LAYOUT)
             return
@@ -672,14 +724,18 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         *kinds* restricts the request to specific stages (the coverage panel's
         per-stage retrigger); ``None`` means every per-track stage.
         *revive_failed* also revives terminally-failed jobs — explicit user
-        retriggers and the version-purge backfill set it; the frontend's automatic
-        keep-warm generate does not.
+        retriggers set it; the automatic version-purge backfill and the frontend's
+        keep-warm generate do not, so a genuinely broken file is only retried when
+        the user asks for it.
         """
+        default_kinds = [KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP]
+        if mert_enabled:
+            default_kinds.insert(default_kinds.index(KIND_MAEST) + 1, KIND_MERT)
         queued = enqueue_library_work(
             state.job_queue,
             infos,
             deps=ANALYSIS_DEPS,
-            kinds=kinds or (KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP),
+            kinds=kinds or tuple(default_kinds),
             priority_paths=priority_paths or [],
             force=force,
             revive_failed=revive_failed,
@@ -697,12 +753,18 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
         backlog (e.g. CLAP segment vectors added later) out of an unrelated restart
         — that one is retriggered explicitly from the coverage panel. Once the
         purged work drains this enqueues nothing.
+
+        A purge revives *done* jobs only: the rows are gone, so their completed
+        work no longer exists and must be redone. Terminally-*failed* jobs are left
+        alone — a genuinely broken track must not be retried by an automatic purge;
+        the user retriggers it explicitly (the coverage panel and force re-analyse
+        pass ``revive_failed=True``).
         """
         kinds = _kinds_for_purged_sources(purged)
         if not kinds:
             return {}
         return _enqueue_analysis(
-            infos=_build_track_infos("", True), kinds=kinds, revive_failed=True
+            infos=_build_track_infos("", True), kinds=kinds, revive_failed=False
         )
 
 
@@ -752,6 +814,22 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
                 gate=maest_mod.is_model_ready,
             )
         )
+        # MERT is an independent encoder with its own worker. It is only
+        # registered when the server opted into genre_full (and not --no-mert);
+        # its worker idles on the model-ready gate so a disabled server never
+        # fails jobs it cannot run.
+        if mert_enabled:
+            mert_batch = _maest_batch_size()
+            state.workers.add(
+                JobWorker(
+                    state.job_queue,
+                    KIND_MERT,
+                    make_mert_handler(ANALYSIS_DEPS, batch_size=mert_batch),
+                    batch_size=mert_batch,
+                    on_event=_job_event_sink,
+                    gate=mert_mod.is_model_ready,
+                )
+            )
         clap_batch = _clap_batch_size()
         state.workers.add(
             JobWorker(
@@ -875,6 +953,9 @@ def build_app(state: TrackspaceState, *, clap_enabled: bool = True) -> Flask:
             enqueue_analysis=_enqueue_analysis,
             analysis_deps=ANALYSIS_DEPS,
             maest_mod=maest_mod,
+            mert_mod=mert_mod,
+            genre_full_enabled=genre_full_enabled,
+            mert_enabled=mert_enabled,
             rhythm_version=RHYTHM_VERSION,
             structure_version=STRUCTURE_VERSION,
         ),
@@ -923,6 +1004,30 @@ def main():
                         help="Skip eager CLAP model loading at startup")
     parser.add_argument("--no-maest", action="store_true",
                         help="Skip eager MAEST model loading at startup")
+    parser.add_argument(
+        "--no-genre-full",
+        action="store_true",
+        help="Disable the genre_full blocks (Genre is the default): the MAEST "
+        "layer-7 block and the independent MERT worker. The legacy default recipe "
+        "is retained internally for compatibility.",
+    )
+    parser.add_argument(
+        "--no-mert",
+        action="store_true",
+        help="Disable MERT even when genre_full is active (layer-7 still runs).",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow MERT's repo-specific custom modeling code (reviewed at the pin). "
+        "Required to run MERT; the CC-BY-NC licence is accepted by default for this "
+        "personal project.",
+    )
+    parser.add_argument(
+        "--allow-download",
+        action="store_true",
+        help="Allow fetching uncached MERT weights; default keeps local_files_only.",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
@@ -931,9 +1036,46 @@ def main():
     # importing ``backend.app`` has no side effects, and purge stale cache rows
     # before the app starts serving.
     state = TrackspaceState.create()
-    app = build_app(state, clap_enabled=not args.no_clap)
+    # Genre is the default; ``--no-genre-full`` opts out.
+    genre_full_enabled = not args.no_genre_full
+    # MERT is only wired when Genre is on, the user did not --no-mert, AND trusted
+    # ``--trust-remote-code``. The CC-BY-NC licence is accepted by default for this
+    # personal project (the module gate stays off standalone), but without trust the
+    # worker can never pass its readiness gate, so enqueueing MERT jobs would leave
+    # them pending forever — the gates must keep MERT off entirely.
+    mert_enabled = (
+        genre_full_enabled
+        and not args.no_mert
+        and args.trust_remote_code
+    )
+    # MERT security gates are set from the CLI before the app is built so the
+    # worker's model-readiness gate can never pass without them. The licence is
+    # accepted by default (personal project); trust and download stay explicit.
+    mert_mod.set_licence_acceptance(True)
+    mert_mod.set_trust_remote_code(args.trust_remote_code)
+    mert_mod.set_allow_download(args.allow_download)
+    if genre_full_enabled and not mert_enabled:
+        if args.no_mert:
+            print("MERT disabled: --no-mert set (layer-7 still runs).")
+        else:
+            print(
+                "MERT disabled: pass --trust-remote-code to run the independent "
+                "MERT encoder (layer-7 still runs)."
+            )
+    app = build_app(
+        state,
+        clap_enabled=not args.no_clap,
+        genre_full_enabled=genre_full_enabled,
+        mert_enabled=mert_enabled,
+    )
     lifecycle = app.extensions["trackspace_lifecycle"]
     startup_purges = _purge_stale_embedding_cache_rows(state)
+    # A changed MAEST checkpoint invalidates the whole MAEST family (maest +
+    # layer-7 together, never unrelated blocks). The on-disk checkpoint fingerprint
+    # is known at startup, so reconcile it here and fold any purge into the backfill.
+    if maest_mod.reconcile_checkpoint(state.feature_cache):
+        for src in ("maest", "maest_logits", "maest_excerpts", "maest_layer7"):
+            startup_purges[src] = startup_purges.get(src, 0) or 1
 
     cli_root = os.path.abspath(args.root) if args.root else None
     state.music_root = cli_root or ""
@@ -974,6 +1116,7 @@ def main():
     print(
         f"Versions: CLAP={EMBEDDING_VERSION} "
         f"Features={FEATURES_VERSION} MAEST={MAEST_VERSION} "
+        f"Layer7={MAEST_LAYER7_VERSION} MERT={MERT_VERSION} "
         f"Rhythm={RHYTHM_VERSION} Structure={STRUCTURE_VERSION}"
     )
 
@@ -1026,6 +1169,32 @@ def main():
             print("Loading MAEST model in background…")
             maest_mod.load_model()
             if maest_mod.is_model_ready():
+                # Reconcile + backfill here, not just at startup: the checkpoint
+                # file may be missing on disk at startup and only downloaded by
+                # this load. Without this handshake, rows cached under an older
+                # checkpoint would survive untouched once the new one arrives.
+                if maest_mod.reconcile_checkpoint(state.feature_cache):
+                    print("MAEST checkpoint changed; purged stale MAEST-family rows")
+                    try:
+                        queued = lifecycle["backfill_purged_analysis"](
+                            {
+                                "maest": 1,
+                                "maest_logits": 1,
+                                "maest_excerpts": 1,
+                                "maest_layer7": 1,
+                            }
+                        )
+                        outstanding = sum(int(v) for v in queued.values())
+                        if outstanding:
+                            detail = ", ".join(
+                                f"{k}={v}" for k, v in sorted(queued.items())
+                            )
+                            print(
+                                f"Backfill: queued {outstanding} MAEST job(s) "
+                                f"({detail})"
+                            )
+                    except Exception:
+                        log.exception("post-load MAEST backfill failed")
                 maest_mod.warmup()
                 print("MAEST model ready.")
             else:
@@ -1033,6 +1202,18 @@ def main():
             # Workers gate on model readiness; nudge them once it flips.
             state.workers.wake(KIND_MAEST)
         threading.Thread(target=_bg_load_maest, daemon=True).start()
+    if mert_enabled:
+        def _bg_load_mert():
+            print("Loading MERT model in background (CC-BY-NC, opt-in)…")
+            mert_mod.load_model()
+            if mert_mod.is_model_ready():
+                mert_mod.warmup()
+                print("MERT model ready.")
+            else:
+                print(f"MERT not available: {mert_mod.load_error()}")
+            # Workers gate on model readiness; nudge them once it flips.
+            state.workers.wake(KIND_MERT)
+        threading.Thread(target=_bg_load_mert, daemon=True).start()
 
     def _bg_warm_audio_features():
         print("Warming audio feature pipeline…")

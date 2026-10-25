@@ -15,7 +15,12 @@ from typing import Any
 
 from flask import Blueprint, jsonify, request
 
-from backend.embeddings.clustering import DEFAULT_WEIGHTS
+from backend.embeddings.clustering import (
+    CLUSTER_GENRE_FULL_WEIGHTS,
+    CLUSTER_RECIPE_IDS,
+    DEFAULT_WEIGHTS,
+)
+from backend.embeddings.projection_config import recipe_for
 from backend.jobs import (
     JOB_KINDS,
     KIND_CLAP,
@@ -27,6 +32,7 @@ from backend.jobs import (
     kind_label,
 )
 from backend.services.request_validation import (
+    ApiValidationError,
     one_of,
     opt_bool,
     opt_int,
@@ -34,6 +40,7 @@ from backend.services.request_validation import (
     opt_str_list,
     opt_weight_map,
     parse_json_body,
+    weight_map,
 )
 
 log = logging.getLogger(__name__)
@@ -52,6 +59,7 @@ def create_api_jobs_blueprint(
     broadcaster: Any,
     sse_response: Callable[[Any], Any],
     maest_mod: Any,
+    genre_full_enabled: bool = False,
 ) -> Blueprint:
     bp = Blueprint("api_jobs", __name__)
 
@@ -221,13 +229,55 @@ def create_api_jobs_blueprint(
         An absent ``weights`` field keeps the current setting (defaults on a fresh
         server), so the plain "rebuild" button stays a re-run rather than a reset.
         A supplied map is validated, stored, and applied by the worker when it runs.
+
+        An explicit ``recipe`` (``default`` / ``genre_full``) fixes the source set.
+        ``recipe=default`` restores the frozen defaults (and, as before, is mutually
+        exclusive with ``weights`` — a recipe is authoritative). ``recipe=genre_full``
+        may *also* carry a ``weights`` override: only the genre recipe's canonical
+        keys are valid, the vector is completed from the genre defaults, and an
+        all-zero vector is rejected. The override replaces the canonical genre vector
+        but keeps the recipe's identity (gated by ``genre_full_enabled``).
         """
         data = parse_json_body(required=False)
-        weights = opt_weight_map(
-            data, "weights", allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS
-        )
-        if weights is not None:
-            clusters.set_weights(weights)
+        recipe = opt_str(data, "recipe", default="").strip().lower()
+        if recipe:
+            one_of(recipe, CLUSTER_RECIPE_IDS, field="recipe")
+            if recipe == "genre_full":
+                if not genre_full_enabled:
+                    raise ApiValidationError(
+                        "genre_full recipe is not enabled on this server"
+                    )
+                genre_recipe = recipe_for(recipe)
+                raw_weights = data.get("weights")
+                if raw_weights is None:
+                    clusters.set_weights(dict(CLUSTER_GENRE_FULL_WEIGHTS))
+                else:
+                    validated = weight_map(
+                        raw_weights,
+                        allowed=genre_recipe.sources,
+                        defaults={
+                            s: float(genre_recipe.weights[s])
+                            for s in genre_recipe.sources
+                        },
+                        field="weights",
+                    )
+                    # Complete back to the genre recipe's full vector (e.g.
+                    # ``features: 0``) so the override keeps the same key set.
+                    completed = dict(genre_recipe.weights)
+                    completed.update(validated)
+                    clusters.set_weights(completed)
+            else:  # recipe == "default"
+                if data.get("weights") is not None:
+                    raise ApiValidationError(
+                        "provide either 'recipe' or 'weights', not both"
+                    )
+                clusters.set_weights(None)
+        else:
+            weights = opt_weight_map(
+                data, "weights", allowed=DEFAULT_WEIGHTS, defaults=DEFAULT_WEIGHTS
+            )
+            if weights is not None:
+                clusters.set_weights(weights)
         n = enqueue_clustering(job_queue, reason="manual")
         workers.wake(KIND_CLUSTER)
         return jsonify({"ok": True, "queued": n, "weights": clusters.weights()})

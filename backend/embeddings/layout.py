@@ -33,6 +33,7 @@ from .projection_backends import (
     _project_tsne,
     reset_projection_backend_cache,
 )
+from .projection_config import recipe_for, tsne_iteration_suffix
 from .semantic_weighting import (
     _apply_low_rank_semantic_weight,
     _build_semantic_basis,
@@ -186,19 +187,31 @@ def _supervised_cache_version(feature_cache) -> int:
     return cache_version(feature_cache)
 
 
-def _source_versions_token(feature_cache=None, *, supervised_version: int | None = None) -> str:
+def _source_versions_token(
+    feature_cache=None,
+    *,
+    supervised_version: int | None = None,
+    sources: tuple[str, ...] | None = None,
+) -> str:
     from .librosa_audio_features import FEATURES_VERSION
-    from .maest import MAEST_VERSION
+    from .maest import MAEST_LAYER7_VERSION, MAEST_VERSION
+    from .mert import MERT_VERSION
     from .rhythm_features import RHYTHM_VERSION
 
     if supervised_version is None:
         supervised_version = _supervised_cache_version(feature_cache)
 
-    return (
+    token = (
         f"C{EMBEDDING_VERSION}F{FEATURES_VERSION}"
         f"M{MAEST_VERSION}R{RHYTHM_VERSION}"
         f"S{supervised_version}"
     )
+    # A composite that consumes the opt-in genre_full blocks must also key on their
+    # cache generations, or a MERT/layer-7 version bump would not invalidate it. The
+    # default lens never includes them, so its token is byte-identical to before.
+    if sources and ("maest_layer7" in sources or "mert_l19" in sources):
+        token += f"L{MAEST_LAYER7_VERSION}E{MERT_VERSION}"
+    return token
 
 
 def _composite_config_token(
@@ -255,7 +268,8 @@ def _static_source_version(source: str) -> int:
     dynamic and therefore resolved separately (see :func:`_source_version`).
     """
     from .librosa_audio_features import FEATURES_VERSION
-    from .maest import MAEST_VERSION
+    from .maest import MAEST_LAYER7_VERSION, MAEST_VERSION
+    from .mert import MERT_VERSION
     from .rhythm_features import RHYTHM_VERSION
 
     return {
@@ -263,6 +277,8 @@ def _static_source_version(source: str) -> int:
         "features": FEATURES_VERSION,
         "maest": MAEST_VERSION,
         "maest_logits": MAEST_VERSION,
+        "maest_layer7": MAEST_LAYER7_VERSION,
+        "mert_l19": MERT_VERSION,
         "rhythm": RHYTHM_VERSION,
     }[source]
 
@@ -442,7 +458,7 @@ def _gather_composite_vecs(
     blend = float(np.clip(features_blend, 0.05, 1.0))
     weights = dict(source_weights or {})
     versions_token = _source_versions_token(
-        feature_cache, supervised_version=supervised_version
+        feature_cache, supervised_version=supervised_version, sources=sources
     )
     comp_key = _composite_param_key(
         paths, sources, mask, blend, weights, versions_token
@@ -664,8 +680,11 @@ def _weight_jacobian(
     would otherwise evict the live fit the base layout reuses. *on_progress* is
     called as ``(done, total)`` per source, for a determinate progress UI.
 
-    A source already at weight 0 has no block, so it has no derivative and is
-    skipped — raising its weight from 0 is a step the linearisation cannot describe.
+    A source at weight 0 still has a meaningful one-sided derivative: raising it is
+    the slider's action, so we step it *up* by ``+eps`` and divide by that same
+    ``eps`` (never a negative or two-sided step). A source with no block available
+    at all (no cached rows for any track) is skipped — stepping it cannot move the
+    chart, so it has no derivative to report.
     """
     _base, base_normed, _spans = project_fn(base_weights)
     out: dict[str, np.ndarray] = {}
@@ -676,13 +695,18 @@ def _weight_jacobian(
     for s in sources:
         done += 1
         weight = float(base_weights.get(s, 1.0))
-        if weight <= 0.0:
+        # One-sided positive step: raise *s* by +delta (never a two-sided or
+        # negative step), so a zero-weight source's derivative is the rate of
+        # raising it from 0.
+        stepped = dict(base_weights)
+        stepped[s] = weight + float(delta)
+        _res, moved, moved_spans = project_fn(stepped, cache_fit=False)
+        # Skip only a source with no block available: its +delta projection still
+        # carries no span for it, so stepping cannot change the chart.
+        if s not in moved_spans:
             if on_progress is not None:
                 on_progress(done, total)
             continue
-        stepped = dict(base_weights)
-        stepped[s] = weight + float(delta)
-        _res, moved, _sp = project_fn(stepped, cache_fit=False)
         if moved.shape == base_normed.shape:
             out[s] = ((moved - base_normed) / float(delta)).astype(np.float32)
         if on_progress is not None:
@@ -748,6 +772,9 @@ def compute_projection(
     on_progress: Callable[[str, int, int], None] | None = None,
     dims: int = 2,
     align_ref: list[dict] | None = None,
+    recipe_id: str | None = None,
+    tsne_n_iter: int | None = None,
+    tsne_early_exaggeration_iter: int | None = None,
 ) -> list[dict] | tuple[list[dict], dict[str, np.ndarray]]:
     if layout_revision and method == "tsne":
         hit = revision_layout_cached(layout_revision, feature_cache)
@@ -756,6 +783,18 @@ def compute_projection(
             return hit
 
     weights0 = dict(source_weights or {})
+
+    # Effective openTSNE budget: the recipe default unless the request overrode it.
+    # The deviation suffix keys the fit cache so two budgets never share a fit; the
+    # default recipe at its default 100/100 yields an empty suffix (byte-identical).
+    _recipe = recipe_for(recipe_id)
+    eff_n_iter = int(tsne_n_iter if tsne_n_iter is not None else _recipe.tsne_n_iter)
+    eff_early = int(
+        tsne_early_exaggeration_iter
+        if tsne_early_exaggeration_iter is not None
+        else _recipe.tsne_early_exaggeration_iter
+    )
+    tsne_suffix = tsne_iteration_suffix(eff_n_iter, eff_early, _recipe)
 
     # The 3-D gauge pins the head-on (x,y) of a 3-D layout to this lens's own
     # 2-D layout (see `lens_gauge`); build the reference arrays once, not per
@@ -813,6 +852,9 @@ def compute_projection(
                 cache_fit=cache_fit,
                 feature_cache=feature_cache,
                 dims=dims,
+                tsne_n_iter=eff_n_iter,
+                tsne_early_exaggeration_iter=eff_early,
+                tsne_key_suffix=tsne_suffix,
             )
 
         # Put every lens in one shared gauge before normalising, so switching lens
@@ -825,13 +867,13 @@ def compute_projection(
         # with the z sign pinned per family. Without a reference it stays ungauged.
         if cache_fit and dims == 2:
             coords = gauge_layout(
-                f"{_source_versions_token(feature_cache)}|{track_set_key(inp.paths)}",
+                f"{_source_versions_token(feature_cache, sources=sources)}|{track_set_key(inp.paths)}",
                 inp.paths,
                 coords,
             )
         elif cache_fit and dims == 3 and align_ref is not None:
             coords = gauge_layout_3d(
-                f"{_source_versions_token(feature_cache)}|{track_set_key(inp.paths)}",
+                f"{_source_versions_token(feature_cache, sources=sources)}|{track_set_key(inp.paths)}",
                 inp.paths,
                 coords,
                 ref_paths,

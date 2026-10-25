@@ -18,20 +18,25 @@ from backend.services.projection_priority import (
 )
 
 
-def versions_tuple(versions: Any) -> tuple[int, ...]:
+def versions_tuple(versions: Any, recipe_id: str | None = None) -> tuple[int, ...]:
     """Cache generations that feed the layout revision hash.
 
     Order matches ``embeddings/layout_revision.compute_layout_revision``'s
     ``cache_versions`` payload; ``structure`` is deliberately excluded (it is not a
-    projection source).
+    projection source). An opt-in genre recipe additionally appends the genre block
+    generations (layer-7, MERT-L19) so a version bump invalidates the genre layout;
+    the default recipe's tuple is byte-identical to before.
     """
-    return (
+    base = (
         versions.clap,
         versions.features,
         versions.maest,
         versions.rhythm,
         versions.supervised,
     )
+    if recipe_id == "genre_full":
+        return base + (versions.maest_layer7, versions.mert_l19)
+    return base
 
 
 def compute_lens_projection(
@@ -61,7 +66,8 @@ def compute_lens_projection(
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
     maps = batch_fetch_maps(feature_cache, fps, source_versions)
     revision = layout_revision_for_projection(
-        infos, maps, proj, cache_versions=versions_tuple(source_versions)
+        infos, maps, proj,
+        cache_versions=versions_tuple(source_versions, getattr(proj, "recipe_id", None)),
     )
     # An already-warmed lens must not wait behind a background fit for another.
     if proj.method == "tsne":
@@ -92,6 +98,9 @@ def compute_lens_projection(
             source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
             required_sources=proj.required_sources,
             dims=proj.dims,
+            recipe_id=getattr(proj, "recipe_id", None),
+            tsne_n_iter=getattr(proj, "tsne_n_iter", None),
+            tsne_early_exaggeration_iter=getattr(proj, "tsne_early_exaggeration_iter", None),
             on_progress=on_progress,
             **extra,
         )

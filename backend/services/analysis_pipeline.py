@@ -44,6 +44,7 @@ from backend.jobs import (
     KIND_FEATURES,
     KIND_LAYOUT,
     KIND_MAEST,
+    KIND_MERT,
     KIND_SCAN,
     KIND_STRUCTURE,
     KIND_SUPERVISED,
@@ -80,6 +81,23 @@ class AnalysisDeps:
     #: Root of the runtime ``data/`` dir — where the supervised head lives.
     data_dir: str = ""
     emit_decode_warning: Callable[[str, str], None] | None = None
+    #: Version of the ``maest_layer7`` cache column. It is produced by the same
+    #: MAEST forward and purged with the MAEST family on a checkpoint change, but
+    #: carries its own version integer.
+    maest_layer7_version: int = 0
+    #: Independent MERT encoder + its cache version. Always wired in production
+    #: (the module is import-safe); ``mert_enabled`` — not this reference — gates
+    #: whether the stage is enqueued and a worker registered.
+    mert_mod: Any = None
+    mert_version: int = 0
+    #: Whether the ``genre_full`` layer-7 block is active. When False the MAEST
+    #: handler behaves as before (embedding/logits/excerpts only); when True it
+    #: also requires and caches the layer-7 vector.
+    layer7_enabled: bool = False
+    #: Whether the MERT stage is wired (genre_full AND not ``--no-mert``). When
+    #: False the MERT kind is never enqueued, so a disabled server cannot pile up
+    #: jobs behind a model that will never load.
+    mert_enabled: bool = False
 
 
 class ClusterStore:
@@ -519,7 +537,7 @@ def make_structure_handler(
 def make_maest_handler(
     deps: AnalysisDeps, *, batch_size: int = 4
 ) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
-    """MAEST embedding + 519 style logits, batched across the claimed jobs."""
+    """MAEST embedding + 519 style logits (+ opt-in layer-7), batched."""
 
     def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
         out: dict[int, JobResult] = {}
@@ -537,13 +555,19 @@ def make_maest_handler(
             if not fp:
                 out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
                 continue
-            # A row counts as cached only when both the pooled outputs *and* the
+            # A row counts as cached only when the pooled outputs *and* the
             # per-excerpt vectors are present: excerpt vectors were added after the
             # pooled pair shipped, so pre-existing rows must be re-analysed once.
+            # When genre_full layer-7 is active, the layer-7 blob is required too.
             if deps.feature_cache.has(
                 "maest", fp, version=deps.maest_version
             ) and deps.feature_cache.has(
                 "maest_excerpts", fp, version=deps.maest_version
+            ) and (
+                not deps.layer7_enabled
+                or deps.feature_cache.has(
+                    "maest_layer7", fp, version=deps.maest_layer7_version
+                )
             ):
                 out[job.id] = JobResult.success(cached=True)
                 continue
@@ -577,6 +601,11 @@ def make_maest_handler(
             if analysis is None:
                 out[job.id] = JobResult.failure("MAEST produced no embedding")
                 continue
+            # A successful result always carries layer-7 (the hook raises rather
+            # than degrades); if it is somehow absent, requeue the same job.
+            if deps.layer7_enabled and analysis.layer7 is None:
+                out[job.id] = JobResult.failure("MAEST produced no layer-7 vector")
+                continue
             try:
                 deps.feature_cache.put_maest(
                     fp,
@@ -584,11 +613,89 @@ def make_maest_handler(
                     analysis.logits,
                     excerpts=analysis.excerpt_embeddings,
                     version=deps.maest_version,
+                    layer7=(
+                        analysis.layer7 if deps.layer7_enabled else None
+                    ),
+                    layer7_version=deps.maest_layer7_version,
                 )
             except Exception as e:
                 out[job.id] = JobResult.failure(f"cache write failed: {e}")
                 continue
             out[job.id] = JobResult.success(excerpts=analysis.num_excerpts)
+        return out
+
+    return handle
+
+
+def make_mert_handler(
+    deps: AnalysisDeps, *, batch_size: int = 4
+) -> Callable[[Sequence[Job]], dict[int, JobResult]]:
+    """MERT layer-19 embedding, batched across the claimed jobs.
+
+    MERT is an independent encoder with its own worker and its own cache source
+    (``mert_l19``); it is never a MAEST-stage flag. Permanent errors (missing
+    file, no fingerprint) return ``retry=False``.
+    """
+
+    def handle(jobs: Sequence[Job]) -> dict[int, JobResult]:
+        out: dict[int, JobResult] = {}
+        targets: list[tuple[Job, str, str]] = []  # (job, abs_path, fingerprint)
+
+        for job in jobs:
+            vpath = job.path
+            if not vpath:
+                out[job.id] = JobResult.failure("job payload has no path", retry=False)
+                continue
+            fp, abs_path = _fingerprint_for(deps, vpath)
+            if abs_path is None:
+                out[job.id] = JobResult.failure("file not found", retry=False)
+                continue
+            if not fp:
+                out[job.id] = JobResult.failure("no fingerprint (is fpcalc installed?)")
+                continue
+            if deps.feature_cache.has(
+                "mert_l19", fp, version=deps.mert_version
+            ):
+                out[job.id] = JobResult.success(cached=True)
+                continue
+            targets.append((job, abs_path, fp))
+
+        if not targets:
+            return out
+
+        if not deps.mert_mod.is_model_ready():
+            deps.mert_mod.load_model()
+        if not deps.mert_mod.is_model_ready():
+            err = deps.mert_mod.load_error() or "MERT model unavailable"
+            for job, _, _ in targets:
+                out[job.id] = JobResult.failure(err)
+            return out
+
+        warns: dict[str, str] = {}
+
+        def _warn(path: str, message: str) -> None:
+            warns[path] = message
+
+        results = deps.mert_mod.analyze_batch(
+            [abs_path for _, abs_path, _ in targets],
+            on_decode_warning=_warn,
+            max_batch=max(1, batch_size * 3),
+        )
+        _relay_warnings(deps, warns)
+
+        for job, abs_path, fp in targets:
+            vec = results.get(abs_path)
+            if vec is None:
+                out[job.id] = JobResult.failure("MERT produced no embedding")
+                continue
+            try:
+                deps.feature_cache.put(
+                    "mert_l19", fp, vec, version=deps.mert_version
+                )
+            except Exception as e:
+                out[job.id] = JobResult.failure(f"cache write failed: {e}")
+                continue
+            out[job.id] = JobResult.success()
         return out
 
     return handle
@@ -780,6 +887,7 @@ def gather_source_blocks(
     *,
     clap_version: int,
     on_progress: Callable[[int, int], None] | None = None,
+    include_genre_full: bool = False,
 ) -> tuple[list[str], dict[str, np.ndarray], np.ndarray | None]:
     """Assemble aligned per-source matrices for the tracks that have MAEST data.
 
@@ -787,6 +895,14 @@ def gather_source_blocks(
     has no meaningful position in the genre space. Optional sources are filled
     with zero rows where missing so every block keeps the same row order as
     *paths*; a zero row is neutral after per-block standardisation.
+
+    With *include_genre_full* the opt-in ``genre_full`` blocks (``maest_layer7``,
+    ``mert_l19``) are additionally gathered, each gated by its own enabled flag
+    (``layer7_enabled`` / ``mert_enabled``). The default recipe never requests
+    them, so a plain gather stays byte-identical to before. They are extra blocks
+    in the returned dict; downstream code ignores any it has no weight for (the
+    supervised trainer restricts its input to the frozen sources explicitly).
+
     *on_progress* receives ``(sources_done, sources_total)`` after each source.
     """
     fps = [t["fingerprint"] for t in infos if t.get("fingerprint")]
@@ -794,14 +910,20 @@ def gather_source_blocks(
         return [], {}, None
 
     fc = deps.feature_cache
-    sources = (
+    sources: list[tuple[str, str, int]] = [
         ("maest", "maest", deps.maest_version),
         ("maest_logits", "maest_logits", deps.maest_version),
         ("rhythm", "rhythm", deps.rhythm_version),
         ("features", "features", deps.features_version),
         ("clap", "clap", clap_version),
         ("supervised", "supervised", supervised_mod.cache_version(fc)),
-    )
+    ]
+    if include_genre_full:
+        if deps.layer7_enabled:
+            sources.append(("maest_layer7", "maest_layer7", deps.maest_layer7_version))
+        if deps.mert_enabled:
+            sources.append(("mert_l19", "mert_l19", deps.mert_version))
+
     maps: dict[str, dict[str, np.ndarray]] = {}
     for i, (name, source, version) in enumerate(sources):
         maps[name] = fc.get_all(source, fps, version=version)
@@ -809,10 +931,6 @@ def gather_source_blocks(
             on_progress(i + 1, len(sources))
     maest_map = maps["maest"]
     logits_map = maps["maest_logits"]
-    rhythm_map = maps["rhythm"]
-    feat_map = maps["features"]
-    clap_map = maps["clap"]
-    supervised_map = maps["supervised"]
 
     paths: list[str] = []
     picked: list[str] = []
@@ -841,19 +959,26 @@ def gather_source_blocks(
         return np.stack(rows, axis=0).astype(np.float32)
 
     blocks: dict[str, np.ndarray] = {}
-    for name, source_map in (
-        ("maest", maest_map),
-        ("maest_logits", logits_map),
-        ("rhythm", rhythm_map),
-        ("features", feat_map),
-        ("clap", clap_map),
-        ("supervised", supervised_map),
-    ):
+    for name, source_map in maps.items():
         block = _stack(source_map, name)
         if block is not None:
             blocks[name] = block
 
     return paths, blocks, blocks.get("maest_logits")
+
+
+#: Sources that only the opt-in ``genre_full`` recipe consumes. Their presence in a
+#: weight map is the signal that a clustering run needs the genre_full gather.
+_GENRE_FULL_BLOCKS: tuple[str, ...] = ("maest_layer7", "mert_l19")
+
+
+def _needs_genre_full(weights: dict[str, float] | None) -> bool:
+    """True when *weights* ask for any genre_full-only block.
+
+    The default recipe's weights never mention these sources, so this is a precise
+    "is the genre lens active" test without threading a recipe id through the store.
+    """
+    return bool(weights) and any(weights.get(s, 0.0) > 0.0 for s in _GENRE_FULL_BLOCKS)
 
 
 def run_clustering(
@@ -882,6 +1007,7 @@ def run_clustering(
         deps,
         infos,
         clap_version=deps.clap_version,
+        include_genre_full=_needs_genre_full(weights),
     )
     if not paths:
         log.info("Clustering: no tracks with MAEST data yet")
@@ -898,6 +1024,9 @@ def run_clustering(
             deps.rhythm_version,
             deps.features_version,
             supervised_mod.cache_version(deps.feature_cache),
+            deps.clap_version,
+            deps.maest_layer7_version,
+            deps.mert_version,
         ),
         on_progress=on_progress,
     )
@@ -1737,8 +1866,8 @@ def enqueue_library_work(
     include already-cached tracks.
 
     *revive_failed* additionally revives terminally-failed rows. Automatic
-    keep-warm enqueues leave it off so a genuinely broken file is not retried on
-    every call; explicit retriggers and the version-purge backfill set it.
+    keep-warm enqueues and the version-purge backfill leave it off so a genuinely
+    broken file is not retried on every call; explicit retriggers set it.
     """
     fc = deps.feature_cache
     queued: dict[str, int] = {}
@@ -1754,6 +1883,18 @@ def enqueue_library_work(
     have_excerpts = (
         set(fc.get_all("maest_excerpts", fps, version=deps.maest_version))
         if KIND_MAEST in kinds
+        else set()
+    )
+    # Layer-7 shipped after the pooled pair too; when genre_full is active a row
+    # missing it is re-queued on the same MAEST job (single-pass capture).
+    have_maest_layer7 = (
+        set(fc.get_all("maest_layer7", fps, version=deps.maest_layer7_version))
+        if KIND_MAEST in kinds and deps.layer7_enabled
+        else set()
+    )
+    have_mert = (
+        set(fc.get_all("mert_l19", fps, version=deps.mert_version))
+        if KIND_MERT in kinds and deps.mert_enabled
         else set()
     )
     have_rhythm = (
@@ -1818,12 +1959,34 @@ def enqueue_library_work(
                 force
                 or t["fingerprint"] not in have_maest
                 or t["fingerprint"] not in have_excerpts
+                or (
+                    deps.layer7_enabled
+                    and t["fingerprint"] not in have_maest_layer7
+                )
             )
         ]
         queued[KIND_MAEST] = queue.enqueue_many(
             KIND_MAEST,
             items,
             priority=100,
+            requeue_terminal=True,
+            requeue_failed=revive_failed,
+        )
+
+    # MERT is its own kind/worker and is skipped entirely when the server is not
+    # opted into genre_full (or was started with --no-mert): the worker gates on
+    # model readiness, so enqueueing would leave jobs pending forever.
+    if KIND_MERT in kinds and deps.mert_enabled:
+        items = [
+            (t["path"], {"path": t["path"]})
+            for t in infos
+            if t.get("fingerprint")
+            and (force or t["fingerprint"] not in have_mert)
+        ]
+        queued[KIND_MERT] = queue.enqueue_many(
+            KIND_MERT,
+            items,
+            priority=108,
             requeue_terminal=True,
             requeue_failed=revive_failed,
         )
@@ -1866,9 +2029,16 @@ def enqueue_library_work(
 
     if priority_paths:
         wanted = list(priority_paths)
-        for kind in (KIND_FEATURES, KIND_STRUCTURE, KIND_MAEST, KIND_CLAP):
+        for kind in (
+            KIND_FEATURES,
+            KIND_STRUCTURE,
+            KIND_MAEST,
+            KIND_MERT,
+            KIND_CLAP,
+        ):
             if kind in kinds and (kind != KIND_CLAP or deps.clap_enabled):
-                queue.prioritize(kind, wanted, priority=0)
+                if kind != KIND_MERT or deps.mert_enabled:
+                    queue.prioritize(kind, wanted, priority=0)
 
     return queued
 

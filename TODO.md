@@ -1,3 +1,14 @@
+-> Allow "bloom scroll" on the cluster to map to another clustering granularity
+
+-> Moved 3d toggle to view properties panel?
+-> Make the dots have a "real size" i.e. scale with distance in 3d view
+
+-> Maybe also Cluster granularity? And source weights?
+
+-> "Move to my library"-button not working?
+
+
+
 # Trackspace — engineering TODO
 
 Remaining, actionable work only. Completed work and the reasoning behind it live in
@@ -5,16 +16,6 @@ the docs: `architecture.md`, `ui_conventions.md`, `audio_pipeline.md`,
 `design-patterns.md`.
 
 ## User feedback
-- [ ] **3-D view: verify in a real browser and tune.** The depth pre-passes in
-  `lib/point-layer.ts` and `lib/glow-layer.ts` (MAX-blend front depth, `DEPTH_SLAB` /
-  `DEPTH_MASK` / `DEPTH_EPS`), the `depthShade` cue and the perspective default have no
-  GL test coverage (happy-dom has no WebGL). Eyeball with `3` on a real library, check
-  the 2-D↔3-D tween and a spherical scope; expose slab/shade strength as a query param
-  (like `?persp=`) if they need fiddling.
-- [ ] **3-D scopes: sphere radius under perspective.** `worldRadiusForPx` / the drawn
-  circle use the perspective scale at the sphere centre, so the outline is exact only for
-  the centre; members near the rim can look slightly in/out under strong `?persp`.
-
 - [ ] **Hide or remove the custom-tags UI.** Tags are no longer central (the 3-D view,
   scopes and weight sliders ignore them). Hide-only is ~10 files (`lenses.ts` drop the
   `tags` lens + E-cycle slot, `tag-panel-view.ts`, `batch-view.ts`, `index.html`
@@ -432,18 +433,14 @@ are single-sourced in `audio_pipeline.md` → *Genre-space evaluation conclusion
 2026)*. Code: `backend/experiments/genre_space/`. The scale-500 run and listening pass are
 done. The detailed, sliced plans for the work below live in `embedding-next-steps.md`:
 
-- [ ] **WS 1 — Wire the user-selected `genre_full` into production (opt-in).**
-  `genre_full` (logits .40, maest .20, layer7 .25, mert19 .15) is **selected by the
-  user** but **not yet in production** (no app-wide source-weight change). Adopt it as
-  an **opt-in recipe id only**: a genre-block weight recipe that must not overwrite the
-  app-wide weights and clobber CLAP/rhythm; decide the total genre-block budget relative
-  to the existing sources, and give each new block (layer-7, MERT19) an independent cache
-  version, queue jobs, and an inference GPU guard under `clap.inference_lock`. Lean
-  fallbacks: `genre_without_layer7` / `genre_without_mert`. Plan, slices and acceptance:
-  `embedding-next-steps.md` → *WS 1*.
-- [ ] **WS 1 — Single-pass layer-7 extraction (priority).** Extraction currently runs two
-  passes; capturing layer-7 during the MAEST full forward removes the ~99 ms per 3-excerpt
-  batch measured in the benchmark. Plan: `embedding-next-steps.md` → *WS 1* (slice 1).
+- [ ] **WS 1 follow-up — real-MERT-live parity, timing and peak RSS.** WS 1 is now the
+  default production recipe (see `embedding-next-steps.md` → *WS 1* → *Rollout status*), but
+  **real MERT inference has not been run**: the L19 path is verified only against a
+  deterministic fake mirroring the pinned `modeling_mert2.py`. Run the production MERT
+  worker with real weights (`--allow-download`), verify L19 parity against the pin, and
+  capture single-pass L7 wall-clock/GPU-time removal (~99 ms/3-excerpt) plus peak RSS /
+  MPS memory for `maest_layer7` and `mert_l19`. Do not mark these measurements done until
+  they are actually taken.
 - [ ] **WS 4 — Larger real microgenre validation, if viable.** The 33 eligible depth-2
   parents gave tiny per-parent query counts (often nq=1), so confidence is low; a bigger
   real cohort would firm it up. `genre_full` is recorded and selected, not proven at scale —

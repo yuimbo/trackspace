@@ -1,6 +1,10 @@
 import {
   COLOR_MODES,
+  GENRE_FULL_LENS,
+  availableLenses,
+  defaultMapLensId,
   getLens,
+  legacyToGenreLensId,
   nextLensId,
   prevLensId,
   stepColorMode,
@@ -26,6 +30,7 @@ import { MAX_PITCH, type Orbit } from "./lib/camera3d";
 import { displayFolderPath } from "./lib/path-presenter";
 import { clamp01 } from "./lib/util";
 import clusterWeights from "./lib/cluster-weights.json";
+import { GENRE_FULL_WEIGHTS } from "./lib/lenses";
 
 /** Cached librosa descriptors ([0,1]) when the fingerprint has a features row. */
 export interface TrackAudioFeatures {
@@ -168,6 +173,8 @@ export const CLUSTER_WEIGHT_LABELS: Record<string, string> = {
   clap: "CLAP",
   supervised: "Folders",
   features: "Audio",
+  maest_layer7: "MAEST layer-7",
+  mert_l19: "MERT L19",
 };
 
 /**
@@ -185,6 +192,9 @@ export const CLUSTER_WEIGHT_DESCRIPTIONS: Record<string, string> = {
     "Folder-supervised head output (128-D) — your own folder organisation; derived, not an encoder",
   features:
     "Audio descriptors (tempo, energy, danceability) — the other three are masked out",
+  maest_layer7: "MAEST layer-7 (2304-D) — the opt-in pure-genre block; only active in the genre_full recipe",
+  mert_l19:
+    "MERT layer-19 (1024-D) — the opt-in MERT genre block; only active in the genre_full recipe",
 };
 
 function _migrateClusterWeights(raw: unknown): Record<string, number> {
@@ -197,6 +207,25 @@ function _migrateClusterWeights(raw: unknown): Record<string, number> {
     }
   }
   return out;
+}
+
+/** Migrate a saved genre recipe weight vector, ignoring unknown/legacy keys. */
+function _migrateGenreWeights(raw: unknown): Record<string, number> {
+  const out: Record<string, number> = { ...GENRE_FULL_WEIGHTS };
+  if (raw && typeof raw === "object") {
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (!(k in out)) continue;
+      const n = Number(v);
+      if (Number.isFinite(n)) out[k] = clamp01(n);
+    }
+  }
+  return out;
+}
+
+/** Saved lens ids the genre map replaced: ``combined``/``maest``/``supervised``
+ *  now resolve to the genre recipe. Unknown ids pass through unchanged. */
+function _migrateLegacyMapLensId(id: string): string {
+  return legacyToGenreLensId(id);
 }
 
 /** Compact display / query-string form for a source weight (drops trailing zeros). */
@@ -254,7 +283,11 @@ function _migrateLensPresets(raw: unknown): LensPreset[] {
     out.push({
       id: p.id,
       name: p.name,
-      baseLens: typeof p.baseLens === "string" ? p.baseLens : "combined",
+      // A legacy base lens (combined / maest / supervised) resolves to the genre
+      // map, matching the scope-lens migration: the genre map replaced those maps.
+      baseLens: legacyToGenreLensId(
+        typeof p.baseLens === "string" ? p.baseLens : "combined",
+      ),
       weights: _migrateClusterWeights(p.weights),
       colorMode: _migrateColorMode(p.colorMode, p.colorByCluster),
       clusterResolution:
@@ -571,6 +604,23 @@ export class Model extends EventBus {
   /** User presets: a base lens plus saved display options. Persisted. */
   lensPresets: LensPreset[] = [];
 
+  /**
+   * True when the server opted into the ``genre_full`` blocks (``--enable-genre-full``),
+   * learned from ``/api/embeddings/status``. Gates the genre_full lens: when false
+   * the built-in lens set (cycle + tabber) is exactly the pre-recipe one.
+   */
+  genreFullEnabled = false;
+
+  /**
+   * Per-dimensionality openTSNE iteration-budget overrides, keyed by ``d2``/``d3``.
+   * Every embedding-map lens shares the budget for its dimensionality: a budget
+   * chosen on the 2-D Genre map is shared by all other 2-D map lenses, and 3-D
+   * keeps its own separate budget. ``null`` entries mean "use the active recipe's
+   * default" (100/100). Sent as ``tsne_n_iter`` /
+   * ``tsne_early_exaggeration_iter`` only when set.
+   */
+  tsneIteration: Record<string, { nIter: number | null; early: number | null }> = {};
+
   get lensId(): string {
     return this._lensId;
   }
@@ -598,7 +648,7 @@ export class Model extends EventBus {
     this._lensId =
       mode === "embeddings"
         ? getLens(this._lensId).kind === "tags"
-          ? "combined"
+          ? defaultMapLensId(this.genreFullEnabled)
           : this._lensId
         : "tags";
   }
@@ -642,19 +692,58 @@ export class Model extends EventBus {
   /** Next built-in lens id for the **E** cycle. */
   nextLens(): string {
     const preset = this.lensPresets.find((p) => p.id === this._lensId);
-    return nextLensId(this._lensId, preset?.baseLens);
+    return nextLensId(
+      this._lensId,
+      preset?.baseLens,
+      availableLenses(this.genreFullEnabled),
+    );
   }
 
   /** Previous built-in lens id for the **Shift+E** cycle. */
   prevLens(): string {
     const preset = this.lensPresets.find((p) => p.id === this._lensId);
-    return prevLensId(this._lensId, preset?.baseLens);
+    return prevLensId(
+      this._lensId,
+      preset?.baseLens,
+      availableLenses(this.genreFullEnabled),
+    );
   }
 
   /** Built-in lens the active view is based on: a preset's base, else the lens id. */
   activeBaseLensId(): string {
     const preset = this.lensPresets.find((p) => p.id === this._lensId);
     return preset?.baseLens ?? this._lensId;
+  }
+
+  /** Per-dimensionality key for a budget override: ``d2``/``d3``. */
+  static tsneIterationKey(dims: 2 | 3): string {
+    return `d${dims}`;
+  }
+
+  /** The active dimensionality's openTSNE budget override, or
+   *  ``{nIter:null, early:null}`` (use the recipe default). Shared by every
+   *  embedding-map lens of that dimensionality. The per-dimensionality lookup is
+   *  hidden here so the projection query and the iteration control read one seam. */
+  tsneIterationFor(): { nIter: number | null; early: number | null } {
+    return (
+      this.tsneIteration[Model.tsneIterationKey(this.is3d ? 3 : 2)] ??
+      { nIter: null, early: null }
+    );
+  }
+
+  /** Persist a budget override for the *active* dimensionality (``d2``/``d3``),
+   *  shared by all embedding-map lenses of that dimensionality. ``null``/``null``
+   *  clears it (recipe default). The coordinator owns when to save/refetch; this
+   *  only mutates the stored per-dimensionality value. */
+  setTsneIterationForActiveView(nIter: number | null, early: number | null): void {
+    const key = Model.tsneIterationKey(this.is3d ? 3 : 2);
+    if (nIter === null && early === null) delete this.tsneIteration[key];
+    else this.tsneIteration[key] = { nIter, early };
+  }
+
+  /** The map lens the "tags → embeddings" toggle lands on: genre when enabled. */
+  defaultMapLensId(): string {
+    return defaultMapLensId(this.genreFullEnabled);
   }
 
   /** Apply a saved preset: base lens plus its captured display options. */
@@ -779,8 +868,26 @@ export class Model extends EventBus {
   /**
    * Per-source weights for clustering and the layout; persisted. One vector drives
    * both pipelines so the map and cluster assignments describe the same space.
+   * (The legacy Combined-map vector — only active when the server did not enable
+   * the genre recipe.)
    */
   clusterWeights: Record<string, number> = { ...DEFAULT_CLUSTER_WEIGHTS };
+
+  /* ── Genre map weights ──────────────────────────────────────
+   * The genre_full recipe's tunable 7-key vector (logits / maest / layer-7 /
+   * MERT / rhythm / clap / supervised). ``genreWeights`` is the *applied*,
+   * persisted vector the map is currently fit at; ``genreDraft`` holds a live
+   * slider draft that has only been *previewed* via the Jacobian and not yet
+   * committed (null = no active draft). */
+  genreWeights: Record<string, number> = { ...GENRE_FULL_WEIGHTS };
+  /** Live slider draft, or null when the sliders match the applied vector. */
+  genreDraft: Record<string, number> | null = null;
+  /** True when the server enabled the MERT genre block. Derived from the status
+   *  payload: the ``mert_l19`` coverage row is only reported when MERT is wired.
+   *  Gates the MERT genre slider (a disabled block can never contribute). */
+  mertEnabled = false;
+  /** Per-source coverage from the last status poll, for genre-slider availability. */
+  coverageSources: { id: string; done: number; pending: number }[] = [];
   clusterRevision: string | null = null;
   clustersAvailable = false;
   /**
@@ -1819,17 +1926,23 @@ export class Model extends EventBus {
         bloomRanges: this.bloomRanges,
         headColorConfident: this.headColorConfident,
         clusterWeights: this.clusterWeights,
+        genreWeights: this.genreWeights,
         trainFolders: this.trainFolders,
         showExternal: this.showExternal,
         externalInProjection: this.externalInProjection,
         rightPanelTab: this.rightPanelTab,
         view3d: this.view3d,
+        tsneIteration: this.tsneIteration,
       }),
     );
     localStorage.setItem(LS_KEY + "_tags", JSON.stringify(this._knownTags));
   }
 
   loadLS(): void {
+    // A fresh startup (no saved data) lands on the Genre map, the user-agreed
+    // default; the saved-data block below overrides with a persisted / migrated
+    // lens when one exists.
+    this._lensId = "genre_full";
     try {
       const d = JSON.parse(localStorage.getItem(LS_KEY) ?? "null");
       if (d) {
@@ -1851,15 +1964,22 @@ export class Model extends EventBus {
             : DEFAULT_PREVIEW_VOLUME;
         this._lensId =
           typeof d.lensId === "string"
-            ? d.lensId
-            : d.viewMode === "embeddings"
-              ? "combined"
-              : "tags";
+            ? _migrateLegacyMapLensId(d.lensId)
+            : // A fresh startup (no saved lens) lands on the Genre map, the
+              // user-agreed default. A legacy ``viewMode: "tags"`` choice is
+              // preserved; everything else defaults to the genre map and the
+              // coordinator reconciles it to the combined fallback if the server
+              // did not enable genre.
+              d.viewMode === "tags"
+              ? "tags"
+              : "genre_full";
         this.lensPresets = _migrateLensPresets(
           (d as { lensPresets?: unknown }).lensPresets,
         );
         if (typeof (d as { scopeLensId?: unknown }).scopeLensId === "string") {
-          this.scopeLensId = (d as { scopeLensId: string }).scopeLensId;
+          this.scopeLensId = _migrateLegacyMapLensId(
+            (d as { scopeLensId: string }).scopeLensId,
+          );
         }
         const cr = Number((d as { clusterResolution?: number }).clusterResolution);
         this.clusterResolution = Number.isFinite(cr) && cr > 0 ? cr : 1.5;
@@ -1882,6 +2002,9 @@ export class Model extends EventBus {
           (d as { headColorConfident?: unknown }).headColorConfident !== false;
         this.clusterWeights = _migrateClusterWeights(
           (d as { clusterWeights?: unknown }).clusterWeights,
+        );
+        this.genreWeights = _migrateGenreWeights(
+          (d as { genreWeights?: unknown }).genreWeights,
         );
         const tf = (d as { trainFolders?: unknown }).trainFolders;
         this.trainFolders = Array.isArray(tf)
@@ -1916,6 +2039,86 @@ export class Model extends EventBus {
               yaw: r.yaw,
               pitch: Math.max(-MAX_PITCH, Math.min(MAX_PITCH, r.pitch)),
             };
+          }
+        }
+        const ti = (d as { tsneIteration?: unknown }).tsneIteration;
+        if (ti && typeof ti === "object") {
+          // Legacy global override — a single ``{nIter, early}`` that used to apply
+          // to every view. Its view is unknowable, so migrate it to the *active*
+          // saved dimensionality only (2-D and 3-D keep separate budgets).
+          // The per-dimensionality map is sanitised entry by entry.
+          if ("nIter" in ti || "early" in ti) {
+            const t = ti as { nIter?: unknown; early?: unknown };
+            const nIter =
+              typeof t.nIter === "number" && Number.isFinite(t.nIter)
+                ? t.nIter
+                : null;
+            const early =
+              typeof t.early === "number" && Number.isFinite(t.early)
+                ? t.early
+                : null;
+            if (nIter !== null || early !== null) {
+              this.tsneIteration[
+                Model.tsneIterationKey(this.view3d.on ? 3 : 2)
+              ] = { nIter, early };
+            }
+          } else {
+            // Per-dimensionality map. ``d2``/``d3`` keys pass through; the older
+            // per-view keys (``lensId:d2``/``lensId:d3``) are collapsed to one
+            // representative per dimension: the active saved lens's own entry for
+            // the active dimension, otherwise (and for the other dimension)
+            // deterministically the genre lens, then the first sorted valid entry.
+            const byDim: Record<2 | 3, Array<{ lens: string; nIter: number | null; early: number | null }>> =
+              { 2: [], 3: [] };
+            const entry = (
+              v: unknown,
+            ): { nIter: number | null; early: number | null } | null => {
+              if (!v || typeof v !== "object") return null;
+              const e = v as { nIter?: unknown; early?: unknown };
+              const nIter =
+                typeof e.nIter === "number" && Number.isFinite(e.nIter)
+                  ? e.nIter
+                  : null;
+              const early =
+                typeof e.early === "number" && Number.isFinite(e.early)
+                  ? e.early
+                  : null;
+              return nIter === null && early === null ? null : { nIter, early };
+            };
+            for (const [key, val] of Object.entries(
+              ti as Record<string, unknown>,
+            )) {
+              const direct = /^d[23]$/.exec(key);
+              const legacy = /^(.+):d([23])$/.exec(key);
+              const e = direct ? entry(val) : null;
+              if (direct && e) {
+                this.tsneIteration[key] = e;
+                continue;
+              }
+              if (!legacy) continue;
+              const v = entry(val);
+              if (!v) continue;
+              const dim = legacy[2] === "3" ? 3 : 2;
+              byDim[dim].push({ lens: legacy[1], ...v });
+            }
+            const activeDim = this.view3d.on ? 3 : 2;
+            const activeLens = this.activeBaseLensId();
+            for (const dim of [2, 3] as const) {
+              const list = byDim[dim];
+              if (list.length === 0) continue;
+              let chosen =
+                dim === activeDim
+                  ? list.find((e) => e.lens === activeLens)
+                  : undefined;
+              chosen ??= list.find((e) => e.lens === GENRE_FULL_LENS.id);
+              chosen ??= [...list].sort((a, b) =>
+                a.lens.localeCompare(b.lens),
+              )[0];
+              this.tsneIteration[Model.tsneIterationKey(dim)] = {
+                nIter: chosen.nIter,
+                early: chosen.early,
+              };
+            }
           }
         }
       }

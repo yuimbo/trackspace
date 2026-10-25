@@ -334,6 +334,25 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   the fixed named sets (`base`, `budget`, `scale`, `early`, `mixes`, `ablation`).
   Usage and the set recipes live in README.md → *Layout evaluation*; this file
   only inventories the surface.
+- **The projection request selects a canonical recipe and an openTSNE budget.**
+  `GET /api/embeddings/projection` accepts `recipe=genre_full` (the default pure-genre
+  lens — Genre is the default; `--no-genre-full` disables its analysis blocks — which
+  fixes its sources/weights/budget, mutually exclusive with `sources=`/`w=`) and
+  `tsne_n_iter` (100–2000) /
+  `tsne_early_exaggeration_iter` (0–1000) overrides of the active recipe's budget. Any
+  deviation is part of `layout_revision` and the fit-cache key, so a user-chosen budget
+  never shares a fit with the recipe default. `POST /api/clusters/rebuild` accepts
+  `recipe=default|genre_full` to switch the *clustering* weights to the genre vector —
+  changing the projection lens never changes the cluster assignments; re-clustering is a
+  separate, explicit action. The recipe registry, weights and budgets are single-sourced
+  in `backend/embeddings/projection_config.py`; the cluster ids/weights alias that
+  registry (`clustering.CLUSTER_RECIPE_IDS` / `CLUSTER_GENRE_FULL_WEIGHTS`).
+- **MERT is an independent `mert` job kind.** Genre is the default, so layer-7 is always
+  captured by the MAEST job; MERT is wired when the server was started without
+  `--no-mert` **and** with `--trust-remote-code` (the CC-BY-NC licence is accepted by
+  default for this personal project). It never auto-downloads weights. Its `mert_l19`
+  cache source has its own version column, written by `make_mert_handler`
+  (`services/analysis_pipeline.py`) under the shared `inference_lock`.
 - **`/api/analysis/problems` is the actionable counterpart to the coverage counts.**
   It lists tracks fpcalc cannot fingerprint at all plus per-path terminal job failures
   (aggregated across kinds), so the UI can surface the damaged files behind a short

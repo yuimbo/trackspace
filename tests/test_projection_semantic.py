@@ -675,7 +675,7 @@ def test_weight_jacobian_predicts_small_weight_steps():
     assert cosine > 0.5
 
 
-def test_weight_jacobian_skips_zero_weight_source():
+def test_weight_jacobian_one_sided_step_for_zero_weight_source():
     fp = "z"
     infos = [{"path": f"a/t{i}.mp3", "fingerprint": fp} for i in range(3)]
     cache = _StubFeatureCache(
@@ -687,7 +687,27 @@ def test_weight_jacobian_skips_zero_weight_source():
         feature_mask=parse_audio_feature_mask("111111"), features_blend=0.5,
         source_weights={"clap": 1.0, "features": 0.0}, with_jacobian=True,
     )
-    # A zero-weight source contributes no block, so it has no derivative.
+    # A zero-weight source that still has a block available has a one-sided
+    # derivative (the rate of raising it from 0) — the slider preview needs it.
+    assert "features" in jac
+    assert "clap" in jac
+    assert jac["features"].shape == (3, 2)
+
+
+def test_weight_jacobian_skips_source_with_no_block():
+    """A source with no cached rows at all has no derivative, even stepped +eps."""
+    fp = "noblock"
+    infos = [{"path": f"nb/t{i}.mp3", "fingerprint": fp} for i in range(3)]
+    # ``clap`` has rows, ``features`` has none. Only ``clap`` is required, so the
+    # tracks still qualify and ``features`` stays an absent (skipped) source.
+    cache = _StubFeatureCache(clap={fp: np.ones(3, dtype=np.float32)})
+    _, jac = compute_projection(
+        infos, cache, method="pca", sources=("clap", "features"),
+        required_sources=("clap",),
+        feature_mask=parse_audio_feature_mask("111111"), features_blend=0.5,
+        source_weights={"clap": 1.0, "features": 0.0}, with_jacobian=True,
+    )
+    # ``features`` has no block available, so it is skipped (not a zero entry).
     assert "features" not in jac
     assert "clap" in jac
 

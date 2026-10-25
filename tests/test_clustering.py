@@ -72,6 +72,59 @@ def test_build_weighted_matrix_handles_no_usable_sources() -> None:
     assert mat.size == 0 and used == [] and effective == {}
 
 
+def test_build_weighted_matrix_accepts_genre_full_blocks() -> None:
+    """The genre_full blocks (layer-7, MERT) participate exactly like the others."""
+    rng = np.random.default_rng(0)
+    blocks = {
+        "maest_logits": rng.normal(size=(10, 8)).astype(np.float32),
+        "maest_layer7": rng.normal(size=(10, 16)).astype(np.float32),
+        "mert_l19": rng.normal(size=(10, 8)).astype(np.float32),
+    }
+    weights = {"maest_logits": 0.4, "maest_layer7": 0.25, "mert_l19": 0.15}
+    mat, used, effective = cl.build_weighted_matrix(blocks, weights)
+    assert used == ["maest_logits", "maest_layer7", "mert_l19"]
+    assert effective == weights
+    assert mat.shape == (10, 8 + 16 + 8)
+    # Non-genre sources with zero weight contribute nothing.
+    assert np.linalg.norm(mat[:, :8], axis=1) == pytest.approx(
+        np.sqrt(0.4), abs=1e-5
+    )
+
+
+def test_cluster_tracks_recovers_genres_with_layer7_only() -> None:
+    """A pure genre profile over the optional layer-7 block still separates genres."""
+    paths, mat, truth = _synthetic_library(dim=32, seed=13)
+    result = cl.cluster_tracks(
+        paths,
+        {"maest_logits": mat, "maest_layer7": mat * 0.5},
+        weights={"maest_logits": 0.4, "maest_layer7": 0.25},
+    )
+    assert result is not None
+    assert "maest_layer7" in result.sources_used
+    best = max(_ari(truth, lv.labels) for lv in result.levels)
+    assert best > 0.85, f"genre clustering failed to recover genres (ARI {best:.2f})"
+
+
+def test_revision_encodes_gathered_source_versions() -> None:
+    """Bumping any gathered source's version must change the cluster identity."""
+    paths, mat, _ = _synthetic_library(n_genres=2, per_genre=12, dim=16)
+    blocks = {"maest_logits": mat, "maest_layer7": mat}
+    base = cl.cluster_tracks(
+        paths,
+        blocks,
+        weights={"maest_logits": 0.4, "maest_layer7": 0.25},
+        cache_versions=(1, 1, 1, 0, 1, 1, 1),
+    )
+    bumped = cl.cluster_tracks(
+        paths,
+        blocks,
+        weights={"maest_logits": 0.4, "maest_layer7": 0.25},
+        cache_versions=(1, 1, 1, 0, 1, 2, 1),  # layer-7 version 1 → 2
+    )
+    assert base is not None and bumped is not None
+    assert base.revision != bumped.revision
+
+
 def test_reduce_dimensions_caps_components() -> None:
     x = np.random.default_rng(3).normal(size=(50, 200)).astype(np.float32)
     assert cl.reduce_dimensions(x, 32).shape == (50, 32)

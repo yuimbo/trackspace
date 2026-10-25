@@ -54,6 +54,82 @@ python -m backend.app -p 8080        # custom port
 python -m backend.app --host 0.0.0.0 # expose on LAN
 ```
 
+**Genre is the default (the Genre map).** The app opens on the **Genre** lens — the
+`genre_full` projection: a canonical recipe (logits .40 / maest .20 / layer-7 .25 /
+MERT-L19 .15, all other sources zero, 7 contributors) with its own 100/100 openTSNE
+budget (the gallery 500/250 is an explicit override, not the default). MAEST layer-7
+is a **default-on** analysis block; the independent MERT encoder
+runs by default too, but only once you pass `--trust-remote-code` (see the flags below).
+The legacy Combined / MAEST / Folder-head maps are replaced by the Genre map
+(CLAP and Rhythm lenses remain). Nothing downloads or executes MERT by itself — see the
+flags below.
+
+Run the full genre blocks (MAEST layer-7 + MERT) with the default start; add
+`--trust-remote-code` to enable MERT:
+
+```bash
+.venv/bin/python -m backend.app /path/to/music \
+  --trust-remote-code
+```
+
+That is **local-only**: it never downloads MERT weights (weights are fetched only with
+the separate `--allow-download` flag) and never runs untrusted remote code. MERT's
+weights are **CC-BY-NC 4.0 (~2.5 GB)** and it ships pinned repo-specific modeling code;
+the CC-BY-NC licence is accepted by default for this **personal project**, but running
+MERT always requires the explicit `--trust-remote-code` flag.
+
+- `--no-genre-full` — disable the genre_full blocks (Genre is the default): no MAEST
+  layer-7 and no MERT worker, and the legacy Combined map replaces the Genre map. The
+  legacy `default` recipe is retained internally for compatibility.
+- `--no-mert` — keep layer-7 but disable MERT (a MAEST-only genre recipe; faster, no
+  download).
+- `--trust-remote-code` — **required to run MERT**: allow MERT's pinned repo-specific
+  modeling code.
+- `--allow-download` — **separate, optional**: fetch uncached MERT weights. Without it
+  the server keeps `local_files_only` and refuses to download.
+
+See *Genre lens & Genre-full rebuild* below for how the Genre view relates to clustering.
+
+## Genre lens & Genre-full rebuild
+
+The **Genre lens** is the default `genre_full` projection: a canonical recipe (logits
+.40 / maest .20 / layer-7 .25 / MERT-L19 .15, all other sources zero) with its own
+100/100 openTSNE budget. The server serves the genre recipe by default; `--no-genre-full`
+disables its layer-7/MERT analysis blocks (the recipe id itself is always served, and a
+disabled server's frontend falls back to the Combined map).
+
+**Switching to the Genre lens is a view only.** It changes the *projection* (where
+tracks sit on the canvas), never the cluster assignments — a cluster's membership and
+the Microgenres panel are unchanged by which lens you are looking at. Re-clustering
+into the genre space is a **separate, explicit** action: the Analysis panel's rebuild
+sends `POST /api/clusters/rebuild` with `recipe=genre_full` (also gated on the server's
+genre_full state). The plain rebuild button is a re-run, not a reset; only an explicit
+`recipe=genre_full` switches the clustering weights to the genre vector.
+
+**Genre map weights preview.** While the Genre map is active, its seven tunable sources
+(logits / maest / layer-7 / MERT / rhythm / clap / supervised) live in the **View
+options** panel. Dragging a slider previews the map through the in-memory weight
+Jacobian (a draft is never written to disk and never triggers a request on its own);
+**Apply** commits the vector — a cluster rebuild + exact re-layout — and **Reset**
+restores the exact applied baseline without a round-trip. A source whose server stage is
+off (or with no cached vectors yet) has a disabled slider.
+
+**openTSNE iteration presets & overrides.** The view-options panel exposes the
+full-fit `tsne_n_iter` and early-exaggeration `tsne_early_exaggeration_iter` as
+named presets plus free numeric fields, persisted **per dimensionality** (keyed
+by `d2`/`d3`, so every 2-D embedding-map lens shares the 2-D budget and 3-D keeps
+its own separate budget):
+
+- Presets: *default* (the active recipe's 100/100 budget — no override sent), *Fast*
+  (100/100), *Balanced* (250/150), *Gallery* (500/250).
+- Ranges: `tsne_n_iter` 100–2000, `tsne_early_exaggeration_iter` 0–1000 (0 disables
+  early exaggeration).
+- A deviation from the active recipe's default is part of the **layout revision and
+  the fit-cache key**, so a user-chosen budget never shares a fit with the recipe
+  default (and `early=0` is treated as a real override, not silently restored to the
+  default). Switching lens or 2-D↔3-D resyncs the control to that dimensionality's
+  stored budget.
+
 ## Docs
 
 - `AGENTS.md` — entry point and core invariants (start here for contributing).

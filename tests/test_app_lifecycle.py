@@ -56,6 +56,36 @@ def test_build_app_accepts_injected_state(tmp_path):
         state.thread_pool.shutdown(wait=False)
 
 
+def test_build_app_default_genre_on_but_mert_explicit_off(tmp_path):
+    """Genre is the default, but MERT never runs from a bare ``build_app``.
+
+    ``main()`` only sets MERT on when ``--trust-remote-code`` is passed; the app
+    default must keep ``mert_enabled`` off so a server cannot pile up MERT jobs
+    behind a model that will never load (the consent jobs bug this slice removes).
+    """
+    from backend.app import build_app
+    from backend.jobs import KIND_MERT
+    from backend.trackspace_state import TrackspaceState
+
+    state = TrackspaceState.create(data_dir=str(tmp_path / "data"))
+    try:
+        app = build_app(state)
+        # Genre is on: the genre_full recipe is served without a feature gate.
+        from backend.embeddings.projection_config import GENRE_FULL_RECIPE_WEIGHTS
+        from backend.services.projection_request import parse_projection_params
+
+        class _Req:
+            def __init__(self, args): self.args = args
+        proj = parse_projection_params(_Req({"recipe": "genre_full"}), genre_full_enabled=True)
+        assert proj.source_weights == GENRE_FULL_RECIPE_WEIGHTS
+
+        # MERT is off: no MERT worker was registered by the bare build_app.
+        worker_kinds = set(state.workers._workers)
+        assert KIND_MERT not in worker_kinds
+    finally:
+        state.thread_pool.shutdown(wait=False)
+
+
 def test_purged_sources_fold_onto_the_stage_that_rewrites_them():
     """A startup purge enqueues only the stages it actually blanked.
 
@@ -147,6 +177,8 @@ def test_source_versions_covers_every_versioned_cache_source():
         "clap_segment_pos",
         "features",
         "maest",
+        "maest_layer7",
+        "mert_l19",
         "rhythm",
         "structure",
     }
@@ -161,5 +193,98 @@ def test_purge_reports_one_entry_per_source(tmp_path):
     try:
         purged = _purge_stale_embedding_cache_rows(state)
         assert set(purged) == set(SOURCE_VERSIONS)
+    finally:
+        state.thread_pool.shutdown(wait=False)
+
+
+def _state_with_track(tmp_path, data_dir) -> tuple["TrackspaceState", str]:
+    """A state with one root holding one mp3 whose fingerprint comes from cache."""
+    import numpy as np
+
+    from backend.trackspace_state import TrackspaceState
+
+    lib = tmp_path / "lib"
+    lib.mkdir(parents=True)
+    track = lib / "a.mp3"
+    track.write_bytes(b"ID3\x00fake")
+    state = TrackspaceState.create(data_dir=data_dir)
+    state.roots = {"r1": str(lib)}
+    state.track_cache.put(
+        str(track),
+        os.path.getmtime(str(track)),
+        {"path": str(track), "fingerprint": "fp1", "title": "A"},
+    )
+    return state, str(track)
+
+
+def test_backfill_purge_revives_done_but_not_failed(tmp_path):
+    """The automatic purge backfill re-queues done work but leaves failures alone."""
+    from backend.app import build_app
+    from backend.jobs import KIND_MAEST
+
+    state, _track = _state_with_track(tmp_path, str(tmp_path / "data"))
+    try:
+        app = build_app(state)
+        queue = state.job_queue
+
+        # A completed MAEST job for the track that exists.
+        queue.enqueue_many(KIND_MAEST, [("r1/a.mp3", {"path": "r1/a.mp3"})])
+        queue.complete(queue.claim(KIND_MAEST)[0])
+        assert queue.stats(KIND_MAEST).done == 1
+        # A terminally-failed MAEST job for a file that no longer exists.
+        queue.enqueue_many(KIND_MAEST, [("r1/gone.mp3", {"path": "r1/gone.mp3"})])
+        queue.fail(queue.claim(KIND_MAEST)[0], "file not found", retry=False)
+        assert queue.stats(KIND_MAEST).failed == 1
+
+        hook = app.extensions["trackspace_lifecycle"]["backfill_purged_analysis"]
+        queued = hook({"maest": 1})
+        assert queued.get(KIND_MAEST, 0) == 1
+        # The done job was revived and re-queued; the failed job was not revived.
+        st = queue.stats(KIND_MAEST)
+        assert st.pending == 1
+        assert st.failed == 1
+    finally:
+        state.thread_pool.shutdown(wait=False)
+
+
+def test_reconcile_after_late_checkpoint_purges_and_backfills(tmp_path, monkeypatch):
+    """A checkpoint downloaded only after startup is reconciled + backfilled on load."""
+    import numpy as np
+
+    from backend.app import build_app
+    from backend.embeddings import maest as maest_mod
+    from backend.jobs import KIND_MAEST
+
+    state, _track = _state_with_track(tmp_path, str(tmp_path / "data"))
+    try:
+        app = build_app(state)
+        # Stale rows written under an older checkpoint, with the old fingerprint
+        # recorded in the meta.
+        state.feature_cache.put_maest(
+            "fp1", np.ones(8, np.float32), np.ones(519, np.float32), version=1
+        )
+        state.feature_cache.set_meta("maest_checkpoint_sha256", "old-sha")
+        assert state.feature_cache.has("maest", "fp1", version=1)
+
+        # At startup the checkpoint is not on disk -> reconcile is a no-op and the
+        # stale rows survive.
+        monkeypatch.setattr(maest_mod, "checkpoint_fingerprint", lambda: None)
+        assert maest_mod.reconcile_checkpoint(state.feature_cache) is False
+        assert state.feature_cache.has("maest", "fp1", version=1)
+
+        # The model load later downloads the checkpoint -> the fingerprint appears
+        # and the family is reconciled (purged + recorded), exactly as the post-load
+        # handshake in ``_bg_load_maest`` does.
+        monkeypatch.setattr(maest_mod, "checkpoint_fingerprint", lambda: "new-sha")
+        assert maest_mod.reconcile_checkpoint(state.feature_cache) is True
+        assert state.feature_cache.has("maest", "fp1", version=1) is False
+        assert state.feature_cache.get_meta("maest_checkpoint_sha256") == "new-sha"
+
+        # The handshake then backfills the rows it just blanked.
+        hook = app.extensions["trackspace_lifecycle"]["backfill_purged_analysis"]
+        queued = hook(
+            {"maest": 1, "maest_logits": 1, "maest_excerpts": 1, "maest_layer7": 1}
+        )
+        assert queued.get(KIND_MAEST, 0) == 1
     finally:
         state.thread_pool.shutdown(wait=False)

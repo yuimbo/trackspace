@@ -20,15 +20,20 @@ export interface WeightJacobian {
   base: MapPos[];
   /** ``source → per-track (dx, dy[, dz])`` in ``paths`` order; ``dz`` only when the row has one. */
   jacobian: Record<string, { dx: number; dy: number; dz?: number }[]>;
+  /** Layout revision the Jacobian was evaluated at; empty when the server sent none.
+   *  The base positions step from this exact layout, so a drag must never apply a
+   *  Jacobian whose revision is no longer the one on screen. */
+  revision: string;
 }
 
-/** Parse ``{positions, jacobian, weights}`` from ``?jacobian=1``; ``null`` on any miss. */
+/** Parse ``{positions, jacobian, weights, revision}`` from ``?jacobian=1``; ``null`` on any miss. */
 export function parseWeightJacobian(raw: unknown): WeightJacobian | null {
   if (!raw || typeof raw !== "object") return null;
   const o = raw as {
     positions?: { path: string; x: number; y: number; z?: number }[];
     jacobian?: unknown;
     weights?: unknown;
+    revision?: unknown;
   };
   if (!Array.isArray(o.positions) || !o.jacobian || typeof o.jacobian !== "object") {
     return null;
@@ -58,6 +63,7 @@ export function parseWeightJacobian(raw: unknown): WeightJacobian | null {
         : { x: Number(p.x), y: Number(p.y), z: Number(p.z) },
     ),
     jacobian,
+    revision: typeof o.revision === "string" ? o.revision : "",
   };
 }
 

@@ -198,6 +198,9 @@ export class Controller {
       applyApproximateWeights: (weights) =>
         this.embedding.applyApproximateWeights(weights),
       fetchWeightJacobian: () => void this.embedding.fetchWeightJacobian(),
+      invalidateWeightJacobian: () => this.embedding.invalidateWeightJacobian(),
+      restoreExactWeightBaseline: () =>
+        this.embedding.restoreExactWeightBaseline(),
       // The queue owns Train's disabled state; the head panel renders it.
       head: this.head,
       // A broken-files row click selects the track and fits the view to it.
@@ -395,6 +398,7 @@ export class Controller {
     this._bindResize();
     this.options.sync();
     this.embedding.syncLensChrome();
+    this.embedding.bindTsneIterationControl();
     this._syncViewModifierChips();
   }
 

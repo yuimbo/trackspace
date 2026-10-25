@@ -509,6 +509,21 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
 - A projection lens requests a source subset (`sources=`) from the backend; the
   combined lens projects every frozen source. The source set is part of
   `layout_revision`, so each lens caches its own coordinates.
+- The **Genre** lens (`genre_full`) is the **default map lens**: the legacy Combined /
+  single-source MAEST / Folder-head maps are replaced by it (CLAP and Rhythm lenses
+  remain in the cycle). It is a **canonical recipe**, not
+  a source/weight selection: the backend fixes its source blocks, weights and
+  100/100 openTSNE budget (the gallery 500/250 is an explicit override), so the query
+  sends `recipe=genre_full` instead of
+  `sources=`/`w=`. A server started with `--no-genre-full` disables its layer-7/MERT
+  analysis blocks and the frontend falls back to the Combined map. Switching to it is a
+  **view only** — it changes the projection, never
+  the cluster assignments; re-clustering to the genre space is a separate, explicit
+  action (the Analysis panel's rebuild, `POST /api/clusters/rebuild` with
+  `recipe=genre_full`). The Genre map's tunable weights preview live in the **View
+  options** panel (draft through the in-memory Jacobian; **Apply** re-clusters + exact
+  refit; **Reset** restores the exact applied baseline; a server-off source's slider is
+  disabled). See README → *Genre lens & Genre-full rebuild*.
 - Layouts are **pre-warmed in the background**: after the cluster pass drains, the
   durable queue runs one low-priority `layout` job per built-in projection lens, so the
   first switch to a lens is a cache hit instead of a seconds-long fit (measured;
@@ -643,9 +658,14 @@ glowing "where does my query match" layer.
 
 Lens and colour live in the persistent top tabbers (a click or **E** / **C**); the
 contextual display toggles live in the top-right **View options** panel
-(`#view-options`) — currently the *Confident only* checkbox, shown only while the
-*Predicted folder* mode is active (the panel itself appears whenever at least one
-`.view-option` row is relevant); and hover preview is a **right-aligned**
+(`#view-options`) — currently the *Confident only* checkbox (shown only while the
+*Predicted folder* mode is active), the **Genre map weights** preview (only while the
+Genre map is active), and the **openTSNE iteration** control (only for a projection
+lens; its budget is stored **per dimensionality** — keyed by `d2`/`d3`, so all 2-D
+map lenses share the 2-D override, 3-D keeps its own, and switching resyncs the
+control);
+the panel appears whenever at least one `.view-option` row is relevant. Hover
+preview is a **right-aligned**
 status-bar speaker toggle + volume (`#status-preview`). The status bar does **not** repeat the
 active lens — the top tabber is that feedback. `OptionsPanelBinder` owns only the hover-preview
 control; the lens `<select>`, the colour `<select>` and the preset save/delete buttons were

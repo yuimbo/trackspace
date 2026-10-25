@@ -427,7 +427,13 @@ def _pca_reduce(mat: np.ndarray, dim: int) -> tuple[np.ndarray, object]:
     return pca.fit_transform(mat), pca
 
 
-def _fit_tsne(reduced: np.ndarray, dims: int = 2) -> tuple[object, np.ndarray]:
+def _fit_tsne(
+    reduced: np.ndarray,
+    dims: int = 2,
+    *,
+    tsne_n_iter: int = OPENTSNE_N_ITER,
+    tsne_early_exaggeration_iter: int = OPENTSNE_EARLY_EXAGGERATION_ITER,
+) -> tuple[object, np.ndarray]:
     from openTSNE import TSNE  # lazy — heavy import
 
     kwargs: dict = {
@@ -436,8 +442,8 @@ def _fit_tsne(reduced: np.ndarray, dims: int = 2) -> tuple[object, np.ndarray]:
         "random_state": 42,
         "n_jobs": -1,
         "verbose": False,
-        "n_iter": OPENTSNE_N_ITER,
-        "early_exaggeration_iter": OPENTSNE_EARLY_EXAGGERATION_ITER,
+        "n_iter": int(tsne_n_iter),
+        "early_exaggeration_iter": int(tsne_early_exaggeration_iter),
     }
     if dims == 3:
         # openTSNE auto-selects negative_gradient_method, but the fft it picks
@@ -448,16 +454,22 @@ def _fit_tsne(reduced: np.ndarray, dims: int = 2) -> tuple[object, np.ndarray]:
     return embedding, np.asarray(embedding, dtype=np.float32)
 
 
-def _fit_cache_key(config_key: str, dims: int = 2) -> str:
+def _fit_cache_key(
+    config_key: str, dims: int = 2, tsne_key_suffix: str = ""
+) -> str:
     """Namespace the fit cache so a recipe change cannot reuse a stale fit.
 
     Bumping ``PROJECTION_RECIPE_VERSION`` changes this suffix, so an embedding
     fitted under an older recipe — in memory or persisted on disk — is a miss
     and refits instead of being reused. A 3-D fit appends ``|dims=3`` so a 2-D
     and a 3-D embedding for the same vector config never share a key; 2-D keys
-    are byte-identical to before the dims parameter existed.
+    are byte-identical to before the dims parameter existed. ``tsne_key_suffix``
+    encodes a non-default openTSNE iteration budget (empty for the recipe default),
+    so a user-chosen budget refits rather than reusing the default-budget fit.
     """
     key = f"{config_key}|opentsne_recipe={PROJECTION_RECIPE_VERSION}"
+    if tsne_key_suffix:
+        key += f"|budget={tsne_key_suffix}"
     return key if dims == 2 else f"{key}|dims=3"
 
 
@@ -486,6 +498,9 @@ def _project_tsne_incremental(
     cache_fit: bool = True,
     feature_cache: object = None,
     dims: int = 2,
+    tsne_n_iter: int = OPENTSNE_N_ITER,
+    tsne_early_exaggeration_iter: int = OPENTSNE_EARLY_EXAGGERATION_ITER,
+    tsne_key_suffix: str = "",
 ) -> np.ndarray:
     """Fit once per vector config, then transform only newly added tracks.
 
@@ -493,9 +508,11 @@ def _project_tsne_incremental(
     one-off configs would otherwise evict the live fit the map needs. The fit is
     also persisted under *config_key* (via *feature_cache*) so a restart can
     transform rather than refit; only the config decides that key, so adding tracks
-    still reuses it.
+    still reuses it. ``tsne_n_iter`` / ``tsne_early_exaggeration_iter`` set the
+    openTSNE budget and ``tsne_key_suffix`` namespaces the fit key so two budgets
+    never share a fitted embedding.
     """
-    fit_key = _fit_cache_key(config_key, dims)
+    fit_key = _fit_cache_key(config_key, dims, tsne_key_suffix)
     fit = _fit_cache_get(fit_key)
     if fit is None and cache_fit:
         fit = _load_persisted_fit(feature_cache, fit_key)
@@ -525,7 +542,12 @@ def _project_tsne_incremental(
             return coords
 
     reduced, pca = _pca_reduce(mat, _opentsne_pca_dim(mat.shape[1]))
-    embedding, coords = _fit_tsne(reduced, dims=dims)
+    embedding, coords = _fit_tsne(
+        reduced,
+        dims=dims,
+        tsne_n_iter=tsne_n_iter,
+        tsne_early_exaggeration_iter=tsne_early_exaggeration_iter,
+    )
     if cache_fit:
         fit = _TsneFit(list(paths), coords, pca, embedding)
         _fit_cache_put(fit_key, fit)
@@ -542,6 +564,9 @@ def _project_tsne(
     cache_fit: bool = True,
     feature_cache: object = None,
     dims: int = 2,
+    tsne_n_iter: int = OPENTSNE_N_ITER,
+    tsne_early_exaggeration_iter: int = OPENTSNE_EARLY_EXAGGERATION_ITER,
+    tsne_key_suffix: str = "",
 ) -> np.ndarray:
     if paths and config_key and _use_opentsne():
         cap = _opentsne_max_points()
@@ -554,6 +579,9 @@ def _project_tsne(
                     cache_fit=cache_fit,
                     feature_cache=feature_cache,
                     dims=dims,
+                    tsne_n_iter=tsne_n_iter,
+                    tsne_early_exaggeration_iter=tsne_early_exaggeration_iter,
+                    tsne_key_suffix=tsne_key_suffix,
                 )
             except Exception as e:
                 log.warning("openTSNE failed; using fitted-backend chain: %s", e)

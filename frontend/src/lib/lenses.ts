@@ -209,30 +209,142 @@ export const BUILTIN_LENSES: readonly Lens[] = [
   { id: "tempo", label: "Tempo spiral", kind: "deterministic", compute: tempoSpiralPosition, guide: "spiral" },
 ];
 
-export function getLens(id: string): Lens {
-  return BUILTIN_LENSES.find((l) => l.id === id) ?? BUILTIN_LENSES[0];
+/**
+ * The opt-in ``genre_full`` lens (logits .40 / maest .20 / layer-7 .25 / MERT .15).
+ * Its ``sources`` are the four *genre analysis* blocks the map waits on / requires
+ * for placement — the tunable non-genre contributors (rhythm/clap/supervised) are a
+ * separate list (``GENRE_FULL_SOURCES``) used for the weight preview and the recipe
+ * ``w=`` override, so the analysis gate never waits on a zero-weight contributor.
+ */
+export const GENRE_FULL_LENS: Lens = {
+  id: "genre_full",
+  label: "Genre",
+  kind: "projection",
+  sources: ["maest_logits", "maest", "maest_layer7", "mert_l19"],
+};
+
+/**
+ * The genre_full recipe's *tunable* sources, in canonical weight order (mirrors
+ * ``backend/embeddings/projection_config.py`` ``GENRE_FULL_SOURCES``). These are
+ * the sliders and the ``w=`` override keys; ``features`` stays excluded — it is
+ * the audio-feature block, never a genre recipe override key.
+ */
+export const GENRE_FULL_SOURCES: readonly string[] = [
+  "maest_logits",
+  "maest",
+  "maest_layer7",
+  "mert_l19",
+  "rhythm",
+  "clap",
+  "supervised",
+];
+
+/**
+ * The canonical genre_full default weights (mirrors
+ * ``backend/embeddings/projection_config.py`` ``GENRE_FULL_RECIPE_WEIGHTS``): the
+ * four genre blocks, the tunable rhythm/clap/supervised at 0, ``features`` absent.
+ * The query omits ``w=`` when the applied vector equals these defaults, so the
+ * default recipe key stays stable.
+ */
+export const GENRE_FULL_WEIGHTS: Record<string, number> = {
+  maest_logits: 0.4,
+  maest: 0.2,
+  maest_layer7: 0.25,
+  mert_l19: 0.15,
+  rhythm: 0,
+  clap: 0,
+  supervised: 0,
+};
+
+/** Lenses made redundant by the genre map: hidden from the E-cycle / tabber. */
+const GENRE_HIDDEN_IDS = new Set(["maest", "supervised"]);
+
+/** Map a legacy lens id to its genre replacement, or pass it through.
+ *
+ *  ``combined`` (the old combined map) and the single-source MAEST / Folder-head
+ *  probes (``maest``/``supervised``) all resolve to the genre map when it is
+ *  enabled. Used by preset migration and the E-cycle so a saved legacy id never
+ *  wraps to an invalid (or surprising) target.
+ */
+export function legacyToGenreLensId(id: string): string {
+  if (id === "combined" || id === "maest" || id === "supervised") {
+    return GENRE_FULL_LENS.id;
+  }
+  return id;
 }
 
-/** Lenses a scope can use: the tag lens has no positions to lay out. */
-export function scopeLenses(): Lens[] {
-  return BUILTIN_LENSES.filter((l) => l.kind !== "tags");
+/** The effective lens set for the current server.
+ *
+ *  The single-source MAEST / Folder-head probes are gone from the cycle. With
+ *  genre enabled the ``combined`` map slot is taken by ``genre_full`` (the genre
+ *  map is the default); with genre disabled ``combined`` remains as the fallback
+ *  default map. ``tags`` and the feature lenses are always present, so the map
+ *  slot always sits right after ``tags`` in the **E** cycle.
+ */
+export function availableLenses(genreFullEnabled: boolean): readonly Lens[] {
+  // BUILTIN minus the redundant single-source probes, keeping ``combined`` in
+  // the map slot so the E-cycle order (tags → map → features) stays stable.
+  const base = BUILTIN_LENSES.filter((l) => !GENRE_HIDDEN_IDS.has(l.id));
+  if (!genreFullEnabled) return base;
+  // Replace the combined-map slot with the genre map.
+  return base.map((l) => (l.id === "combined" ? GENRE_FULL_LENS : l));
+}
+
+/** The default map lens: the genre recipe when enabled, else legacy ``combined``. */
+export function defaultMapLensId(genreFullEnabled: boolean): string {
+  return genreFullEnabled ? GENRE_FULL_LENS.id : "combined";
+}
+
+export function getLens(id: string): Lens {
+  return (
+    BUILTIN_LENSES.find((l) => l.id === id) ??
+    (id === GENRE_FULL_LENS.id ? GENRE_FULL_LENS : undefined) ??
+    BUILTIN_LENSES[0]
+  );
+}
+
+/** Lenses a scope can use: the tag lens has no positions to lay out, and the
+ *  genre recipe (or the legacy ``combined`` fallback) is a valid scope projection
+ *  kind. ``genreFullEnabled`` selects which map lens is on the list. */
+export function scopeLenses(genreFullEnabled = false): Lens[] {
+  return availableLenses(genreFullEnabled).filter((l) => l.kind !== "tags");
 }
 
 /** Next built-in lens id for the **E** cycle; a preset cycles from its base lens. */
-export function nextLensId(id: string, baseLens?: string): string {
-  return stepLensId(id, 1, baseLens);
+export function nextLensId(
+  id: string,
+  baseLens?: string,
+  available: readonly Lens[] = BUILTIN_LENSES,
+): string {
+  return stepLensId(id, 1, available, baseLens);
 }
 
 /** Previous built-in lens id for the **Shift+E** cycle. */
-export function prevLensId(id: string, baseLens?: string): string {
-  return stepLensId(id, -1, baseLens);
+export function prevLensId(
+  id: string,
+  baseLens?: string,
+  available: readonly Lens[] = BUILTIN_LENSES,
+): string {
+  return stepLensId(id, -1, available, baseLens);
 }
 
-function stepLensId(id: string, dir: 1 | -1, baseLens?: string): string {
-  const from = baseLens ?? id;
-  const idx = BUILTIN_LENSES.findIndex((l) => l.id === from);
-  const n = BUILTIN_LENSES.length;
-  return BUILTIN_LENSES[(idx + dir + n) % n].id;
+function stepLensId(
+  id: string,
+  dir: 1 | -1,
+  available: readonly Lens[],
+  baseLens?: string,
+): string {
+  let from = baseLens ?? id;
+  // A legacy map id that the genre map replaced resolves to the genre map when it
+  // is present, so E from a saved legacy lens (a preset base) lands on a valid map
+  // target rather than wrapping to tags.
+  if (available.some((l) => l.id === GENRE_FULL_LENS.id)) {
+    from = legacyToGenreLensId(from);
+  }
+  const idx = available.findIndex((l) => l.id === from);
+  const n = available.length;
+  if (idx === -1) return available[0].id;
+  return available[(idx + dir + n) % n].id;
 }
 
 /** Lens source names for the "wait for analysis" gate; tags waits on nothing. */

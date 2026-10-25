@@ -9,6 +9,7 @@ Pipeline order (each stage's output feeds the next):
     features  → classical DSP / rhythm descriptors (CPU, librosa + madmom)
     structure → intro/drop/break timestamps (CPU, whole-track loudness envelope)
     maest     → MAEST embedding + 519 genre logits (GPU, batched)
+    mert      → MERT layer-19 embedding (GPU, batched, opt-in CC-BY-NC)
     clap      → CLAP audio embedding (GPU, batched; text encoder shared with layout)
     supervise → folder-supervised projection head over cached vectors (CPU, singleton)
     cluster   → kNN graph + multi-resolution Leiden (whole-library, singleton)
@@ -21,6 +22,7 @@ KIND_SCAN = "scan"
 KIND_FEATURES = "features"
 KIND_STRUCTURE = "structure"
 KIND_MAEST = "maest"
+KIND_MERT = "mert"
 KIND_CLAP = "clap"
 KIND_SUPERVISED = "supervise"
 KIND_CLUSTER = "cluster"
@@ -32,6 +34,7 @@ JOB_KINDS: tuple[str, ...] = (
     KIND_FEATURES,
     KIND_STRUCTURE,
     KIND_MAEST,
+    KIND_MERT,
     KIND_CLAP,
     KIND_SUPERVISED,
     KIND_CLUSTER,
@@ -43,6 +46,7 @@ _LABELS: dict[str, str] = {
     KIND_FEATURES: "Audio features",
     KIND_STRUCTURE: "Track structure",
     KIND_MAEST: "MAEST analysis",
+    KIND_MERT: "MERT analysis",
     KIND_CLAP: "CLAP analysis",
     KIND_SUPERVISED: "Folder supervision",
     KIND_CLUSTER: "Clustering",

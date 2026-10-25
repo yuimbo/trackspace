@@ -259,6 +259,135 @@ describe("EmbeddingCoordinator projection fetch", () => {
     expect(String(call![0])).not.toContain("w=");
   });
 
+  it("genre_full lens requests the canonical recipe, not sources/weights", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) => {
+      if (url.startsWith("/api/embeddings/status")) {
+        return { ...STATUS_OK, genre_full_enabled: true };
+      }
+      return projectionRoute(url);
+    });
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    const url = String(call![0]);
+    expect(url).toContain("recipe=genre_full");
+    expect(url).not.toContain("sources=");
+    expect(url).not.toContain("w=");
+  });
+
+  it("genre_full sends the 7-key w override only when weights deviate from the defaults", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) => {
+      if (url.startsWith("/api/embeddings/status")) {
+        return { ...STATUS_OK, genre_full_enabled: true };
+      }
+      return projectionRoute(url);
+    });
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    model.genreWeights = { ...model.genreWeights, rhythm: 0.3 };
+    await coord.ensureAndProject();
+    const call = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    const url = String(call![0]);
+    expect(url).toContain("recipe=genre_full");
+    // Canonical 7-key order, features excluded.
+    expect(url).toContain(
+      "w=maest_logits:0.4,maest:0.2,maest_layer7:0.25,mert_l19:0.15,rhythm:0.3,clap:0,supervised:0",
+    );
+  });
+
+  it("reconciles a legacy active lens to the genre map when the server enables genre", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) => {
+      if (url.startsWith("/api/embeddings/status")) {
+        return { ...STATUS_OK, genre_full_enabled: true };
+      }
+      return projectionRoute(url);
+    });
+    model.genreFullEnabled = false;
+    model.lensId = "combined";
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    expect(model.genreFullEnabled).toBe(true);
+    // The symmetric conversion: an active legacy map converts to the genre map.
+    expect(model.lensId).toBe("genre_full");
+    const proj = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    expect(String(proj![0])).toContain("recipe=genre_full");
+  });
+
+  it("falls back from the genre map to combined when the server disables genre", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    // STATUS_OK has no genre_full_enabled → the server disabled genre.
+    expect(model.genreFullEnabled).toBe(false);
+    expect(model.lensId).toBe("combined");
+    const proj = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    expect(String(proj![0])).not.toContain("recipe=genre_full");
+  });
+
+  it("sends the tsne iteration override only when set", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    await coord.ensureAndProject();
+    const first = fetchSpy.mock.calls.find(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    expect(String(first![0])).not.toContain("tsne_n_iter");
+
+    coord.setTsneIteration(250, 150);
+    await flush();
+    const calls = fetchSpy.mock.calls.filter(([u]) =>
+      String(u).startsWith("/api/embeddings/projection"),
+    );
+    const url = String(calls[calls.length - 1][0]);
+    expect(url).toContain("tsne_n_iter=250");
+    expect(url).toContain("tsne_early_exaggeration_iter=150");
+  });
+
+  it("setTsneIteration mutates the model and refetches the layout", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    await coord.ensureAndProject();
+    const before = fetchCalls(fetchSpy, "/api/embeddings/projection");
+    coord.setTsneIteration(500, 250);
+    expect(model.tsneIterationFor()).toEqual({ nIter: 500, early: 250 });
+    await flush();
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBeGreaterThan(
+      before,
+    );
+  });
+
+  it("keeps the tsne budget per dimensionality", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    model.genreFullEnabled = true;
+    model.lensId = "genre_full";
+    // Set a budget on the 2-D genre view.
+    coord.setTsneIteration(250, 150);
+    expect(model.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
+    // Toggling to 3-D reads an empty (recipe-default) budget — 2-D must not spill.
+    model.view3d.on = true;
+    expect(model.tsneIterationFor()).toEqual({ nIter: null, early: null });
+    // Setting a 3-D budget does not touch the 2-D one.
+    coord.setTsneIteration(500, 250);
+    model.view3d.on = false;
+    expect(model.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
+  });
+
   it("includes externals whenever external roots exist, even when hidden", async () => {
     const { model, coord, fetchSpy } = makeHarness(projectionRoute);
     model.viewMode = "embeddings";
@@ -370,6 +499,7 @@ describe("EmbeddingCoordinator projection fetch", () => {
             positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
             weights: { ...DEFAULT_CLUSTER_WEIGHTS },
             jacobian: { maest: [[0.01, 0.02]] },
+            revision: "r",
           }
         : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "r" },
     );
@@ -387,6 +517,168 @@ describe("EmbeddingCoordinator projection fetch", () => {
     model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
     await coord.fetchWeightJacobian();
     expect(jacCalls()).toBe(2);
+  });
+
+  it("drops a stale Jacobian response when a newer fetch supersedes it", async () => {
+    let releaseOld!: (v: Response) => void;
+    const { model, coord } = makeHarness();
+    const base = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes("jacobian=1")) {
+          // The first (old) request is held; a later one resolves immediately.
+          if (!releaseOld) {
+            return new Promise<Response>((r) => (releaseOld = r));
+          }
+          return Promise.resolve(
+            jsonResponse({
+              positions: [{ path: "a.mp3", x: 0.2, y: 0.2 }],
+              weights: { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 },
+              jacobian: { rhythm: [[0.1, 0.1]] },
+            }),
+          );
+        }
+        return base(input, init);
+      }),
+    );
+    model.viewMode = "embeddings";
+    model.embeddingsReady = true;
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.2, y: 0.2 }]]);
+
+    const old = coord.fetchWeightJacobian();
+    model.clusterWeights = { ...DEFAULT_CLUSTER_WEIGHTS, rhythm: 0.5 };
+    const newer = coord.fetchWeightJacobian();
+    await newer;
+
+    // The stale first response lands after the newer one: its base (rhythm-less)
+    // must not overwrite the current Jacobian.
+    releaseOld(
+      jsonResponse({
+        positions: [{ path: "a.mp3", x: 0.9, y: 0.9 }],
+        weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+        jacobian: { maest: [[0.5, 0.5]] },
+      }),
+    );
+    await old;
+    const cached = coord["_weightJacobian"]!;
+    expect(cached.weights.rhythm).toBe(0.5);
+    expect(cached.jacobian.rhythm).toBeDefined();
+    expect(cached.jacobian.maest).toBeUndefined();
+  });
+
+  it("refetches the Jacobian after an apply clears it", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: { maest: [[0.01, 0.02]] },
+          }
+        : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "r" },
+    );
+    model.viewMode = "embeddings";
+    model.embeddingsReady = true;
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.1, y: 0.2 }]]);
+    await coord.fetchWeightJacobian();
+    expect(
+      fetchSpy.mock.calls.filter(([u]) => String(u).includes("jacobian=1")).length,
+    ).toBe(1);
+
+    coord.invalidateWeightJacobian();
+    await coord.fetchWeightJacobian();
+    expect(
+      fetchSpy.mock.calls.filter(([u]) => String(u).includes("jacobian=1")).length,
+    ).toBe(2);
+  });
+
+  it("invalidateLayoutCache also drops the cached weight Jacobian", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: { maest: [[0.01, 0.02]] },
+            revision: "r",
+          }
+        : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "r" },
+    );
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject();
+    await coord.fetchWeightJacobian();
+    const jacCalls = () =>
+      fetchSpy.mock.calls.filter(([u]) => String(u).includes("jacobian=1")).length;
+    expect(jacCalls()).toBe(1);
+    // A layout-revision change (SSE done / library reload) drops the Jacobian too:
+    // its base is tied to the old layout.
+    coord.invalidateLayoutCache();
+    await coord.fetchWeightJacobian();
+    expect(jacCalls()).toBe(2);
+  });
+
+  it("drops a Jacobian response whose baseline revision is stale", async () => {
+    const { model, coord, fetchSpy } = makeHarness((url) =>
+      url.includes("jacobian=1")
+        ? {
+            positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
+            weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+            jacobian: { maest: [[0.01, 0.02]] },
+            revision: "rev-OLD", // older than the layout currently in hand
+          }
+        : { positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }], revision: "rev-NEW" },
+    );
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject(); // caches revision "rev-NEW"
+    await coord.fetchWeightJacobian();
+    // The response's baseline (rev-OLD) is not the layout in hand: not cached,
+    // so a drag cannot approximate around a stale frame.
+    expect(coord["_weightJacobian"]).toBeNull();
+    expect(
+      coord.applyApproximateWeights({ ...DEFAULT_CLUSTER_WEIGHTS, maest: 0.6 }),
+    ).toBe(false);
+  });
+
+  it("does not apply a Jacobian whose baseline revision no longer matches the layout", async () => {
+    const { model, coord } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.1, y: 0.2 }]]);
+    const qs = coord["_projectionQueryString"]();
+    coord["_jacobianKey"] = qs;
+    coord["_weightJacobian"] = {
+      weights: { ...DEFAULT_CLUSTER_WEIGHTS },
+      paths: ["a.mp3"],
+      base: [{ x: 0.1, y: 0.2 }],
+      jacobian: { maest: [{ dx: 0.01, dy: 0.02 }] },
+      revision: "rev-1",
+    };
+    // The layout moved on (same query string, a new revision): the Jacobian's
+    // base is stale, so the drag must not be applied.
+    coord["_layoutCache"].set(qs, {
+      revision: "rev-2",
+      positions: new Map([["a.mp3", { x: 0.1, y: 0.2 }]]),
+    });
+    expect(
+      coord.applyApproximateWeights({ ...DEFAULT_CLUSTER_WEIGHTS, maest: 0.6 }),
+    ).toBe(false);
+    expect(model.embeddingPositions.get("a.mp3")).toEqual({ x: 0.1, y: 0.2 });
+  });
+
+  it("restores the exact applied baseline from the layout cache without a round-trip", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    await coord.ensureAndProject(); // caches the applied layout
+    const exact = new Map(model.embeddingPositions);
+    // A drag approximated the positions on top of the applied baseline.
+    model.embeddingPositions = new Map([["a.mp3", { x: 0.9, y: 0.9 }]]);
+    const projBefore = () =>
+      fetchSpy.mock.calls.filter(([u]) =>
+        String(u).startsWith("/api/embeddings/projection"),
+      ).length;
+    const before = projBefore();
+    expect(coord.restoreExactWeightBaseline()).toBe(true);
+    expect(model.embeddingPositions.get("a.mp3")).toEqual(exact.get("a.mp3"));
+    // Restored locally — no HTTP round-trip.
+    expect(projBefore()).toBe(before);
   });
 });
 
@@ -954,25 +1246,42 @@ describe("EmbeddingCoordinator lens switching", () => {
     expect(model.vp).toEqual({ ox: 0.1, oy: 0.2, zoom: 2 });
   });
 
-  it("E cycles every built-in lens and wraps back to tags", async () => {
+  it("E cycles the available lenses and wraps back to tags", async () => {
     const { model, coord } = makeHarness(projectionRoute);
     vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    // Genre disabled: the cycle is tags → combined (fallback map) → the feature
+    // lenses; the single-source MAEST / Folder-head probes are gone.
     const seen = [model.lensId];
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 6; i++) {
       await coord.cycleLens();
       seen.push(model.lensId);
     }
     expect(seen).toEqual([
       "tags",
       "combined",
-      "maest",
-      "supervised",
       "clap",
       "rhythm",
       "camelot",
       "tempo",
       "tags",
     ]);
+  });
+
+  it("cycles tags → genre map → feature lenses when genre is enabled", async () => {
+    const { model, coord } = makeHarness((url) => {
+      if (url.startsWith("/api/embeddings/status")) {
+        return { ...STATUS_OK, genre_full_enabled: true };
+      }
+      return projectionRoute(url);
+    });
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.genreFullEnabled = true;
+    const seen = [model.lensId];
+    for (let i = 0; i < 6; i++) {
+      await coord.cycleLens();
+      seen.push(model.lensId);
+    }
+    expect(seen).toEqual(["tags", "genre_full", "clap", "rhythm", "camelot", "tempo", "tags"]);
   });
 
   it("adds the source param for a per-source lens", async () => {

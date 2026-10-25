@@ -21,10 +21,14 @@ detect genre-spanning tracks without re-running inference.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -34,6 +38,9 @@ from .clap import inference_lock
 log = logging.getLogger(__name__)
 
 MAEST_ARCH = "discogs-maest-30s-pw-129e-519l"
+#: ``configs.default_cfgs`` key in the installed maest_infer (underscore form),
+#: used to locate the checkpoint file in the torch.hub cache for fingerprinting.
+MAEST_CFG_KEY = "discogs_maest_30s_pw_129e_519l"
 MAEST_SR = 16000
 #: Plan §2 — three 30 s excerpts instead of whole tracks.
 MAEST_SEGMENT_SECONDS = 30
@@ -41,9 +48,22 @@ MAEST_NUM_SEGMENTS = 3
 
 MAEST_EMBED_DIM = 768
 MAEST_LOGIT_DIM = 519
+#: Zero-based transformer block of the one-based 7th layer (of 12).
+MAEST_LAYER7_BLOCK = 6
+#: Native ``cat(cls, dist, patch-mean)`` of block 6 — 3 × 768, not Essentia's 768.
+MAEST_LAYER7_DIM = 3 * MAEST_EMBED_DIM
 
 #: Bump when excerpt strategy, pooling, or the checkpoint changes.
 MAEST_VERSION = 1
+#: Algorithm version for the ``maest_layer7`` cache column. Coupled to MAEST via
+#: the checkpoint fingerprint (see :func:`reconcile_checkpoint`): a changed
+#: checkpoint invalidates layer-7 and maest together, never one alone.
+MAEST_LAYER7_VERSION = 1
+
+#: The MAEST family of cache sources, purged together on a checkpoint change.
+_MAEST_FAMILY_SOURCES = ("maest", "maest_logits", "maest_excerpts", "maest_layer7")
+#: feature_meta key recording the checkpoint fingerprint last used to write rows.
+_CHECKPOINT_META_KEY = "maest_checkpoint_sha256"
 
 _model = None
 _mel = None
@@ -54,16 +74,26 @@ _model_lock = threading.Lock()
 #: concurrently — see ``audio_pipeline.md``. Imported, not redefined, on purpose.
 _loaded = False
 _load_failed: str | None = None
+_checkpoint_sha256: str | None = None
 
 
 @dataclass(frozen=True)
 class MaestAnalysis:
-    """Pooled track-level MAEST outputs plus the per-excerpt vectors."""
+    """Pooled track-level MAEST outputs plus the per-excerpt vectors.
+
+    ``layer7`` is the pooled native 2304-D ``cat(cls, dist, patch-mean)`` of block 6
+    (one-based layer 7), captured single-pass from the same full forward that yields
+    ``embedding``/``logits`` — not a second model pass. ``analyze_batch`` always
+    fills it: the scoped block-6 hook raises loudly (never silently degrades) if the
+    transformer block layout is unexpected, so a successful result carries layer-7.
+    The field default stays ``None`` only for constructor compatibility.
+    """
 
     embedding: np.ndarray  # (768,)
     logits: np.ndarray  # (519,)
     excerpt_embeddings: np.ndarray  # (n_excerpts, 768)
     num_excerpts: int
+    layer7: np.ndarray | None = None  # (2304,) pooled; always set by analyze_batch
 
 
 def is_model_ready() -> bool:
@@ -73,6 +103,71 @@ def is_model_ready() -> bool:
 def load_error() -> str | None:
     """Reason MAEST is unavailable, or ``None`` when it loaded (or is untried)."""
     return _load_failed
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _checkpoint_cache_path() -> Path | None:
+    """Path of the frozen checkpoint in the torch.hub cache, or ``None``."""
+    try:
+        from maest_infer import configs
+        from torch.hub import get_dir
+
+        url = configs.default_cfgs[MAEST_CFG_KEY]["url"]
+        return Path(get_dir()) / "checkpoints" / Path(urlparse(url).path).name
+    except Exception:
+        return None
+
+
+def checkpoint_fingerprint() -> str | None:
+    """Streaming SHA-256 of the frozen checkpoint file, or ``None`` if unknown.
+
+    Computed from the on-disk torch.hub cache file (memoised), so it is available
+    even before the model object is loaded and never trusts a registry value. It is
+    the manifest fingerprint that couples the whole MAEST family's cache identity: a
+    changed checkpoint changes this fingerprint, and :func:`reconcile_checkpoint`
+    invalidates ``maest`` + ``maest_layer7`` together.
+    """
+    global _checkpoint_sha256
+    if _checkpoint_sha256 is not None:
+        return _checkpoint_sha256
+    path = _checkpoint_cache_path()
+    if path is not None and path.is_file():
+        try:
+            _checkpoint_sha256 = _sha256_file(path)
+            return _checkpoint_sha256
+        except OSError:
+            return None
+    return None
+
+
+def reconcile_checkpoint(feature_cache) -> bool:
+    """Blank the MAEST-family cache rows when the checkpoint fingerprint changed.
+
+    Returns ``True`` when a mismatch was found and the family was purged (and the
+    new fingerprint recorded); ``False`` when the checkpoint is unknown (not on
+    disk) or already matches, so callers can run it unconditionally at startup and
+    from the post-load handshake without a guard. Enforcement is deliberately
+    version-agnostic: a checkpoint swap must invalidate every MAEST row, whatever
+    its algorithm version.
+
+    The purge and the fingerprint write are one atomic cache transaction (see
+    ``FeatureCache.reconcile_source_fingerprint``), so a failure cannot leave the
+    family blanked with a stale recorded fingerprint — the recorded value is only
+    advanced when the purge itself committed.
+    """
+    sha = checkpoint_fingerprint()
+    if sha is None:
+        return False
+    return feature_cache.reconcile_source_fingerprint(
+        _CHECKPOINT_META_KEY, sha, _MAEST_FAMILY_SOURCES
+    )
 
 
 def load_model() -> None:
@@ -103,7 +198,10 @@ def load_model() -> None:
                 _device = "mps"
             else:
                 _device = "cpu"
-            _model = model.to(_device)
+            # Weight dispatch to the accelerator is itself a device op; run it under
+            # the shared inference lock so it cannot race mlx-vis/CLAP/MERT.
+            with inference_lock:
+                _model = model.to(_device)
 
             # The mel front end must run on CPU: torchaudio's STFT requires the
             # input and the window buffer on the same device, and `model.to()`
@@ -141,6 +239,39 @@ def _pad_or_trim(audio: np.ndarray, target_len: int) -> np.ndarray:
     out = np.zeros(target_len, dtype=np.float32)
     out[:n] = audio
     return out
+
+
+@contextlib.contextmanager
+def _capture_layer7(model) -> Iterator[dict]:
+    """Yield a dict filled with block-6 layer-7 during an otherwise-unmodified forward.
+
+    Registers a scoped forward hook on exactly ``model.blocks[MAEST_LAYER7_BLOCK]``
+    (one-based layer 7) that records ``cat(cls, dist, patch-mean)`` of the block's
+    output — the same tensor the benchmark's two-pass ``transformer_block=6`` path
+    returns. The hook is removed in a ``finally`` even if the forward raises, so it can
+    never leak onto a later call. On a wrong submodule the block output shape differs,
+    and the hook raises loudly rather than silently capturing garbage.
+    """
+    import torch
+
+    captured: dict = {}
+
+    def _hook(_module, _args, output):
+        if output.ndim != 3 or output.shape[-1] != MAEST_EMBED_DIM or output.shape[1] < 3:
+            raise RuntimeError(
+                f"MAEST layer-7 hook saw unexpected block output shape {tuple(output.shape)}; "
+                "the transformer block layout changed"
+            )
+        cls = output[:, 0, :]
+        dist = output[:, 1, :]
+        feats = output[:, 2:, :].mean(dim=1)
+        captured["layer7"] = torch.cat([cls, dist, feats], dim=1)
+
+    handle = model.blocks[MAEST_LAYER7_BLOCK].register_forward_hook(_hook)
+    try:
+        yield captured
+    finally:
+        handle.remove()
 
 
 def analyze(
@@ -209,6 +340,7 @@ def analyze_batch(
 
     per_track_emb: dict[str, list[np.ndarray]] = {p: [] for p in paths}
     per_track_logits: dict[str, list[np.ndarray]] = {p: [] for p in paths}
+    per_track_layer7: dict[str, list[np.ndarray]] = {p: [] for p in paths}
 
     for start in range(0, len(flat), max_batch):
         chunk = flat[start : start + max_batch]
@@ -220,9 +352,18 @@ def analyze_batch(
             with inference_lock:
                 mel_dev = mel.to(_device)
                 with torch.inference_mode():
-                    logits, emb = _model(mel_dev, melspectrogram_input=True)
+                    # Scoped hook captures layer-7 from the SAME full forward that
+                    # returns logits + embedding — single-pass, removed in a finally.
+                    with _capture_layer7(_model) as captured:
+                        logits, emb = _model(mel_dev, melspectrogram_input=True)
+                    layer7_t = captured.get("layer7")
                 logits_np = logits.detach().to("cpu").numpy().astype(np.float32)
                 emb_np = emb.detach().to("cpu").numpy().astype(np.float32)
+                layer7_np = (
+                    None
+                    if layer7_t is None
+                    else layer7_t.detach().to("cpu").numpy().astype(np.float32)
+                )
         except Exception as e:
             log.warning("MAEST batch inference failed (%d excerpts): %s", len(chunk), e)
             continue
@@ -230,6 +371,8 @@ def analyze_batch(
         for i, p in enumerate(chunk_owner):
             per_track_emb[p].append(emb_np[i])
             per_track_logits[p].append(logits_np[i])
+            if layer7_np is not None:
+                per_track_layer7[p].append(layer7_np[i])
 
     for p in paths:
         embs = per_track_emb.get(p) or []
@@ -237,11 +380,16 @@ def analyze_batch(
         if not embs or not lgts:
             continue
         stacked = np.stack(embs, axis=0).astype(np.float32)
+        layer7 = None
+        l7s = per_track_layer7.get(p) or []
+        if l7s:
+            layer7 = np.stack(l7s, axis=0).mean(axis=0).astype(np.float32)
         results[p] = MaestAnalysis(
             embedding=stacked.mean(axis=0).astype(np.float32),
             logits=np.stack(lgts, axis=0).mean(axis=0).astype(np.float32),
             excerpt_embeddings=stacked,
             num_excerpts=len(embs),
+            layer7=layer7,
         )
 
     return results

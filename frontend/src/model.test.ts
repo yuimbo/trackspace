@@ -202,7 +202,65 @@ describe("Model lens", () => {
     );
     const m = new Model();
     m.loadLS();
-    expect(m.lensId).toBe("combined");
+    // The legacy combined map resolves to the genre recipe, now the default map.
+    expect(m.lensId).toBe("genre_full");
+  });
+
+  it("migrates saved combined/maest/supervised lens ids to the genre map", () => {
+    for (const legacy of ["combined", "maest", "supervised"]) {
+      localStorage.setItem("trackspace", JSON.stringify({ lensId: legacy }));
+      const m = new Model();
+      m.loadLS();
+      expect(m.lensId).toBe("genre_full");
+    }
+  });
+
+  it("a fresh loadLS lands on the Genre map, not tags", () => {
+    localStorage.clear();
+    const m = new Model();
+    m.loadLS();
+    expect(m.lensId).toBe("genre_full");
+    expect(m.viewMode).toBe("embeddings");
+  });
+
+  it("preserves an explicitly saved tags lens on reload", () => {
+    localStorage.setItem("trackspace", JSON.stringify({ lensId: "tags" }));
+    const m = new Model();
+    m.loadLS();
+    expect(m.lensId).toBe("tags");
+  });
+
+  it("preserves saved camelot and the distinct clap/rhythm lenses", () => {
+    for (const id of ["camelot", "clap", "rhythm"]) {
+      localStorage.setItem("trackspace", JSON.stringify({ lensId: id }));
+      const m = new Model();
+      m.loadLS();
+      expect(m.lensId).toBe(id);
+    }
+  });
+
+  it("migrates stored preset base lenses to the genre map", () => {
+    for (const legacy of ["combined", "maest", "supervised"]) {
+      localStorage.setItem(
+        "trackspace",
+        JSON.stringify({
+          lensPresets: [{ id: "preset:1", name: "My view", baseLens: legacy }],
+        }),
+      );
+      const m = new Model();
+      m.loadLS();
+      expect(m.lensPresets[0].baseLens).toBe("genre_full");
+    }
+  });
+
+  it("migrates a saved scope lens id to the genre map", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ scopeLensId: "combined" }),
+    );
+    const m = new Model();
+    m.loadLS();
+    expect(m.scopeLensId).toBe("genre_full");
   });
 
   it("persists the active lens and presets", () => {
@@ -877,5 +935,121 @@ describe("Model 3-D orbit view", () => {
     m2.loadLS();
     // The reloaded view starts fully on, not frozen mid-tween.
     expect(m2.view3dBlend).toBe(1);
+  });
+});
+
+describe("Model per-dimensionality t-SNE iteration budget", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("shares one budget per dimensionality across every lens", () => {
+    const m = new Model();
+    m.genreFullEnabled = true;
+    m.lensId = "genre_full";
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.setTsneIterationForActiveView(250, 150);
+    m.view3d.on = true;
+    m.setTsneIterationForActiveView(500, 250);
+    m.saveLS();
+
+    const m2 = new Model();
+    m2.loadLS();
+    m2.genreFullEnabled = true;
+    m2.lensId = "genre_full";
+    // 2-D and 3-D keep their own budgets.
+    m2.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    expect(m2.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
+    m2.view3d.on = true;
+    expect(m2.tsneIterationFor()).toEqual({ nIter: 500, early: 250 });
+    // A different lens in the same 2-D dimension shares the 2-D budget.
+    m2.view3d.on = false;
+    m2.lensId = "clap";
+    expect(m2.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
+  });
+
+  it("migrates a legacy global override to the active saved dimension only", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({
+        lensId: "genre_full",
+        view3d: { on: false, yaw: 0.6, pitch: 0.35 },
+        // Legacy global shape: one budget for every view.
+        tsneIteration: { nIter: 500, early: 250 },
+      }),
+    );
+    const m = new Model();
+    m.loadLS();
+    // The legacy override lands on the active saved dimensionality (2-D)…
+    m.genreFullEnabled = true;
+    expect(m.tsneIterationFor()).toEqual({ nIter: 500, early: 250 });
+    // …and nowhere else: 3-D keeps the recipe default.
+    m.view3d.on = true;
+    expect(m.tsneIterationFor()).toEqual({ nIter: null, early: null });
+    // …but it is shared across every 2-D lens.
+    m.view3d.on = false;
+    m.lensId = "clap";
+    expect(m.tsneIterationFor()).toEqual({ nIter: 500, early: 250 });
+  });
+
+  it("migrates a legacy per-view (lens:dims) map to per-dimensionality", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({
+        lensId: "clap",
+        view3d: { on: false, yaw: 0.6, pitch: 0.35 },
+        // Old per-view shape: keyed by lens + dimensionality.
+        tsneIteration: {
+          "clap:d2": { nIter: 200, early: 100 },
+          "genre_full:d2": { nIter: 900, early: 800 },
+          "genre_full:d3": { nIter: 300, early: 150 },
+          "rhythm:d3": { nIter: 400, early: 200 },
+        },
+      }),
+    );
+    const m = new Model();
+    m.loadLS();
+    m.genreFullEnabled = true;
+    m.lensId = "clap";
+    // The active dimension prefers the active saved lens (clap), not genre.
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    expect(m.tsneIterationFor()).toEqual({ nIter: 200, early: 100 });
+    // The other dimension picks the genre entry deterministically.
+    m.view3d.on = true;
+    expect(m.tsneIterationFor()).toEqual({ nIter: 300, early: 150 });
+  });
+
+  it("migrates a legacy per-view map's other dimension to the first sorted valid entry", () => {
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({
+        lensId: "clap",
+        view3d: { on: false, yaw: 0.6, pitch: 0.35 },
+        // No genre entry for 3-D: the non-active dimension falls back to the
+        // first sorted valid entry (rhythm < tempo).
+        tsneIteration: {
+          "tempo:d3": { nIter: 400, early: 200 },
+          "rhythm:d3": { nIter: 300, early: 150 },
+          "clap:d2": { nIter: 200, early: 100 },
+        },
+      }),
+    );
+    const m = new Model();
+    m.loadLS();
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    expect(m.tsneIterationFor()).toEqual({ nIter: 200, early: 100 });
+    m.view3d.on = true;
+    expect(m.tsneIterationFor()).toEqual({ nIter: 300, early: 150 });
+  });
+
+  it("keeps the per-dimensionality map fresh: no stored override for a fresh 100/100", () => {
+    const m = new Model();
+    m.genreFullEnabled = true;
+    m.lensId = "genre_full";
+    expect(m.tsneIterationFor()).toEqual({ nIter: null, early: null });
+    // Clearing an override removes the entry entirely (recipe default 100/100).
+    m.setTsneIterationForActiveView(250, 150);
+    expect(m.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
+    m.setTsneIterationForActiveView(null, null);
+    expect(m.tsneIterationFor()).toEqual({ nIter: null, early: null });
+    expect(Object.keys(m.tsneIteration)).toHaveLength(0);
   });
 });

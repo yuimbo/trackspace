@@ -20,12 +20,22 @@ source-parameterised::
     cache.put_maest(fp, embedding, logits, excerpts)   # paired escape hatch
 
 Canonical source names are ``clap``, ``features``, ``maest``, ``maest_logits``,
-``maest_excerpts`` and ``rhythm``.
+``maest_excerpts``, ``maest_layer7``, ``rhythm`` and ``mert_l19``.
 
 ``maest_excerpts`` stores the per-excerpt MAEST embeddings as one flat float32
 blob of shape ``(n_excerpts, MAEST_EMBED_DIM)``. It shares ``maest_version``
 because a single model pass produces the pooled embedding, the logits and the
 excerpts together, and the reader owns the dimension (the blob carries no header).
+
+``maest_layer7`` is the pooled native 2304-D ``cat(cls, dist, patch-mean)`` of
+MAEST block 6, captured single-pass in the same forward. It gets its **own**
+version column (``maest_layer7_version``) but is produced by the same model pass
+as the rest of the MAEST family, so it is purged/invalidated together with them
+via the MAEST checkpoint fingerprint (see ``maest.reconcile_checkpoint``).
+
+``mert_l19`` is the pooled 1024-D MERT layer-19 vector, produced by an
+independent encoder (``backend.embeddings.mert``) and versioned by its own
+``mert_version`` column.
 """
 
 import hashlib
@@ -36,6 +46,7 @@ import sqlite3
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -123,7 +134,14 @@ _SOURCES: dict[str, _SourceSpec] = {
     #: Per-excerpt MAEST vectors; shares the MAEST version column. Only written by
     #: ``put_maest`` and read back for weak-supervision hard-negative mining.
     "maest_excerpts": _SourceSpec("maest_excerpts", "maest_version", "maestexc:"),
+    #: Pooled native 2304-D ``cat(cls, dist, patch-mean)`` of MAEST block 6. Own
+    #: version column (single-pass capture is independent of the pooled pair) but
+    #: coupled to the MAEST family through the checkpoint fingerprint so a changed
+    #: checkpoint invalidates it together with ``maest``, never one alone.
+    "maest_layer7": _SourceSpec("maest_layer7", "maest_layer7_version", "maestl7:"),
     "rhythm": _SourceSpec("rhythm", "rhythm_version", "rhythm:"),
+    #: Pooled 1024-D MERT layer-19 vector from the independent MERT encoder.
+    "mert_l19": _SourceSpec("mert_l19", "mert_version", "mertl19:"),
     #: Folder-supervised projection output. Versioned by training-run id, so a
     #: retrain rewrites every row under a new version and old rows read absent.
     "supervised": _SourceSpec("supervised_embedding", "supervised_version", "sup:"),
@@ -265,6 +283,10 @@ class FeatureCache:
                 ("maest_logits", "BLOB"),
                 ("maest_excerpts", "BLOB"),
                 ("maest_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("maest_layer7", "BLOB"),
+                ("maest_layer7_version", "INTEGER NOT NULL DEFAULT 0"),
+                ("mert_l19", "BLOB"),
+                ("mert_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("supervised_embedding", "BLOB"),
                 ("supervised_version", "INTEGER NOT NULL DEFAULT 0"),
                 ("rhythm", "BLOB"),
@@ -849,6 +871,60 @@ class FeatureCache:
                     self._evict_mem_keys_with_prefix_unlocked(prefix)
         return n
 
+    def reconcile_source_fingerprint(
+        self, meta_key: str, fingerprint: str, sources: Sequence[str]
+    ) -> bool:
+        """Atomically blank a *sources* family and record its identity fingerprint.
+
+        One transaction blanks every source's family columns AND records
+        *fingerprint* under *meta_key*, so a changed identity can never leave
+        blanked rows with a stale recorded value, nor fresh rows carrying a value
+        that says a purge happened when it did not. The caller reuses the spec's
+        ``purge_cols`` (``_SourceSpec.null_cols``) so the per-source spec stays the
+        single owner of which columns a reconcile blanks.
+
+        Returns ``True`` when *fingerprint* differed and the family was blanked and
+        the value committed; ``False`` when it already matches (nothing to do). On
+        any failure the whole transaction rolls back — rows and the recorded
+        fingerprint stay untouched and the caller may retry — and the error is
+        logged; no fingerprint is recorded on a failure. The in-memory LRU and the
+        presence memo (invalidated via the write epoch) are only touched after a
+        successful commit, never on a rollback.
+        """
+        fingerprint = str(fingerprint)
+        specs = [self._spec(s) for s in sources]
+        cols: list[str] = []
+        for spec in specs:
+            for c in spec.null_cols:
+                if c not in cols:
+                    cols.append(c)
+        sets = ", ".join(f"{c}=X''" for c in cols)
+        present = " OR ".join(f"length({c}) > 0" for c in cols)
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT value FROM feature_meta WHERE key=?", (meta_key,)
+                ).fetchone()
+                if row and str(row[0]) == fingerprint:
+                    return False
+                conn.execute(
+                    f"UPDATE audio_features SET {sets} WHERE ({present})"
+                )
+                conn.execute(
+                    "INSERT INTO feature_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (meta_key, fingerprint),
+                )
+        except Exception:
+            log.exception("reconcile_source_fingerprint(%s) failed", meta_key)
+            return False
+        with self._lock:
+            self._write_epoch += 1
+            for spec in specs:
+                for prefix in spec.evict_prefixes:
+                    self._evict_mem_keys_with_prefix_unlocked(prefix)
+        return True
+
     def put_maest(
         self,
         fingerprint: str,
@@ -856,6 +932,8 @@ class FeatureCache:
         logits: np.ndarray,
         excerpts: np.ndarray | None = None,
         version: int = 0,
+        layer7: np.ndarray | None = None,
+        layer7_version: int | None = None,
     ) -> None:
         """Write MAEST embedding + style logits (+ optional per-excerpt vectors).
 
@@ -863,6 +941,11 @@ class FeatureCache:
         When *excerpts* is omitted, an existing excerpt blob is left untouched
         (so a caller that only has pooled outputs cannot erase mined vectors).
         Excerpts are stored flattened; the reader reshapes by ``MAEST_EMBED_DIM``.
+
+        *layer7* (the pooled 2304-D block-6 vector) is written atomically in the
+        same row when provided, under its own ``maest_layer7_version`` column
+        (defaulting to *version*). It too is left untouched when omitted, so a
+        caller that has not captured it cannot erase a previously stored vector.
         """
         emb_arr = np.asarray(embedding, dtype=np.float32)
         log_arr = np.asarray(logits, dtype=np.float32)
@@ -874,6 +957,12 @@ class FeatureCache:
                 exc_arr = exc_arr.reshape(1, -1)
             if exc_arr.size == 0:
                 exc_arr = None
+
+        l7_arr: np.ndarray | None = None
+        if layer7 is not None:
+            l7_arr = np.asarray(layer7, dtype=np.float32)
+            if l7_arr.size == 0:
+                l7_arr = None
 
         cols = [
             "fingerprint",
@@ -898,6 +987,18 @@ class FeatureCache:
             cols.insert(4, "maest_excerpts")
             vals.insert(4, exc_arr.tobytes())
             set_clause += ", maest_excerpts=excluded.maest_excerpts"
+        if l7_arr is not None:
+            cols.insert(4, "maest_layer7")
+            vals.insert(4, l7_arr.tobytes())
+            cols.insert(5, "maest_layer7_version")
+            vals.insert(
+                5,
+                layer7_version if layer7_version is not None else version,
+            )
+            set_clause += (
+                ", maest_layer7=excluded.maest_layer7, "
+                "maest_layer7_version=excluded.maest_layer7_version"
+            )
 
         sql = (
             f"INSERT INTO audio_features ({', '.join(cols)}) "
@@ -915,3 +1016,5 @@ class FeatureCache:
             self._lru_put("maestlog:" + fingerprint, log_arr.astype(np.float32))
             if exc_arr is not None:
                 self._lru_put("maestexc:" + fingerprint, exc_arr.reshape(-1).astype(np.float32))
+            if l7_arr is not None:
+                self._lru_put("maestl7:" + fingerprint, l7_arr.reshape(-1).astype(np.float32))
