@@ -17,6 +17,7 @@ from flask import Blueprint, jsonify, request
 from werkzeug.exceptions import NotFound
 
 from backend.embeddings.layout_evaluation import (
+    GALLERY_SETS,
     load_completed,
     load_recipe_json,
     manifest_dict,
@@ -25,22 +26,12 @@ from backend.services.request_validation import ApiValidationError, one_of
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_-]+$")
 
-#: Named gallery sets. The value is the fixed subdirectory of the base
-#: layout-evaluation dir the set's artifacts live in (``None`` = the base dir
-#: itself). Only these names are ever resolved — never arbitrary path input.
+#: Named gallery sets and their fixed artifact directories, derived from the one
+#: authoritative :data:`backend.embeddings.layout_evaluation.GALLERY_SETS`.
+#: ``None`` = the base layout-evaluation dir. Only these names are ever resolved
+#: — never arbitrary path input.
 SET_SUBDIRS: dict[str, str | None] = {
-    "base": None,
-    "budget": "budget",
-    "scale": "scale",
-    "early": "early",
-    "mixes": "mixes",
-    "ablation": "ablation",
-    #: Offline genre-space representation comparison.
-    "genre": "genre",
-    #: Fixed directed 5-option contrastive genre preset (logits/hidden/layer7/MERT19).
-    "genre-directed": "genre-directed",
-    #: Fixed 2-option logits on/off genre ablation (genre_full vs genre_without_logits).
-    "genre-logits-ab": "genre-logits-ab",
+    name: gallery_set.directory for name, gallery_set in GALLERY_SETS.items()
 }
 
 

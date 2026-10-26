@@ -415,6 +415,67 @@ def test_recipe_identity_preserved_for_original_recipes():
     )
 
 
+# ── gallery-set registry ────────────────────────────────────────────────────
+
+
+def test_gallery_set_registry_is_derived_from_one_mapping():
+    # The default generation is still exactly the original eight.
+    assert [r.id for r in le.RECIPES] == [
+        "baseline", "pca2", "pca25", "tsne_budget",
+        "umap2_n15", "umap2_n60", "umap_tsne", "tsne_umap_init",
+    ]
+    assert le.GALLERY_SETS["base"].recipes is le.RECIPES
+    assert le.GALLERY_SETS["base"].directory is None
+
+    # RECIPES_BY_ID is the exact union of the built-in sets — no second,
+    # hand-maintained list of recipe ids.
+    builtin_ids = {
+        recipe.id
+        for gallery_set in le.GALLERY_SETS.values()
+        if gallery_set.recipes is not None
+        for recipe in gallery_set.recipes
+    }
+    assert builtin_ids == set(le.RECIPES_BY_ID)
+
+    for name, gallery_set in le.GALLERY_SETS.items():
+        if gallery_set.recipes is None:
+            continue
+        # The documented control/reference leads the alignment order.
+        assert gallery_set.recipes[0].id in le.RECIPES_BY_ID, name
+
+
+def test_gallery_sets_share_the_same_recipe_objects():
+    # A registry refactor must not fork a frozen identity: shared controls are
+    # the same object in every set and in the registry.
+    for gallery_set in le.GALLERY_SETS.values():
+        for recipe in gallery_set.recipes or ():
+            assert le.RECIPES_BY_ID[recipe.id] is recipe
+    assert le.RECIPES_BY_ID["tsne_chain50_250_1000_final50"] is (
+        le.TSNE_CHAIN50_250_1000_FINAL50
+    )
+    assert le.GALLERY_SETS["hierarchy-heuristic"].recipes[0] is (
+        le.TSNE_CHAIN50_250_1000_FINAL50
+    )
+    assert le.GALLERY_SETS["hierarchy-density"].recipes[0] is le.TSNE_GEO8_COMBINED
+    assert le.GALLERY_SETS["hierarchy-gamma"].recipes[0] is le.TSNE_DENSITY4
+
+
+def test_gallery_set_routes_derive_and_external_sets_are_honest():
+    from backend.routes.api_layout_evaluation import SET_SUBDIRS
+
+    assert SET_SUBDIRS == {
+        name: gallery_set.directory
+        for name, gallery_set in le.GALLERY_SETS.items()
+    }
+    assert SET_SUBDIRS["base"] is None
+    for name in (
+        "genre", "genre-directed", "genre-logits-ab",
+        "folder-separation", "folder-cheap",
+    ):
+        assert SET_SUBDIRS[name] == name
+        assert le.GALLERY_SETS[name].recipes is None
+
+
 # ── generation: end-to-end, small-n, cache isolation, stale handling ─────────
 
 
@@ -422,6 +483,8 @@ def test_generation_produces_all_eight(gallery):
     _fc, _infos, out = gallery
     manifest = le.manifest_dict(out)
     assert manifest["status"] == "complete"
+    assert manifest["n_jobs"] == 2
+    assert "umap_jit" in manifest["notes"]
     assert len(manifest["recipes"]) == 8
     assert all(r["status"] == "complete" for r in manifest["recipes"].values())
     # An unspecified generation runs exactly the original eight — the registry
@@ -544,6 +607,8 @@ def test_scale_gallery_four_maps_reference_control_no_auto_baseline(tmp_path):
     manifest = _run_scale(fc, infos, out)
     scale = ["tsne_budget100", "tsne_p60", "tsne_p120", "tsne_multiscale30_120"]
     assert manifest["status"] == "complete"
+    assert manifest["n_jobs"] == 2
+    assert "umap_jit" not in manifest["notes"]
     # Exactly the four scale recipes — the baseline (500-iteration) map must NOT
     # be auto-added just to serve as the alignment reference.
     assert sorted(manifest["recipes"]) == sorted(scale)
@@ -1023,13 +1088,33 @@ def test_generation_does_not_touch_production_fit_cache(tmp_path):
 def test_too_few_tracks_skips_with_clear_reason(tmp_path):
     fc, infos = _build_cache(tmp_path, 3)
     manifest = _run(fc, infos, tmp_path / "out")
-    assert manifest["status"] == "complete"
+    # No requested recipe completed, so the generation is failed, not complete.
+    assert manifest["status"] == "failed"
     assert all(
         r["status"] == "skipped" and "too few tracks" in r["reason"]
         for r in manifest["recipes"].values()
     )
     # No artifacts are written for a skipped run.
     assert le.load_completed(tmp_path / "out") == {}
+
+
+def test_initial_manifest_written_before_gather(tmp_path, monkeypatch):
+    fc, infos = _build_cache(tmp_path, 8)
+    out = tmp_path / "out"
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("gather failed")
+
+    monkeypatch.setattr(
+        "backend.embeddings.layout.prepare_projection_input", boom
+    )
+    with pytest.raises(RuntimeError, match="gather failed"):
+        _run(fc, infos, out)
+    manifest = le.manifest_dict(out)
+    assert manifest["status"] == "in_progress"
+    assert manifest["recipes"] == {}
+    assert manifest["dataset_fingerprint"] == ""
+    assert manifest["n_jobs"] == 2
 
 
 def test_stale_artifacts_never_appear_valid(gallery, tmp_path):
@@ -1062,6 +1147,7 @@ def test_partial_generation_records_errors(tmp_path, monkeypatch):
 
     monkeypatch.setattr(le, "fit_recipe", _fail)
     manifest = _run(fc, infos, out)
+    assert manifest["status"] == "partial"
     assert manifest["recipes"]["pca25"]["status"] == "error"
     assert "RuntimeError: boom" in manifest["recipes"]["pca25"]["reason"]
     assert all(
@@ -1533,3 +1619,37 @@ def test_cli_mix_with_sources_subset_rejected_clean_exit(tmp_path, monkeypatch):
         )
     assert "absent from the run sources" in str(ei.value)
     assert not (out / "manifest.json").exists()
+
+
+def test_cli_set_selects_recipes_reference_and_default_output(tmp_path, monkeypatch):
+    import backend.precompute_layout_evaluation as cli
+
+    captured = {}
+
+    def _fake_run_generation(**kwargs):
+        captured.update(kwargs)
+        os.makedirs(kwargs["output_dir"], exist_ok=True)
+        return {
+            "dataset_fingerprint": "fp",
+            "sources": [],
+            "source_weights": {},
+            "dataset": {"count": 1},
+            "recipes": {},
+        }
+
+    monkeypatch.setattr(cli, "run_generation", _fake_run_generation)
+    _cli_main(monkeypatch, tmp_path, "--set", "hierarchy-heuristic")
+
+    gallery_set = le.GALLERY_SETS["hierarchy-heuristic"]
+    assert captured["recipe_ids"] == [r.id for r in gallery_set.recipes]
+    assert captured["reference_id"] == gallery_set.recipes[0].id
+    assert captured["output_dir"] == str(
+        tmp_path / "data" / "layout-evaluation" / "hierarchy-heuristic"
+    )
+
+
+def test_cli_external_set_rejected_clean_exit(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit) as ei:
+        _cli_main(monkeypatch, tmp_path, "--set", "genre")
+    assert "externally generated" in str(ei.value)
+    assert not (tmp_path / "data" / "layout-evaluation" / "genre").exists()

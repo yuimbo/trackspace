@@ -17,6 +17,7 @@ you are touching.
 | `audio_pipeline.md` | Fingerprinting → embeddings → projection → clustering, and the analysis job queue |
 | `embedding-next-steps.md` | The implementation plans for embedding/analysis work (selected `genre_full` adoption, optimization, MuQ evaluation, validation) |
 | `trackspace-projection-methods.md` | Research notes on parametric/kernel projection candidates; background, not normative |
+| `layout-evaluation.md` | Offline layout-evaluation recipe catalogue, CLI, gallery and benchmark protocols |
 | `TODO.md` | Actionable tasks, deferred work, product roadmap |
 | `README.md` | Setup and running |
 
@@ -55,7 +56,7 @@ The detailed file tree and line-count snapshot are in `architecture.md`.
 
 **Layout-evaluation CLI + gallery:** `python -m backend.precompute_layout_evaluation`
   generates the offline eval maps; open the app with `?layout_eval=1` for the browser
-  gallery. Usage, the named sets and the gallery: README.md → *Layout evaluation*.
+  gallery. Recipe catalogue, CLI, gallery and benchmarks: `layout-evaluation.md`.
 
 ---
 

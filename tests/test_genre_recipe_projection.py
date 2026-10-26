@@ -2,7 +2,7 @@
 
 The default recipe must stay byte-identical (same revision/cache keys as before
 this slice); the opt-in genre_full recipe must key its own revision/fit on the
-genre block cache generations and its 100/100 openTSNE budget (encoded
+genre block cache generations and its 50/0 openTSNE budget (encoded
 absolutely so a default never aliases a legacy budget), and a user-chosen
 iteration budget must never share a fit with the recipe default.
 
@@ -98,7 +98,8 @@ def test_default_recipe_revision_is_byte_identical():
 
 def test_default_recipe_tsne_suffix_is_empty():
     recipe = recipe_for(None)
-    assert tsne_iteration_suffix(100, 100, recipe) == ""
+    assert (recipe.tsne_n_iter, recipe.tsne_early_exaggeration_iter) == (50, 0)
+    assert tsne_iteration_suffix(50, 0, recipe) == ""
     # A deviating budget is encoded, so it refits rather than reusing the default.
     assert tsne_iteration_suffix(250, 150, recipe) == "n250|e150"
 
@@ -149,72 +150,71 @@ def test_genre_recipe_keeps_maest_pair_required_and_others_optional():
 
 def test_tsne_budget_deviation_changes_the_layout_revision():
     default_proj = parse_projection_params(_Req({}))
-    fast_proj = parse_projection_params(_Req({"tsne_n_iter": "100", "tsne_early_exaggeration_iter": "100"}))
+    same_proj = parse_projection_params(_Req({}))
+    fast_proj = parse_projection_params(_Req({"tsne_n_iter": "100"}))
     balanced_proj = parse_projection_params(_Req({"tsne_n_iter": "250", "tsne_early_exaggeration_iter": "150"}))
-    # Fast == the default budget → same revision (reuses the default layout).
-    assert _revision(fast_proj) == _revision(default_proj)
-    # Balanced deviates → a distinct revision (a different fit).
+    # An omitted budget is the recipe default → same revision.
+    assert _revision(same_proj) == _revision(default_proj)
+    # Any explicit budget (even 100/100, above the 50/0 default) deviates → a
+    # distinct revision (a different fit).
+    assert _revision(fast_proj) != _revision(default_proj)
     assert _revision(balanced_proj) != _revision(default_proj)
 
 
 def test_tsne_budget_deviation_changes_the_fit_cache_key():
     recipe = recipe_for(None)
-    assert tsne_iteration_suffix(100, 100, recipe) == ""
+    assert tsne_iteration_suffix(50, 0, recipe) == ""
     assert "n250" in tsne_iteration_suffix(250, 150, recipe)
     genre = recipe_for("genre_full")
-    # The genre recipe encodes its effective budget *absolutely*, so its 100/100
-    # default never aliases the legacy 500/250 default fit under a bare key.
-    assert tsne_iteration_suffix(100, 100, genre) == "n100|e100"
+    # The genre recipe encodes its effective budget *absolutely*, so its 50/0
+    # default never aliases a legacy default fit under a bare key.
+    assert tsne_iteration_suffix(50, 0, genre) == "n50|e0"
     assert tsne_iteration_suffix(500, 250, genre) == "n500|e250"
-    assert tsne_iteration_suffix(100, 100, genre) != tsne_iteration_suffix(500, 250, genre)
+    assert tsne_iteration_suffix(50, 0, genre) != tsne_iteration_suffix(500, 250, genre)
     # A user override of the genre budget still encodes absolutely.
     assert tsne_iteration_suffix(250, 150, genre) == "n250|e150"
 
 
-def test_early_exaggeration_zero_is_a_real_override():
-    """``early=0`` (disable early exaggeration) is a genuine deviation, not the default.
+def test_early_exaggeration_zero_matches_the_default_budget():
+    """``early=0`` is the default now, so it must not fork the revision.
 
-    Regression: ``layout_revision_for_projection`` used
-    ``getattr(...) or recipe.default``, so an explicit 0 was swallowed into the
-    default recipe's 100 and shared the default layout's revision — a 0-early fit
-    would have been served the default fit. The ``is None`` check must preserve it.
+    ``layout_revision_for_projection`` uses explicit ``is None`` checks, so an
+    omitted early budget and an explicit 0 resolve to the same default; a non-zero
+    early budget is still a deviation and gets its own revision.
     """
     default_proj = parse_projection_params(_Req({}))
     early0_proj = parse_projection_params(_Req({"tsne_early_exaggeration_iter": "0"}))
     assert early0_proj.tsne_early_exaggeration_iter == 0
-    assert early0_proj.tsne_n_iter == 100  # n_iter unchanged by the early override
-    # 0 != the default recipe's 100, so the deviation must change the revision.
-    assert _revision(early0_proj) != _revision(default_proj)
-    # And it must equal the explicit compute_layout_revision form.
-    assert _revision(early0_proj) == compute_layout_revision(
-        eligible_paths=eligible_paths_for_projection(
-            _INFOS, _MAPS, early0_proj.sources, early0_proj.required_sources
-        ),
-        cache_versions=_CV,
-        weights=early0_proj.source_weights,
-        sources=early0_proj.sources,
-        tsne_early_exaggeration_iter=0,
-    )
-    # A non-zero deviation also differs from both.
+    assert early0_proj.tsne_n_iter == 50  # n_iter unchanged by the early override
+    assert _revision(early0_proj) == _revision(default_proj)
+    # A non-zero deviation differs from the default.
     early150_proj = parse_projection_params(_Req({"tsne_early_exaggeration_iter": "150"}))
     assert _revision(early150_proj) != _revision(default_proj)
-    assert _revision(early150_proj) != _revision(early0_proj)
+    assert _revision(early150_proj) == compute_layout_revision(
+        eligible_paths=eligible_paths_for_projection(
+            _INFOS, _MAPS, early150_proj.sources, early150_proj.required_sources
+        ),
+        cache_versions=_CV,
+        weights=early150_proj.source_weights,
+        sources=early150_proj.sources,
+        tsne_early_exaggeration_iter=150,
+    )
 
 
 def test_genre_full_budget_propagates_to_effective_params():
     proj = parse_projection_params(_Req({"recipe": "genre_full"}), genre_full_enabled=True)
-    # The effective budget the projection runs at is the recipe's 100/100 default.
-    assert proj.tsne_n_iter == 100
-    assert proj.tsne_early_exaggeration_iter == 100
+    # The effective budget the projection runs at is the recipe's 50/0 default.
+    assert proj.tsne_n_iter == 50
+    assert proj.tsne_early_exaggeration_iter == 0
     # The genre recipe encodes its effective budget absolutely, so the default
-    # 100/100 and the gallery 500/250 override never share a revision.
-    assert tsne_iteration_suffix(100, 100, recipe_for("genre_full")) == "n100|e100"
+    # 50/0 and the gallery 500/250 override never share a revision.
+    assert tsne_iteration_suffix(50, 0, recipe_for("genre_full")) == "n50|e0"
     default_proj = parse_projection_params(_Req({}))
     assert _revision(proj) != _revision(default_proj)
 
 
 def test_genre_default_and_gallery_budget_revisions_differ():
-    """The 100/100 default must never read the legacy 500/250 fit/layout: the
+    """The 50/0 default must never read the legacy 500/250 fit/layout: the
     genre recipe encodes its effective budget absolutely, so the two budgets fork
     their layout revisions (and fit keys)."""
     default_genre = parse_projection_params(

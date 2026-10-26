@@ -9,6 +9,7 @@ the PCA / t-SNE backends in `projection_backends`. Re-exported from
 
 import hashlib
 import logging
+import os
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
@@ -27,18 +28,34 @@ from .clap import (
     _load_audio_segments,
 )
 from .feature_encoding import FEATURE_ENCODING_VERSION, encode_feature_vector
-from .lens_gauge import gauge_layout, gauge_layout_3d
+from .layout_revision import GAUGE_3D_VERSION
+from .lens_gauge import (
+    GAUGE_VERSION2,
+    MIN_SHARED,
+    gauge_layout,
+    gauge_layout_3d,
+    has_reference,
+    seed_reference,
+)
+from .linalg_utils import matched_indices
 from .projection_backends import (
     _project_pca,
     _project_tsne,
     reset_projection_backend_cache,
 )
-from .projection_config import recipe_for, tsne_iteration_suffix
+from .projection_config import (
+    FROZEN_FOLDER_BASIS_MODE,
+    FROZEN_FOLDER_BOOST,
+    FROZEN_FOLDER_DEPTH_BOOST,
+    recipe_for,
+    tsne_iteration_suffix,
+)
 from .semantic_weighting import (
     _apply_low_rank_semantic_weight,
     _build_semantic_basis,
     _folder_seeds_from_track_paths,
     _semantic_basis_param_key,
+    validate_folder_basis_mode,
 )
 
 log = logging.getLogger(__name__)
@@ -146,8 +163,171 @@ def _composite_cache_put(key: str, value) -> None:
             _composite_cache_bytes -= int(old_v[1].nbytes)
 
 
+#: Metadata prefix for the persisted gauge anchor of a stable family. The value is
+#: the layout revision whose persisted row is that family's reference frame.
+_GAUGE_ANCHOR_META_PREFIX = "gauge_anchor"
+
+
+def _gauge_scope_for(paths: list[str], gauge_scope: str | None) -> str:
+    """The stable scope that identifies a gauge family.
+
+    An explicit *gauge_scope* is used verbatim: the route, status and prefetch pass
+    the configured library roots as ``library:<id>|<id>``. That is the only scope
+    that stays stable when the configured roots change independently of the visible
+    tracks, and it is part of the coordinate revision, so it must come from the
+    configuration rather than be re-derived here.
+
+    The fallback infers a scope from the paths, deliberately *not* from the exact
+    track set: a folder subset and the whole library slice must share one frame.
+    Virtual paths encode their root as the first component, which is stable under
+    subsetting. Absolute paths have no root id — their first component is empty for
+    every volume, so keying on it would put unrelated libraries in one frame — and
+    fall back to their common ancestor directory instead. That ancestor narrows as
+    the path set narrows, so without configured roots a folder subset may fork the
+    family rather than join a foreign one; callers with configured roots must pass
+    the explicit scope to keep subsets in one frame.
+    """
+    if gauge_scope is not None:
+        return str(gauge_scope)
+    roots = {
+        str(p).split("/", 1)[0] for p in paths if p and not os.path.isabs(str(p))
+    }
+    absolute_dirs = sorted({
+        os.path.dirname(str(p)) for p in paths if os.path.isabs(str(p))
+    })
+    if absolute_dirs:
+        try:
+            roots.add("abs:" + os.path.commonpath(absolute_dirs))
+        except ValueError:
+            # Mixed drives/anchors: no trustworthy common prefix exists.
+            roots.add("abs:")
+    return "\n".join(sorted(roots))
+
+
+def _gauge_family(
+    gauge_scope: str | None,
+    paths: list[str],
+    feature_cache,
+    dims: int,
+) -> str:
+    """Stable family key shared by every lens over the same library scope.
+
+    The source-version part uses the supervised-source generations (not the
+    lens's own subset), so switching between ``clap`` and ``genre_full`` does not
+    fork the family. 2-D and 3-D have separate namespaces; each carries the gauge
+    semantics generation so a version bump never reuses an old frame.
+    """
+    token = _source_versions_token(
+        feature_cache, sources=("maest_layer7", "mert_l19")
+    )
+    namespace = (
+        f"2d{GAUGE_VERSION2}"
+        if dims == 2
+        else f"3d{GAUGE_VERSION2}.{GAUGE_3D_VERSION}"
+    )
+    return f"{namespace}|{_gauge_scope_for(paths, gauge_scope)}|{token}"
+
+
+def _positions_array(
+    positions: list[dict], dims: int
+) -> tuple[list[str], np.ndarray] | None:
+    """Paths plus a float64 coordinate matrix from cached positions, or ``None``."""
+    if not positions:
+        return None
+    if dims == 3 and not all("z" in p for p in positions):
+        return None
+    paths = [str(p["path"]) for p in positions]
+    try:
+        coords = np.asarray(
+            [
+                [float(p["x"]), float(p["y"])]
+                + ([float(p["z"])] if dims == 3 else [])
+                for p in positions
+            ],
+            dtype=np.float64,
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if coords.shape != (len(paths), dims) or not np.all(np.isfinite(coords)):
+        return None
+    return paths, coords
+
+
+def _anchor_meta_key(family: str) -> str:
+    return f"{_GAUGE_ANCHOR_META_PREFIX}:{family}"
+
+
+def _ensure_gauge_reference(
+    family: str,
+    feature_cache,
+    *,
+    positions: list[dict] | None = None,
+    dims: int = 2,
+) -> None:
+    """Restore *family*'s reference frame before aligning a layout.
+
+    The persisted anchor (metadata → layout row) wins; if it is missing or its row
+    was deleted, the just-loaded *positions* seed the in-memory reference so the
+    family stays coherent until the next store replaces the pointer. Seeding never
+    overwrites a live in-memory reference.
+    """
+    if has_reference(family):
+        return
+    get_meta = getattr(feature_cache, "get_meta", None)
+    get_layout = getattr(feature_cache, "get_layout", None)
+    revision = get_meta(_anchor_meta_key(family)) if get_meta is not None else None
+    if revision and get_layout is not None:
+        loaded = _positions_array(get_layout(revision) or [], dims)
+        if loaded is not None:
+            seed_reference(family, *loaded)
+            return
+    if positions:
+        loaded = _positions_array(positions, dims)
+        if loaded is not None:
+            seed_reference(family, *loaded)
+
+
+def _store_gauge_anchor(
+    family: str,
+    feature_cache,
+    revision: str | None,
+    positions: list[dict],
+    dims: int,
+) -> None:
+    """Point *family*'s metadata at *revision* when no usable anchor exists.
+
+    Only a complete, fittable layout (>= ``MIN_SHARED`` tracks, finite coordinates
+    of the right shape) may anchor. An existing pointer whose layout row is gone is
+    replaced; a live one is kept, so the first valid layout stays the reference
+    across restarts. A malformed row is skipped rather than persisted as the frame.
+    """
+    if not revision:
+        return
+    loaded = _positions_array(positions, dims)
+    if loaded is None or len(loaded[0]) < MIN_SHARED:
+        return
+    get_meta = getattr(feature_cache, "get_meta", None)
+    set_meta = getattr(feature_cache, "set_meta", None)
+    get_layout = getattr(feature_cache, "get_layout", None)
+    if set_meta is None:
+        return
+    key = _anchor_meta_key(family)
+    current = get_meta(key) if get_meta is not None else None
+    if current:
+        if get_layout is None:
+            return
+        # A deleted cache row must not strand the family on a missing anchor.
+        if get_layout(current):
+            return
+    set_meta(key, revision)
+
+
 def revision_layout_cached(
-    revision: str | None, feature_cache=None
+    revision: str | None,
+    feature_cache=None,
+    *,
+    gauge_scope: str | None = None,
+    dims: int = 2,
 ) -> list[dict] | None:
     """The cached t-SNE layout for *revision*, or ``None``.
 
@@ -155,22 +335,32 @@ def revision_layout_cached(
     so without the disk tier a restart re-fits every lens (~20 s each). Lets a
     caller short-circuit before taking the projection slot: an already-warmed lens
     must not wait behind a background fit for another lens.
+
+    A hit also restores (or seeds) the stable family's gauge reference, so a
+    restart that serves a persisted layout still aligns the *next* cold lens. The
+    hit's coordinates are returned unchanged — they are already in the family
+    frame and must never be re-normalised.
     """
     if not revision:
         return None
     hit = _tier_cache_get(_revision_layout_cache, revision)
-    if hit is not None:
-        return hit
-    getter = getattr(feature_cache, "get_layout", None)
-    if getter is None:
-        return None
-    disk = getter(revision)
-    if not disk:
-        return None
-    _tier_cache_put(
-        _revision_layout_cache, revision, disk, _REVISION_LAYOUT_CACHE_MAX
+    if hit is None:
+        getter = getattr(feature_cache, "get_layout", None)
+        if getter is None:
+            return None
+        hit = getter(revision)
+        if not hit:
+            return None
+        _tier_cache_put(
+            _revision_layout_cache, revision, hit, _REVISION_LAYOUT_CACHE_MAX
+        )
+    paths = [str(p["path"]) for p in hit]
+    family = _gauge_family(gauge_scope, paths, feature_cache, dims)
+    _ensure_gauge_reference(
+        family, feature_cache, positions=hit, dims=dims
     )
-    return disk
+    _store_gauge_anchor(family, feature_cache, revision, hit, dims)
+    return hit
 
 
 def _supervised_cache_version(feature_cache) -> int:
@@ -556,6 +746,7 @@ def prepare_projection_input(
     context_folders: list[str] | None = None,
     folder_boost: float = 3.0,
     folder_depth_boost: float = 1.5,
+    folder_basis_mode: str = "full",
 ) -> ProjectionInput:
     """Gather the composite matrix and apply any semantic weighting.
 
@@ -563,18 +754,34 @@ def prepare_projection_input(
     gating) and then re-projects the CLAP column span along semantic folder/tag
     directions when a model is ready and supervision is supplied. ``scale_folders``
     derives the folder seeds from the track paths when no explicit context folders
-    are given. The defaults mirror the interactive projection; ``scale_folders=False``
-    and empty context mean no supervision, which is the evaluation default.
+    are given. The defaults mirror the frozen evaluation path (full basis, 3.0 /
+    1.5); production passes its canonical params. ``scale_folders=False`` and empty
+    context mean no supervision, which is the evaluation default.
+
+    The folder-weighting gate is structural: data-driven folder directions need
+    no CLAP, and a recipe with no CLAP column has no text fallbacks, so
+    folder-only weighting applies whenever there are no tags and no CLAP slot —
+    regardless of whether the text tower has loaded. Tags and a CLAP column
+    still require the model.
 
     ``tsne_config`` is the effective vector-config key the production t-SNE fit
     cache keys on (``comp_config`` plus the semantic-basis params when weighting
     is active). The evaluation generator ignores it for its own uncached fits but
     it is returned so callers that do use the production cache key identically.
 
+    ``folder_basis_mode`` defaults to ``"full"`` for the frozen evaluation and
+    benchmark paths; production passes ``FROZEN_FOLDER_BASIS_MODE``
+    (``"centroids"``) explicitly from ``compute_projection``. ``"centroids"``
+    keeps only the hierarchical contrast directions and skips the within-folder
+    PC SVD; ``"approx"`` solves those PCs with a seeded randomized SVD.
+    Non-default modes are namespaced into the semantic-basis key, never exposed
+    by the API, and never aliased onto a cached full basis.
+
     A degenerate input — fewer than two tracks, or a matrix with fewer than two
     rows — returns the unweighted bundle with no semantic inference, since there
     is nothing meaningful to project or re-weight.
     """
+    validate_folder_basis_mode(folder_basis_mode)
     paths, mat, clap_dim, clap_col_lo, comp_key, comp_config, spans = (
         _gather_composite_vecs(
             track_infos,
@@ -602,7 +809,14 @@ def prepare_projection_input(
     else:
         folder_seeds = None
 
-    needs_weight = is_model_ready() and (bool(context_tags) or bool(folder_seeds))
+    # CLAP is only needed when a text direction can actually enter the basis:
+    # explicit tags, or a CLAP column that folder text-fallbacks could fill.
+    # Data-driven folder directions are model-free, so a recipe with no CLAP slot
+    # and no tags applies them even while the text tower has not loaded.
+    allow_without_model = not context_tags and clap_dim <= 0
+    needs_weight = (bool(context_tags) or bool(folder_seeds)) and (
+        is_model_ready() or allow_without_model
+    )
     mat_proj = mat
     basis_key = ""
     if needs_weight:
@@ -613,7 +827,7 @@ def prepare_projection_input(
         # direction, so it does refit.
         basis_key = (
             f"{comp_config}"
-            f"|{_semantic_basis_param_key(context_tags, folder_seeds)}"
+            f"|{_semantic_basis_param_key(context_tags, folder_seeds, folder_basis_mode)}"
         )
         basis = _tier_cache_get(_semantic_basis_cache, basis_key)
         if basis is None:
@@ -621,6 +835,7 @@ def prepare_projection_input(
             tags_for_weight = context_tags if clap_dim > 0 else None
             T_n, exp = _build_semantic_basis(
                 mat, paths, tags_for_weight, folder_seeds, clap_col_lo, clap_hi,
+                folder_basis_mode,
             )
             _tier_cache_put(
                 _semantic_basis_cache, basis_key, (T_n, exp),
@@ -653,11 +868,26 @@ def _source_block_dim(source: str, smap: dict[str, np.ndarray]) -> int:
 
 
 def _normalise_coords(coords: np.ndarray) -> np.ndarray:
-    mins = coords.min(axis=0)
-    maxs = coords.max(axis=0)
-    ranges = maxs - mins
-    ranges[ranges < 1e-9] = 1.0
-    return (coords - mins) / ranges
+    """Stretch every axis independently so each spans ``[0, 1]``.
+
+    The served map must fill the view on every axis, so an elongated cloud
+    becomes square instead of leaving most of one axis empty. That per-axis
+    stretch is intentionally anisotropic: it is a display convention, not a
+    structure claim, and the cross-lens gauge preserves orientation rather than
+    exact distances or a 3-D head-on overlay. A degenerate axis (zero or
+    non-finite span) is centred at 0.5 instead of dividing by zero.
+    """
+    out = np.array(coords, dtype=np.float64, copy=True)
+    if out.ndim != 2 or out.shape[0] == 0:
+        return coords
+    mins = out.min(axis=0)
+    maxs = out.max(axis=0)
+    span = maxs - mins
+    degenerate = ~np.isfinite(span) | (span < 1e-9)
+    safe_span = np.where(degenerate, 1.0, span)
+    out = (out - mins) / safe_span
+    out[:, degenerate] = 0.5
+    return out
 
 
 def _weight_jacobian(
@@ -667,6 +897,7 @@ def _weight_jacobian(
     *,
     delta: float = 1e-3,
     on_progress: Callable[[int, int], None] | None = None,
+    alignment_reference: list[dict] | None = None,
 ) -> dict[str, np.ndarray]:
     """Finite-difference ``d(2-D coords) / d(source weight)`` at *base_weights*.
 
@@ -677,8 +908,19 @@ def _weight_jacobian(
     substitute for the full recompute on release.
 
     The perturbation fits are thrown away (*cache_fit=False*): their one-off configs
-    would otherwise evict the live fit the base layout reuses. *on_progress* is
-    called as ``(done, total)`` per source, for a determinate progress UI.
+    would otherwise evict the live fit the base layout reuses. Both the base and
+    the perturbations are *ungauged* (``gauge=False``) so the finite difference is
+    taken in one shared coordinate frame. *on_progress* is called as
+    ``(done, total)`` per source, for a determinate progress UI.
+
+    *alignment_reference* is the **served** base layout (already gauged and
+    per-axis normalised for display). The ungauged base is mapped onto it with a
+    least-squares 2-D affine fit on the shared paths, and that one transform is
+    applied to every perturbation before differencing. Translation cancels; the
+    derivative carries the gauge's rotation plus the deliberate per-axis display
+    stretch, so a drag preview moves in the frame the user sees. Perturbations are
+    never gauged individually — that would refit each one and both pollute the
+    family anchor and make the difference depend on the fit.
 
     A source at weight 0 still has a meaningful one-sided derivative: raising it is
     the slider's action, so we step it *up* by ``+eps`` and divide by that same
@@ -686,11 +928,17 @@ def _weight_jacobian(
     at all (no cached rows for any track) is skipped — stepping it cannot move the
     chart, so it has no derivative to report.
     """
-    _base, base_normed, _spans = project_fn(base_weights)
+    base_result, base_normed, _spans = project_fn(base_weights, gauge=False)
     out: dict[str, np.ndarray] = {}
-    total = len(sources)
     if base_normed.shape[0] < 2:
         return out
+    transform = _gauge_transform_for(base_result, base_normed, alignment_reference)
+    aligned_base = (
+        base_normed
+        if transform is None
+        else _apply_gauge_transform(base_normed, transform)
+    )
+    total = len(sources)
     done = 0
     for s in sources:
         done += 1
@@ -700,7 +948,9 @@ def _weight_jacobian(
         # raising it from 0.
         stepped = dict(base_weights)
         stepped[s] = weight + float(delta)
-        _res, moved, moved_spans = project_fn(stepped, cache_fit=False)
+        _res, moved, moved_spans = project_fn(
+            stepped, cache_fit=False, gauge=False
+        )
         # Skip only a source with no block available: its +delta projection still
         # carries no span for it, so stepping cannot change the chart.
         if s not in moved_spans:
@@ -708,10 +958,62 @@ def _weight_jacobian(
                 on_progress(done, total)
             continue
         if moved.shape == base_normed.shape:
-            out[s] = ((moved - base_normed) / float(delta)).astype(np.float32)
+            aligned_moved = (
+                moved
+                if transform is None
+                else _apply_gauge_transform(moved, transform)
+            )
+            out[s] = ((aligned_moved - aligned_base) / float(delta)).astype(np.float32)
         if on_progress is not None:
             on_progress(done, total)
     return out
+
+
+def _gauge_transform_for(
+    base_result: list[dict],
+    base_normed: np.ndarray,
+    alignment_reference: list[dict] | None,
+) -> np.ndarray | None:
+    """Least-squares affine map from the ungauged base onto the served base.
+
+    A similarity fit cannot express the served frame: the final display
+    normalisation stretches each axis independently after the orientation fit, so
+    the map from the raw normalised base to the served coordinates is affine (a
+    rotation followed by an axis-wise stretch). Returns a ``2x3`` matrix, or
+    ``None`` when the fit is underdetermined, degenerate or non-finite.
+    """
+    if alignment_reference is None or base_normed.ndim != 2:
+        return None
+    if base_normed.shape[1] != 2:
+        return None
+    ref = _positions_array(alignment_reference, 2)
+    if ref is None:
+        return None
+    ref_paths, ref_coords = ref
+    base_paths = [str(p["path"]) for p in base_result]
+    mine, theirs = matched_indices(base_paths, ref_paths)
+    if len(mine) < 3:
+        return None
+    src = base_normed[mine]
+    dst = ref_coords[theirs]
+    design = np.column_stack([src, np.ones(len(src))])
+    try:
+        if np.linalg.matrix_rank(design) < 3:
+            return None
+        solution, *_ = np.linalg.lstsq(design, dst, rcond=None)
+    except np.linalg.LinAlgError:
+        log.debug("jacobian gauge transform failed; leaving the derivative ungauged", exc_info=True)
+        return None
+    transform = np.asarray(solution, dtype=np.float64).T
+    if transform.shape != (2, 3) or not np.all(np.isfinite(transform)):
+        return None
+    return transform
+
+
+def _apply_gauge_transform(coords: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    """Map ungauged coordinates into the served base frame (affine ``2x3``)."""
+    return coords @ transform[:, :2].T + transform[:, 2]
+
 
 
 def parse_audio_feature_mask(raw: str | None) -> np.ndarray:
@@ -760,8 +1062,8 @@ def compute_projection(
     context_tags: list[str] | None = None,
     context_folders: list[str] | None = None,
     scale_folders: bool = False,
-    folder_boost: float = 3.0,
-    folder_depth_boost: float = 1.5,
+    folder_boost: float = FROZEN_FOLDER_BOOST,
+    folder_depth_boost: float = FROZEN_FOLDER_DEPTH_BOOST,
     sources: tuple[str, ...] = ("clap",),
     feature_mask: np.ndarray | None = None,
     features_blend: float = 0.42,
@@ -775,10 +1077,16 @@ def compute_projection(
     recipe_id: str | None = None,
     tsne_n_iter: int | None = None,
     tsne_early_exaggeration_iter: int | None = None,
+    gauge_scope: str | None = None,
 ) -> list[dict] | tuple[list[dict], dict[str, np.ndarray]]:
     if layout_revision and method == "tsne":
-        hit = revision_layout_cached(layout_revision, feature_cache)
-        if hit is not None:
+        hit = revision_layout_cached(
+            layout_revision,
+            feature_cache,
+            gauge_scope=gauge_scope,
+            dims=dims,
+        )
+        if hit is not None and not with_jacobian:
             log.debug("projection: revision cache hit (tsne)")
             return hit
 
@@ -786,7 +1094,7 @@ def compute_projection(
 
     # Effective openTSNE budget: the recipe default unless the request overrode it.
     # The deviation suffix keys the fit cache so two budgets never share a fit; the
-    # default recipe at its default 100/100 yields an empty suffix (byte-identical).
+    # default recipe at its default 50/0 yields an empty suffix (byte-identical).
     _recipe = recipe_for(recipe_id)
     eff_n_iter = int(tsne_n_iter if tsne_n_iter is not None else _recipe.tsne_n_iter)
     eff_early = int(
@@ -807,12 +1115,25 @@ def compute_projection(
             [[p["x"], p["y"]] for p in align_ref], dtype=np.float64
         )
 
-    def _project_at(w: dict[str, float], *, cache_fit: bool = True):
+    # The gauge family key depends only on the scope, the track set and ``dims``,
+    # all of which every pass over this request shares, so it is derived at most
+    # once — and never for the ungauged Jacobian passes.
+    gauge_family: str | None = None
+
+    def _project_at(
+        w: dict[str, float], *, cache_fit: bool = True, gauge: bool = True
+    ):
         """Gather → weight → project → normalise for one weight vector.
 
         Returns ``(result, normed, spans)``. The composite gather is keyed on
         the weights, so a perturbation re-runs only the projection.
+
+        *gauge* is off for the Jacobian difference pass: the base and every
+        perturbation must share one frame, so both stay ungauged rather than
+        aligning a perturbation (which would register a reference and change
+        the frame between difference terms).
         """
+        nonlocal gauge_family
         inp = prepare_projection_input(
             track_infos,
             feature_cache,
@@ -826,6 +1147,7 @@ def compute_projection(
             context_folders=context_folders,
             folder_boost=folder_boost,
             folder_depth_boost=folder_depth_boost,
+            folder_basis_mode=FROZEN_FOLDER_BASIS_MODE,
         )
         # `mat.shape[0] < 2` guards the degenerate all-zero-weight case, where
         # every block is dropped. The HTTP routes reject that vector before
@@ -857,29 +1179,37 @@ def compute_projection(
                 tsne_key_suffix=tsne_suffix,
             )
 
-        # Put every lens in one shared gauge before normalising, so switching lens
-        # is not an apparent rotation/flip of the whole map (see `lens_gauge`).
-        # Keyed by the track set + cache generations, not the lens: layouts are only
-        # comparable within one such family. The Jacobian's perturbation fits are
-        # excluded — they must stay in their own frame to difference correctly.
-        # A 3-D layout is gauged head-on: its (x,y) is an arbitrary frame of the
-        # same lens's 2-D layout, so it is fitted onto that layout (the reference)
-        # with the z sign pinned per family. Without a reference it stays ungauged.
-        if cache_fit and dims == 2:
-            coords = gauge_layout(
-                f"{_source_versions_token(feature_cache, sources=sources)}|{track_set_key(inp.paths)}",
-                inp.paths,
-                coords,
-            )
-        elif cache_fit and dims == 3 and align_ref is not None:
-            coords = gauge_layout_3d(
-                f"{_source_versions_token(feature_cache, sources=sources)}|{track_set_key(inp.paths)}",
-                inp.paths,
-                coords,
-                ref_paths,
-                ref_xy,
-            )
+        # Normalise per axis *before* gauging so the orientation fit sees a
+        # comparable shape, then align to the family's reference. The gauge applies
+        # rotation/reflection/translation only; uniform scale is ignored. Rotation
+        # changes the axis extents, so the final served coordinate is normalised
+        # per axis again below to fill every axis of the view.
         normed = _normalise_coords(coords)
+        if gauge and cache_fit and (
+            dims == 2 or (dims == 3 and align_ref is not None)
+        ):
+            if gauge_family is None:
+                gauge_family = _gauge_family(
+                    gauge_scope, inp.paths, feature_cache, dims
+                )
+            # One frame per stable family (library scope + cache generations),
+            # shared by every lens and folder subset. A persisted anchor is
+            # restored first so a cold start keeps the pre-restart frame.
+            _ensure_gauge_reference(gauge_family, feature_cache, dims=dims)
+            if dims == 2:
+                normed = gauge_layout(gauge_family, inp.paths, normed)
+            else:
+                normed = gauge_layout_3d(
+                    gauge_family,
+                    inp.paths,
+                    normed,
+                    ref_paths,
+                    ref_xy,
+                )
+        # Final display geometry: stretch each axis independently so the map fills
+        # the view box. This is deliberate for both 2-D and 3-D — the x/y overlay
+        # with the 2-D reference is only approximate after it, by design.
+        normed = _normalise_coords(normed)
         result = [
             {
                 "path": inp.paths[i],
@@ -905,6 +1235,14 @@ def compute_projection(
         putter = getattr(feature_cache, "put_layout", None)
         if putter is not None:
             putter(layout_revision, result)
+        # First complete layout for a family becomes its persisted anchor; a tiny
+        # folder never does. The pointer is only written when absent/unusable.
+        family = gauge_family
+        if family is None:
+            family = _gauge_family(
+                gauge_scope, [p["path"] for p in result], feature_cache, dims
+            )
+        _store_gauge_anchor(family, feature_cache, layout_revision, result, dims)
 
     if with_jacobian:
         jacobian = _weight_jacobian(
@@ -916,6 +1254,10 @@ def compute_projection(
                 if on_progress is not None
                 else None
             ),
+            # 2-D only: the derivative must live in the frame the user sees. A
+            # cached layout hit skipped the early return above so this pass still
+            # runs; a tiny/no-chart layout yields an empty Jacobian (not an error).
+            alignment_reference=result if dims == 2 else None,
         )
         return result, jacobian
     return result

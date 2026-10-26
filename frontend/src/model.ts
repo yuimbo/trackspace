@@ -28,6 +28,7 @@ import {
 import { clusterColor, dirTagColors, keyColor, tempoColor } from "./lib/colors";
 import { MAX_PITCH, type Orbit } from "./lib/camera3d";
 import { displayFolderPath } from "./lib/path-presenter";
+import type { EvalDims } from "./lib/layout-eval";
 import { clamp01 } from "./lib/util";
 import clusterWeights from "./lib/cluster-weights.json";
 import { GENRE_FULL_WEIGHTS } from "./lib/lenses";
@@ -556,6 +557,12 @@ export class Model extends EventBus {
    */
   evalUniverse: Set<string> | null = null;
   /**
+   * Dimensionality of the layout-evaluation artifact on screen. Session-only,
+   * defaults to 2 and resets when eval mode ends; it never touches the persisted
+   * production ``view3d`` option.
+   */
+  evalDims: EvalDims = 2;
+  /**
    * Sidebar focus: highlighted tree row and default parent for “+ Folder”.
    * Does **not** filter the canvas — the full loaded library is always in scope
    * (only per-session hides apply). Persisted as ``folder`` in localStorage.
@@ -616,7 +623,7 @@ export class Model extends EventBus {
    * Every embedding-map lens shares the budget for its dimensionality: a budget
    * chosen on the 2-D Genre map is shared by all other 2-D map lenses, and 3-D
    * keeps its own separate budget. ``null`` entries mean "use the active recipe's
-   * default" (100/100). Sent as ``tsne_n_iter`` /
+   * default" (the production multilevel 50/0 budget). Sent as ``tsne_n_iter`` /
    * ``tsne_early_exaggeration_iter`` only when set.
    */
   tsneIteration: Record<string, { nIter: number | null; early: number | null }> = {};
@@ -660,9 +667,9 @@ export class Model extends EventBus {
    * stay 2-D).
    */
   get is3d(): boolean {
+    if (this.evalMode) return this.evalDims === 3;
     return (
       this.view3d.on &&
-      !this.evalMode &&
       this.lens().kind === "projection"
     );
   }
@@ -676,9 +683,9 @@ export class Model extends EventBus {
    * *rendering* gate.
    */
   get shows3d(): boolean {
+    if (this.evalMode) return this.evalDims === 3 || this.view3dBlend > 0;
     return (
       (this.view3d.on || this.view3dBlend > 0) &&
-      !this.evalMode &&
       this.lens().kind === "projection"
     );
   }
@@ -977,11 +984,13 @@ export class Model extends EventBus {
   /* ── Computed ──────────────────────────────────────────────── */
 
   /**
-   * True when the track belongs to the current view scope. External roots are
-   * analysed and laid out like any other, but stay out of the default view until
-   * "Show external" is on — so the map still shows where they would land.
+   * True when the track belongs to the current view scope. Under eval the
+   * artifact universe is the authority: every artifact track is drawn, including
+   * external-root tracks, and every non-artifact track is hidden — without
+   * mutating ``showExternal``. Outside eval the normal external filter applies.
    */
   trackInViewUnion(t: Track): boolean {
+    if (this.evalUniverse) return this.evalUniverse.has(t.path);
     return this.showExternal || !this.isExternalTrack(t);
   }
 
@@ -1057,7 +1066,6 @@ export class Model extends EventBus {
   get tracks(): Track[] {
     if (this._cache) return this._cache;
     const result = this.allTracks.filter((t) => {
-      if (this.evalUniverse && !this.evalUniverse.has(t.path)) return false;
       if (!this.trackInViewUnion(t) || this.isTrackHidden(t)) return false;
       return true;
     });
@@ -1175,9 +1183,21 @@ export class Model extends EventBus {
   setEvalMode(on: boolean): void {
     if (this.evalMode === on) return;
     this.evalMode = on;
+    this.evalDims = 2;
+    // Production blend state is persisted through `view3d.on`; an eval session's
+    // blend is transient, so leaving must not leave the production camera 3-D.
+    this.view3dBlend = this.view3d.on ? 1 : 0;
     // Deliberately does NOT touch `_lensId`: the view-mode getter reports the
     // embedding map while eval is on, so a mid-eval `saveLS` still persists the
     // user's normal lens rather than overwriting it.
+    this._invalidateView();
+    this.emit("change");
+  }
+
+  /** Commit the eval artifact dimensionality (after its positions applied). */
+  setEvalDims(dims: EvalDims): void {
+    if (this.evalDims === dims) return;
+    this.evalDims = dims;
     this._invalidateView();
     this.emit("change");
   }

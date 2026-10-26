@@ -927,6 +927,44 @@ describe("CanvasInteractionController fit view", () => {
     expect(tweenTarget(deps)).toEqual({ ox: 0, oy: 0, zoom: 1 });
   });
 
+  it("fits the embedding map's real bounds instead of forcing the unit viewport", () => {
+    const { model, canvas, deps, coord } = makeHarness();
+    model.viewMode = "embeddings";
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+    ]);
+    canvas.worldPosForTrack.mockImplementation((t: Track) => ({
+      wx: t.path === "a.mp3" ? 0.2 : 0.8,
+      wy: t.path === "a.mp3" ? 0.3 : 0.7,
+    }));
+    model.vp = { ox: 0, oy: 0, zoom: 1 };
+    coord.fitView();
+    // The 0.6 × 0.4 box fits with the existing 10% margin (min axis wins), not
+    // the old hard-coded {0,0,1}.
+    expect(tweenTarget(deps).zoom).toBeCloseTo(4 / 3, 6);
+    expect(tweenTarget(deps).ox).toBeCloseTo(0.125, 6);
+    expect(tweenTarget(deps).oy).toBeCloseTo(0.125, 6);
+  });
+
+  it("fits the projected 3-D bounds without resetting the orbit", () => {
+    const { model, canvas, deps, coord } = makeHarness();
+    model.view3d.on = true;
+    model.lensId = "combined";
+    model.setAllTracks([
+      makeTrack({ path: "a.mp3" }),
+      makeTrack({ path: "b.mp3" }),
+    ]);
+    canvas.worldPosForTrack.mockImplementation((t: Track) => ({
+      wx: t.path === "a.mp3" ? 0.2 : 0.8,
+      wy: t.path === "a.mp3" ? 0.3 : 0.7,
+    }));
+    const orbit = { ...model.view3d };
+    coord.fitView();
+    expect(tweenTarget(deps).zoom).toBeCloseTo(4 / 3, 6);
+    expect(model.view3d).toEqual(orbit);
+  });
+
   it("fits to the hovered folder disc", () => {
     const { model, canvas, deps, coord } = makeHarness();
     canvas.hoverTarget = { kind: "folder", prefix: "House" };

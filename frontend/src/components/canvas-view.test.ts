@@ -92,6 +92,7 @@ function makeFakeCtx(): {
 
 describe("CanvasView cluster hover glow", () => {
   let alphas: number[];
+  let arcs: { x: number; y: number; r: number; alpha: number }[];
   let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
 
   beforeEach(() => {
@@ -100,6 +101,7 @@ describe("CanvasView cluster hover glow", () => {
       '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
     const fake = makeFakeCtx();
     alphas = fake.alphas;
+    arcs = fake.arcs;
     origGetContext = HTMLCanvasElement.prototype.getContext;
     HTMLCanvasElement.prototype.getContext = (() =>
       fake.ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
@@ -233,6 +235,32 @@ describe("CanvasView cluster hover glow", () => {
     const cv = makeCanvas();
     cv.draw();
     expect(alphas).not.toContain(0.15);
+  });
+
+  it("fades external tracks outside eval but not when the artifact cohort is shown", () => {
+    const m = new Model();
+    m.lensId = "combined";
+    m.setAllTracks([
+      makeTrack({ path: "a.mp3", folder: "lib" }),
+      makeTrack({ path: "b.mp3", folder: "ext" }),
+    ]);
+    m.setExternalRoots(["ext"]);
+    m.setShowExternal(true);
+    m.embeddingPositions = new Map([
+      ["a.mp3", { x: 0.3, y: 0.3 }],
+      ["b.mp3", { x: 0.7, y: 0.7 }],
+    ]);
+    const cv = new CanvasView(m);
+
+    cv.draw();
+    // Normal view: the external track is secondary in the dot pass.
+    expect(arcs.some((a) => a.alpha === 0.5)).toBe(true);
+
+    m.setEvalMode(true);
+    arcs.length = 0;
+    cv.draw();
+    // Eval: the artifact cohort is all equally visible; no external fade.
+    expect(arcs.some((a) => a.alpha === 0.5)).toBe(false);
   });
 });
 

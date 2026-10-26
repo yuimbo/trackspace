@@ -190,8 +190,10 @@ export class Controller {
       status: statusView,
       canvas: canvasView,
       scheduleDraw: () => this.canvas.scheduleDraw(),
-      // Deferred: `embedding` is constructed just below. Applying weights
-      // re-clusters on the server *and* refits the 2-D layout.
+      // Deferred: `embedding` is constructed just below. View options folds and
+      // panel visibility have one owner, the embedding coordinator.
+      syncViewOptions: () => this.embedding.syncLensChrome(),
+      // Applying weights re-clusters on the server *and* refits the 2-D layout.
       refreshProjection: () => this.embedding.refreshProjection(),
       // Live slider drags use the cached source-weight Jacobian; the full
       // re-cluster + refit still runs on Apply.
@@ -218,6 +220,10 @@ export class Controller {
       status: statusView,
       canvas: canvasView,
       viewMods: this.viewMods,
+      // The influences panel reuses the analysis weight builder and shared
+      // labels; this coordinator only supplies the backend's effective config.
+      renderProjectionSettings: (settings, error) =>
+        this.analysis.renderProjectionSettings(settings, error),
     });
 
     // Read-only layout-evaluation gallery (`?layout_eval=1`). It reuses the
@@ -239,8 +245,8 @@ export class Controller {
     this.eval = new EvaluationCoordinator({
       model,
       view: this.evalToolbar,
-      applyPositions: (positions) =>
-        this.embedding.applyPrecomputedPositions(positions),
+      applyPositions: (positions, dims) =>
+        this.embedding.applyPrecomputedPositions(positions, dims),
       resetCamera: () => this.embedding.tweenViewport({ ox: 0, oy: 0, zoom: 1 }),
       fetchManifest: () => api<unknown>(`/api/layout-evaluation${setQs()}`),
       fetchArtifact: (id) =>
@@ -1250,6 +1256,12 @@ export class Controller {
 
   /** Flip the 3-D orbit view; shared by the `3` hotkey and the on-canvas view tab. */
   private _toggleView3D(): void {
+    // In the read-only eval gallery **3** switches the current group between its
+    // 2-D and 3-D artifact; production keeps the lens/refetch toggle.
+    if (this.model.evalMode) {
+      void this.eval.toggleDims();
+      return;
+    }
     void this.embedding.setView3D(!this.model.view3d.on);
   }
 

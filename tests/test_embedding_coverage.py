@@ -214,6 +214,19 @@ def test_layout_revision_changes_with_sources():
     assert r_combined != r_clap
 
 
+def test_layout_revision_changes_with_gauge_scope_but_not_when_absent():
+    """The configured gauge scope selects the reference frame, and it is not
+    derivable from the eligible paths: one slice under two root configurations
+    must never share coordinates. No scope keeps the pre-scope hash."""
+    kw = _base_revision_kwargs()
+    r_unscoped = compute_layout_revision(**kw)
+    assert r_unscoped == compute_layout_revision(**{**kw, "gauge_scope": None})
+    r_a = compute_layout_revision(**{**kw, "gauge_scope": "library:a"})
+    r_ab = compute_layout_revision(**{**kw, "gauge_scope": "library:a|b"})
+    assert r_a not in (r_unscoped, r_ab)
+    assert r_ab != r_unscoped
+
+
 def test_layout_revision_dims3_differs_and_2d_matches_default():
     """dims=3 must fork the revision (3-D caches must never serve 2-D coords);
     dims=2 must be byte-identical to omitting the parameter, so existing 2-D
@@ -243,6 +256,21 @@ def test_layout_revision_3d_gauges_with_gauge3d_version():
     )
     assert r_3d_new != r_3d
     assert r_2d_new == r_2d
+
+
+def test_layout_revision_includes_the_shared_gauge_version_for_both_dims():
+    """A gauge/normalisation change must invalidate 2-D *and* 3-D layouts."""
+    from backend.embeddings.layout_revision import GAUGE_VERSION2
+
+    kw = _base_revision_kwargs()
+    r_2d = compute_layout_revision(**{**kw, "dims": 2})
+    r_3d = compute_layout_revision(**{**kw, "dims": 3})
+    assert compute_layout_revision(
+        **{**kw, "dims": 2, "gauge_2d_version": GAUGE_VERSION2 + 1}
+    ) != r_2d
+    assert compute_layout_revision(
+        **{**kw, "dims": 3, "gauge_2d_version": GAUGE_VERSION2 + 1}
+    ) != r_3d
 
 
 def test_layout_revision_stable_for_equivalent_weights():

@@ -9,12 +9,15 @@ layout cache, the t-SNE fit cache, or MP3 tags.
 Usage::
 
     python -m backend.precompute_layout_evaluation [--output DIR] [--limit N]
-        [--recipes id,id,...] [--reference id] [--sources s1,s2] [--seed 42]
-        [--threads -1] [--root /path] [--data-dir DIR]
+        [--recipes id,id,... | --set SET] [--reference id] [--sources s1,s2]
+        [--seed 42] [--threads -1] [--root /path] [--data-dir DIR]
 
 The server serves these from ``<data-dir>/layout-evaluation``; point ``--output``
 there (the default) so the browser eval can read them. ``TRACKSPACE_DATA_DIR``
-selects the cache directory (default ``data/``).
+selects the cache directory (default ``data/``). ``--set`` selects a built-in
+gallery set's recipes, reference, and default output directory from
+:data:`backend.embeddings.layout_evaluation.GALLERY_SETS`; externally generated
+genre/folder sets are rejected with a pointer to their own CLI.
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ from backend.embeddings.feature_cache import (
 )
 from backend.embeddings.layout_evaluation import (
     BASELINE_ID,
+    GALLERY_SETS,
     run_generation,
 )
 from backend.embeddings.projection_config import (
@@ -40,6 +44,7 @@ from backend.embeddings.projection_config import (
     FROZEN_SOURCES,
     FROZEN_SOURCE_WEIGHTS,
     required_sources_for,
+    single_lens_weights,
 )
 from backend.services.roots_registry import (
     add_root,
@@ -84,16 +89,27 @@ def _parse_sources(raw: str) -> tuple[str, ...]:
 
 
 def load_infos(
-    roots: OrderedDict, track_cache: TrackCache, root_roles=None
+    roots: OrderedDict,
+    track_cache: TrackCache,
+    root_roles=None,
+    *,
+    scope: str = "library",
 ) -> tuple[list[dict], int]:
-    """Path + fingerprint for every cached library track under *roots*.
+    """Path + fingerprint for every cached track under *roots*.
 
     Fingerprints come from the track cache only — nothing is recomputed, so the
     library is never re-scanned or re-fingerprinted. Tracks whose cache entry is
     missing are skipped (reported by the caller via the count).
-    Returns ``(infos, n_mp3s)``.
+    ``scope="library"`` keeps the historical library-roots-only selection;
+    ``scope="all"`` includes external roots too, matching a 3-D / fit_scope=all
+    projection. Returns ``(infos, n_mp3s)``.
     """
-    root_ids = library_root_ids(roots, root_roles or {})
+    if scope == "library":
+        root_ids = library_root_ids(roots, root_roles or {})
+    elif scope == "all":
+        root_ids = list(roots)
+    else:
+        raise ValueError(f"unknown scope {scope!r} (expected 'library' or 'all')")
     abs_paths = list_mp3s("", roots, recursive=True, root_ids=root_ids)
     pairs: list[tuple[str, float]] = []
     for p in abs_paths:
@@ -120,8 +136,19 @@ def main() -> None:
     parser.add_argument("--data-dir", default=None, help="Cache dir holding roots.json + audio_features.db (default: data/)")
     parser.add_argument("--root", default=None, help="Single library root (overrides roots.json)")
     parser.add_argument("--limit", type=int, default=None, help="Cap the number of tracks used (smoke tests)")
-    parser.add_argument("--recipes", default=None, help="Comma-separated recipe ids (default: all)")
-    parser.add_argument("--reference", default=None, help="Recipe id the other maps align onto (default: baseline)")
+    recipe_source = parser.add_mutually_exclusive_group()
+    recipe_source.add_argument("--recipes", default=None, help="Comma-separated recipe ids (default: all)")
+    recipe_source.add_argument(
+        "--set",
+        dest="set_name",
+        default=None,
+        metavar="SET",
+        help=(
+            "A built-in gallery set from GALLERY_SETS (recipes, reference and "
+            "default output dir); mutually exclusive with --recipes"
+        ),
+    )
+    parser.add_argument("--reference", default=None, help="Recipe id the other maps align onto (default: the set reference, else baseline)")
     parser.add_argument("--sources", default=None, help="Comma-separated source blocks (default: production default lens)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--threads", type=int, default=-1, help="n_jobs for UMAP/openTSNE (default -1 = all cores)")
@@ -141,25 +168,55 @@ def main() -> None:
     _require_opentsne()
 
     data_dir = os.path.abspath(args.data_dir or _data_dir())
-    output_dir = os.path.abspath(args.output or os.path.join(data_dir, "layout-evaluation"))
+
+    gallery = None
+    if args.set_name is not None:
+        gallery = GALLERY_SETS.get(args.set_name)
+        if gallery is None:
+            builtin = ", ".join(
+                name for name, entry in GALLERY_SETS.items() if entry.recipes is not None
+            )
+            raise SystemExit(
+                f"unknown --set {args.set_name!r} (built-in sets: {builtin})"
+            )
+        if gallery.recipes is None:
+            raise SystemExit(
+                f"--set {args.set_name!r} is externally generated and cannot be "
+                "built by this CLI (genre sets: `python -m "
+                "backend.experiments.genre_space maps`; folder sets: `python -m "
+                "backend.benchmark_production_projection`; see "
+                "layout-evaluation.md); pass --recipes for this tool instead"
+            )
+
+    default_output = os.path.join(data_dir, "layout-evaluation")
+    if gallery is not None and gallery.directory:
+        default_output = os.path.join(default_output, gallery.directory)
+    output_dir = os.path.abspath(args.output or default_output)
 
     sources = _parse_sources(args.sources) if args.sources else FROZEN_SOURCES
     weights = dict(FROZEN_SOURCE_WEIGHTS)
     # A per-source eval keeps the single source at weight 1 and the rest at 0,
     # matching the per-source production lenses.
     if args.sources:
-        weights = {k: (1.0 if k in sources else 0.0) for k in FROZEN_SOURCE_WEIGHTS}
+        weights = single_lens_weights(sources)
     try:
         required_sources = required_sources_for(sources)
     except ValueError as e:
         raise SystemExit(str(e)) from None
 
     recipe_ids = (
-        [r.strip() for r in args.recipes.split(",") if r.strip()]
-        if args.recipes
-        else None
+        [r.id for r in gallery.recipes]
+        if gallery is not None
+        else (
+            [r.strip() for r in args.recipes.split(",") if r.strip()]
+            if args.recipes
+            else None
+        )
     )
-    reference = args.reference or BASELINE_ID
+    builtin_reference = (
+        gallery.recipes[0].id if gallery is not None and gallery.recipes else None
+    )
+    reference = args.reference or builtin_reference or BASELINE_ID
 
     # Resolve roots (persisted, or a single --root).
     roots: OrderedDict[str, str] = OrderedDict()
@@ -196,9 +253,6 @@ def main() -> None:
                 "run the analysis pipeline first"
             )
 
-        actual_sources = sources
-        actual_weights = weights
-
         def _progress(stage: str, done: int = 0, total: int = 0) -> None:
             print(f"[layout-eval] {stage} {done}/{total}")
 
@@ -206,8 +260,8 @@ def main() -> None:
             feature_cache=feature_cache,
             infos=infos,
             output_dir=output_dir,
-            sources=actual_sources,
-            source_weights=actual_weights,
+            sources=sources,
+            source_weights=weights,
             required_sources=required_sources,
             feature_mask=FROZEN_FEATURE_MASK.copy(),
             features_blend=FROZEN_FEATURES_BLEND,
@@ -223,11 +277,6 @@ def main() -> None:
         # validates all of these before any artifact write. Surface them as a
         # clean exit (no traceback), like the other CLI validation errors.
         raise SystemExit(str(e)) from None
-    finally:
-        # FeatureCache / TrackCache hold no persistent open connections beyond
-        # each method's own `ClosingConnection`; dropping them is enough.
-        del track_cache
-        del feature_cache
 
     print()
     print(f"Artifacts: {output_dir}")

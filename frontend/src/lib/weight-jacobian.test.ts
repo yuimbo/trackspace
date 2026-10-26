@@ -5,8 +5,9 @@ import {
   type WeightJacobian,
 } from "./weight-jacobian";
 
-// Base spans [0,1] per axis, as the server's min-max normalisation guarantees.
-// Five points, so the interior can move while the extremes define the frame.
+// A square base spanning [0,1] on both axes, i.e. the frame a first ungauged
+// layout gets. Five points, so the interior can move while the extremes define
+// the frame.
 const jac = (): WeightJacobian => ({
   weights: { maest: 0.5, clap: 0.5 },
   paths: ["a.mp3", "b.mp3", "c.mp3", "d.mp3", "e.mp3"],
@@ -51,6 +52,43 @@ const jac3d = (): WeightJacobian => ({
   },
   revision: "rev-1",
 });
+
+// A rectangular cloud that sits outside the unit box: the server normalises each
+// axis *before* the gauge, so a displayed layout can be 4:1, offset and larger
+// than [0,1]². Four points; the extremes define its per-axis frame.
+const rect = (): WeightJacobian => ({
+  weights: { maest: 0.5, clap: 0.5 },
+  paths: ["a.mp3", "b.mp3", "c.mp3", "d.mp3"],
+  base: [
+    { x: 1.2, y: -0.4 },
+    { x: 1.8, y: -0.2 },
+    { x: 2.6, y: 0.0 },
+    { x: 3.2, y: 0.1 },
+  ],
+  jacobian: {
+    maest: [
+      { dx: 0.1, dy: 0.2 },
+      { dx: -0.1, dy: 0.1 },
+      { dx: 0.2, dy: -0.1 },
+      { dx: -0.2, dy: -0.2 },
+    ],
+  },
+  revision: "rev-1",
+});
+
+const spans = (pts: Iterable<{ x: number; y: number }>) => {
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const p of pts) {
+    minX = Math.min(minX, p.x);
+    maxX = Math.max(maxX, p.x);
+    minY = Math.min(minY, p.y);
+    maxY = Math.max(maxY, p.y);
+  }
+  return { x: maxX - minX, y: maxY - minY };
+};
 
 describe("parseWeightJacobian", () => {
   it("parses positions, weights and the per-source deltas", () => {
@@ -117,8 +155,8 @@ describe("parseWeightJacobian", () => {
     });
     expect(parsed).not.toBeNull();
     expect(parsed!.jacobian).toEqual({});
-    // The base already spans the [0,1] frame, so renormalisation is a no-op and
-    // a drag leaves every track exactly where the server placed it.
+    // The step is anchored to the base cloud, so a drag leaves every track
+    // exactly where the server placed it.
     const out = approximatePositions(parsed!, { maest: 0.7 });
     expect(out.get("a.mp3")).toEqual({ x: 0, y: 0, z: 0 });
     expect(out.get("b.mp3")).toEqual({ x: 1, y: 1, z: 1 });
@@ -208,5 +246,80 @@ describe("approximatePositions", () => {
     const c = out.get("c.mp3")!;
     expect(c.z).toBeUndefined();
     expect("z" in c).toBe(false);
+  });
+
+  it("returns a rectangular, out-of-box base exactly at zero delta", () => {
+    // A displayed layout is normalised before the gauge, so it may be 4:1 and
+    // sit outside [0,1]². Re-normalising it standalone would recentre and
+    // rescale the map on the first drag event; a zero delta must be the identity.
+    const j = rect();
+    const out = approximatePositions(j, { maest: 0.5, clap: 0.5 });
+    j.base.forEach((p, i) => expect(out.get(j.paths[i])).toEqual(p));
+  });
+
+  it("maps each axis to its own base extent", () => {
+    const j = rect();
+    const before = spans(j.base);
+    expect(before.x / before.y).toBeCloseTo(4, 5);
+    const out = approximatePositions(j, { maest: 0.6, clap: 0.5 });
+    const after = spans(out.values());
+    // Per-axis min/max anchoring restores both base extents independently:
+    // x 2, y 0.5 (4:1), not a shared-span 1.7 / 0.1 raw-step frame.
+    expect(after.x).toBeCloseTo(before.x, 6);
+    expect(after.y).toBeCloseTo(before.y, 6);
+    // Controlled interior: the stepped cloud's x span is 1.97 centred at 2.195,
+    // so scaleX = 2/1.97 around the base centre 2.2.
+    expect(out.get("b.mp3")!.x).toBeCloseTo(1.788832, 5);
+    expect(out.get("c.mp3")!.x).toBeCloseTo(2.631472, 5);
+    // Its y span is 0.46 centred at -0.15, so scaleY = 0.5/0.46 restores the
+    // base extent; c lands near the base minimum, not the unit-box maximum.
+    expect(out.get("c.mp3")!.y).toBeCloseTo(0.002174, 5);
+  });
+
+  it("renormalises a short-axis move to the base extent, not the unit box", () => {
+    const j = rect();
+    j.jacobian = {
+      maest: [
+        { dx: 0, dy: -0.2 },
+        { dx: 0, dy: 0 },
+        { dx: 0, dy: 0 },
+        { dx: 0, dy: 0.2 },
+      ],
+    };
+    const before = spans(j.base);
+    const out = approximatePositions(j, { maest: 0.6, clap: 0.5 });
+    const after = spans(out.values());
+    // The stepped y span is 0.54; per-axis scaling maps it back to the base's
+    // 0.5 (not [0,1]), so a single-axis drag cannot refill the whole box.
+    expect(after.y).toBeCloseTo(before.y, 6);
+    expect(after.y).toBeLessThan(1);
+    expect(out.get("b.mp3")!.y).toBeCloseTo(-0.196296, 5);
+    expect(out.get("c.mp3")!.y).toBeCloseTo(-0.011111, 5);
+  });
+
+  it("maps x, y and z to independent base extents in a rectangular 3-D base", () => {
+    const j = jac3d();
+    j.base = [
+      { x: 0, y: 0, z: 0 },
+      { x: 0.25, y: 0.5, z: 0.25 },
+      { x: 0.5, y: 1, z: 0.5 },
+      { x: 0.75, y: 1.5, z: 0.75 },
+      { x: 1, y: 2, z: 1 },
+    ];
+    const before = spans(j.base);
+    const out = approximatePositions(j, { maest: 0.6, clap: 0.5 });
+    const after = spans(out.values());
+    expect(after.x).toBeCloseTo(before.x, 6);
+    expect(after.y).toBeCloseTo(before.y, 6);
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    for (const p of out.values()) {
+      expect(Number.isFinite(p.x)).toBe(true);
+      expect(Number.isFinite(p.y)).toBe(true);
+      expect(Number.isFinite(p.z)).toBe(true);
+      minZ = Math.min(minZ, p.z!);
+      maxZ = Math.max(maxZ, p.z!);
+    }
+    expect(maxZ - minZ).toBeCloseTo(1, 6);
   });
 });

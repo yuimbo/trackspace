@@ -8,7 +8,6 @@
 // release. It is deliberately a cheap approximation — the sign and direction
 // are right, the magnitude only to first order.
 
-import { clamp01 } from "./util";
 import type { MapPos } from "../model";
 
 export interface WeightJacobian {
@@ -67,17 +66,57 @@ export function parseWeightJacobian(raw: unknown): WeightJacobian | null {
   };
 }
 
+/** Min/max of one cloud; ``minZ``/``maxZ`` only meaningful when it carries z. */
+interface Bounds {
+  minX: number;
+  maxX: number;
+  minY: number;
+  maxY: number;
+  minZ: number;
+  maxZ: number;
+}
+
+function bounds(pts: readonly { x: number; y: number; z?: number }[]): Bounds {
+  const b: Bounds = {
+    minX: Infinity,
+    maxX: -Infinity,
+    minY: Infinity,
+    maxY: -Infinity,
+    minZ: Infinity,
+    maxZ: -Infinity,
+  };
+  for (const p of pts) {
+    if (p.x < b.minX) b.minX = p.x;
+    if (p.x > b.maxX) b.maxX = p.x;
+    if (p.y < b.minY) b.minY = p.y;
+    if (p.y > b.maxY) b.maxY = p.y;
+    if (p.z !== undefined) {
+      if (p.z < b.minZ) b.minZ = p.z;
+      if (p.z > b.maxZ) b.maxZ = p.z;
+    }
+  }
+  return b;
+}
+
 /** Approximate positions at *weights* by a first-order step from the base layout.
  *
  *  Always steps from the Jacobian's own base positions, never from the current
  *  map: re-basing on an already-approximated map while ``dw`` stays relative to
  *  the fetch-time weights would compound each drag event's delta.
  *
- *  The result is renormalised per axis (min-max, clamped to the unit square —
- *  or the unit cube when the payload carries z), matching the server's min-max
- *  normalisation of every layout, so a drag cannot drift or zoom the map out of
- *  frame. The Jacobian already has its translation/uniform-zoom component removed,
- *  so the visible change is the shape change.
+ *  Each axis is rescaled onto the base's own extent, never re-filled into the unit
+ *  box. The served base is the *fitted* chart after its per-axis display
+ *  normalisation, and that chart is then extended by Nyström placement for
+ *  external roots; placed rows can lie outside the fitted `[0, 1]` bounds because
+ *  they are evaluated from the frozen fit, not re-normalised with it. The base
+ *  cloud's own per-axis centre and span is therefore the only frame that
+ *  reproduces what is on screen, and a zero delta is exactly the identity.
+ *  Normalising the stepped cloud standalone would resize and recentre the map on
+ *  the first drag event. Rescaling each axis to the base span still strips the
+ *  translation and uniform zoom a step accumulates, which is what a drag must not
+ *  show. A non-zero step may change the displayed aspect ratio: that is the shape
+ *  change the fitted chart's per-axis normalisation applies, not a shared-span
+ *  gauge.
  */
 export function approximatePositions(
   jac: WeightJacobian,
@@ -87,13 +126,20 @@ export function approximatePositions(
     deltas,
     dw: (weights[source] ?? 0) - (jac.weights[source] ?? 0),
   }));
-  const moved: { path: string; x: number; y: number; z?: number }[] = [];
-  let minX = Infinity;
-  let maxX = -Infinity;
-  let minY = Infinity;
-  let maxY = -Infinity;
-  let minZ = Infinity;
-  let maxZ = -Infinity;
+  // At the Jacobian's own weights the base *is* the answer; return it untouched
+  // rather than round-tripping it through the frame fit, so a drag that starts
+  // and returns to the anchor lands on the server's exact positions.
+  if (steps.every((step) => !step.dw)) {
+    const out = new Map<string, MapPos>();
+    jac.paths.forEach((path, i) => {
+      const pos = jac.base[i];
+      if (pos) out.set(path, pos);
+    });
+    return out;
+  }
+  const paths: string[] = [];
+  const base: MapPos[] = [];
+  const moved: MapPos[] = [];
   for (let i = 0; i < jac.paths.length; i++) {
     const pos = jac.base[i];
     if (!pos) continue;
@@ -108,31 +154,41 @@ export function approximatePositions(
       dy += d.dy * step.dw;
       dz += (d.dz ?? 0) * step.dw;
     }
-    const x = pos.x + dx;
-    const y = pos.y + dy;
     const z = pos.z === undefined ? undefined : pos.z + dz;
-    moved.push({ path: jac.paths[i], x, y, ...(z === undefined ? {} : { z }) });
-    if (x < minX) minX = x;
-    if (x > maxX) maxX = x;
-    if (y < minY) minY = y;
-    if (y > maxY) maxY = y;
-    if (z !== undefined) {
-      if (z < minZ) minZ = z;
-      if (z > maxZ) maxZ = z;
-    }
+    paths.push(jac.paths[i]);
+    base.push(pos);
+    moved.push({ x: pos.x + dx, y: pos.y + dy, ...(z === undefined ? {} : { z }) });
   }
-  const spanX = maxX - minX || 1;
-  const spanY = maxY - minY || 1;
+  const b = bounds(base);
+  const m = bounds(moved);
+  // Anchor on the base span; a degenerate base span (a flat cloud) falls back to
+  // filling the unit span from the stepped cloud, like the fitted chart's
+  // zero-span fallback.
+  const scale = (baseSpan: number, movedSpan: number): number => {
+    if (!(movedSpan > 1e-9)) return 1;
+    return baseSpan > 1e-9 ? baseSpan / movedSpan : 1 / movedSpan;
+  };
+  const scaleX = scale(b.maxX - b.minX, m.maxX - m.minX);
+  const scaleY = scale(b.maxY - b.minY, m.maxY - m.minY);
+  const cxBase = (b.minX + b.maxX) / 2;
+  const cyBase = (b.minY + b.maxY) / 2;
+  const cxMoved = (m.minX + m.maxX) / 2;
+  const cyMoved = (m.minY + m.maxY) / 2;
   const hasZ = moved.some((p) => p.z !== undefined);
-  const spanZ = hasZ ? maxZ - minZ || 1 : 1;
+  const scaleZ = hasZ ? scale(b.maxZ - b.minZ, m.maxZ - m.minZ) : 1;
+  const czBase = (b.minZ + b.maxZ) / 2;
+  const czMoved = (m.minZ + m.maxZ) / 2;
   const out = new Map<string, MapPos>();
-  for (const p of moved) {
+  for (let i = 0; i < moved.length; i++) {
+    const p = moved[i];
     const pos: MapPos = {
-      x: clamp01((p.x - minX) / spanX),
-      y: clamp01((p.y - minY) / spanY),
+      x: cxBase + (p.x - cxMoved) * scaleX,
+      y: cyBase + (p.y - cyMoved) * scaleY,
     };
-    if (hasZ && p.z !== undefined) pos.z = clamp01((p.z - minZ) / spanZ);
-    out.set(p.path, pos);
+    if (hasZ && p.z !== undefined) {
+      pos.z = czBase + (p.z - czMoved) * scaleZ;
+    }
+    out.set(paths[i], pos);
   }
   return out;
 }

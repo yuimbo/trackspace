@@ -268,6 +268,32 @@ afterEach(() => {
   localStorage.clear();
 });
 
+describe("Controller 3D hotkey routing", () => {
+  it("routes 3 to the eval dims toggle in eval mode and to production otherwise", () => {
+    const h = makeHarness();
+    const internals = h.ctrl as unknown as {
+      eval: { toggleDims(): Promise<void> };
+      embedding: { setView3D(on: boolean): Promise<void> };
+    };
+    const evalToggle = vi.spyOn(internals.eval, "toggleDims").mockResolvedValue();
+    const prodToggle = vi.spyOn(internals.embedding, "setView3D").mockResolvedValue();
+    const press = () =>
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "3", code: "Digit3", bubbles: true }),
+      );
+
+    h.model.setEvalMode(true);
+    press();
+    expect(evalToggle).toHaveBeenCalledTimes(1);
+    expect(prodToggle).not.toHaveBeenCalled();
+
+    h.model.setEvalMode(false);
+    press();
+    expect(prodToggle).toHaveBeenCalledTimes(1);
+    expect(evalToggle).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("Controller eval read-only tag-write guard", () => {
   it("does not mutate, queue or move while eval read-only is active", async () => {
     const h = makeHarness();

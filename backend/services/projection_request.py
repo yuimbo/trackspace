@@ -5,14 +5,22 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from backend.embeddings.projection_config import (
+    AVAILABLE_SOURCES,
     DEFAULT_RECIPE_TSNE_EARLY_EXAGGERATION_ITER,
     DEFAULT_RECIPE_TSNE_N_ITER,
     FROZEN_FEATURE_MASK,
+    FROZEN_FOLDER_BASIS_MODE,
     FROZEN_FOLDER_BOOST,
     FROZEN_FOLDER_DEPTH_BOOST,
     FROZEN_SCALE_FOLDERS,
     FROZEN_SOURCE_WEIGHTS,
     FROZEN_SOURCES,
+    GENRE_FULL_SOURCES,
+    OPENTSNE_COARSE_EARLY_EXAGGERATION_ITER,
+    OPENTSNE_COARSE_ITERATION_BUDGET,
+    OPENTSNE_FINAL_EXAGGERATION,
+    OPENTSNE_MULTILEVEL_FRACTIONS,
+    OPENTSNE_PERPLEXITY_GAMMA,
     PROJECTION_RECIPE_IDS,
     TSNE_EARLY_EXAGGERATION_ITER_HI,
     TSNE_EARLY_EXAGGERATION_ITER_LO,
@@ -20,6 +28,7 @@ from backend.embeddings.projection_config import (
     TSNE_N_ITER_LO,
     recipe_for,
     required_sources_for,
+    single_lens_weights,
 )
 from backend.services.request_validation import ApiValidationError, one_of, weight_map
 from backend.tuning import FROZEN_FEATURES_BLEND
@@ -68,7 +77,7 @@ class ProjectionParams:
     #: Canonical recipe id (``None``/``"default"`` = the frozen app defaults, ``"genre_full"``
     #: = the opt-in pure-genre lens). Part of ``layout_revision`` and the fit-cache key.
     recipe_id: str | None = None
-    #: openTSNE full-fit iteration budget (effective values; default 100 for both
+    #: openTSNE full-fit iteration budget (effective values; default 50/0 for both
     #: recipes unless overridden — the gallery 500/250 is an explicit override). A
     #: deviation from the recipe default is part of ``layout_revision`` and the
     #: fit-cache key, so two iteration budgets never share a fitted embedding.
@@ -242,6 +251,129 @@ def projection_params_for_recipe(
     )
 
 
+def effective_source_weights(params: ProjectionParams) -> dict[str, float]:
+    """The weight vector the projection actually applies for *params*.
+
+    The combined/default lens omits ``w=`` and uses the frozen defaults. A
+    canonical recipe carries its complete weight vector. An explicit per-source
+    lens fixes its blocks: when no ``w=`` is present, its own sources are 1 and
+    everything else is 0, matching ``PROJECTION_LENSES`` and the client's
+    ``lensWeights``.
+
+    In every case the result is masked to the lens's active ``sources``: the
+    gather only consumes those blocks, so a ``w=`` entry for an inactive source
+    is not an influence. A weighted zero *inside* the lens is preserved (a
+    canonical recipe's explicit zeros stay zero).
+    """
+    if params.source_weights is not None:
+        weights = dict(params.source_weights)
+    elif params.sources == FROZEN_SOURCES:
+        weights = dict(FROZEN_SOURCE_WEIGHTS)
+    else:
+        weights = single_lens_weights(params.sources)
+    active = set(params.sources)
+    return {s: (float(w) if s in active else 0.0) for s, w in weights.items()}
+
+
+def _editable_weight_keys(params: ProjectionParams) -> tuple[str, ...]:
+    """Source keys ``w=`` may tune for *params*, using the request's own rules.
+
+    A canonical genre recipe accepts exactly its seven tunable sources
+    (``features`` is deliberately excluded). The combined/default lens accepts
+    the complete frozen weight vector (including ``features``). An explicit
+    per-source lens is fixed by ``sources=``; its weights are not editable.
+    """
+    if params.recipe_id == "genre_full":
+        return GENRE_FULL_SOURCES
+    if params.sources != FROZEN_SOURCES:
+        return ()
+    return tuple(FROZEN_SOURCE_WEIGHTS)
+
+
+def projection_settings_payload(
+    params: ProjectionParams,
+    *,
+    genre_full_enabled: bool,
+    mert_enabled: bool,
+) -> dict[str, Any]:
+    """Describe the effective projection configuration for the current query.
+
+    Read-only and cheap: every value comes from the parsed request or the frozen
+    config. It never scans the library, loads a model, or computes a layout, so a
+    runtime count (the final-fit perplexity) is a textual rule, not a number.
+    """
+    weights = effective_source_weights(params)
+    full_weights = {s: float(weights.get(s, 0.0)) for s in AVAILABLE_SOURCES}
+    editable_keys = _editable_weight_keys(params)
+    recipe = recipe_for(params.recipe_id)
+
+    available_by_source = {
+        s: (
+            genre_full_enabled
+            if s == "maest_layer7"
+            else mert_enabled
+            if s == "mert_l19"
+            else True
+        )
+        for s in AVAILABLE_SOURCES
+    }
+
+    sources = [
+        {
+            "id": s,
+            "weight": full_weights[s],
+            "available": available_by_source[s],
+            "in_lens": s in params.sources,
+        }
+        for s in AVAILABLE_SOURCES
+    ]
+
+    return {
+        "ok": True,
+        "method": params.method,
+        "dims": int(params.dims),
+        "recipe": params.recipe_id or "default",
+        "sources": sources,
+        "weights_editable": bool(editable_keys),
+        "weights_editable_keys": list(editable_keys),
+        "budget": {
+            "tsne_n_iter": int(params.tsne_n_iter),
+            "tsne_early_exaggeration_iter": int(params.tsne_early_exaggeration_iter),
+            "default_tsne_n_iter": int(recipe.tsne_n_iter),
+            "default_tsne_early_exaggeration_iter": int(
+                recipe.tsne_early_exaggeration_iter
+            ),
+            "final_exaggeration": OPENTSNE_FINAL_EXAGGERATION,
+        },
+        "folder_basis": {
+            "mode": FROZEN_FOLDER_BASIS_MODE,
+            "boost": FROZEN_FOLDER_BOOST,
+            "depth_boost": FROZEN_FOLDER_DEPTH_BOOST,
+        },
+        "coarse_schedule": {
+            "fraction_count": len(OPENTSNE_MULTILEVEL_FRACTIONS),
+            "min_fraction": OPENTSNE_MULTILEVEL_FRACTIONS[0],
+            "max_fraction": OPENTSNE_MULTILEVEL_FRACTIONS[-1],
+            "iteration_budget": OPENTSNE_COARSE_ITERATION_BUDGET,
+            "early_exaggeration_iter": OPENTSNE_COARSE_EARLY_EXAGGERATION_ITER,
+            "perplexity_gamma": OPENTSNE_PERPLEXITY_GAMMA,
+            "perplexity_rule": (
+                "min(30 + 50 * (1 - t) ** gamma, (count - 1) / 3)"
+            ),
+        },
+        "final_perplexity": {
+            "rule": "min(30, max(5, (n - 1) / 3))",
+            "resolved": None,
+            "note": "depends on the runtime track count; settings never scans",
+        },
+        "audio_features": {
+            "blend": FROZEN_FEATURES_BLEND,
+            "mask": [float(v) for v in FROZEN_FEATURE_MASK],
+            "dim": int(FROZEN_FEATURE_MASK.size),
+        },
+    }
+
+
 def parse_projection_params(
     req: Any,
     *,
@@ -258,7 +390,7 @@ def parse_projection_params(
     for explicitly (an unknown value is a structured 400).
 
     ``recipe`` selects a canonical recipe: ``recipe=genre_full`` fixes the source
-    set to the pure-genre lens and its 100/100 openTSNE budget (a disabled server
+    set to the pure-genre lens and its 50/0 openTSNE budget (a disabled server
     rejects it with a 400). Its weights may be tuned with ``w=`` — only the
     recipe's canonical source keys are valid overrides, completed from the genre
     defaults, and the vector is still part of ``layout_revision`` so a re-weighting

@@ -73,6 +73,37 @@ describe("parseEvalManifest", () => {
     expect(parseEvalManifest("nope")).toBeNull();
     expect(parseEvalManifest({})).toBeNull();
   });
+
+  it("defaults legacy entries to 2-D with the id as the group", () => {
+    const m = parseEvalManifest(MANIFEST)!;
+    expect(m.recipes[0]).toMatchObject({ id: "baseline", dims: 2, group: "baseline" });
+    expect(m.recipes[1]).toMatchObject({ id: "pca2", dims: 2, group: "pca2" });
+  });
+
+  it("parses paired dims/group metadata", () => {
+    const m = parseEvalManifest({
+      ...MANIFEST,
+      recipes: {
+        base: { status: "complete", label: "Base", dims: 2, group: "base" },
+        base_3d: { status: "complete", label: "Base (3D)", dims: 3, group: "base" },
+      },
+    })!;
+    expect(m.recipes.map((r) => [r.id, r.dims, r.group])).toEqual([
+      ["base", 2, "base"],
+      ["base_3d", 3, "base"],
+    ]);
+  });
+
+  it("rejects an entry with an unsupported dims value", () => {
+    const m = parseEvalManifest({
+      ...MANIFEST,
+      recipes: {
+        odd: { status: "complete", label: "Odd", dims: 4, group: "odd" },
+        ok: { status: "complete", label: "Ok", dims: 2, group: "ok" },
+      },
+    });
+    expect(m!.recipes.map((r) => r.id)).toEqual(["ok"]);
+  });
 });
 
 describe("isUnsupportedEvalSchema", () => {
@@ -126,6 +157,48 @@ describe("parseEvalArtifact", () => {
   it("rejects an empty or non-array positions set", () => {
     expect(parseEvalArtifact({ ...artifact, positions: [] })).toBeNull();
     expect(parseEvalArtifact({ ...artifact, positions: "nope" })).toBeNull();
+  });
+
+  it("defaults a legacy artifact to 2-D and the id as the group", () => {
+    const a = parseEvalArtifact(artifact)!;
+    expect(a.dims).toBe(2);
+    expect(a.group).toBe("baseline");
+    expect(a.positions.get("a.mp3")).toEqual({ x: 0.1, y: 0.2 });
+  });
+
+  it("parses a paired 3-D artifact with finite z", () => {
+    const a = parseEvalArtifact({
+      ...artifact,
+      dims: 3,
+      group: "baseline",
+      positions: [
+        { path: "a.mp3", x: 0.1, y: 0.2, z: 0.3 },
+        { path: "b.mp3", x: 0.8, y: 0.9, z: 0.4 },
+      ],
+    })!;
+    expect(a.dims).toBe(3);
+    expect(a.group).toBe("baseline");
+    expect(a.positions.get("a.mp3")).toEqual({ x: 0.1, y: 0.2, z: 0.3 });
+  });
+
+  it("rejects a 3-D artifact whose positions lack a finite z", () => {
+    const base = { ...artifact, dims: 3, group: "baseline" };
+    expect(
+      parseEvalArtifact({
+        ...base,
+        positions: [{ path: "a.mp3", x: 0.1, y: 0.2 }],
+      }),
+    ).toBeNull();
+    expect(
+      parseEvalArtifact({
+        ...base,
+        positions: [{ path: "a.mp3", x: 0.1, y: 0.2, z: Infinity }],
+      }),
+    ).toBeNull();
+  });
+
+  it("rejects an unsupported artifact dimensionality", () => {
+    expect(parseEvalArtifact({ ...artifact, dims: 4 })).toBeNull();
   });
 });
 

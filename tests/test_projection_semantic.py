@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 import backend.embeddings.layout as layout
+import backend.embeddings.lens_gauge as lens_gauge
+import backend.embeddings.semantic_weighting as semantic_weighting
 from backend.embeddings.layout import (
     _gather_composite_vecs,
     _get_prepared_source_row,
@@ -15,11 +17,14 @@ from backend.embeddings.layout import (
     parse_folder_boost,
     parse_folder_depth_boost,
 )
+from backend.embeddings.layout_revision import compute_layout_revision
 from backend.embeddings.semantic_weighting import (
     _apply_low_rank_semantic_weight,
     _build_folder_directions,
     _expand_folder_nodes,
+    _folder_orthogonal_pc_directions,
     _folder_seeds_from_track_paths,
+    _semantic_basis_param_key,
 )
 from backend.embeddings.librosa_audio_features import AUDIO_FEATURE_DIM
 
@@ -432,6 +437,19 @@ def test_low_rank_semantic_weight_responds_to_depth_sliders():
     assert not np.allclose(o1, o2)
 
 
+def test_low_rank_boost_2_4_is_uniform_40_percent_of_6_across_depths():
+    rng = np.random.default_rng(21)
+    n, d, k = 24, 10, 6
+    mat = rng.standard_normal((n, d)).astype(np.float32)
+    T_n = rng.standard_normal((k, d)).astype(np.float32)
+    T_n = T_n / np.linalg.norm(T_n, axis=1, keepdims=True)
+    exp = np.array([0, 1, 2, 3, 0, 2], dtype=np.int32)
+    old = _apply_low_rank_semantic_weight(mat, T_n, exp, 6.0, 3.0)
+    new = _apply_low_rank_semantic_weight(mat, T_n, exp, 2.4, 3.0)
+    expected = mat + 0.4 * (old - mat)
+    np.testing.assert_allclose(new, expected, rtol=1e-5, atol=1e-6)
+
+
 def test_low_rank_matches_dense_W():
     rng = np.random.default_rng(2)
     n, d, k = 12, 6, 4
@@ -484,6 +502,230 @@ def test_build_folder_directions_adds_orthogonal_pca_for_large_folders():
     hier_folk = dirs[0]
     folk_pc = dirs[1]
     assert abs(float(np.dot(folk_pc, hier_folk))) < 0.05
+
+
+def test_centroids_basis_mode_skips_pc_svd_and_keeps_hierarchy(monkeypatch):
+    d = 4
+    paths = [f"m/gen/folk/t{i}.mp3" for i in range(8)]
+    paths += [f"m/gen/rock/t{i}.mp3" for i in range(4)]
+    mat = np.zeros((12, d), dtype=np.float32)
+    mat[:4, 0] = 10.0
+    mat[4:8, 1] = 10.0
+    mat[8:, 2] = 8.0
+    seeds = _folder_seeds_from_track_paths(paths)
+
+    def _fail_svd(*_args, **_kwargs):
+        raise AssertionError("centroids mode must not run the within-folder SVD")
+
+    monkeypatch.setattr(semantic_weighting, "svd_singular", _fail_svd)
+    dirs, exps, _fb = _build_folder_directions(
+        mat, paths, seeds, basis_mode="centroids",
+    )
+    hier = _build_folder_directions(mat, paths, seeds, max_pca_components=0)
+    assert dirs is not None and exps is not None
+    np.testing.assert_array_equal(dirs, hier[0])
+    np.testing.assert_array_equal(exps, hier[1])
+
+
+def test_full_basis_mode_is_the_default():
+    d = 4
+    paths = [f"m/gen/folk/t{i}.mp3" for i in range(8)]
+    paths += [f"m/gen/rock/t{i}.mp3" for i in range(4)]
+    mat = np.zeros((12, d), dtype=np.float32)
+    mat[:4, 0] = 10.0
+    mat[4:8, 1] = 10.0
+    mat[8:, 2] = 8.0
+    seeds = _folder_seeds_from_track_paths(paths)
+    implicit = _build_folder_directions(mat, paths, seeds)
+    explicit = _build_folder_directions(mat, paths, seeds, basis_mode="full")
+    np.testing.assert_array_equal(implicit[0], explicit[0])
+    np.testing.assert_array_equal(implicit[1], explicit[1])
+
+
+def test_approx_pc_directions_match_full_subspace_for_clear_spectral_gap():
+    d = 6
+    n = 8
+    block = np.zeros((n, d), dtype=np.float32)
+    block[:, 1] = np.array([1, 1, 1, 1, -1, -1, -1, -1], dtype=np.float32) * 10.0
+    block[:, 2] = np.array([1, -1, 1, -1, 1, -1, 1, -1], dtype=np.float32) * 3.0
+    d_unit = np.zeros(d, dtype=np.float32)
+    d_unit[0] = 1.0
+
+    full = _folder_orthogonal_pc_directions(
+        block, d_unit, max_components=2, min_second_sv_ratio=0.18,
+        basis_mode="full",
+    )
+    approx = _folder_orthogonal_pc_directions(
+        block, d_unit, max_components=2, min_second_sv_ratio=0.18,
+        basis_mode="approx",
+    )
+    assert len(full) == len(approx) == 2
+    for v in approx:
+        assert v.shape == (d,)
+        assert np.isfinite(v).all()
+        assert abs(float(np.linalg.norm(v)) - 1.0) < 1e-5
+        assert abs(float(v @ d_unit)) < 1e-5
+    # Clear spectral gap: the seeded randomized solver recovers the same
+    # 2-D subspace, not necessarily byte-identical vectors.
+    cos = np.abs(np.asarray(approx) @ np.asarray(full).T)
+    assert np.all(cos.max(axis=1) > 0.999)
+
+
+def test_semantic_basis_key_namespaces_only_nondefault_modes():
+    full = _semantic_basis_param_key(None, ["a/b"], "full")
+    assert full == _semantic_basis_param_key(None, ["a/b"])
+    assert len({
+        full,
+        _semantic_basis_param_key(None, ["a/b"], "centroids"),
+        _semantic_basis_param_key(None, ["a/b"], "approx"),
+    }) == 3
+
+
+def test_build_folder_directions_rejects_unknown_basis_mode():
+    with pytest.raises(ValueError, match="unknown folder basis mode"):
+        _build_folder_directions(
+            np.zeros((4, 3), dtype=np.float32),
+            ["a/t1.mp3", "a/t2.mp3", "b/t3.mp3", "b/t4.mp3"],
+            ["a", "b"],
+            basis_mode="bogus",
+        )
+
+
+def test_prepare_projection_input_namespaces_basis_mode_and_validates(monkeypatch):
+    layout._semantic_basis_cache.clear()
+    monkeypatch.setattr(layout, "is_model_ready", lambda: True)
+    vecs = {
+        "f0": np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        "f1": np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
+        "f2": np.array([0.0, 0.0, 1.0, 0.0], dtype=np.float32),
+        "f3": np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32),
+    }
+    paths = ["a/t0.mp3", "a/t1.mp3", "b/t2.mp3", "b/t3.mp3"]
+    infos = [{"path": p, "fingerprint": f"f{i}"} for i, p in enumerate(paths)]
+    cache = _StubFeatureCache(clap=vecs)
+
+    def _prep(mode=None):
+        kwargs = {"scale_folders": True, "sources": ("clap",)}
+        if mode is not None:
+            kwargs["folder_basis_mode"] = mode
+        return layout.prepare_projection_input(infos, cache, **kwargs)
+
+    implicit = _prep()
+    full = _prep("full")
+    centroids = _prep("centroids")
+    approx = _prep("approx")
+    assert implicit.tsne_config == full.tsne_config
+    assert "fbmcentroids" in centroids.tsne_config
+    assert "fbmapprox" in approx.tsne_config
+    assert len({implicit.tsne_config, centroids.tsne_config,
+                approx.tsne_config}) == 3
+    assert implicit.comp_config == centroids.comp_config == approx.comp_config
+    assert len(layout._semantic_basis_cache) == 3
+
+    with pytest.raises(ValueError, match="unknown folder basis mode"):
+        _prep("bogus")
+
+
+def test_prepare_projection_input_applies_folder_weighting_without_clap_or_model(monkeypatch):
+    """A no-CLAP recipe needs no text model for data-driven folder directions."""
+    layout._semantic_basis_cache.clear()
+    monkeypatch.setattr(layout, "is_model_ready", lambda: False)
+    rng = np.random.default_rng(8)
+    feats = {f"f{i}": rng.standard_normal(6).astype(np.float32) for i in range(8)}
+    paths = [
+        f"{'alpha' if i < 4 else 'beta'}/t{i}.mp3" for i in range(8)
+    ]
+    infos = [{"path": p, "fingerprint": f"f{i}"} for i, p in enumerate(paths)]
+    inp = layout.prepare_projection_input(
+        infos,
+        _StubFeatureCache(feats=feats),
+        sources=("features",),
+        feature_mask=parse_audio_feature_mask("111111"),
+        required_sources=("features",),
+        scale_folders=True,
+    )
+    assert inp.tsne_config != inp.comp_config  # folder weighting was applied
+    assert not np.array_equal(inp.mat_proj, inp.mat)
+
+
+def test_prepare_projection_input_requires_model_for_clap_or_tags(monkeypatch):
+    """A CLAP column or explicit tags still need the model for text directions."""
+    layout._semantic_basis_cache.clear()
+    monkeypatch.setattr(layout, "is_model_ready", lambda: False)
+    rng = np.random.default_rng(10)
+    clap = {f"f{i}": rng.standard_normal(4).astype(np.float32) for i in range(8)}
+    paths = [
+        f"{'alpha' if i < 4 else 'beta'}/t{i}.mp3" for i in range(8)
+    ]
+    infos = [{"path": p, "fingerprint": f"f{i}"} for i, p in enumerate(paths)]
+    cache = _StubFeatureCache(clap=clap)
+    with_clap = layout.prepare_projection_input(
+        infos, cache, sources=("clap",), scale_folders=True,
+    )
+    assert with_clap.tsne_config == with_clap.comp_config
+
+    feats = {f"f{i}": rng.standard_normal(6).astype(np.float32) for i in range(8)}
+    tagged = layout.prepare_projection_input(
+        infos, _StubFeatureCache(feats=feats), sources=("features",),
+        feature_mask=parse_audio_feature_mask("111111"),
+        required_sources=("features",), scale_folders=True,
+        context_tags=["techno"],
+    )
+    assert tagged.tsne_config == tagged.comp_config
+
+
+def test_compute_projection_uses_centroid_basis_and_canonical_boost(monkeypatch):
+    """Production compute selects the centroid basis, canonical boost and no PC SVD."""
+    from backend.embeddings import semantic_weighting
+    from backend.embeddings.projection_config import (
+        FROZEN_FOLDER_BASIS_MODE,
+        FROZEN_FOLDER_BOOST,
+        FROZEN_FOLDER_DEPTH_BOOST,
+    )
+
+    layout._semantic_basis_cache.clear()
+    monkeypatch.setattr(layout, "is_model_ready", lambda: False)
+
+    def _pc_svd_must_not_run(*_args, **_kwargs):
+        raise AssertionError("production centroid basis must skip within-folder SVD")
+
+    monkeypatch.setattr(
+        semantic_weighting, "_folder_orthogonal_pc_directions",
+        _pc_svd_must_not_run,
+    )
+    rng = np.random.default_rng(9)
+    feats = {f"f{i}": rng.standard_normal(6).astype(np.float32) for i in range(8)}
+    paths = [
+        f"{'alpha' if i < 4 else 'beta'}/t{i}.mp3" for i in range(8)
+    ]
+    infos = [{"path": p, "fingerprint": f"f{i}"} for i, p in enumerate(paths)]
+    cache = _StubFeatureCache(feats=feats)
+    seen: dict = {}
+    real_prepare = layout.prepare_projection_input
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        inp = real_prepare(*args, **kwargs)
+        seen["inp"] = inp
+        return inp
+
+    monkeypatch.setattr(layout, "prepare_projection_input", spy)
+    out = compute_projection(
+        infos,
+        cache,
+        method="pca",
+        scale_folders=True,
+        sources=("features",),
+        feature_mask=parse_audio_feature_mask("111111"),
+        required_sources=("features",),
+    )
+    assert len(out) == 8
+    assert (FROZEN_FOLDER_BASIS_MODE, FROZEN_FOLDER_BOOST,
+            FROZEN_FOLDER_DEPTH_BOOST) == ("centroids", 2.4, 3.0)
+    assert seen["folder_basis_mode"] == "centroids"
+    assert seen["folder_boost"] == pytest.approx(2.4)
+    assert seen["folder_depth_boost"] == pytest.approx(3.0)
+    assert "fbmcentroids" in seen["inp"].tsne_config
 
 
 def test_compute_projection_pca_without_semantics():
@@ -734,16 +976,178 @@ def test_weight_jacobian_reports_layout_and_per_source_progress():
     assert seen[-1] == ("jacobian", 2, 2)
 
 
+def _coords(positions: list[dict]) -> np.ndarray:
+    return np.asarray([[p["x"], p["y"]] for p in positions], dtype=np.float64)
+
+
+def test_jacobian_request_does_not_return_the_cached_positions_list(monkeypatch):
+    """A warm revision + ``with_jacobian`` must still return ``(positions, jac)``.
+
+    The early cache return used to hand back the bare list, so the route's tuple
+    unpack 500'd on an already-warm layout.
+    """
+    rng = np.random.default_rng(21)
+    n = 12
+    cache = _StubFeatureCache()
+    infos = []
+    for i in range(n):
+        fp = f"c{i}"
+        cache._maps["clap"][fp] = rng.standard_normal(4).astype(np.float32)
+        infos.append({"path": f"a/t{i}.mp3", "fingerprint": fp})
+    monkeypatch.setattr(
+        layout,
+        "_project_tsne",
+        lambda mat, **_k: rng.standard_normal((mat.shape[0], 2)),
+    )
+    layout._revision_layout_cache.clear()
+    layout._revision_layout_cache["rev-warm"] = [
+        {"path": t["path"], "x": 0.0, "y": 0.0} for t in infos
+    ]
+    try:
+        positions, jac = compute_projection(
+            infos,
+            cache,
+            method="tsne",
+            sources=("clap",),
+            source_weights={"clap": 1.0},
+            layout_revision="rev-warm",
+            with_jacobian=True,
+        )
+    finally:
+        layout._revision_layout_cache.clear()
+    assert len(positions) == n
+    assert isinstance(jac, dict)
+    assert "clap" in jac
+
+
+def test_gauge_scope_rekeys_coordinates_but_not_the_tsne_fit(monkeypatch):
+    """Changing the configured roots must change the coordinate revision, while
+    the fitted t-SNE embedding stays keyed on the vector config alone."""
+    rng = np.random.default_rng(5)
+    n = 20
+    clap, feats, infos = {}, {}, []
+    for i in range(n):
+        fp = f"s{i}"
+        clap[fp] = rng.standard_normal(8).astype(np.float32)
+        feats[fp] = rng.standard_normal(6).astype(np.float32)
+        infos.append({"path": f"a/t{i}.mp3", "fingerprint": fp})
+    cache = _StubFeatureCache(clap=clap, feats=feats)
+    paths = [t["path"] for t in infos]
+
+    fit_keys: list[str] = []
+
+    def fake_tsne(_mat, *, paths, config_key, **_kw):
+        fit_keys.append(config_key)
+        return np.linspace(-1.0, 1.0, 2 * len(paths)).reshape(len(paths), 2)
+
+    monkeypatch.setattr(layout, "_project_tsne", fake_tsne)
+    revisions: list[str] = []
+    lens_gauge.reset_gauge_cache()
+    try:
+        for scope in ("library:a", "library:a|b"):
+            revision = compute_layout_revision(
+                eligible_paths=paths, cache_versions=(1,), gauge_scope=scope
+            )
+            revisions.append(revision)
+            compute_projection(
+                infos,
+                cache,
+                method="tsne",
+                sources=("clap", "features"),
+                source_weights={"clap": 0.5, "features": 0.5},
+                layout_revision=revision,
+                gauge_scope=scope,
+            )
+    finally:
+        lens_gauge.reset_gauge_cache()
+        layout._revision_layout_cache.clear()
+
+    assert revisions[0] != revisions[1]
+    assert fit_keys and len(set(fit_keys)) == 1
+
+
+def test_weight_jacobian_is_in_the_served_gauge_frame():
+    """The fallback derivative must carry the gauge's rotation and scale.
+
+    A pre-seeded (non-anchor) reference rotates and scales the raw layout. The
+    raw base and a raw one-sided step come from fresh scopes (each is its own
+    anchor, so neither is gauged). The expected derivative is the raw step
+    difference mapped by the *same* base transform the served layout uses. The
+    old ungauged difference matched the raw step, not what the user sees.
+    """
+    rng = np.random.default_rng(3)
+    n = 40
+    clap, feats, infos = {}, {}, []
+    for i in range(n):
+        fp = f"g{i}"
+        clap[fp] = rng.standard_normal(8).astype(np.float32)
+        feats[fp] = rng.standard_normal(6).astype(np.float32)
+        infos.append({"path": f"a/b/t{i}.mp3", "fingerprint": fp})
+    cache = _StubFeatureCache(clap=clap, feats=feats)
+    weights = {"clap": 0.4, "features": 0.6}
+    delta = 1e-3
+    mask = parse_audio_feature_mask("111111")
+
+    def project(w: dict[str, float], scope: str, **kw):
+        return compute_projection(
+            infos,
+            cache,
+            method="pca",
+            sources=("clap", "features"),
+            feature_mask=mask,
+            features_blend=0.5,
+            source_weights=w,
+            gauge_scope=scope,
+            **kw,
+        )
+
+    lens_gauge.reset_gauge_cache()
+    try:
+        raw_base = _coords(project(weights, "raw-base"))
+        raw_step = _coords(
+            project({"clap": 0.4 + delta, "features": 0.6}, "raw-step")
+        )
+        t = np.deg2rad(37.0)
+        rot = np.array([[np.cos(t), -np.sin(t)], [np.sin(t), np.cos(t)]])
+        ref = layout._normalise_coords(
+            1.7 * (rot @ raw_base.T).T + np.array([3.0, -2.0])
+        )
+        paths = [t["path"] for t in infos]
+        family = layout._gauge_family("test", paths, cache, 2)
+        assert lens_gauge.seed_reference(family, paths, ref)
+
+        served_base = _coords(project(weights, "test"))
+        # The served map keeps the reference orientation but is stretched per axis
+        # to fill the view, so it is close, not exactly equal.
+        assert np.allclose(np.ptp(served_base, axis=0), 1.0)
+        assert np.corrcoef(served_base[:, 0], ref[:, 0])[0, 1] > 0.999
+        assert np.corrcoef(served_base[:, 1], ref[:, 1])[0, 1] > 0.999
+        _served, jac = project(weights, "test", with_jacobian=True)
+    finally:
+        lens_gauge.reset_gauge_cache()
+
+    # The served frame is orientation + per-axis display stretch, so the raw ->
+    # served map is affine, not a similarity.
+    design = np.column_stack([raw_base, np.ones(len(raw_base))])
+    solution, *_ = np.linalg.lstsq(design, served_base, rcond=None)
+    affine = np.asarray(solution, dtype=np.float64).T
+    expected = (
+        raw_step @ affine[:, :2].T + affine[:, 2] - served_base
+    ) / delta
+    np.testing.assert_allclose(
+        jac["clap"].astype(np.float64), expected, rtol=2e-3, atol=2e-3
+    )
+
+
 def _pearson(a: list[float], b: list[float]) -> float:
     a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
     a, b = a - a.mean(), b - b.mean()
     return float((a * b).sum()) / float(np.linalg.norm(a) * np.linalg.norm(b))
 
 
-def test_compute_projection_dims3_aligns_xy_to_reference():
-    """The 3-D layout's head-on (x,y) is an arbitrary frame of the same lens's
-    2-D layout; passing that 2-D layout as ``align_ref`` must pin it back, even
-    when the reference is deliberately rotated/reflected."""
+def test_compute_projection_dims3_keeps_xy_orientation_and_fills_volume():
+    """The final served 3-D frame keeps the head-on orientation but is stretched
+    per axis to fill the unit volume; an exact x/y overlay is not required."""
     from backend.embeddings import lens_gauge, projection_backends
 
     lens_gauge.reset_gauge_cache()
@@ -781,3 +1185,7 @@ def test_compute_projection_dims3_aligns_xy_to_reference():
     ys = [by_path[p["path"]]["y"] for p in align_ref]
     assert _pearson(xs, [p["x"] for p in align_ref]) > 0.99
     assert _pearson(ys, [p["y"] for p in align_ref]) > 0.99
+    for axis in ("x", "y", "z"):
+        values = np.asarray([p[axis] for p in out])
+        assert np.isclose(values.min(), 0.0)
+        assert np.isclose(values.max(), 1.0)

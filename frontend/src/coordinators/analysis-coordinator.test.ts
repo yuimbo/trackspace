@@ -7,6 +7,7 @@ import {
   type QueueStatus,
 } from "../model";
 import { AnalysisCoordinator } from "./analysis-coordinator";
+import type { ProjectionSettings } from "../lib/projection-settings";
 import { toast } from "../lib/toast";
 
 vi.mock("../lib/toast", async (importOriginal) => {
@@ -91,10 +92,18 @@ const PANEL_HTML = `
       <button id="btn-genre-reset"></button>
       <button id="btn-genre-defaults"></button>
     </div>
+    <div id="cluster-weights-fold" class="view-option hidden">
+      <details id="cluster-weights-details">
+        <div id="cluster-weights"></div>
+        <p id="cluster-weights-note"></p>
+      </details>
+    </div>
+    <div id="influences-fold" class="view-option hidden">
+      <div id="influence-sources"></div>
+      <div id="influence-fixed"></div>
+    </div>
   </div>
   <input id="cluster-resolution-range" type="range" />
-  <div id="cluster-weights"></div>
-  <p id="cluster-weights-note"></p>
   <div id="analysis-coverage"></div>
   <div id="analysis-retrigger"></div>
   <div id="analysis-problems"></div>
@@ -117,6 +126,7 @@ interface Harness {
   model: Model;
   update: ReturnType<typeof vi.fn>;
   scheduleDraw: ReturnType<typeof vi.fn>;
+  syncViewOptions: ReturnType<typeof vi.fn>;
   refreshProjection: ReturnType<typeof vi.fn>;
   applyApproximateWeights: ReturnType<typeof vi.fn>;
   invalidateWeightJacobian: ReturnType<typeof vi.fn>;
@@ -136,6 +146,7 @@ function makeHarness(
   const model = new Model();
   const update = vi.fn();
   const scheduleDraw = vi.fn();
+  const syncViewOptions = vi.fn();
   const refreshProjection = vi.fn();
   const applyApproximateWeights = vi.fn(() => true);
   const invalidateWeightJacobian = vi.fn();
@@ -148,6 +159,7 @@ function makeHarness(
     status: { update },
     scheduleDraw,
     canvas,
+    syncViewOptions,
     refreshProjection,
     applyApproximateWeights,
     invalidateWeightJacobian,
@@ -162,6 +174,7 @@ function makeHarness(
     model,
     update,
     scheduleDraw,
+    syncViewOptions,
     refreshProjection,
     applyApproximateWeights,
     invalidateWeightJacobian,
@@ -385,6 +398,20 @@ describe("AnalysisCoordinator status polling", () => {
     expect(clusterCalls).toHaveLength(0);
   });
 
+  it("leaves the View options folds and editors alone on a stats tick", async () => {
+    // A queue poll owns queue availability (Apply/Train buttons), not the lens,
+    // colour mode, dimensionality or budget the folds are derived from: resyncing
+    // them here wiped a half-typed iteration budget and rebuilt the influences
+    // list on every stats event.
+    const { coord, syncViewOptions } = makeHarness((url) =>
+      url.startsWith("/api/jobs/status") ? makeQueueStatus({}) : {},
+    );
+
+    await coord.refreshQueueStatus();
+
+    expect(syncViewOptions).not.toHaveBeenCalled();
+  });
+
   it("invalidates predicted folders when a supervise run finishes", async () => {
     let outstanding = 1;
     const refreshHeadInfo = vi.fn();
@@ -453,6 +480,47 @@ describe("AnalysisCoordinator cluster fetch", () => {
     expect(document.getElementById("cluster-meta")!.textContent).toContain(
       "Rebuild clusters",
     );
+  });
+
+  it("updates availability controls without rebuilding View options unless colouring falls back", async () => {
+    let available = false;
+    const { model, coord, syncViewOptions } = makeHarness((url) =>
+      url.startsWith("/api/clusters")
+        ? available
+          ? {
+              available: true,
+              revision: "r",
+              resolution: 1.5,
+              resolutions: [1.5],
+              assignments: {},
+              names: {},
+              sizes: {},
+            }
+          : { available: false }
+        : {},
+    );
+    model.colorMode = "folder";
+    const $cr = document.getElementById(
+      "cluster-resolution-range",
+    ) as HTMLInputElement;
+
+    await coord.fetchClusters();
+    expect($cr.disabled).toBe(true);
+    expect(syncViewOptions).not.toHaveBeenCalled();
+
+    available = true;
+    await coord.fetchClusters();
+    expect($cr.disabled).toBe(false);
+    // Availability alone is not a lens/colour/dimensionality/budget change.
+    expect(syncViewOptions).not.toHaveBeenCalled();
+
+    // Losing the clusters while colouring by cluster forces the folder fallback:
+    // that *is* a colour change the View options folds must see.
+    model.colorMode = "cluster";
+    available = false;
+    await coord.fetchClusters();
+    expect(model.colorMode).toBe("folder");
+    expect(syncViewOptions).toHaveBeenCalledTimes(1);
   });
 
   it("coalesces concurrent fetches into one trailing fetch", async () => {
@@ -557,20 +625,15 @@ describe("AnalysisCoordinator cluster fetch", () => {
 // ─── Panel bindings ─────────────────────────────────────────
 
 describe("AnalysisCoordinator panel bindings", () => {
-  it("cycles colour modes and folds the gate out only in head mode", () => {
-    const { model, coord, scheduleDraw } = makeHarness();
+  it("cycles colour modes and asks View options to resync", () => {
+    const { model, coord, scheduleDraw, syncViewOptions } = makeHarness();
     model.clustersAvailable = true;
     coord.bindPanel();
     vi.spyOn(coord, "fetchFolderPredictions").mockResolvedValue();
 
     coord.cycleColorMode();
     expect(model.colorMode).toBe("head");
-    expect(
-      document.getElementById("head-confident-fold")!.classList.contains("hidden"),
-    ).toBe(false);
-    expect(
-      document.getElementById("view-options")!.classList.contains("hidden"),
-    ).toBe(false);
+    expect(syncViewOptions).toHaveBeenCalled();
     expect(scheduleDraw).toHaveBeenCalled();
 
     coord.cycleColorMode();
@@ -584,12 +647,6 @@ describe("AnalysisCoordinator panel bindings", () => {
 
     coord.cycleColorMode();
     expect(model.colorMode).toBe("folder");
-    expect(
-      document.getElementById("head-confident-fold")!.classList.contains("hidden"),
-    ).toBe(true);
-    expect(
-      document.getElementById("view-options")!.classList.contains("hidden"),
-    ).toBe(true);
   });
 
   it("cycles colour modes backward with shift", () => {
@@ -719,8 +776,8 @@ describe("AnalysisCoordinator panel bindings", () => {
     );
   });
 
-  it("persists the confidence gate and folds it out only in head mode", () => {
-    const { model, coord } = makeHarness();
+  it("persists the confidence gate and asks View options to resync", () => {
+    const { model, coord, syncViewOptions } = makeHarness();
     model.colorMode = "head";
     coord.bindPanel();
 
@@ -733,15 +790,10 @@ describe("AnalysisCoordinator panel bindings", () => {
     $hc.dispatchEvent(new Event("change"));
     expect(model.headColorConfident).toBe(false);
 
-    // Switching away folds the gate back, which only affects predicted folders.
     model.colorMode = "folder";
+    syncViewOptions.mockClear();
     coord.applyColorMode("folder", false);
-    expect(
-      document.getElementById("head-confident-fold")!.classList.contains("hidden"),
-    ).toBe(true);
-    expect(
-      document.getElementById("view-options")!.classList.contains("hidden"),
-    ).toBe(true);
+    expect(syncViewOptions).toHaveBeenCalled();
   });
 
   it("invalidates and refetches predictions when the head changes", async () => {
@@ -830,17 +882,6 @@ describe("AnalysisCoordinator panel bindings", () => {
         (init as RequestInit | undefined)?.method === "POST",
     );
     expect(post).toBeDefined();
-  });
-
-  it("is hidden until the server enables genre_full", () => {
-    const { model, coord } = makeHarness();
-    coord.bindPanel();
-    const $fold = document.getElementById("genre-weights-fold")!;
-    expect($fold.classList.contains("hidden")).toBe(true);
-    model.genreFullEnabled = true;
-    model.lensId = "genre_full";
-    coord["_syncColorControls"]();
-    expect($fold.classList.contains("hidden")).toBe(false);
   });
 
   it("applies genre weights as a draft, posting the recipe + vector on Apply", async () => {
@@ -1501,5 +1542,121 @@ describe("AnalysisCoordinator broken files", () => {
       paths: ["a.mp3"],
       stages: ["structure", "maest"],
     });
+  });
+});
+
+// ─── Read-only influences (projection settings) ──────────────
+
+function makeProjectionSettings(
+  overrides: Partial<ProjectionSettings> = {},
+): ProjectionSettings {
+  const ids = [
+    "maest_logits",
+    "maest",
+    "maest_layer7",
+    "mert_l19",
+    "rhythm",
+    "clap",
+    "supervised",
+    "features",
+  ];
+  return {
+    ok: true,
+    method: "tsne",
+    dims: 2,
+    recipe: "genre_full",
+    sources: ids.map((id) => ({
+      id,
+      weight: id === "maest_logits" ? 0.4 : id === "features" ? 0 : 0.1,
+      available: id !== "mert_l19",
+      in_lens: id !== "features",
+    })),
+    weights_editable: true,
+    weights_editable_keys: ids.filter((id) => id !== "features"),
+    budget: {
+      tsne_n_iter: 50,
+      tsne_early_exaggeration_iter: 0,
+      default_tsne_n_iter: 50,
+      default_tsne_early_exaggeration_iter: 0,
+      final_exaggeration: 1.25,
+    },
+    folder_basis: {
+      mode: "centroids",
+      boost: 2.4,
+      depth_boost: 3,
+    },
+    coarse_schedule: {
+      fraction_count: 16,
+      min_fraction: 1 / 256,
+      max_fraction: 1 / 16,
+      iteration_budget: 16,
+      early_exaggeration_iter: 100,
+      perplexity_gamma: 4,
+      perplexity_rule: "30 + 50 * (1 - t) ** gamma",
+    },
+    final_perplexity: {
+      rule: "min(30, max(5, (n - 1) / 3))",
+      resolved: null,
+      note: "depends on the runtime track count",
+    },
+    audio_features: { blend: 0.42, mask: [1, 1, 1, 1, 1, 1], dim: 6 },
+    ...overrides,
+  };
+}
+
+describe("AnalysisCoordinator read-only influences", () => {
+  it("renders only non-editable sources and greys an unavailable one", () => {
+    const { coord } = makeHarness();
+    coord.renderProjectionSettings(makeProjectionSettings());
+
+    const rows = [...document.querySelectorAll(".influence-source")];
+    expect(rows).toHaveLength(1);
+    const features = rows[0];
+    expect(features.textContent).toContain("Audio");
+    expect(features.textContent).toContain("0");
+    expect(features.textContent).toContain("not in lens");
+    expect(features.querySelector(".influence-source-weight")!.textContent).toBe(
+      "0",
+    );
+
+    // Per-source lens: every source is fixed; unavailable is a capability fact,
+    // not a missing-vector count.
+    const perSource = makeProjectionSettings({ weights_editable: false });
+    coord.renderProjectionSettings({
+      ...perSource,
+      weights_editable_keys: [],
+    });
+    const all = [...document.querySelectorAll(".influence-source")];
+    expect(all).toHaveLength(8);
+    const mert = all.find((row) => row.textContent?.includes("MERT L19"))!;
+    expect(mert.textContent).toContain("unavailable");
+  });
+
+  it("describes fixed processing rules from the backend payload", () => {
+    const { coord } = makeHarness();
+    coord.renderProjectionSettings(makeProjectionSettings());
+    const fixed = document.getElementById("influence-fixed")!.textContent!;
+
+    expect(fixed).toContain("centroids");
+    expect(fixed).toContain("2.4");
+    expect(fixed).toContain("1.25");
+    expect(fixed).toContain("16");
+    expect(fixed).toContain("1/256 → 1/16");
+    expect(fixed).toContain("1/256");
+    expect(fixed).toContain("min(30, max(5, (n - 1) / 3))");
+    expect(fixed).toContain("0.42");
+    expect(fixed).toContain("6 dims · all on");
+  });
+
+  it("replaces a stale payload with an inline unavailable message", () => {
+    const { coord } = makeHarness();
+    coord.renderProjectionSettings(makeProjectionSettings());
+    expect(document.querySelectorAll(".influence-source")).toHaveLength(1);
+
+    coord.renderProjectionSettings(null, "Projection settings unavailable");
+    const host = document.getElementById("influence-sources")!;
+    expect(host.querySelectorAll(".influence-source")).toHaveLength(0);
+    expect(host.textContent).toContain("unavailable");
+    expect(document.getElementById("influence-fixed")!.children).toHaveLength(0);
   });
 });

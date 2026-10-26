@@ -60,3 +60,32 @@ def test_cache_connections_close(tmp_path, factory):
         conn.execute("SELECT 1")
     with pytest.raises(sqlite3.ProgrammingError):
         conn.execute("SELECT 1")
+
+
+def test_feature_meta_closes_connections_and_is_not_a_source_version(tmp_path, monkeypatch):
+    """The gauge anchor lives in ``feature_meta``; reading/writing it must close
+    its SQLite handle and must not bump a cache generation."""
+    from backend.embeddings import layout
+    from backend.embeddings import feature_cache as fc_mod
+
+    opened: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        opened.append(conn)
+        return conn
+
+    monkeypatch.setattr(fc_mod.sqlite3, "connect", tracking_connect)
+    cache = FeatureCache(str(tmp_path / "features.db"))
+    epoch = cache.write_epoch()
+    token = layout._source_versions_token(cache)
+    cache.set_meta("gauge_anchor:family", "rev-a")
+
+    assert cache.get_meta("gauge_anchor:family") == "rev-a"
+    assert layout._source_versions_token(cache) == token
+    assert cache.write_epoch() == epoch
+    assert opened
+    for conn in opened:
+        with pytest.raises(sqlite3.ProgrammingError):
+            conn.execute("SELECT 1")

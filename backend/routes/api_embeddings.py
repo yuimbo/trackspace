@@ -12,7 +12,6 @@ from flask import Blueprint, jsonify, request
 
 from backend.embeddings import landmark_projection as landmark_mod
 from backend.embeddings import supervised as supervised_mod
-from backend.embeddings.projection_config import FROZEN_SOURCE_WEIGHTS
 from backend.jobs import (
     KIND_CLAP,
     KIND_FEATURES,
@@ -21,7 +20,15 @@ from backend.jobs import (
     KIND_STRUCTURE,
 )
 from backend.services.embedding_status_cache import EmbeddingStatusCache
-from backend.services.lens_layout import compute_lens_projection, versions_tuple
+from backend.services.lens_layout import (
+    compute_lens_projection,
+    gauge_scope_for,
+    versions_tuple,
+)
+from backend.services.projection_request import (
+    effective_source_weights,
+    projection_settings_payload,
+)
 from backend.services.request_validation import (
     one_of,
     opt_bool,
@@ -277,6 +284,11 @@ def create_api_embeddings_blueprint(
         versions = _versions()
         write_epoch = feature_cache.write_epoch()
         proj_fp = projection_query_fingerprint(request)
+        # The configured gauge scope is part of the coordinate revision, so it must
+        # also key the status cache: a role/root change re-scopes the frame without
+        # touching a file, and a cached revision from the old scope would otherwise
+        # keep the client on the previous frame's coordinates.
+        scope = gauge_scope_for(library_root_ids())
 
         running, progress = _analysis_progress()
 
@@ -322,6 +334,7 @@ def create_api_embeddings_blueprint(
                     maps,
                     proj,
                     cache_versions=versions_tuple(versions, getattr(proj, "recipe_id", None)),
+                    gauge_scope=scope,
                 ),
             )
 
@@ -331,7 +344,7 @@ def create_api_embeddings_blueprint(
             # numbers that are already wrong by the time they are rendered.
             base, layout_revision = _compute()
         else:
-            cov_key = (lib_sig, write_epoch, proj_fp)
+            cov_key = (lib_sig, write_epoch, proj_fp, scope)
             cached_cov = status_cache.get_status_coverage(cov_key)
             if cached_cov is not None:
                 base, layout_revision = cached_cov
@@ -425,6 +438,28 @@ def create_api_embeddings_blueprint(
             }
         )
 
+    @bp.route("/api/embeddings/projection-settings")
+    def api_embeddings_projection_settings():
+        """Describe the effective projection config for the current query.
+
+        This is the cheap read-only companion to ``/api/embeddings/projection``:
+        the same query parser, but no library scan, model load or fit.
+        It exists so the View options panel can show every source influence
+        (including fixed/disabled blocks) without inferring the rules client-side.
+        ``for_status`` mirrors the status bootstrap: a disabled genre_full request
+        is still described (capabilities say it is unavailable) instead of a 400.
+        """
+        proj = parse_projection_params_fn(
+            request, default_when_no_method=True, for_status=True
+        )
+        return jsonify(
+            projection_settings_payload(
+                proj,
+                genre_full_enabled=genre_full_enabled,
+                mert_enabled=mert_enabled,
+            )
+        )
+
     @bp.route("/api/embeddings/projection")
     @bp.route("/api/embeddings/umap")  # backward compat alias
     def api_embeddings_projection():
@@ -471,7 +506,7 @@ def create_api_embeddings_blueprint(
             })
 
         pversions = _versions()
-        weights0 = dict(proj.source_weights or FROZEN_SOURCE_WEIGHTS)
+        weights0 = effective_source_weights(proj)
 
         def _positions_for(
             proj: Any,
@@ -498,6 +533,9 @@ def create_api_embeddings_blueprint(
                 embedding_version=embedding_version,
                 on_progress=_layout_progress if report_progress else None,
                 align_ref=align_ref,
+                # One workspace family for every lens and every view: the
+                # configured library roots, never the requested folder's paths.
+                library_root_ids=library_root_ids(),
             )
             placed_positions = (
                 _place_into_chart(
@@ -529,16 +567,24 @@ def create_api_embeddings_blueprint(
                 fit_scope=raw_fit_scope,
             )
             try:
-                ref_positions, _ref_fit, _ref_revision = _positions_for(
+                _ref_positions, _ref_fit, _ref_revision = _positions_for(
                     ref_proj,
                     ref_fit_infos,
                     ref_place_infos,
                     report_progress=False,
                 )
-                align_ref = [
-                    {"path": p["path"], "x": p["x"], "y": p["y"]}
-                    for p in ref_positions
-                ]
+                # Only the *fitted* reference tracks: placed externals carry
+                # Nyström approximation error, so aligning a 3-D fit to them would
+                # bake that error into the head-on frame. A reference with no
+                # fitted tracks is no reference.
+                align_ref = (
+                    [
+                        {"path": p["path"], "x": p["x"], "y": p["y"]}
+                        for p in _ref_fit
+                    ]
+                    if _ref_fit
+                    else None
+                )
             except Exception:
                 log.warning(
                     "3-D projection: 2-D reference layout failed; leaving the 3-D "
@@ -601,13 +647,14 @@ def create_api_embeddings_blueprint(
                 feature_mask=proj.feature_mask,
                 features_blend=proj.features_blend,
                 layout_revision=revision,
-                source_weights=proj.source_weights or FROZEN_SOURCE_WEIGHTS,
+                source_weights=weights0,
                 required_sources=proj.required_sources,
                 with_jacobian=True,
                 dims=proj.dims,
                 recipe_id=getattr(proj, "recipe_id", None),
                 tsne_n_iter=getattr(proj, "tsne_n_iter", None),
                 tsne_early_exaggeration_iter=getattr(proj, "tsne_early_exaggeration_iter", None),
+                gauge_scope=gauge_scope_for(library_root_ids()),
             )
         else:
             _layout_progress("jacobian", 0, 0)

@@ -59,11 +59,13 @@ at least two points, so a far lone dot is never grabbed).
 ### 3-D view
 
 `model.view3d {on, yaw, pitch}` is a client-side view option, persisted in localStorage.
-Two gates read it: `model.is3d` (the *mode*: on, not eval gallery, projection lens — query
-string, interactions, scope/tag rules) and `model.shows3d` (the *rendering*: `is3d`'s gate
-that stays true while the collapse tween runs). Toggle: the `3D` tab beside the lens tabs, or
-the **3** key (`EmbeddingCoordinator.setView3D`, which refetches with `dims=3` — a true 3-D
-t-SNE, cached separately from the 2-D layout).
+Two gates read it: `model.is3d` (the *mode*: production **3-D** on a projection lens, or
+the eval gallery's selected artifact being 3-D — query string, interactions, scope/tag
+rules) and `model.shows3d` (the *rendering*: `is3d`'s gate that stays true while the
+collapse tween runs). Toggle: the `3D` tab beside the lens tabs, or the **3** key
+(`EmbeddingCoordinator.setView3D` in production, which refetches with `dims=3` — a true
+3-D t-SNE, cached separately from the 2-D layout; `EvaluationCoordinator.toggleDims` in
+the eval gallery, which switches the current group to its precomputed 3-D sibling).
 
 - **Camera.** `lib/camera3d.ts` rotates the unit cube about its centre and applies a slight
   perspective (`?persp=0.28` default, `0` = orthographic; read once at load). The rotated x/y
@@ -76,10 +78,12 @@ t-SNE, cached separately from the 2-D layout).
   alongside a position lerp). A toggle is one gesture: the blend tween and the dot lerp start
   together (`TOGGLE_MS`) once the new layout is applied, so a slow 3-D fit delays the whole
   motion rather than splitting it. The grid and the cube frame crossfade with it.
-- **Gauge.** A 3-D layout is fitted so its head-on (x,y) matches the same lens's 2-D layout
-  (`lens_gauge.gauge_layout_3d`; z sign anchored per track-set family). The 2-D layouts are
-  already aligned across lenses, so 2-D↔3-D barely moves x/y and 3-D lens switches stay
-  consistent.
+- **Gauge.** A 3-D layout is fitted so its head-on orientation matches the same lens's
+  2-D layout (`lens_gauge.gauge_layout_3d`; z sign anchored per stable gauge family).
+  The served frame is then normalised per axis, so x, y and z each fill `[0, 1]`: the
+  2-D x/y overlay is approximate, not exact, and the map fills the unit volume. The 2-D
+  layouts are already aligned across lenses, so 2-D↔3-D and 3-D lens switches keep a
+  consistent orientation.
 - **Controls.** Alt+drag or middle-drag orbits; Alt+Shift+drag and trackpad scroll pan; wheel
   zooms. In 2-D, Alt/middle-drag still pan. Orbit persists on mouse-up, not per move.
 - **Depth-aware metaballs.** `MetaballLayer.render(points, true)` MAX-blends each pixel's front
@@ -132,7 +136,7 @@ The debounce collapses rapid drag updates into one network round-trip.
 Never write to disk synchronously inside an event handler.
 
 Gallery mode (`?layout_eval=1`) blocks every write client-side and never persists
-view settings; see README.md → *Layout evaluation*. Hover-to-play works unchanged in it.
+view settings; see layout-evaluation.md. Hover-to-play works unchanged in it.
 
 ---
 
@@ -287,8 +291,9 @@ longer scrolls to the brim:
   *Hover preview and tooltip*); and the contextual display toggles live in the
   top-right **View options** panel (`#view-options`) on the canvas edge. There is no
   View tab. The panel appears whenever at least one of its `.view-option` rows is
-  relevant — currently only the **Confident only** gate (`#head-confident-fold`),
-  shown in predicted-folder colour mode.
+  relevant: the **Confident only** gate (predicted-folder colour mode), the
+  source-weight editors (below), the **All influences** readout and the openTSNE
+  iteration control.
 - **The imprint controls are not here either.** They live in the **head modal** (see below);
   the head's info and training/export/import/compare live in the Analysis tab's **Folder
   head** section.
@@ -513,7 +518,7 @@ The UI half of the embedding-space view; the pipeline it drives is in `audio_pip
   single-source MAEST / Folder-head maps are replaced by it (CLAP and Rhythm lenses
   remain in the cycle). It is a **canonical recipe**, not
   a source/weight selection: the backend fixes its source blocks, weights and
-  100/100 openTSNE budget (the gallery 500/250 is an explicit override), so the query
+  50/0 multilevel t-SNE budget (the gallery 500/250 is an explicit override), so the query
   sends `recipe=genre_full` instead of
   `sources=`/`w=`. A server started with `--no-genre-full` disables its layer-7/MERT
   analysis blocks and the frontend falls back to the Combined map. Switching to it is a
@@ -658,13 +663,32 @@ glowing "where does my query match" layer.
 
 Lens and colour live in the persistent top tabbers (a click or **E** / **C**); the
 contextual display toggles live in the top-right **View options** panel
-(`#view-options`) — currently the *Confident only* checkbox (shown only while the
-*Predicted folder* mode is active), the **Genre map weights** preview (only while the
-Genre map is active), and the **openTSNE iteration** control (only for a projection
-lens; its budget is stored **per dimensionality** — keyed by `d2`/`d3`, so all 2-D
-map lenses share the 2-D override, 3-D keeps its own, and switching resyncs the
-control);
-the panel appears whenever at least one `.view-option` row is relevant. Hover
+(`#view-options`): the *Confident only* checkbox (shown only while the *Predicted
+folder* mode is active), the **Common source weights** editor (the combined map's
+vector, which also drives microgenre clustering; its Jacobian preview still loads
+when the fold opens), the **Genre map weights** preview (only while the Genre map is
+active), the read-only **All influences** fold, and the **openTSNE iteration**
+control (only for a projection lens; its budget is stored **per dimensionality** —
+keyed by `d2`/`d3`, so all 2-D map lenses share the 2-D override, 3-D keeps its
+own, and switching resyncs the control). An empty control (the *Default* preset)
+sends no override, so the fit runs the production multilevel chain's 50 normal / 0
+early final fit with late exaggeration 1.25; the numeric floor is 50 and an
+explicit 50 is a legal override, shown as **Custom** because it is an explicit
+deviation. The panel appears whenever at least one `.view-option` row is relevant.
+
+**All influences** is driven by `GET /api/embeddings/projection-settings`, fetched
+with the same query as the layout and cached per query. It lists every source the
+projection can consume, but omits rows already represented by an editable slider
+above (the combined editor's six keys, or the genre recipe's seven); the remainder
+shows its effective weight and why it is fixed (`not in lens`, `inactive`,
+`fixed by lens`, or `unavailable` from the server capability — never a
+vector-count). A collapsible **Processing (fixed)** group renders the folder basis,
+final-fit exaggeration, sample-init hierarchy (16 levels, 1/256 → 1/16, one-iteration
+budget, early exaggeration 100, gamma 4), final-perplexity rule and audio-feature
+blend/mask as greys readouts from the payload, never as fake disabled sliders.
+If the fetch fails the panel says so inline instead of leaving an older lens's
+settings on screen; in the read-only eval gallery it shows a fixed note and never
+calls the endpoint. Hover
 preview is a **right-aligned**
 status-bar speaker toggle + volume (`#status-preview`). The status bar does **not** repeat the
 active lens — the top tabber is that feedback. `OptionsPanelBinder` owns only the hover-preview

@@ -60,15 +60,16 @@
       <label title="openTSNE fit budget: iterations and early-exaggeration phase">
         Iterations
         <select id="tsne-iteration-preset">
-          <option value="default">Default · 100 / 100</option>
+          <option value="default">Default · 50 / 0</option>
           <option value="fast">Fast · 100 / 100</option>
           <option value="balanced">Balanced · 250 / 150</option>
           <option value="gallery">Gallery · 500 / 250</option>
+          <option value="custom" disabled>Custom</option>
         </select>
       </label>
       <span class="view-option-inline">
         <label>Iter
-          <input type="number" id="tsne-n-iter" min="100" max="2000" step="10" />
+          <input type="number" id="tsne-n-iter" min="50" max="2000" step="10" />
         </label>
         <label>Early
           <input type="number" id="tsne-early-iter" min="0" max="1000" step="10" />
@@ -105,6 +106,52 @@
           Defaults
         </button>
       </div>
+    </div>
+    <!-- Combined-map source weights. The same vector drives microgenre
+         clustering and the map fit, so the editor lives here beside the other
+         view controls rather than in the Analysis tab. -->
+    <div id="cluster-weights-fold" class="view-option hidden">
+      <details id="cluster-weights-details">
+        <summary>Common source weights</summary>
+        <div id="cluster-weights"></div>
+        <p class="cluster-weights-scope">
+          Applies to both microgenre clustering and the Combined map.
+        </p>
+        <p id="cluster-weights-note" class="cluster-weights-note"></p>
+        <div class="cluster-weight-actions">
+          <button
+            id="btn-apply-weights"
+            type="button"
+            title="Re-cluster and re-layout with these weights"
+          >
+            Apply
+          </button>
+          <button
+            id="btn-reset-weights"
+            type="button"
+            title="Undo slider changes: back to the weights currently applied"
+          >
+            Reset
+          </button>
+          <button
+            id="btn-default-weights"
+            type="button"
+            title="Load the default source weights and apply them"
+          >
+            Defaults
+          </button>
+        </div>
+      </details>
+    </div>
+    <!-- Read-only influences: every available source (including fixed and
+         zero-weight blocks) plus the fixed processing rules, all described by
+         the backend's projection-settings payload. -->
+    <div id="influences-fold" class="view-option hidden">
+      <details id="influences-details" class="influences-details">
+        <summary>All influences</summary>
+        <div id="influence-sources" class="influence-sources"></div>
+        <div id="influence-fixed" class="influence-fixed"></div>
+      </details>
     </div>
   </div>
 
@@ -180,34 +227,9 @@
         title="Leiden resolution: left = broad genres, right = microgenres"
       />
     </label>
-    <details id="cluster-weights-details">
-      <summary>Source weights</summary>
-      <div id="cluster-weights"></div>
-      <p id="cluster-weights-note" class="cluster-weights-note"></p>
-      <div class="cluster-weight-actions">
-        <button
-          id="btn-apply-weights"
-          type="button"
-          title="Re-cluster and re-layout with these weights"
-        >
-          Apply
-        </button>
-        <button
-          id="btn-reset-weights"
-          type="button"
-          title="Undo slider changes: back to the weights currently applied"
-        >
-          Reset
-        </button>
-        <button
-          id="btn-default-weights"
-          type="button"
-          title="Load the default source weights and apply them"
-        >
-          Defaults
-        </button>
-      </div>
-    </details>
+    <p class="analysis-panel-note">
+      Source weights live in <strong>View options → Common source weights</strong>.
+    </p>
     <div id="cluster-meta" class="cluster-meta"></div>
     <ul id="cluster-list" class="cluster-list"></ul>
     <button id="btn-rebuild-clusters" type="button" title="Recompute clusters">

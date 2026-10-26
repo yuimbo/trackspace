@@ -567,12 +567,38 @@ lens's `sources=` subset and optional `w=` weights; both are part of
 **Incremental t-SNE (openTSNE).** On by default (`TRACKSPACE_OPENTSNE=0`
 disables it), `_project_tsne` routes to `_project_tsne_incremental`, which fits
 an embedding once per *vector config* and then places only newly added tracks into
-it via `TSNEEmbedding.transform` instead of refitting the library. The production
-fit uses the openTSNE-only iteration budget in `projection_config`
-(`OPENTSNE_N_ITER=100`, `OPENTSNE_EARLY_EXAGGERATION_ITER=100`); the fallback
-cuML / mlx-vis / sklearn backends keep their own iteration defaults and are
-untouched. Measured on this machine (7,153 tracks, warm OS cache, single runs),
-the production 100/100 fit is **~3.5 s** (6.0 s at 100/250, 12.4 s at 500/250).
+it via `TSNEEmbedding.transform` instead of refitting the library.
+
+**Production fit: multilevel sample init.** The openTSNE-only budget in
+`projection_config` is `OPENTSNE_N_ITER=50` / `OPENTSNE_EARLY_EXAGGERATION_ITER=0`,
+but those are only the *final* full-data fit. `_fit_tsne` runs the shared chain in
+`embeddings/multilevel_tsne.py`: 16 geometrically spaced fraction levels from
+1/256 to 1/16 of the runtime track count, a fixed **16 normal iterations across the
+coarse chain** (one or more per surviving level, early exaggeration 100 on the
+coarsest only), coarse perplexity `30 + 50·(1−t)^4` anchored at 1/256, each level
+expanded from the previous level's coordinates, then the full-data fit at 50/0
+using the production perplexity rule (`min(30, max(5, (n−1)/3))`, i.e. 30 for
+n ≥ 91 and lower on tiny libraries) and late exaggeration
+`OPENTSNE_FINAL_EXAGGERATION=1.25` on the final fit only. The chain is
+dimension-agnostic (the same schedule in 3-D, pinned to Barnes-Hut) and
+size-adaptive (fractions resolve against the actual `n`). The
+fallback cuML / mlx-vis / sklearn backends keep their own iteration defaults and are
+untouched. Historical timing measurements under the earlier flat budgets, on this
+machine (7,153 tracks, warm OS cache, single runs): **~3.5 s** at 100/100 (6.0 s at
+100/250, 12.4 s at 500/250). Those were measured before the multilevel chain
+replaced them, so they are not the current production cost.
+
+**Full-scope production benchmark (genre_full, all roots).**
+`backend/benchmark_production_projection.py` measured the **15,571-track**
+eligible set (15,574 fingerprinted, 15,618 MP3s). Its full protocol, exclusions
+(queue/HTTP, Nyström placement, Jacobian, 3-D reference fit), artifact names and
+per-phase numbers live in `layout-evaluation.md` → *Production projection
+benchmark*. The headline: with the legacy exact-SVD `full` folder basis at boost
+6 / depth 3, prepare dominated the pipeline; production now uses the cheaper
+centroid-only 2.4 basis, so those historical prepare seconds are **not** the
+current cold cost. The first current cold fit is paid once because the fit is
+persisted.
+
 The transform-vs-refit evidence below was measured on the real library
 (n=14,163, 50-D) under the old 500/250 iteration budget: a cold fit is 23.8 s, a
 `.transform` of 708 new tracks is **1.28 s (19× faster)**, and placed-point
@@ -628,14 +654,16 @@ returns `{"path","x","y","z"}` positions and fits every visible track in one cha
 its own fit-cache namespace (`|dims=3`) and layout-revision payload, so 2-D and 3-D
 caches never collide. A 3-D layout is gauged *head-on* (`gauge_layout_3d`): the route
 first computes the same lens's 2-D layout (same query and fit scope) and the 3-D layout
-is similarity-fitted so its x,y match it, with the z sign pinned per track-set family
-(`GAUGE_3D_VERSION` is part of the 3-D revision). Because 2-D layouts are already
-aligned across lenses (below), 2-D↔3-D barely moves x/y and 3-D lens switches stay
-consistent; if the reference fails the 3-D layout is returned ungauged. The landmark
-extension and its weight Jacobian are dimension-agnostic: `?dims=3&jacobian=1` serves 3-component rows
-from a chart fitted on x/y/z, with the same gauge projection as 2-D (see below). The
-fallback chain is scikit-learn Barnes-Hut only (cuML and mlx-vis are 2-D only /
-unverified).
+is fitted so its x,y orientation matches it, with the z sign pinned per track-set
+family (`GAUGE_3D_VERSION` is part of the 3-D revision). The served frame is then
+normalised per axis, x, y and z each spanning `[0, 1]`, so the map fills the unit
+volume; the 2-D x/y overlay is therefore approximate, not exact, by design. Because
+2-D layouts are already aligned across lenses (below), 2-D↔3-D still moves x/y only
+slightly and 3-D lens switches stay consistent; if the reference fails the 3-D layout
+is returned ungauged. The landmark extension and its weight Jacobian are
+dimension-agnostic: `?dims=3&jacobian=1` serves 3-component rows from a chart fitted
+on x/y/z, with the same gauge projection as 2-D (see below). The fallback chain is
+scikit-learn Barnes-Hut only (cuML and mlx-vis are 2-D only / unverified).
 
 ### Lens gauge (why a lens switch does not flip the map)
 
@@ -644,24 +672,68 @@ lenses over the same library land in arbitrary, unrelated frames — switching l
 looked like the whole map flipped even though neighbourhoods were unchanged.
 Measured on the real library, **6 of 10 lens pairs differed by a reflection**.
 
-`embeddings/lens_gauge.py` fits a Procrustes (Kabsch) **similarity** transform —
-rotation, reflection, uniform scale, translation — from each new layout onto a
-reference layout, using the tracks the two share. `compute_projection` calls
-`gauge_layout()` just before `_normalise_coords`, so the gauged coordinates are what
-gets normalised, cached and persisted; a restart therefore replays already-gauged
-layouts and re-anchors consistently.
+`embeddings/lens_gauge.py` fits a Procrustes (Kabsch) transform — rotation,
+reflection and translation, **uniform scale ignored** — from each new layout onto a
+reference layout, using the tracks the two share. `compute_projection` normalises
+each axis to `[0, 1]` first, then calls `gauge_layout()`, then normalises each axis
+again for the served coordinate. That second per-axis stretch is deliberately
+anisotropic: it makes an elongated cloud fill every axis of the view instead of
+leaving one axis mostly empty, at the cost of exact 2-D/3-D x/y overlay and
+distance ratios. What the gauge guarantees is orientation and handedness, not
+metric fidelity. The final served coordinates span `[0, 1]` on every axis, and
+those are what get cached and persisted.
 
 Measured end-to-end on the five real cached lenses: **mean pairwise RMSE 0.518 →
-0.305 (−41%), every pair improved**, two reflections corrected. The transform is
-shape-preserving, so this changes only the gauge and never the structure —
-distance-ratio spread 2.8e-16 and 100% nearest-neighbour preservation.
+0.305 (−41%), every pair improved**, two reflections corrected. That comparison is
+about orientation agreement; the display normalisation is applied on top and is
+not expected to preserve distance ratios.
 
-The family key is `source-versions | track_set_key(paths)`: layouts are only
-comparable over the same track set and cache generation. It deliberately excludes
-sources/mask/weights — keying on anything lens-varying would give every lens its own
-anchor and the alignment would silently never fire (`track_set_key` exists so that
-coupling is explicit rather than an accident of a hash slice, and
-`test_track_set_key_is_lens_independent` pins it).
+The family key is `gauge-version | dims | gauge_scope | all-source-versions`. The
+scope is the **configured library roots** as `library:<id>|<id>`, passed by both
+the HTTP route (2-D and the 3-D reference) and the prefetch job, *not* the
+requested folder or the exact track set — so a folder subset, an external-only
+view and the whole library share one frame. Scope comes from the root registry,
+never from selected paths; a folder-derived scope would flip the family per
+request. The same scope is part of the coordinate `layout_revision`, so re-rooting
+or re-roling the library re-keys the persisted coordinates instead of leaving them
+in the previous frame; the *fit* cache is unaffected (it keys on the vector config
+and recipe budget), so the re-scoped layout reuses the fitted embedding. With no
+library roots configured the scope is omitted and the fallback is the set of root
+prefixes present in the paths, with absolute paths scoped by their common ancestor
+directory (a folder subset may then fork the family rather than join a foreign
+frame). The version part deliberately uses
+every projection source generation rather than the lens's own `sources`, so a
+`clap` lens and `genre_full` do not fork the family. Sources/mask/weights stay
+out, or every lens would anchor itself and the alignment would silently never
+fire (`track_set_key` remains the explicit track-set key for the fit/placement
+caches, and `test_track_set_key_is_lens_independent` pins it).
+
+Alignment needs at least `MIN_SHARED` (8) shared tracks. A disjoint pair of
+layouts is therefore *excluded*, not forced into a guessed frame: the family
+key groups them but the overlap guard leaves each in its own frame. The family
+is a workspace convention, not a guarantee that every pair of lenses is
+geometrically alignable.
+
+The first complete layout (>= `MIN_SHARED` tracks) for a family becomes its
+reference; a tiny folder is skipped so it cannot strand the family. The first
+layout revision is remembered in `FeatureCache` metadata
+(`gauge_anchor:<family>`) and its persisted row is the reference after a restart.
+That row stores the **served, per-axis-normalised** coordinates. Cache hits restore
+that reference without touching the returned coordinates, so the next cold lens
+aligns to the same frame. The layout table is pruned to its newest rows, so an
+anchor row can disappear; the pointer then falls back to the next complete layout
+rather than stranding the family. The finite-difference Jacobian fallback computes
+its base and perturbations **ungauged** in one frame, then maps that raw base onto
+the served (gauged and per-axis-normalised) base with a least-squares 2-D affine
+fit and applies the same transform to every perturbation before differencing.
+Translation cancels, and the derivative carries both the gauge rotation and the
+display stretch, so a weight-drag preview matches the drawn map. Perturbations are
+never gauged individually: that would refit each one and pollute the family anchor.
+
+Normalisation (`_normalise_coords`, independent min/max on every axis) puts both
+the pre-gauge fit input and the final served layout in the unit box. A degenerate
+axis (zero span) is centred at 0.5. Because the final pass is per axis, a served
+layout fills `[0, 1]` on x, y and z even when the underlying cloud is elongated.
 
 Two alternatives were measured and **rejected**:
 
@@ -692,8 +764,9 @@ without the disk tier every restart re-fits all five lenses (seconds each —
 measured; see *Projection methods*); the disk
 tier turns that into a ~5 ms read (~356 KB for 14k tracks). The key is
 `layout_revision` — a deterministic SHA-256 computed by
-`compute_layout_revision()` from sorted eligible paths, method, sources, feature
-mask/blend, folder/tag context, and cache version constants. Because the key is
+`compute_layout_revision()` from sorted eligible paths, the configured gauge
+scope, sources, the effective source weights, the recipe/budget deviations, and
+cache version constants. Because the key is
 content-addressed, row order in the input data does not affect cache identity, and it
 is stable across restarts.
 
@@ -776,10 +849,12 @@ hierarchically: broad genre distinctions live at shallow levels, subtle
 microgenre differences at deeper levels.
 
 **Depth-increasing boost:**  Deeper levels receive *more* weight
-(`boost × depth_boost^(depth−1)`, default `depth_boost = 1.5`) because broad
-genre axes are already well-separated in CLAP space — it is the fine sibling
-distinctions that dimensionality reduction tends to collapse and that benefit
-most from amplification.
+(`boost × depth_boost^(depth−1)`, production `boost = 2.4`, `depth_boost = 3.0`)
+because broad genre axes are already well-separated in CLAP space — it is the fine
+sibling distinctions that dimensionality reduction tends to collapse and that
+benefit most from amplification. The 2.4 amplitude is 40% of the former 6.0
+default; the helper defaults (`3.0` / `1.5`) remain for the frozen
+evaluation/benchmark paths.
 
 **Fallback:** Folders with fewer than 2 embedded tracks cannot produce a
 reliable centroid; these fall back to CLAP text embedding of the folder's
@@ -808,6 +883,21 @@ converge"* on such a block and 500 the whole projection request. All SVDs in the
 clustering path go through `embeddings/linalg_utils.svd_singular`, which retries with scipy's
 `gesvd` driver — it converges on the same input — and the folder PC helper also skips a
 non-finite block outright.
+
+**Basis solver modes.** `_build_folder_directions` and `prepare_projection_input`
+accept `folder_basis_mode`: `centroids` is the production mode
+(`FROZEN_FOLDER_BASIS_MODE`, hierarchical contrast directions only, no
+within-folder PC SVD), `full` is the legacy exact-SVD basis kept for the frozen
+evaluation/benchmark paths, and `approx` solves the same PCs from a seeded
+`sklearn` randomized SVD. Non-default modes are namespaced into the semantic-basis
+cache key and never exposed by the HTTP API; full keys, results, and the basis
+version are unchanged, so a cached full basis can never alias a centroid one.
+
+**Model-free folder directions.** Data-driven folder contrasts do not need CLAP.
+When the recipe has no CLAP column and no tags, `prepare_projection_input` applies
+them even if the text tower has not loaded, so a cold `genre_full` map (CLAP weight
+0) is not silently unweighted. A positive CLAP column or explicit tags still
+require the model for their text directions.
 
 ---
 
@@ -1019,9 +1109,12 @@ dg_i/dw_s = −(1/tau) sum_l a_il Delta_ils (c_l − g_i)
   scales the whole map carries no shape information — the canvas refits the view anyway —
   so it reads as "nothing happened". Only the shape change is returned, and the extremes
   of the map define the frame. This applies to both `dims=2` and `dims=3`.
-- The frontend **re-normalises every preview state to the unit square**, matching the
-  server's min-max normalisation of every layout, so a drag cannot drift or zoom the map
-  out of frame.
+- The frontend **anchors every preview state on the base cloud's bounds, per axis**:
+  each axis is mapped from its own base-span range back onto the base range, so a
+  zero delta is exactly the identity and the preview cannot drift, zoom or stretch the
+  map on the first drag event. This mirrors the backend display policy — each axis
+  fills `[0, 1]` in the served frame — so axis-wise anchoring is stable at zero; it
+  does **not** preserve raw embedding distances or an exact unnormalised shape.
 - Cost is `O(N*M*S)` after the `Delta` cache (128 landmarks: ~51 MB at 20k
   tracks). The route uses it for `?jacobian=1` and falls back to the refit-FD when
   the chart cannot be fit (too few tracks).

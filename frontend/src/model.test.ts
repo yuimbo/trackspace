@@ -908,6 +908,36 @@ describe("Model 3-D orbit view", () => {
     expect(m.shows3d).toBe(false);
   });
 
+  it("eval dims drive is3d/shows3d and reset when eval ends", () => {
+    const m = new Model();
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.setEvalMode(true);
+    expect(m.evalDims).toBe(2);
+    expect(m.is3d).toBe(false);
+    expect(m.shows3d).toBe(false);
+
+    m.setEvalDims(3);
+    expect(m.is3d).toBe(true);
+    expect(m.shows3d).toBe(true);
+    // The eval dimensionality does not depend on the production lens kind.
+    m.lensId = "tags";
+    expect(m.is3d).toBe(true);
+
+    m.view3dBlend = 0.4;
+    m.setEvalDims(2);
+    expect(m.is3d).toBe(false);
+    // The collapse tween keeps rendering 3-D until the blend reaches 0.
+    expect(m.shows3d).toBe(true);
+    m.view3dBlend = 0;
+    expect(m.shows3d).toBe(false);
+
+    m.setEvalDims(3);
+    m.setEvalMode(false);
+    expect(m.evalDims).toBe(2);
+    expect(m.is3d).toBe(false);
+    expect(m.view3dBlend).toBe(0);
+  });
+
   it("loadLS snaps the blend to the persisted on/off state", () => {
     localStorage.setItem(
       "trackspace",
@@ -1040,12 +1070,12 @@ describe("Model per-dimensionality t-SNE iteration budget", () => {
     expect(m.tsneIterationFor()).toEqual({ nIter: 300, early: 150 });
   });
 
-  it("keeps the per-dimensionality map fresh: no stored override for a fresh 100/100", () => {
+  it("keeps the per-dimensionality map fresh: no stored override for a fresh 50/0", () => {
     const m = new Model();
     m.genreFullEnabled = true;
     m.lensId = "genre_full";
     expect(m.tsneIterationFor()).toEqual({ nIter: null, early: null });
-    // Clearing an override removes the entry entirely (recipe default 100/100).
+    // Clearing an override removes the entry entirely (recipe default 50/0).
     m.setTsneIterationForActiveView(250, 150);
     expect(m.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
     m.setTsneIterationForActiveView(null, null);

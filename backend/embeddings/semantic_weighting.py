@@ -25,17 +25,36 @@ FOLDER_PCA_MIN_TRACKS = 8
 FOLDER_PCA_MAX_COMPONENTS = 2
 FOLDER_PCA_SECOND_SV_RATIO = 0.18
 
+#: Folder-basis solver modes. ``full`` is the production default; the others are
+#: benchmark-only seams and are never exposed by the HTTP API or recipe config.
+FOLDER_BASIS_MODES = ("full", "centroids", "approx")
+
+
+def validate_folder_basis_mode(mode: str) -> str:
+    if mode not in FOLDER_BASIS_MODES:
+        raise ValueError(
+            f"unknown folder basis mode {mode!r} "
+            f"(allowed: {', '.join(FOLDER_BASIS_MODES)})"
+        )
+    return mode
+
 
 def _semantic_basis_param_key(
     context_tags: list[str] | None,
     folder_seeds: list[str] | None,
+    folder_basis_mode: str = "full",
 ) -> str:
     tags = ",".join(sorted(context_tags)) if context_tags else ""
     if folder_seeds:
         fp = ",".join(sorted(folder_seeds))
     else:
         fp = "-"
-    return f"{tags}|{fp}|fsbv{FOLDER_SEMANTIC_BASIS_VERSION}"
+    key = f"{tags}|{fp}|fsbv{FOLDER_SEMANTIC_BASIS_VERSION}"
+    # Default full keeps the legacy key byte-identical; non-default modes are
+    # namespaced so a cached full basis can never alias a centroid/approx one.
+    if folder_basis_mode != "full":
+        key += f"|fbm{folder_basis_mode}"
+    return key
 
 
 def _folder_seeds_from_track_paths(paths: list[str]) -> list[str]:
@@ -63,7 +82,9 @@ def _folder_orthogonal_pc_directions(
     *,
     max_components: int,
     min_second_sv_ratio: float,
+    basis_mode: str = "full",
 ) -> list[np.ndarray]:
+    validate_folder_basis_mode(basis_mode)
     n = mat_block.shape[0]
     if n < 4 or max_components < 1:
         return []
@@ -77,7 +98,20 @@ def _folder_orthogonal_pc_directions(
         log.debug("folder PC directions: non-finite block %s; skipping", mat_block.shape)
         return []
 
-    _, s, vt = svd_singular(x_orth.astype(np.float64))
+    x64 = x_orth.astype(np.float64)
+    if basis_mode == "approx":
+        from sklearn.utils.extmath import randomized_svd
+
+        n_components = min(2, x64.shape[0], x64.shape[1])
+        _, s, vt = randomized_svd(
+            x64,
+            n_components=n_components,
+            n_iter=5,
+            n_oversamples=10,
+            random_state=42,
+        )
+    else:
+        _, s, vt = svd_singular(x64)
     if s.size == 0 or float(s[0]) < 1e-12:
         return []
 
@@ -103,7 +137,9 @@ def _build_folder_directions(
     min_tracks: int = 2,
     min_tracks_pca: int = FOLDER_PCA_MIN_TRACKS,
     max_pca_components: int = FOLDER_PCA_MAX_COMPONENTS,
+    basis_mode: str = "full",
 ) -> tuple[np.ndarray | None, np.ndarray | None, list[tuple[str, int]]]:
+    validate_folder_basis_mode(basis_mode)
     if not folder_seeds:
         return None, None, []
 
@@ -156,13 +192,18 @@ def _build_folder_directions(
         exps.append(exp)
 
         idx_list = node_indices[node]
-        if len(idx_list) >= min_tracks_pca and max_pca_components > 0:
+        if (
+            basis_mode != "centroids"
+            and len(idx_list) >= min_tracks_pca
+            and max_pca_components > 0
+        ):
             block = mat[idx_list]
             extras = _folder_orthogonal_pc_directions(
                 block,
                 d_unit,
                 max_components=max_pca_components,
                 min_second_sv_ratio=FOLDER_PCA_SECOND_SV_RATIO,
+                basis_mode=basis_mode,
             )
             for v_pc in extras:
                 dirs.append(v_pc)
@@ -223,14 +264,18 @@ def _build_semantic_basis(
     folder_seeds: list[str] | None,
     clap_lo: int,
     clap_hi: int,
+    folder_basis_mode: str = "full",
 ) -> tuple[np.ndarray, np.ndarray]:
+    validate_folder_basis_mode(folder_basis_mode)
     d_total = mat.shape[1]
     have_clap_slot = clap_lo < clap_hi
     all_dirs: list[np.ndarray] = []
     all_exp: list[np.ndarray] = []
 
     if folder_seeds:
-        fd, f_exp, fallbacks = _build_folder_directions(mat, paths, folder_seeds)
+        fd, f_exp, fallbacks = _build_folder_directions(
+            mat, paths, folder_seeds, basis_mode=folder_basis_mode,
+        )
         if fd is not None and f_exp is not None:
             all_dirs.append(fd)
             all_exp.append(f_exp)

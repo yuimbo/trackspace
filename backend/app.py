@@ -586,6 +586,8 @@ def build_app(
             ),
             embedding_version=EMBEDDING_VERSION,
             user=False,
+            # Same workspace family as the HTTP route: configured library roots.
+            library_root_ids=_library_root_ids(),
         )
         return len(positions)
 

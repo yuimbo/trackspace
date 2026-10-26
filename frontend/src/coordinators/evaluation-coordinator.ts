@@ -21,6 +21,7 @@ import {
   parseEvalArtifact,
   parseEvalManifest,
   type EvalArtifact,
+  type EvalDims,
   type EvalManifest,
   type EvalManifestRecipe,
 } from "../lib/layout-eval";
@@ -32,7 +33,7 @@ import {
   type EvalRatingRecord,
 } from "../lib/eval-ratings";
 import { setEvalReadOnly } from "../lib/eval-readonly";
-import { latestSeq, type Seq } from "../lib/async";
+import { clearOnNewTimer, latestSeq, type Seq } from "../lib/async";
 import type { EvalToolbarState, EvalToolbarView } from "../components/eval-toolbar-view";
 
 /** Max artifact maps kept in memory; the least-recently-used one is evicted past this. */
@@ -42,11 +43,21 @@ export interface EvaluationDeps {
   model: Model;
   view: EvalToolbarView;
   /** Apply a precomputed position map on the shared canvas animation frame. */
-  applyPositions(positions: Map<string, { x: number; y: number }>): void;
+  applyPositions(
+    positions: Map<string, { x: number; y: number; z?: number }>,
+    dims: EvalDims,
+  ): void;
   /** Move the camera to the default full-map view. */
   resetCamera(): void;
   fetchManifest(): Promise<unknown>;
   fetchArtifact(id: string): Promise<unknown>;
+}
+
+/** One blind navigation step: a 2-D base and/or its 3-D sibling. */
+interface EvalGroup {
+  id: string;
+  letter: string;
+  members: Map<EvalDims, EvalManifestRecipe>;
 }
 
 function msg(e: unknown): string {
@@ -56,10 +67,17 @@ function msg(e: unknown): string {
 export class EvaluationCoordinator {
   private seq: Seq = latestSeq();
   private manifest: EvalManifest | null = null;
-  private maps: { recipeId: string; letter: string; label: string }[] = [];
+  private groups: EvalGroup[] = [];
+  // The applied map is one identity — index + artifact + dims — committed only
+  // when its artifact is ready to draw, so a failed load leaves the canvas and
+  // its ratings on the map the user is still looking at.
   private currentIndex = 0;
-  private artifacts = new Map<string, EvalArtifact>();
   private currentArtifact: EvalArtifact | null = null;
+  /** Navigation cursor: the last selection asked for; may run ahead while it loads. */
+  private requestedIndex = 0;
+  /** User's latest dimensionality intent; may differ from the applied artifact. */
+  private requestedDims: EvalDims = 2;
+  private artifacts = new Map<string, EvalArtifact>();
   private loaded = false;
   private revealed = false;
   private busy = false;
@@ -68,10 +86,13 @@ export class EvaluationCoordinator {
   private eligible = 0;
   private total = 0;
   private unavailable = 0;
-  private noteTimer = 0;
+  /** The one debounced note save; flushed before a map switch, export or exit. */
+  private pendingNote: (() => void) | null = null;
+  private noteDebounce = clearOnNewTimer();
 
   constructor(private deps: EvaluationDeps) {
-    this.deps.view.onSelect = (i) => void this._selectMap(i);
+    this.deps.view.onSelect = (i) =>
+      void this._selectGroup(i, this.requestedDims);
     this.deps.view.onPrev = () => void this._step(-1);
     this.deps.view.onNext = () => void this._step(1);
     this.deps.view.onResetCamera = () => this.deps.resetCamera();
@@ -116,18 +137,17 @@ export class EvaluationCoordinator {
       }
       this.manifest = manifest;
       this.fp = manifest.datasetFingerprint;
-      this.maps = manifest.recipes.map((r, i) => ({
-        recipeId: r.id,
-        letter: blindLetter(i),
-        label: r.label,
-      }));
+      this.groups = this._buildGroups(manifest.recipes);
+      const initial = initialRecipeId
+        ? manifest.recipes.find((r) => r.id === initialRecipeId)
+        : undefined;
       let start = 0;
-      if (initialRecipeId) {
-        const idx = this.maps.findIndex((x) => x.recipeId === initialRecipeId);
+      if (initial) {
+        const idx = this.groups.findIndex((x) => x.id === initial.group);
         if (idx >= 0) start = idx;
+        this.requestedDims = initial.dims;
       }
-      this.currentIndex = start;
-      await this._selectMap(start);
+      await this._selectGroup(start, this.requestedDims);
     } catch (e) {
       this._error(`Failed to load the layout-evaluation manifest: ${msg(e)}`);
     }
@@ -142,51 +162,123 @@ export class EvaluationCoordinator {
 
   /* ── Map selection ───────────────────────────────────────── */
 
-  private async _step(dir: 1 | -1): Promise<void> {
-    const next = this.currentIndex + dir;
-    if (next < 0 || next >= this.maps.length) return;
-    await this._selectMap(next);
+  /**
+   * Collapse manifest recipes into navigation groups. A group is the paired
+   * family (``group`` defaults to the recipe id), so a 2-D base and its 3-D
+   * sibling share one blind letter and one navigation step. The first recipe in
+   * manifest order wins for a duplicated dimensionality.
+   */
+  private _buildGroups(recipes: EvalManifestRecipe[]): EvalGroup[] {
+    const byId = new Map<string, EvalGroup>();
+    const groups: EvalGroup[] = [];
+    for (const recipe of recipes) {
+      let group = byId.get(recipe.group);
+      if (!group) {
+        group = {
+          id: recipe.group,
+          letter: blindLetter(groups.length),
+          members: new Map(),
+        };
+        byId.set(recipe.group, group);
+        groups.push(group);
+      }
+      if (!group.members.has(recipe.dims)) group.members.set(recipe.dims, recipe);
+    }
+    return groups;
   }
 
-  private async _selectMap(index: number): Promise<void> {
-    const map = this.maps[index];
-    if (!map) return;
-    this.currentIndex = index;
+  /** The group's artifact for *desired*, falling back to 2-D then 3-D. */
+  private _pickDims(group: EvalGroup, desired: EvalDims): EvalDims | null {
+    if (group.members.has(desired)) return desired;
+    if (group.members.has(2)) return 2;
+    if (group.members.has(3)) return 3;
+    return null;
+  }
+
+  /** The group's label without the backend's raw 3-D suffix. */
+  private _groupLabel(group: EvalGroup): string {
+    const recipe = group.members.get(2) ?? group.members.get(3);
+    return recipe ? recipe.label.replace(/\s*\(3D\)$/, "") : group.id;
+  }
+
+  /**
+   * Switch the current group between its 2-D and 3-D artifact (the **3** key in
+   * eval mode). An unpaired group is a no-op, and the switch is a cache/fetch of
+   * the sibling artifact only — never a production projection request.
+   */
+  async toggleDims(): Promise<void> {
+    const group = this.groups[this.requestedIndex];
+    if (!group) return;
+    const target: EvalDims = this.requestedDims === 3 ? 2 : 3;
+    if (!group.members.has(target)) return;
+    this.requestedDims = target;
+    await this._selectGroup(this.requestedIndex, target);
+  }
+
+  private async _step(dir: 1 | -1): Promise<void> {
+    const next = this.requestedIndex + dir;
+    if (next < 0 || next >= this.groups.length) return;
+    await this._selectGroup(next, this.requestedDims);
+  }
+
+  private async _selectGroup(index: number, desired: EvalDims): Promise<void> {
+    const group = this.groups[index];
+    if (!group) return;
+    const dims = this._pickDims(group, desired);
+    if (dims === null) return;
+    const meta = group.members.get(dims)!;
+    // The note typed so far belongs to the map being left, not the one loading.
+    this._flushNote();
+    this.requestedDims = desired;
+    this.requestedIndex = index;
     const token = this.seq.next();
     this.busy = true;
     this._render();
 
-    let artifact = this.artifacts.get(map.recipeId) ?? null;
+    let artifact = this.artifacts.get(meta.id) ?? null;
     if (artifact) {
       // LRU: re-insert to move the hit to the most-recently-used end.
-      this.artifacts.delete(map.recipeId);
-      this.artifacts.set(map.recipeId, artifact);
+      this.artifacts.delete(meta.id);
+      this.artifacts.set(meta.id, artifact);
     } else {
       try {
-        const raw = await this.deps.fetchArtifact(map.recipeId);
+        const raw = await this.deps.fetchArtifact(meta.id);
         // A newer selection won the race: drop this stale response.
         if (!this.seq.isCurrent(token)) return;
         artifact = parseEvalArtifact(raw);
-        if (!artifact) {
-          this.busy = false;
-          this._error(`Map ${map.letter} artifact is missing or invalid.`);
+        if (
+          !artifact ||
+          artifact.id !== meta.id ||
+          artifact.dims !== meta.dims ||
+          artifact.group !== group.id
+        ) {
+          this._failed(`Map ${group.letter} artifact is missing or invalid.`);
           return;
         }
-        this._cacheArtifact(map.recipeId, artifact);
+        this._cacheArtifact(meta.id, artifact);
       } catch (e) {
         if (!this.seq.isCurrent(token)) return;
-        this.busy = false;
-        this._error(`Failed to load Map ${map.letter}: ${msg(e)}`);
+        this._failed(`Failed to load Map ${group.letter}: ${msg(e)}`);
         return;
       }
     }
     if (!this.seq.isCurrent(token)) return;
 
+    this.currentIndex = index;
     this.currentArtifact = artifact;
+    this.requestedDims = artifact.dims;
     this.busy = false;
-    this.deps.applyPositions(artifact.positions);
+    this.error = null;
+    this.deps.applyPositions(artifact.positions, artifact.dims);
     if (this.loaded) this._applyUniverse(artifact);
     this._render();
+  }
+
+  /** Drop the failed request: keep the applied map (and its ratings) untouched. */
+  private _failed(message: string): void {
+    this.requestedIndex = this.currentIndex;
+    this.requestedDims = this.currentArtifact?.dims ?? 2;
+    this._error(message);
   }
 
   /** Insert into the artifact cache, evicting the least-recently-used entry past the bound. */
@@ -216,10 +308,11 @@ export class EvaluationCoordinator {
   private _toggleReveal(checked: boolean): void {
     this.revealed = checked;
     if (checked && this.fp) {
-      const recipeId = this.maps[this.currentIndex]?.recipeId;
+      const group = this.groups[this.currentIndex];
+      const recipeId = this.currentArtifact?.id;
       const revision = this.currentArtifact?.revision;
-      const label = this.maps[this.currentIndex]?.label ?? "";
-      if (revision) saveRating(this.fp, revision, { label, recipeId });
+      const label = group ? this._groupLabel(group) : "";
+      if (recipeId && revision) saveRating(this.fp, revision, { label, recipeId });
     }
     this._render();
   }
@@ -237,34 +330,45 @@ export class EvaluationCoordinator {
     value: number | null,
   ): void {
     const revision = this.currentArtifact?.revision;
-    const recipeId = this.maps[this.currentIndex]?.recipeId ?? "";
+    const recipeId = this.currentArtifact?.id ?? "";
+    const group = this.groups[this.currentIndex];
     if (!this.fp || !revision) return;
     saveRating(this.fp, revision, {
       [category]: value,
       recipeId,
-      label: this.revealed ? (this.maps[this.currentIndex]?.label ?? "") : "",
+      label: this.revealed && group ? this._groupLabel(group) : "",
     });
     this._render();
   }
 
   private _note(text: string): void {
-    const revision = this.currentArtifact?.revision;
-    const recipeId = this.maps[this.currentIndex]?.recipeId ?? "";
-    if (!this.fp || !revision) return;
+    const artifact = this.currentArtifact;
+    const group = this.groups[this.currentIndex];
+    if (!this.fp || !artifact) return;
     // Capture the target so a map switch mid-debounce lands the note on the
-    // right record.
+    // right record instead of the map that happens to be showing when it fires.
     const fp = this.fp;
-    const rev = revision;
-    const label = this.revealed ? (this.maps[this.currentIndex]?.label ?? "") : "";
-    clearTimeout(this.noteTimer);
-    this.noteTimer = setTimeout(() => {
-      saveRating(fp, rev, { note: text, recipeId, label });
+    const revision = artifact.revision;
+    const recipeId = artifact.id;
+    const label = this.revealed && group ? this._groupLabel(group) : "";
+    this.pendingNote = () => saveRating(fp, revision, { note: text, recipeId, label });
+    this.noteDebounce.set(() => {
+      this._flushNote();
       this._render();
-    }, 400) as unknown as number;
+    }, 400);
+  }
+
+  /** Persist the debounced note now, if one is waiting. */
+  private _flushNote(): void {
+    this.noteDebounce.cancel();
+    const save = this.pendingNote;
+    this.pendingNote = null;
+    save?.();
   }
 
   private _export(): void {
     if (!this.fp) return;
+    this._flushNote();
     const records = Object.values(loadAllRatings()[this.fp] ?? {});
     const json = buildEvalExport(this.fp, records);
     const blob = new Blob([json], { type: "application/json" });
@@ -279,6 +383,7 @@ export class EvaluationCoordinator {
   }
 
   private _exit(): void {
+    this._flushNote();
     window.location.href = evalExitUrl(window.location.href);
   }
 
@@ -304,8 +409,10 @@ export class EvaluationCoordinator {
       this.deps.view.render(this._emptyState());
       return;
     }
-    const cur = this.maps[this.currentIndex];
-    const meta = this.manifest.recipes.find((r) => r.id === cur?.recipeId);
+    const group = this.groups[this.currentIndex];
+    const meta = this.currentArtifact
+      ? this.manifest.recipes.find((r) => r.id === this.currentArtifact!.id)
+      : undefined;
     // Parse the ratings store once per render; per-map lookups are plain reads.
     const ratings = loadAllRatings();
     const fpRatings = this.fp ? (ratings[this.fp] ?? {}) : {};
@@ -313,15 +420,16 @@ export class EvaluationCoordinator {
     const state: EvalToolbarState = {
       busy: this.busy,
       currentIndex: this.currentIndex,
-      count: this.maps.length,
-      maps: this.maps.map((m, i) => {
-        const art = this.artifacts.get(m.recipeId);
-        const rev = art?.revision ?? "";
+      count: this.groups.length,
+      maps: this.groups.map((g, i) => {
+        const shown = this._artifactForGroup(g, i);
+        const rev = shown.artifact?.revision ?? "";
         const rec = rev ? (fpRatings[rev] ?? null) : null;
         return {
           index: i,
-          letter: m.letter,
-          label: this.revealed ? m.label : undefined,
+          letter: g.letter,
+          label: this.revealed ? this._groupLabel(g) : undefined,
+          dims: shown.dims,
           rated: ratedCount(rec),
           revealed: this.revealed,
         };
@@ -333,10 +441,42 @@ export class EvaluationCoordinator {
       unavailable: this.unavailable,
       ratings: record,
       note: record?.note ?? "",
+      canRate: this.currentArtifact !== null && !this.busy,
+      dims: this.currentArtifact?.dims ?? 2,
+      paired: group ? group.members.has(2) && group.members.has(3) : false,
       datasetLabel: this.fp ? `dataset ${this.fp.slice(0, 8)}` : "",
       error: this.error,
     };
     this.deps.view.render(state);
+  }
+
+  /**
+   * The artifact whose rating badge a group shows. A group's badge is always
+   * tied to one explicit dimension: the current group's applied artifact, else
+   * the requested dimension, else a cached 2-D/3-D sibling.
+   */
+  private _artifactForGroup(
+    group: EvalGroup,
+    index: number,
+  ): { artifact: EvalArtifact | null; dims: EvalDims } {
+    const current = this.currentArtifact;
+    if (
+      index === this.currentIndex &&
+      current &&
+      group.members.get(current.dims)?.id === current.id
+    ) {
+      return { artifact: current, dims: current.dims };
+    }
+    const dims = this._pickDims(group, this.requestedDims) ?? 2;
+    const recipe = group.members.get(dims);
+    const cached = recipe ? (this.artifacts.get(recipe.id) ?? null) : null;
+    if (cached) return { artifact: cached, dims };
+    for (const fallback of [2, 3] as EvalDims[]) {
+      const member = group.members.get(fallback);
+      const artifact = member ? (this.artifacts.get(member.id) ?? null) : null;
+      if (artifact) return { artifact, dims: fallback };
+    }
+    return { artifact: null, dims };
   }
 
   private _emptyState(): EvalToolbarState {
@@ -352,6 +492,9 @@ export class EvaluationCoordinator {
       unavailable: 0,
       ratings: null,
       note: "",
+      canRate: false,
+      dims: 2,
+      paired: false,
       datasetLabel: "",
       error: this.error,
     };

@@ -240,6 +240,22 @@ def test_unreadable_persisted_fit_refits():
     assert pb.tsne_fit_stats()["fit"] == 1
 
 
+def test_cached_fit_has_full_affinities_and_reuses_after_warm():
+    """A cold multilevel fit stores the final full-data embedding (N×N affinities,
+    so ``transform`` sees the whole library) and a warm same-set request is a pure
+    coordinate slice with no compute."""
+    mat = _matrix(120)
+    full = pb._project_tsne(mat, paths=_paths(120), config_key="cfg")
+    fit = next(iter(pb._tsne_fit_cache.values()))
+    assert fit.paths == _paths(120)
+    assert fit.embedding.affinities.P.shape == (120, 120)
+    assert fit.coords.shape == (120, 2)
+
+    again = pb._project_tsne(mat, paths=_paths(120), config_key="cfg")
+    assert np.array_equal(again, full)
+    assert pb.tsne_fit_stats() == {"fit": 1, "transform": 0, "reuse": 1, "evict": 0}
+
+
 def test_stale_persisted_fit_ignored_after_recipe_change():
     """A blob written before the recipe bump (old, un-namespaced key) is a miss.
 
@@ -263,50 +279,115 @@ def test_stale_persisted_fit_ignored_after_recipe_change():
     assert ns_key in store.blobs
 
 
+def test_recipe_bump_10_invalidates_persisted_v9_fit():
+    """A version-9 fit key is a miss under the centroid/1.25 recipe (version 10)."""
+    store = _FakeFitStore()
+    v9_key = "cfg|opentsne_recipe=9"
+    store.blobs[v9_key] = b"version-9 fit blob"
+    mat = _matrix(120)
+    out = pb._project_tsne(
+        mat, paths=_paths(120), config_key="cfg", feature_cache=store
+    )
+    assert out.shape == (120, 2)
+    assert pb.PROJECTION_RECIPE_VERSION == 10
+    assert pb.tsne_fit_stats()["fit"] == 1
+    assert store.blobs[v9_key] == b"version-9 fit blob"
+    assert "cfg|opentsne_recipe=10" in store.blobs
+
+
 def test_fit_uses_production_iter_budget(monkeypatch):
-    """The production openTSNE fit passes the configured iteration budget."""
+    """The production chain's FINAL fit passes the configured budget; the coarse
+    levels run one normal iteration each with early exaggeration only first."""
     import openTSNE
 
     from backend.embeddings.projection_config import (
         OPENTSNE_EARLY_EXAGGERATION_ITER,
+        OPENTSNE_FINAL_EXAGGERATION,
         OPENTSNE_N_ITER,
     )
 
-    calls: dict = {}
+    calls: list[dict] = []
 
     class _RecordingTSNE:
         def __init__(self, **kwargs):
-            calls.update(kwargs)
+            calls.append(dict(kwargs))
 
-        def fit(self, x):
-            return np.zeros((len(x), 2), dtype=np.float32)
+        def fit(self, x, initialization=None):
+            dims = calls[-1]["n_components"]
+            if initialization is not None:
+                assert initialization.shape == (len(x), dims)
+            return np.zeros((len(x), dims), dtype=np.float32)
 
     monkeypatch.setattr(openTSNE, "TSNE", _RecordingTSNE)
     pb._fit_tsne(_matrix(120))
-    assert calls["n_iter"] == OPENTSNE_N_ITER
-    assert calls["early_exaggeration_iter"] == OPENTSNE_EARLY_EXAGGERATION_ITER
+
+    # Multilevel: a coarse chain then the full-data final fit.
+    assert len(calls) > 1
+    assert calls[-1]["n_iter"] == OPENTSNE_N_ITER == 50
+    assert calls[-1]["early_exaggeration_iter"] == OPENTSNE_EARLY_EXAGGERATION_ITER == 0
+    assert calls[-1]["exaggeration"] == pytest.approx(OPENTSNE_FINAL_EXAGGERATION)
+    assert calls[-1]["perplexity"] == pytest.approx(30.0)
+    # Fewer than 16 coarse levels survive at this n, so the fixed 16-iteration
+    # budget spreads across them (one or more each), never into the final fit.
+    assert sum(c["n_iter"] for c in calls[:-1]) == 16
+    assert all(c["n_iter"] >= 1 for c in calls[:-1])
+    assert calls[0]["early_exaggeration_iter"] == 100
+    assert all(c["early_exaggeration_iter"] == 0 for c in calls[1:-1])
 
 
-def test_fit_receives_requested_iter_budget(monkeypatch):
-    """A requested budget flows through ``_project_tsne`` to the openTSNE fit."""
+def test_production_fitter_multilevel_both_dims(monkeypatch):
+    """The production fitter is multilevel in 2-D and 3-D; the 3-D final fit keeps
+    ``n_components=3`` and a 3-column coordinate matrix."""
     import openTSNE
 
-    calls: dict = {}
+    calls: list[dict] = []
 
     class _RecordingTSNE:
         def __init__(self, **kwargs):
-            calls.update(kwargs)
+            calls.append(dict(kwargs))
 
-        def fit(self, x):
-            return np.zeros((len(x), 2), dtype=np.float32)
+        def fit(self, x, initialization=None):
+            dims = calls[-1]["n_components"]
+            return np.zeros((len(x), dims), dtype=np.float32)
+
+    monkeypatch.setattr(openTSNE, "TSNE", _RecordingTSNE)
+
+    _emb2, coords2 = pb._fit_tsne(_matrix(120), dims=2)
+    assert coords2.shape == (120, 2)
+    assert calls[-1]["n_components"] == 2
+    assert len(calls) > 1
+
+    calls.clear()
+    _emb3, coords3 = pb._fit_tsne(_matrix(120), dims=3)
+    assert coords3.shape == (120, 3)
+    assert calls[-1]["n_components"] == 3
+    assert calls[-1]["negative_gradient_method"] == "bh"
+    assert len(calls) > 1
+
+
+def test_fit_receives_requested_iter_budget(monkeypatch):
+    """A requested budget flows through ``_project_tsne`` to the final openTSNE
+    fit only (the coarse schedule stays fixed)."""
+    import openTSNE
+
+    calls: list[dict] = []
+
+    class _RecordingTSNE:
+        def __init__(self, **kwargs):
+            calls.append(dict(kwargs))
+
+        def fit(self, x, initialization=None):
+            dims = calls[-1]["n_components"]
+            return np.zeros((len(x), dims), dtype=np.float32)
 
     monkeypatch.setattr(openTSNE, "TSNE", _RecordingTSNE)
     pb._project_tsne(
         _matrix(60), paths=_paths(60), config_key="cfg",
         tsne_n_iter=250, tsne_early_exaggeration_iter=150,
     )
-    assert calls["n_iter"] == 250
-    assert calls["early_exaggeration_iter"] == 150
+    assert calls[-1]["n_iter"] == 250
+    assert calls[-1]["early_exaggeration_iter"] == 150
+    assert sum(c["n_iter"] for c in calls[:-1]) == 16
 
 
 def test_budget_override_refits_instead_of_reusing():

@@ -1,9 +1,12 @@
--> Allow "bloom scroll" on the cluster to map to another clustering granularity
+-> Allow "bloom scroll" on the cluster coloring; i.e. scrolling can bloom selection at a finer/rougher clustering level
 
--> Moved 3d toggle to view properties panel?
--> Make the dots have a "real size" i.e. scale with distance in 3d view
+-> Add a third tabbable view layer "iso-surfaces":
+  Off / Predicted folders / Clusters
+  Or maybe it should just be an "iso-surface" toggle when inside the predicted folder or cluster colour mode? (which would renfer those iso-blobs instead of the per-track metaballs)
 
--> Maybe also Cluster granularity? And source weights?
+-> Move into "view options"
+  2D/3D toggle
+  Cluster granularity?
 
 -> "Move to my library"-button not working?
 
@@ -46,8 +49,8 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
   **frozen reference set** and cache it in a chart artifact, then apply it
   statelessly. That gives distribution matching without the drift. This is the same
   `chart_revision` split the landmark extension needs — do both together.
-  (`PROJECTION_RECIPE_VERSION` is already 8, bumped for the openTSNE 100/100
-  iteration budget; a normalisation change would bump it again.)
+  (`PROJECTION_RECIPE_VERSION` is already 10; a normalisation change would bump it
+  again.)
 - [ ] **Pick the technique and measure it.** Cheapest first: per-source z-score
   (`clustering._standardize`); **whitening** (ZCA/PCA) to equalise covariance;
   **CORAL** to align second-order statistics; **CCA / Deep CCA** for a shared
@@ -507,7 +510,7 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       `UnboundLocalError` on a pre-reduced float32 matrix (its PCA branch expects the
       raw input); `_project_tsne_fallback` passes the raw composite, so this is latent —
       do not "optimise" by pre-reducing there. Also: the fallback chain does not pass
-      the production 100/100 iteration budget through, so the map differs by backend —
+      the production 50/0 iteration budget through, so the map differs by backend —
       decide whether to thread `OPENTSNE_N_ITER` / `OPENTSNE_EARLY_EXAGGERATION_ITER`
       through or accept and document the difference. Files:
       `backend/embeddings/projection_backends.py`.
@@ -571,14 +574,20 @@ Baselines and measured conclusions live in `audio_pipeline.md` → *Per-stage th
       allocation per stage before adding workers or batches.
 - [ ] **Cluster/projection timing at scale.** `DEFAULT_RESOLUTIONS` and k=20 were
       calibrated at ~9.5k tracks; re-measure once the library doubles.
-- [ ] **Layout-evaluation gallery: fidelity + cold/warm benchmarking.** The first
-      gallery (eight precomputed maps in `backend/embeddings/layout_evaluation.py`)
-      is generation-only — it records timings but no neighbourhood-recall or
-      cold/warm/insertion comparison. Extend it to score each recipe's layout with
-      the existing fidelity harness (`backend/embeddings/layout_fidelity.py`) and
-      measure a warm re-run (the per-recipe PCA is currently recomputed; the
-      manifest notes the UMAP JIT cost on a fresh process). Files:
-      `backend/embeddings/layout_evaluation.py`.
+- [ ] **Layout-evaluation: score the remaining generated galleries.** The
+      scaling benchmark (`backend/benchmark_layout_scaling.py`) scores selected
+      recipe sets across library sizes, and `hierarchy-ramps-timings.json` scores
+      the 14 fraction/density/gamma recipes at the 7,153-track library-root
+      cohort. Still missing: per-artifact neighbourhood-recall for `base`, the
+      `budget`/`scale`/`early`/`mixes`/`ablation` sets, and the
+      `hierarchy`/`hierarchy-budget`/`hierarchy-depth` galleries (the other
+      built-in sets have a full-scale scaling report). Apply
+      `backend/embeddings/layout_fidelity.py` to every map already generated; do
+      not regenerate just to score. Questions: do the 500/1000/2000 coarse samples
+      seed landmarks that survive the refinement, is there a coarse-budget floor,
+      and does multilevel depth beat a two-level map at the same final budget?
+      Files: `backend/embeddings/layout_evaluation.py`,
+      `backend/benchmark_layout_scaling.py`.
 
 ## Projection speed and quality follow-ups
 
@@ -606,15 +615,18 @@ neighbourhood sweeps) are not re-listed; measured conclusions live in
       composite space would separate representation limits from projection limits (the
       user observed CLAP/rhythm-only maps are diffuse). Reuse the experimental score
       CSV/ranking; the metric harness is done, the UI is not.
-- [ ] **Measure end-to-end first projection after a restart** on the real library;
-      the cache wins in `audio_pipeline.md` → *Projection caching* are measured per
-      call only.
+- [ ] **Measure request-level first projection after a restart** on the real library.
+      The cache wins in `audio_pipeline.md` → *Projection caching* are measured per
+      call only; capture the actual first `/api/embeddings/projection` latency
+      (queue + gather + fit + Nyström, not the benchmark's pipeline estimate) and a
+      warm re-run. The gallery's per-recipe PCA is recomputed and UMAP pays a JIT
+      cost on a fresh process, so include one cold gallery generation too.
 - [ ] **Per-track `has()` / per-job SQLite connection churn in analysis workers**
       (`services/analysis_pipeline.py`, `embeddings/feature_cache.py`,
       `jobs/queue.py`) is deliberately unchanged: invariant 11 closes the handle
       per call for FD-leak reasons, and the gain would be ~0.1 ms/call. Accepted
       unless profiling shows analysis throughput is connection-bound; do not hold
       connections across rows.
-- [ ] **Split `backend/embeddings/layout_evaluation.py`** (1250 lines): the seams
+- [ ] **Split `backend/embeddings/layout_evaluation.py`**: the seams
       are recipes + registry / fit primitives + alignment / generation + manifest
       IO.

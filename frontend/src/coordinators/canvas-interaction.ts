@@ -1118,25 +1118,24 @@ export class CanvasInteractionController {
 
   private _computeFitVP(): { ox: number; oy: number; zoom: number } {
     const m = this.deps.model;
-
-    // In embedding mode positions are already normalised to [0,1], so the
-    // default viewport shows everything.
-    if (m.viewMode === "embeddings") return { ox: 0, oy: 0, zoom: 1 };
-
     const visible = m.tracks.filter((t) => m.isVisible(t));
     if (visible.length === 0) return { ox: 0, oy: 0, zoom: 1 };
 
+    // The same world-position helper the canvas draws from (tag axes, embedding
+    // positions, a scope's re-layout, the 3-D view frame), so a fit frames what
+    // is actually on screen rather than assuming embedding coordinates fill the
+    // unit box.
     let minX = Infinity,
       maxX = -Infinity,
       minY = Infinity,
       maxY = -Infinity;
     for (const t of visible) {
-      const wx = m.axisX ? m.axisScalar(t, m.axisX) : 0.5;
-      const wy = m.axisY ? m.axisScalar(t, m.axisY) : 0.5;
-      if (wx < minX) minX = wx;
-      if (wx > maxX) maxX = wx;
-      if (wy < minY) minY = wy;
-      if (wy > maxY) maxY = wy;
+      const p = this.deps.canvas.worldPosForTrack(t);
+      if (!p) continue;
+      if (p.wx < minX) minX = p.wx;
+      if (p.wx > maxX) maxX = p.wx;
+      if (p.wy < minY) minY = p.wy;
+      if (p.wy > maxY) maxY = p.wy;
     }
     if (maxX - minX < 0.01 && maxY - minY < 0.01)
       return { ox: 0, oy: 0, zoom: 1 };

@@ -6,7 +6,7 @@ from typing import Any
 
 
 TrackInfosKey = tuple[str, bool, str]
-StatusCoverageKey = tuple[str, int, str]
+StatusCoverageKey = tuple[str, int, str, str | None]
 
 
 class EmbeddingStatusCache:

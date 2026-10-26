@@ -31,15 +31,18 @@ from backend.embeddings.coverage import (
 from backend.embeddings.feature_cache import FeatureCache
 from backend.embeddings.layout import compute_projection as real_compute_projection
 from backend.embeddings.librosa_audio_features import audio_features_display_bpm_key
+from backend.embeddings.projection_config import FROZEN_SOURCES
 from backend.factory import _register_error_handlers
 from backend.routes.api_embeddings import create_api_embeddings_blueprint
 from backend.routes.api_library import create_api_library_blueprint
 from backend.services.embedding_status_cache import EmbeddingStatusCache
 from backend.services.layout_revision_for_status import layout_revision_for_projection
+from backend.services.lens_layout import compute_lens_projection
 from backend.services.parallel_reads import iter_parallel_reads, read_paths_parallel
 from backend.services.projection_request import (
     embedding_projection_query_fingerprint,
     parse_projection_params,
+    projection_params_for_lens,
 )
 from backend.services.track_payload import build_track_list, track_dict_from_read
 from backend.services.virtual_paths import list_mp3s, virtual_from_abs
@@ -73,6 +76,7 @@ class _FakeEmbeddings:
             "paths": [t["path"] for t in infos],
             "has_align_ref": "align_ref" in _k,
             "align_ref": _k.get("align_ref"),
+            "gauge_scope": _k.get("gauge_scope"),
             "with_jacobian": bool(_k.get("with_jacobian")),
         })
         if self.fail_on_dims2 and dims == 2:
@@ -89,8 +93,14 @@ class _FakeEmbeddings:
             for t in infos
         ]
         if _k.get("with_jacobian"):
-            # Mirrors the real signature: (positions, per-source jacobian).
-            jacobian = {"clap": np.zeros((len(infos), dims), dtype=np.float32)}
+            # Mirrors the real signature: (positions, per-source jacobian). With
+            # fewer than two tracks there is no chart, so the real fallback yields
+            # an empty (not empty-shaped) Jacobian.
+            jacobian = (
+                {"clap": np.zeros((len(infos), dims), dtype=np.float32)}
+                if len(infos) >= 2
+                else {}
+            )
             return positions, jacobian
         return positions
 
@@ -157,7 +167,14 @@ def fake_embeddings():
 
 @pytest.fixture
 def client(roots, tmp_path, fake_embeddings):
+    return _make_client(roots, tmp_path, fake_embeddings)
+
+
+def _make_client(
+    roots, tmp_path, fake_embeddings, *, genre_full_enabled=False, library_roots=None
+):
     roots_map = roots
+    library_roots = ["a"] if library_roots is None else list(library_roots)
     executor = ThreadPoolExecutor(max_workers=2)
 
     def cached_read_all(path: str) -> dict:
@@ -236,9 +253,11 @@ def client(roots, tmp_path, fake_embeddings):
         library_mtime_signature=library_signature,
         track_infos_cached=track_infos_cached,
         projection_query_fingerprint=embedding_projection_query_fingerprint,
-        parse_projection_params_fn=parse_projection_params,
+        parse_projection_params_fn=lambda req, **kw: parse_projection_params(
+            req, genre_full_enabled=genre_full_enabled, **kw
+        ),
         build_track_infos_fn=build_infos,
-        library_root_ids=lambda: ["a"],
+        library_root_ids=lambda: library_roots,
         resolve_virtual_path=lambda rel: rel,
         virtual_from_abs_path=virtual_from_abs_fn,
         broadcast_embed_event=lambda _e: None,
@@ -249,7 +268,7 @@ def client(roots, tmp_path, fake_embeddings):
         job_queue=_FakeQueue(),
         maest_mod=_FakeMaest(),
         mert_mod=_FakeMert(),
-        genre_full_enabled=False,
+        genre_full_enabled=genre_full_enabled,
         mert_enabled=False,
         rhythm_version=1,
         structure_version=1,
@@ -407,6 +426,93 @@ def test_projection_fit_scope_library_matches_default_revision(client):
     assert scoped["revision"] == default["revision"]
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "?folder=a/sub",
+        "?include_external=1",
+        "?include_external=1&fit_scope=all",
+        "?sources=clap",
+        "?w=clap:1",
+        "?dims=2",
+        "?dims=3",
+    ],
+)
+def test_projection_gauge_scope_is_the_configured_library_roots(
+    fake_embeddings, client, query
+):
+    """Every production request — folder, external, source, weights, 2-D and the
+    3-D reference/main pair — uses one workspace family, derived from the
+    configured library roots rather than the selected paths."""
+    fake_embeddings.calls.clear()
+    r = client.get("/api/embeddings/projection" + query)
+    assert r.status_code == 200
+    assert fake_embeddings.calls
+    assert {c["gauge_scope"] for c in fake_embeddings.calls} == {"library:a"}
+
+
+def test_projection_genre_and_source_lenses_share_the_gauge_scope(
+    roots, tmp_path, fake_embeddings
+):
+    client = _make_client(roots, tmp_path, fake_embeddings, genre_full_enabled=True)
+    for query in ("?recipe=genre_full", "?recipe=genre_full&dims=3"):
+        fake_embeddings.calls.clear()
+        r = client.get("/api/embeddings/projection" + query)
+        assert r.status_code == 200, r.get_json()
+        assert {c["gauge_scope"] for c in fake_embeddings.calls} == {"library:a"}
+
+
+def _status_and_projection_revisions(client, query: str) -> tuple[str, str]:
+    status = client.get("/api/embeddings/status" + query)
+    projection = client.get("/api/embeddings/projection" + query)
+    assert status.status_code == 200, status.get_json()
+    assert projection.status_code == 200, projection.get_json()
+    return status.get_json()["layout_revision"], projection.get_json()["revision"]
+
+
+def test_coordinate_revision_follows_the_configured_scope(roots, tmp_path):
+    """The same visible slice under a different configured root set is a different
+    frame: status and the projection route must agree, the prefetch must warm that
+    same revision, and the fit cache must stay scope-independent."""
+    client_a = _make_client(roots, tmp_path, _FakeEmbeddings(), library_roots=["a"])
+    client_ab = _make_client(
+        roots, tmp_path, _FakeEmbeddings(), library_roots=["a", "b"]
+    )
+    status_a, proj_a = _status_and_projection_revisions(client_a, "?folder=a")
+    status_ab, proj_ab = _status_and_projection_revisions(client_ab, "?folder=a")
+    assert status_a == proj_a
+    assert status_ab == proj_ab
+    assert status_a != status_ab
+
+    # The prefetch path, through the same shared implementation the route uses.
+    cache = FeatureCache(str(tmp_path / "prefetch.db"))
+    versions = SourceVersions(
+        clap=1,
+        features=1,
+        maest=1,
+        rhythm=1,
+        supervised=0,
+        structure=1,
+        maest_layer7=1,
+        mert_l19=1,
+    )
+    for expected, library_roots in ((proj_a, ["a"]), (proj_ab, ["a", "b"])):
+        _positions, revision = compute_lens_projection(
+            [{"path": "a/one.mp3", "fingerprint": "fp-one.mp3"}],
+            cache,
+            projection_params_for_lens(FROZEN_SOURCES, None),
+            embeddings_mod=_FakeEmbeddings(),
+            batch_fetch_maps=batch_fetch_maps,
+            layout_revision_for_projection=layout_revision_for_projection,
+            source_versions=versions,
+            embedding_version=1,
+            user=False,
+            library_root_ids=library_roots,
+        )
+        assert revision == expected
+
+
 def test_list_mp3s_root_ids_limits_all_roots_walk(roots):
     assert len(list_mp3s("", roots, recursive=True)) == 6
     scoped = list_mp3s("", roots, recursive=True, root_ids=["a"])
@@ -454,6 +560,32 @@ def test_projection_dims_bogus_is_400(client):
     r = client.get("/api/embeddings/projection?dims=bogus")
     assert r.status_code == 400
     assert r.get_json()["error"]
+
+
+def test_projection_empty_folder_jacobian_returns_no_chart(
+    fake_embeddings, client, monkeypatch
+):
+    """A warm (or empty) layout with ``jacobian=1`` must stay a tuple response.
+
+    The cache early-return used to hand the route a bare positions list, so the
+    unpack raised and the request 500'd. Repeating the request hits the cached
+    revision; an empty folder and a one-track folder both have no chart.
+    """
+    from backend.embeddings import landmark_projection as landmark_mod
+
+    monkeypatch.setattr(landmark_mod, "landmark_model_for", lambda *a, **k: None)
+    for _ in range(2):
+        r = client.get("/api/embeddings/projection?folder=a/empty&jacobian=1")
+        assert r.status_code == 200, r.get_json()
+        body = r.get_json()
+        assert body["positions"] == []
+        assert body["jacobian"] == {}
+
+    r = client.get("/api/embeddings/projection?folder=a/sub&jacobian=1")
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    assert len(body["positions"]) == 1
+    assert body["jacobian"] == {}
 
 
 def test_projection_dims3_no_landmark_jacobian_returns_exact_and_empty(
@@ -526,6 +658,39 @@ def test_projection_dims3_reference_uses_raw_fit_scope(fake_embeddings, client):
     assert ref_call["paths"] == _library_paths()
     assert main_call["paths"] == _all_paths()
     assert [p["path"] for p in main_call["align_ref"]] == ref_call["paths"]
+
+
+def test_projection_dims3_reference_uses_only_fitted_tracks(
+    fake_embeddings, client, monkeypatch
+):
+    """Externals placed by Nyström on the 2-D reference must not become the 3-D
+    alignment target: placement is approximate, so only fitted rows are used."""
+    from backend.embeddings import landmark_projection as landmark_mod
+
+    class _Model:
+        def __init__(self, paths):
+            self.paths = paths
+
+        def evaluate(self, _weights):
+            return np.zeros((len(self.paths), 2), dtype=np.float32)
+
+    def _model(revision, base_infos, feature_cache, base_positions, *, place_infos=None, **_kw):
+        if not place_infos:
+            return None
+        paths = [p["path"] for p in base_infos] + [p["path"] for p in place_infos]
+        return _Model(paths)
+
+    monkeypatch.setattr(landmark_mod, "landmark_model_for", _model)
+    fake_embeddings.calls.clear()
+    r = client.get(
+        "/api/embeddings/projection?dims=3&include_external=1&fit_scope=library"
+    )
+    assert r.status_code == 200
+    ref_call, main_call = fake_embeddings.calls
+    assert ref_call["paths"] == _library_paths()
+    assert main_call["paths"] == _all_paths()
+    # The reference contains the placed externals, but align_ref must not.
+    assert [p["path"] for p in main_call["align_ref"]] == _library_paths()
 
 
 def test_projection_dims3_reference_failure_still_returns_positions(

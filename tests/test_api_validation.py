@@ -587,15 +587,17 @@ def test_projection_weight_spec_out_of_range_is_400():
 
 
 def test_default_recipe_is_byte_identical():
-    """An omitted recipe parses to the frozen default (100/100, no recipe id)."""
+    """An omitted recipe parses to the frozen default (50/0, no recipe id)."""
     from backend.embeddings.projection_config import FROZEN_SOURCES
 
     p = parse_projection_params(_Req({}))
     assert p.recipe_id is None
-    assert p.tsne_n_iter == 100
-    assert p.tsne_early_exaggeration_iter == 100
+    assert p.tsne_n_iter == 50
+    assert p.tsne_early_exaggeration_iter == 0
     assert p.sources == FROZEN_SOURCES
     assert p.source_weights is None
+    assert p.folder_boost == pytest.approx(2.4)
+    assert p.folder_depth_boost == pytest.approx(3.0)
 
 
 def test_genre_full_recipe_requires_the_feature_gate():
@@ -637,9 +639,9 @@ def test_genre_full_recipe_enabled_sets_sources_weights_and_budget():
     assert p.recipe_id == "genre_full"
     assert p.sources == GENRE_FULL_SOURCES
     assert p.source_weights == GENRE_FULL_RECIPE_WEIGHTS
-    # The user-agreed 100/100 default.
-    assert p.tsne_n_iter == 100
-    assert p.tsne_early_exaggeration_iter == 100
+    # The user-agreed 50/0 default (multilevel final fit).
+    assert p.tsne_n_iter == 50
+    assert p.tsne_early_exaggeration_iter == 0
     assert p.required_sources == ("maest_logits", "maest")
 
 
@@ -689,13 +691,13 @@ def test_genre_full_weight_override_rejects_all_zero():
 
 
 def test_genre_full_weight_override_keeps_recipe_budget():
-    """An override retains the recipe identity and its 100/100 budget."""
+    """An override retains the recipe identity and its 50/0 budget."""
     p = parse_projection_params(
         _Req({"recipe": "genre_full", "w": "rhythm:0.1"}), genre_full_enabled=True
     )
     assert p.recipe_id == "genre_full"
-    assert p.tsne_n_iter == 100
-    assert p.tsne_early_exaggeration_iter == 100
+    assert p.tsne_n_iter == 50
+    assert p.tsne_early_exaggeration_iter == 0
 
 
 def test_projection_recipe_unknown_is_400():
@@ -730,8 +732,14 @@ def test_tsne_iteration_params_apply_to_genre_recipe():
 
 
 def test_tsne_n_iter_bounds_are_validated():
+    # The production default (50/0) is accepted explicitly: the floor is the
+    # default, not an arbitrary minimum above it.
+    p = parse_projection_params(
+        _Req({"tsne_n_iter": "50", "tsne_early_exaggeration_iter": "0"})
+    )
+    assert (p.tsne_n_iter, p.tsne_early_exaggeration_iter) == (50, 0)
     with pytest.raises(ApiValidationError):
-        parse_projection_params(_Req({"tsne_n_iter": "99"}))  # below 100
+        parse_projection_params(_Req({"tsne_n_iter": "49"}))  # below 50
     with pytest.raises(ApiValidationError):
         parse_projection_params(_Req({"tsne_n_iter": "2001"}))  # above 2000
     with pytest.raises(ApiValidationError):

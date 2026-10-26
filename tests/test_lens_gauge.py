@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from backend.embeddings import lens_gauge
+from backend.embeddings.layout import _normalise_coords
 
 
 @pytest.fixture(autouse=True)
@@ -44,12 +45,14 @@ def test_a_reflected_layout_is_flipped_back():
 
 
 def test_rotation_and_scale_are_undone():
-    pts = _cloud()
+    pts = _normalise_coords(_cloud())
     paths = [f"t{i}" for i in range(len(pts))]
     lens_gauge.gauge_layout("fam", paths, pts)
     moved = (2.5 * (_rot(37) @ pts.T)).T + np.array([4.0, -3.0])
     out = lens_gauge.gauge_layout("fam", paths, moved)
-    assert np.allclose(out, pts, atol=1e-6)
+    # Orientation is restored; the final per-axis display normalisation then
+    # removes the input's uniform scale.
+    assert np.allclose(_normalise_coords(out), pts, atol=1e-6)
 
 
 def test_alignment_preserves_shape():

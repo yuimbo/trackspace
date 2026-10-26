@@ -33,6 +33,7 @@ backend/
     clustering.py         weighted blocks → PCA → cosine kNN → multi-resolution Leiden
     supervised.py         folder-supervised 128-D projection head (weak supervision)
     layout_evaluation.py  precomputed eval maps + manifest (read-only over caches)
+    multilevel_tsne.py    reusable multilevel t-SNE core: expansion, level loop, fraction schedule
     rhythm_features.py    14-D rhythm/DSP descriptors
     clap.py               CLAP audio + text encoder
     clap_describe.py      zero-shot phrase bank + contrastive semantic coordinates
@@ -90,7 +91,7 @@ data/                     SQLite caches (gitignored, created at runtime)
 | Feature cache | `backend/embeddings/feature_cache.py` | 883 | One generic `_SOURCES` registry + fan-out journal + origin memory |
 | Clustering | `backend/embeddings/clustering.py` | 578 | |
 | Layout fidelity (bench) | `backend/embeddings/layout_fidelity.py` | 61 | Neighbourhood recall; imported only by tests, not production |
-| Layout evaluation | `backend/embeddings/layout_evaluation.py` | 1250 | Eval recipes + fitting + manifest/artifact IO (read-only) |
+| Layout evaluation | `backend/embeddings/layout_evaluation.py` | — | Eval recipes + fitting + manifest/artifact IO (read-only) |
 | Frontend orchestration | `frontend/src/controller.ts` | 1231 | Wiring, data loading, tag-write queue, preview, keyboard |
 | Analysis coordinator | `frontend/src/coordinators/analysis-coordinator.ts` | 1108 | Queue SSE + cluster panel + source weights |
 | Head coordinator | `frontend/src/coordinators/head-coordinator.ts` | 730 | Head info + train/export/import/compare, imprint, fan-out undo |
@@ -148,7 +149,7 @@ is unit-testable without the DOM-heavy views — see `coordinators/*.test.ts`.
 `model.evalMode` is set for the session: `lib/api.ts` refuses every non-GET
 request (`isEvalReadOnly`), `Model.saveLS` is a no-op, and no lens/scope/weight
 compute runs — so the write invariants above hold even while the gallery is open.
-See README.md → *Layout evaluation*.
+See layout-evaluation.md.
 
 ### Event bus: two granularities of change
 
@@ -331,14 +332,38 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   (`{path, x, y}`), revision and timing. Only recipes the current manifest marks
   `complete` are served; ids are validated (`[A-Za-z0-9_-]+`) and
   missing/corrupt/non-finite artifacts are a JSON error. `?set=` selects one of
-  the fixed named sets (`base`, `budget`, `scale`, `early`, `mixes`, `ablation`).
-  Usage and the set recipes live in README.md → *Layout evaluation*; this file
+  the `GALLERY_SETS` names (every non-`base` set is a fixed subdirectory of the
+  eval dir). Usage and the set recipes live in layout-evaluation.md; this file
   only inventories the surface.
+- **`/api/embeddings/projection-settings` is the cheap projection-config read.**
+  It parses the same `method` / `dims` / `recipe` / `sources` / `w` /
+  `tsne_*` query as `GET /api/embeddings/projection` and returns the effective
+  source weights (all sources, zeros outside the active lens), the editable weight
+  keys, the recipe id, the budget defaults, and the frozen folder-basis /
+  coarse-schedule / audio-feature constants. It performs no library scan, model load
+  or fit, and the final-fit perplexity is a textual rule because the runtime track
+  count is deliberately not resolved. `EmbeddingCoordinator` fetches it per
+  projection query (cached, sequence-guarded, eval-inert) and `AnalysisCoordinator`
+  renders the fixed/absent influences and processing readouts in the View options
+  panel.
+- **The production projection is one multilevel sample-init t-SNE chain for every
+  lens.** `embeddings/projection_backends._fit_tsne` delegates to
+  `embeddings/multilevel_tsne.py`; the fraction span, coarse budget, gamma
+  schedule, final-fit budget, late exaggeration and production perplexity rule are
+  single-sourced in `audio_pipeline.md` → *Projection methods*. The schedule
+  depends only on `n` and the output dimensionality, so 2-D and 3-D (and the
+  `default` and `genre_full` recipes) share it; the recipe selects the
+  sources/weights, not the optimiser. Production folder weighting is the
+  centroid-only semantic basis (`audio_pipeline.md` → *Semantic weighting*), and
+  data-driven folder directions apply without CLAP when the recipe has no CLAP
+  column and no tags. The fit is cached and persisted under
+  `PROJECTION_RECIPE_VERSION` (10), so a cold fit is paid once and later library
+  additions are placed with `TSNEEmbedding.transform`.
 - **The projection request selects a canonical recipe and an openTSNE budget.**
   `GET /api/embeddings/projection` accepts `recipe=genre_full` (the default pure-genre
   lens — Genre is the default; `--no-genre-full` disables its analysis blocks — which
   fixes its sources/weights/budget, mutually exclusive with `sources=`/`w=`) and
-  `tsne_n_iter` (100–2000) /
+  `tsne_n_iter` (50–2000) /
   `tsne_early_exaggeration_iter` (0–1000) overrides of the active recipe's budget. Any
   deviation is part of `layout_revision` and the fit-cache key, so a user-chosen budget
   never shares a fit with the recipe default. `POST /api/clusters/rebuild` accepts
@@ -347,6 +372,28 @@ fan-out's pre-move relative folder survives the move journal being pruned.
   separate, explicit action. The recipe registry, weights and budgets are single-sourced
   in `backend/embeddings/projection_config.py`; the cluster ids/weights alias that
   registry (`clustering.CLUSTER_RECIPE_IDS` / `CLUSTER_GENRE_FULL_WEIGHTS`).
+- **Every lens over a configured library shares one gauge family.** The projection
+  route, the status revision and the layout-prefetch job pass the configured library
+  root ids as the canonical `library:<id>|<id>` scope
+  (`services/lens_layout.gauge_scope_for`), for 2-D, the 3-D head-on reference and
+  every lens recipe alike. The scope never comes
+  from the requested folder, so a folder subset or external-only view stays in the
+  same workspace frame; it is also part of the coordinate `layout_revision`, so
+  changing the configured roots/roles re-keys the coordinates rather than serving
+  the previous frame (the t-SNE fit cache is untouched and still reused). With no
+  library roots it is omitted and the root prefixes
+  of the request paths are the fallback, absolute paths being scoped by their common
+  ancestor. The gauge applies only rotation,
+  reflection and translation (uniform scale ignored), and the final served
+  coordinates are normalised per axis, so every lens fills `[0, 1]` on every axis.
+  That per-axis stretch is intentional display geometry: cross-lens orientation is
+  preserved, exact 2-D/3-D overlay and distance ratios are not. The family
+  reference is the first layout with at least `MIN_SHARED` (8) shared tracks;
+  disjoint layouts are excluded by the overlap guard rather than aligned by guess,
+  so a shared family is a workspace convention, not a promise that every pair of
+  lenses lines up. The reference revision is persisted in `FeatureCache` metadata
+  and restored on a cache hit; if that row is pruned, the next complete layout
+  replaces the pointer. See `audio_pipeline.md` → *Lens gauge*.
 - **MERT is an independent `mert` job kind.** Genre is the default, so layer-7 is always
   captured by the MAEST job; MERT is wired when the server was started without
   `--no-mert` **and** with `--trust-remote-code` (the CC-BY-NC licence is accepted by
@@ -415,10 +462,12 @@ with vitest coverage:
   exclusions, filters, external) with `push`/`update`/`dismiss`/`remove`/`popNewest`, plus
   the corner chip view. See `design-patterns.md` → *Active view modifiers*.
 - ✅ `EvaluationCoordinator` — the read-only eval gallery (`?layout_eval=1`):
-  manifest fetch + schema-version check, per-recipe artifact load, blind-letter
-  map ordering, ratings persistence/export, and the read-only session wiring
-  (`setEvalReadOnly` / `model.evalMode`). It owns no write path — `lib/api.ts`
-  refuses non-GET while eval is active. Usage: README.md → *Layout evaluation*.
+  manifest fetch + schema-version check, per-recipe artifact load, one blind letter
+  per paired `group` (2-D base + explicit 3-D sibling), the selected-dimension
+  toggle, ratings persistence/export keyed by artifact revision, and the read-only
+  session wiring (`setEvalReadOnly` / `model.evalMode` / `model.evalDims`). It owns
+  no write path — `lib/api.ts` refuses non-GET while eval is active. Usage:
+  layout-evaluation.md.
 
 **Cross-cutting unification** — the recurring UI/async/data shapes were pulled into shared
 modules so a concept has one definition:

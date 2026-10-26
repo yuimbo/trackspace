@@ -26,6 +26,8 @@ import { type Lens, GENRE_FULL_LENS, GENRE_FULL_SOURCES, GENRE_FULL_WEIGHTS, get
 import { toast } from "../lib/toast";
 import { api, postJSON } from "../lib/api";
 import { clamp } from "../lib/util";
+import type { EvalDims } from "../lib/layout-eval";
+import type { ProjectionSettings } from "../lib/projection-settings";
 import { SseSubscription, latestSeq } from "../lib/async";
 import type { ViewModifierSink } from "./view-modifier-coordinator";
 import {
@@ -40,6 +42,8 @@ type EmbeddingLayoutStatusHint = {
 };
 
 const LAYOUT_CACHE_MAX = 8;
+/** Cap on cached projection-settings payloads (one per query string). */
+const SETTINGS_CACHE_MAX = 16;
 
 /**
  * Length of the 2-D↔3-D toggle. The camera blend tween and the dot-position
@@ -108,7 +112,8 @@ function _encodeGenreWeights(w: Record<string, number>): string {
  *  Returns ``null`` for an empty field (clear the override), ``undefined`` for an
  *  out-of-range / non-integer / non-finite value (ignored), or the validated int.
  *  Both fields share this so the bound rule lives in one place. ``early`` may be
- *  ``0`` (0 disables early exaggeration); ``nIter`` starts at 100.
+ *  ``0`` (0 disables early exaggeration); ``nIter`` starts at 50, the production
+ *  default (the multilevel chain, not the final-fit count, carries the quality).
  */
 function _parseBoundedOverride(
   text: string,
@@ -226,6 +231,12 @@ export interface EmbeddingDeps {
     /** Position ignoring any scope, for membership and open/close anchors. */
     outerPosForTrack(t: Track): { wx: number; wy: number; wz?: number } | null;
   };
+  /** Render the effective projection configuration in View options. A null
+   *  *settings* means "nothing to show"; *error* explains an unavailable payload. */
+  renderProjectionSettings?(
+    settings: ProjectionSettings | null,
+    error?: string,
+  ): void;
 }
 
 /** Smallest scope half-extent, in world units. */
@@ -240,6 +251,15 @@ export class EmbeddingCoordinator {
   private _projectionFetchPending = false;
   /** Query-string → {revision, positions} map so A→B→A revisits are instant. */
   private _layoutCache = new Map<string, CachedLayout>();
+  /** Query-string → effective projection settings (cheap, never evicts a fit). */
+  private _settingsCache = new Map<string, ProjectionSettings>();
+  /** Monotonic id so a slow settings fetch cannot overwrite a newer lens/view. */
+  private _settingsSeq = latestSeq();
+  /** What the influences panel currently shows (payload identity + error), so a
+   *  resync of an unchanged view never recreates its rows or closes its folds. */
+  private _renderedSettings:
+    | { settings: ProjectionSettings | null; error?: string }
+    | null = null;
 
   /** Source-weight Jacobian at the last fetched weights, for live drags. */
   private _weightJacobian: WeightJacobian | null = null;
@@ -351,13 +371,26 @@ export class EmbeddingCoordinator {
    * frame. Intentionally independent of lens/weights: the map is read-only and
    * never triggers a projection fetch. Switching maps animates the transition the
    * same way a lens switch does, so selection/colour/filters stay stable.
+   *
+   * *dims* commits the artifact dimensionality only after its positions are
+   * applied; a paired 2-D↔3-D switch also tweens the camera blend through the
+   * existing `_tweenBlend` frame so the dots and the orbit arrive together.
    */
-  applyPrecomputedPositions(positions: Map<string, { x: number; y: number }>): void {
+  applyPrecomputedPositions(
+    positions: Map<string, { x: number; y: number; z?: number }>,
+    dims: EvalDims = 2,
+  ): void {
     const m = this.deps.model;
     m.embeddingsReady = true;
+    const targetBlend = dims === 3 ? 1 : 0;
+    const toggles =
+      m.evalMode && (m.evalDims !== dims || m.view3dBlend !== targetBlend);
     // `_animatePositionUpdate` snapshots the current positions first, then sets
     // the new map and lerps between them on the shared frame.
-    this._animatePositionUpdate(positions);
+    this._animatePositionUpdate(positions, toggles ? TOGGLE_MS : undefined);
+    if (!m.evalMode) return;
+    m.setEvalDims(dims);
+    this._tweenBlend(targetBlend);
   }
 
   /** Refetch the layout after a weight change (the query string carries them).
@@ -369,9 +402,91 @@ export class EmbeddingCoordinator {
   refreshProjection(): Promise<void> {
     if (this._evalInert) return Promise.resolve();
     const m = this.deps.model;
-    if (!m.embeddingsReady || m.lens().kind !== "projection")
-      return Promise.resolve();
+    if (m.lens().kind !== "projection") return Promise.resolve();
+    // The applied weights/budget are part of the settings query, so refresh even
+    // when there is no layout to refetch yet.
+    void this.refreshProjectionSettings();
+    if (!m.embeddingsReady) return Promise.resolve();
     return this._fetchProjection();
+  }
+
+  /**
+   * Fetch the effective projection configuration for the active query.
+   *
+   * The backend parses the same query as the layout route and returns every
+   * source's influence, including fixed/disabled blocks, so the influences panel
+   * never re-derives recipe rules. Cached per query string; a response for a
+   * stale lens/dimensionality/budget is dropped by sequence. Eval galleries are
+   * compute-inert: they show a fixed note and never hit production endpoints.
+   */
+  async refreshProjectionSettings(): Promise<void> {
+    if (!this.deps.renderProjectionSettings) return;
+    if (this._evalInert) {
+      this._settingsSeq.next();
+      this._renderSettings(
+        null,
+        "Fixed evaluation configuration — see the gallery metadata.",
+      );
+      return;
+    }
+    const m = this.deps.model;
+    if (m.lens().kind !== "projection") {
+      this._settingsSeq.next();
+      this._renderSettings(null);
+      return;
+    }
+    const qs = this._projectionQueryString();
+    const cached = this._settingsCache.get(qs);
+    if (cached) {
+      this._renderSettings(cached);
+      return;
+    }
+    const seq = this._settingsSeq.next();
+    try {
+      // Inline error below: a failed settings read must not also toast.
+      const settings = await api<ProjectionSettings>(
+        `/api/embeddings/projection-settings?${qs}`,
+        undefined,
+        true,
+      );
+      // A newer request (lens/dimensionality/budget) or a moved view wins.
+      if (!this._settingsSeq.isCurrent(seq)) return;
+      if (qs !== this._projectionQueryString()) return;
+      this._settingsCache.delete(qs);
+      this._settingsCache.set(qs, settings);
+      if (this._settingsCache.size > SETTINGS_CACHE_MAX) {
+        const oldest = this._settingsCache.keys().next().value;
+        if (oldest !== undefined) this._settingsCache.delete(oldest);
+      }
+      this._renderSettings(settings);
+    } catch {
+      // Never leave an older payload on screen pretending it describes this view.
+      if (!this._settingsSeq.isCurrent(seq)) return;
+      if (qs !== this._projectionQueryString()) return;
+      this._settingsCache.delete(qs);
+      this._renderSettings(
+        null,
+        "Projection settings unavailable — switch lens to retry.",
+      );
+    }
+  }
+
+  /**
+   * Publish the settings payload to the panel unless it is already on screen.
+   *
+   * A repeated resync resolves the *same* cached payload object, so identity is
+   * an exact "nothing changed" test: re-rendering would rebuild every influence
+   * row and collapse the open *Processing (fixed)* fold for no reason.
+   */
+  private _renderSettings(
+    settings: ProjectionSettings | null,
+    error?: string,
+  ): void {
+    const shown = this._renderedSettings;
+    if (shown && shown.settings === settings && shown.error === error) return;
+    this._renderedSettings = { settings, error };
+    if (error === undefined) this.deps.renderProjectionSettings?.(settings);
+    else this.deps.renderProjectionSettings?.(settings, error);
   }
 
   /**
@@ -392,7 +507,11 @@ export class EmbeddingCoordinator {
     void this.refreshProjection();
   }
 
-  /** Named presets for the openTSNE iteration control (Fast / Balanced / Gallery). */
+  /** Named presets for the openTSNE iteration control.
+   *
+   *  ``default`` sends no override, so the server fits the active recipe's
+   *  production multilevel budget (50/0). The remaining presets are explicit
+   *  deviations — all longer than the default — kept as named profiles. */
   private static readonly TSNE_PRESETS: Record<
     string,
     { nIter: number; early: number } | null
@@ -420,8 +539,15 @@ export class EmbeddingCoordinator {
     ) as HTMLInputElement | null;
     if (!$preset || !$nIter || !$early) return;
 
-    const readModel = () => {
+    let lastBudgetKey = "";
+    const readModel = (force = false) => {
       const ti = this.deps.model.tsneIterationFor();
+      // Writing the fields is a *resync*, not a repaint: it must not run on an
+      // unchanged tick, or a half-typed budget is replaced under the cursor. Only
+      // a changed stored budget / active dimensionality rewrites them.
+      const key = `${ti.nIter}:${ti.early}`;
+      if (!force && key === lastBudgetKey) return;
+      lastBudgetKey = key;
       $nIter.value = ti.nIter == null ? "" : String(ti.nIter);
       $early.value = ti.early == null ? "" : String(ti.early);
       const presetId = Object.entries(EmbeddingCoordinator.TSNE_PRESETS).find(
@@ -429,28 +555,41 @@ export class EmbeddingCoordinator {
           (v == null && ti.nIter == null && ti.early == null) ||
           (v != null && v.nIter === ti.nIter && v.early === ti.early),
       )?.[0];
-      $preset.value = presetId ?? "default";
+      // An explicit budget that matches no named preset reads as Custom, not as
+      // Default: the stored override must be visible after a reopen/reload.
+      $preset.value =
+        presetId ?? (ti.nIter == null && ti.early == null ? "default" : "custom");
     };
     this._resyncTsneControl = readModel;
     readModel();
 
     $preset.addEventListener("change", () => {
+      // ``default`` maps to ``null`` (no override), so membership — not
+      // truthiness — decides whether this is a preset. ``custom`` is display-only.
+      if (!($preset.value in EmbeddingCoordinator.TSNE_PRESETS)) return;
       const p = EmbeddingCoordinator.TSNE_PRESETS[$preset.value];
-      if (!p) return;
-      this.setTsneIteration(p.nIter, p.early);
-      readModel();
+      this.setTsneIteration(p?.nIter ?? null, p?.early ?? null);
+      readModel(true);
     });
     $nIter.addEventListener("change", () => {
-      const nIter = _parseBoundedOverride($nIter.value.trim(), 100, 2000);
-      if (nIter === undefined) return;
+      const nIter = _parseBoundedOverride($nIter.value.trim(), 50, 2000);
+      if (nIter === undefined) {
+        // Invalid (out of range, decimal, non-numeric): show the actual stored
+        // budget rather than leaving the rejected text in the field.
+        readModel(true);
+        return;
+      }
       this.setTsneIteration(nIter, this.deps.model.tsneIterationFor().early);
-      readModel();
+      readModel(true);
     });
     $early.addEventListener("change", () => {
       const early = _parseBoundedOverride($early.value.trim(), 0, 1000);
-      if (early === undefined) return;
+      if (early === undefined) {
+        readModel(true);
+        return;
+      }
       this.setTsneIteration(this.deps.model.tsneIterationFor().nIter, early);
-      readModel();
+      readModel(true);
     });
   }
 
@@ -477,6 +616,7 @@ export class EmbeddingCoordinator {
     m.saveLS();
     this.deps.status.update(m);
     this.deps.canvas.scheduleDraw();
+    void this.refreshProjectionSettings();
     // The iteration control is keyed by dimensionality too: re-read it so the
     // 2-D↔3-D toggle shows the other view's own stored budget.
     this._resyncTsneControl?.();
@@ -521,13 +661,16 @@ export class EmbeddingCoordinator {
    * so a re-toggle cancels the in-flight tween and continues from wherever the
    * blend has reached. A 2-D↔3-D toggle starts it from `_applyPositions`
    * alongside the position lerp at the same length, so the camera and the dots
-   * arrive together. On a non-projection lens nothing ever renders 3-D, so the
-   * blend is set instantly instead of animating a no-op.
+   * arrive together. On a non-projection production lens nothing ever renders
+   * 3-D, so the blend is set instantly instead of animating a no-op; the eval
+   * gallery is the exception (its artifact, not the lens, decides).
    */
   private _tweenBlend(target: number, ms = TOGGLE_MS): void {
     const m = this.deps.model;
     const cv = this.deps.canvas;
-    if (m.lens().kind !== "projection") {
+    // Eval galleries can pair a 3-D artifact with any production lens, so the
+    // dimensionality — not the lens kind — decides whether the blend animates.
+    if (!m.evalMode && m.lens().kind !== "projection") {
       m.view3dBlend = target;
       return;
     }
@@ -719,9 +862,14 @@ export class EmbeddingCoordinator {
       const genreOn = status.genre_full_enabled === true;
       // MERT is only reported (as a ``mert_l19`` coverage row) when the server
       // enabled it; derive the gate from that row's presence, simplest form.
-      m.mertEnabled = (status.sources ?? []).some((s) => s.id === "mert_l19");
+      const mertOn = (status.sources ?? []).some((s) => s.id === "mert_l19");
       const genreChanged = m.genreFullEnabled !== genreOn;
+      const mertChanged = m.mertEnabled !== mertOn;
       m.genreFullEnabled = genreOn;
+      m.mertEnabled = mertOn;
+      // A settings payload from the previous capability state would keep
+      // describing a source as available/unavailable after the gate moved.
+      if (genreChanged || mertChanged) this._settingsCache.clear();
       // Reconcile the active lens with the learned gate in BOTH directions: a
       // genre map on a disabled server falls back to combined; a legacy map lens
       // on an enabled server converts to the genre map. Returns whether the lens
@@ -961,7 +1109,7 @@ export class EmbeddingCoordinator {
     const fit =
       m.showExternal && m.externalInProjection ? "&fit_scope=all" : "";
     // The opt-in genre_full lens is a canonical recipe: the backend fixes its
-    // sources, weights and 500/250 budget, so the query names the recipe id and
+    // sources, weights and 50/0 multilevel budget, so the query names the recipe id and
     // omits the per-request sources/weights. When the applied genre weights
     // deviate from the recipe defaults, the override rides as ``w=<7 keys>`` in
     // canonical order; the default key stays recipe-only.
@@ -1431,17 +1579,17 @@ export class EmbeddingCoordinator {
     );
   }
 
-  /** Sync lens-dependent chrome: the combined-map weight panel and the genre
-   *  map weight preview in view-options, plus the panel's own visibility. */
+  /** Sync every View options fold and the panel's visibility. Single owner so
+   *  the lens/colour/dimensionality rules cannot drift between coordinators. */
   syncLensChrome(): void {
     const m = this.deps.model;
     const lens = m.lens();
     // Source weights only re-weight the combined lens; a per-source lens fixes
-    // them, so hide the sliders where they would do nothing.
-    const details = document.getElementById(
-      "cluster-weights-details",
-    ) as HTMLDetailsElement | null;
-    if (details) details.hidden = lens.kind !== "projection" || !!lens.sources;
+    // them, so hide the editable editor where it would do nothing. The read-only
+    // influences list below still shows every source and why it is fixed.
+    const editableCombined = lens.kind === "projection" && !lens.sources;
+    const fold = document.getElementById("cluster-weights-fold");
+    if (fold) fold.classList.toggle("hidden", !editableCombined);
     // The genre map weight preview lives in view-options, shown only for the
     // genre lens when the server enabled it.
     const genre = document.getElementById("genre-weights-fold");
@@ -1451,6 +1599,16 @@ export class EmbeddingCoordinator {
         !(m.genreFullEnabled && lens.id === GENRE_FULL_LENS.id),
       );
     }
+    // Every projection lens exposes all influences, including the fixed ones.
+    const influences = document.getElementById("influences-fold");
+    if (influences) influences.classList.toggle("hidden", lens.kind !== "projection");
+    // The iteration budget only affects a projection fit.
+    const tsne = document.getElementById("tsne-iteration-fold");
+    if (tsne) tsne.classList.toggle("hidden", lens.kind !== "projection");
+    // The confident gate only exists while predicted-folder colouring is active.
+    const confident = document.getElementById("head-confident-fold");
+    if (confident) confident.classList.toggle("hidden", m.colorMode !== "head");
+    void this.refreshProjectionSettings();
     this._syncViewOptionsVisibility();
     // The iteration control reflects the active dimensionality's per-dimension
     // budget; re-read it when the lens (or a model change) shifts which

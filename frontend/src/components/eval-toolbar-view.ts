@@ -6,6 +6,7 @@
 // never mutates the model or issues requests.
 
 import { emptyRatings, type EvalRatings, type RatingCategory } from "../lib/eval-ratings";
+import type { EvalDims } from "../lib/layout-eval";
 
 /** One map entry in the select (blind letter until revealed). */
 export interface EvalMapOption {
@@ -13,6 +14,8 @@ export interface EvalMapOption {
   letter: string;
   /** Algorithm/recipe label; only surfaced once the user reveals names. */
   label?: string;
+  /** Dimensionality whose rating badge this option shows. */
+  dims: EvalDims;
   /** How many of the four categories already have a 1–5 score. */
   rated: number;
   revealed: boolean;
@@ -36,6 +39,12 @@ export interface EvalToolbarState {
   unavailable: number;
   ratings: EvalRatings | null;
   note: string;
+  /** True while an applied artifact can accept a rating/note. */
+  canRate: boolean;
+  /** Dimensionality of the selected artifact. */
+  dims: EvalDims;
+  /** True when the selected group has both a 2-D and a 3-D artifact. */
+  paired: boolean;
   /** Short dataset identity, e.g. "dataset 1a2b3c4d". */
   datasetLabel: string;
   error: string | null;
@@ -119,22 +128,19 @@ export class EvalToolbarView {
     $('[data-role="dataset"]').textContent = state.datasetLabel;
 
     const select = $('[data-role="select"]') as HTMLSelectElement;
-    const prevSelected = Number(select.value);
     select.innerHTML = "";
     for (const m of state.maps) {
       const opt = document.createElement("option");
       opt.value = String(m.index);
       const rating = m.rated > 0 ? ` · ${m.rated}/4 rated` : "";
-      opt.textContent = m.revealed && m.label
-        ? `${m.letter}. ${m.label}${rating}`
-        : `${m.letter}${rating}`;
+      const label = m.revealed && m.label ? `${m.letter}. ${m.label}` : m.letter;
+      // The badge is per artifact dimension, never an aggregate across siblings.
+      opt.textContent = `${label} · ${m.dims}D${rating}`;
       select.appendChild(opt);
     }
-    if (Number.isInteger(prevSelected) && prevSelected < state.maps.length) {
-      select.value = String(prevSelected);
-    } else {
-      select.value = String(state.currentIndex);
-    }
+    // Mirror the applied map: the state's currentIndex is the only selection
+    // authority (a pending switch keeps the old option until it applies).
+    select.value = String(state.currentIndex);
     ($('[data-role="prev"]') as HTMLButtonElement).disabled = state.count <= 1;
     ($('[data-role="next"]') as HTMLButtonElement).disabled = state.count <= 1;
 
@@ -143,11 +149,13 @@ export class EvalToolbarView {
     $('[data-role="status"]').textContent =
       `${state.eligible} / ${state.total} artifact tracks in library` +
       (state.unavailable > 0 ? ` · ${state.unavailable} unavailable` : "") +
+      (state.paired ? ` · ${state.dims}D (2D/3D · 3 to toggle)` : "") +
       (state.revealed && state.currentTiming ? ` — ${state.currentTiming}` : "");
 
     this._renderRatings($('[data-role="ratings"]') as HTMLElement, state);
 
     const note = $('[data-role="note"]') as HTMLTextAreaElement;
+    note.disabled = !state.canRate;
     // Don't clobber in-progress typing: the note is debounced and saved, so a
     // mid-typing render (e.g. a rating click) must not reset the field.
     if (document.activeElement !== note && note.value !== state.note) {
@@ -186,6 +194,7 @@ export class EvalToolbarView {
         b.textContent = String(n);
         b.className = value === n ? "on" : "";
         b.title = `${n} / 5`;
+        b.disabled = !state.canRate;
         b.addEventListener("click", () => {
           // Clicking the current value clears it (a quick re-rate).
           this.onRate?.(c.key, value === n ? null : n);

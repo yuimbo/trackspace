@@ -23,11 +23,41 @@ import numpy as np
 from .librosa_audio_features import AUDIO_FEATURE_DIM
 
 # Bump in layout_revision.compute_layout_revision payload when this recipe changes.
-PROJECTION_RECIPE_VERSION = 8
+PROJECTION_RECIPE_VERSION = 10
 
-#: openTSNE full-fit budget; evaluation recipes specify their own frozen budgets.
-OPENTSNE_N_ITER = 100
-OPENTSNE_EARLY_EXAGGERATION_ITER = 100
+#: openTSNE full-data (final) fit budget; evaluation recipes specify their own
+#: frozen budgets.
+OPENTSNE_N_ITER = 50
+OPENTSNE_EARLY_EXAGGERATION_ITER = 0
+
+#: Late exaggeration on the full-data final fit only. The coarse chain keeps its
+#: own early-exaggeration schedule; an explicit caller value (e.g. the benchmark's
+#: 1.0 control) still wins.
+OPENTSNE_FINAL_EXAGGERATION = 1.25
+
+#: Production multilevel sample-init chain: 16 geometrically spaced fractions
+#: from 1/256 to 1/16 of the runtime dataset (ratio 16 over 15 steps). The very
+#: first level is ~28 rows on the 7153-track library, so the chain starts from a
+#: cheap coarse map and expands up to the full fit. These are the *production*
+#: schedule; evaluation recipes carry their own frozen fractions/budgets and must
+#: never derive from these mutable constants.
+OPENTSNE_MULTILEVEL_FRACTIONS: tuple[float, ...] = tuple(
+    2.0 ** (-8.0 + 4.0 * i / 15.0) for i in range(16)
+)
+
+#: Total normal-iteration budget for the coarse chain. At the full 16-level
+#: density each level gets exactly one iteration; a smaller surviving chain splits
+#: the same budget by inverse-sqrt weight (at least one each).
+OPENTSNE_COARSE_ITERATION_BUDGET = 16
+
+#: Early exaggeration only on the first (coarsest) level.
+OPENTSNE_COARSE_EARLY_EXAGGERATION_ITER = 100
+
+#: Coarse-level perplexity schedule ``p(t)=30+50·(1−t)^gamma``, anchored at the
+#: chain's bottom fraction (``t`` is the log-scaled position between ``n/256``
+#: and ``n``). Gamma 4 keeps the coarse levels low for longer.
+OPENTSNE_PERPLEXITY_GAMMA = 4.0
+OPENTSNE_PERPLEXITY_START_FRACTION = OPENTSNE_MULTILEVEL_FRACTIONS[0]
 
 # ──────────────────────────────────────────────────────────────
 # Canonical projection recipes
@@ -40,13 +70,13 @@ OPENTSNE_EARLY_EXAGGERATION_ITER = 100
 # these recipes are a separate, opt-in registry the frontend selects by id.
 #
 # ``default`` mirrors the pre-recipe behaviour byte-for-byte (frozen sources +
-# weights, openTSNE 100/100) so a default request hashes and caches identically.
-# ``genre_full`` is the pure-genre lens (logits .40 / maest .20 / layer-7 .25 /
-# MERT-L19 .15, the tunable rhythm/clap/supervised at 0, all other sources zero)
-# with its own 100/100 budget. Genre is the default, so the recipe is always
-# served; ``--no-genre-full`` disables the layer-7/MERT analysis blocks on the
-# server side (the recipe id itself is not gated). The gallery 500/250 profile is
-# an explicit client override, not the recipe default.
+# weights, openTSNE 50/0 multilevel final fit) so a default request hashes and
+# caches identically. ``genre_full`` is the pure-genre lens (logits .40 / maest .20 /
+# layer-7 .25 / MERT-L19 .15, the tunable rhythm/clap/supervised at 0, all other
+# sources zero) with its own 50/0 budget. Genre is the default, so the recipe is
+# always served; ``--no-genre-full`` disables the layer-7/MERT analysis blocks on
+# the server side (the recipe id itself is not gated). The gallery 500/250 profile
+# is an explicit client override, not the recipe default.
 
 #: Every source the projection layer can consume, including the opt-in genre_full
 #: blocks. ``FROZEN_SOURCES`` (the default recipe's set) is the combined/subset
@@ -94,8 +124,11 @@ GENRE_FULL_RECIPE_WEIGHTS: dict[str, float] = {
 
 #: openTSNE iteration budget bounds for the opt-in quality fields. ``tsne_n_iter``
 #: is the full-fit iteration count, ``tsne_early_exaggeration_iter`` the early
-#: exaggeration phase (openTSNE accepts 0 to disable it).
-TSNE_N_ITER_LO = 100
+#: exaggeration phase (openTSNE accepts 0 to disable it). The floor equals the
+#: production default (50/0) so a client can always send the default explicitly;
+#: the multilevel sample-init chain, not the final-fit iteration count, carries
+#: the layout quality.
+TSNE_N_ITER_LO = 50
 TSNE_N_ITER_HI = 2000
 TSNE_EARLY_EXAGGERATION_ITER_LO = 0
 TSNE_EARLY_EXAGGERATION_ITER_HI = 1000
@@ -104,12 +137,12 @@ TSNE_EARLY_EXAGGERATION_ITER_HI = 1000
 DEFAULT_RECIPE_TSNE_N_ITER = OPENTSNE_N_ITER
 DEFAULT_RECIPE_TSNE_EARLY_EXAGGERATION_ITER = OPENTSNE_EARLY_EXAGGERATION_ITER
 
-#: genre_full recipe's openTSNE budget. The recipe default is 100/100 (the
-#: user-agreed default); the gallery 500/250 profile is an explicit client
-#: override. Because the genre budget is encoded *absolutely* in its cache keys,
-#: this default can move without aliasing any earlier fit/layout.
-GENRE_FULL_TSNE_N_ITER = 100
-GENRE_FULL_TSNE_EARLY_EXAGGERATION_ITER = 100
+#: genre_full recipe's openTSNE budget. The recipe default is 50/0 (multilevel
+#: final fit); the gallery 500/250 profile is an explicit client override. Because
+#: the genre budget is encoded *absolutely* in its cache keys, this default can
+#: move without aliasing any earlier fit/layout.
+GENRE_FULL_TSNE_N_ITER = 50
+GENRE_FULL_TSNE_EARLY_EXAGGERATION_ITER = 0
 
 
 @dataclass(frozen=True)
@@ -193,14 +226,14 @@ def tsne_iteration_suffix(
     """Encode a deviation from *recipe*'s openTSNE budget for cache keys.
 
     Only a *deviation* from the recipe's default budget is encoded, so the default
-    recipe at its default 100/100 produces an empty suffix (byte-identical cache
+    recipe at its default 50/0 produces an empty suffix (byte-identical cache
     keys), while a user-chosen faster/slower budget changes the fit-cache key and
     the layout revision so the two configurations never share a fit.
 
     ``genre_full`` is the exception: its *effective* budget is always encoded
-    (absolute), because the recipe default moved from 500/250 to 100/100 and the
-    legacy 500/250 default fit was stored under a bare key. Encoding the genre
-    budget absolutely guarantees the 100/100 default never aliases that legacy
+    (absolute), because the recipe default moved from 500/250 to 100/100 and then
+    to 50/0, while legacy defaults were stored under bare keys. Encoding the genre
+    budget absolutely guarantees the current default never aliases an old
     fit/layout under the same key, and that any future default change (or an
     explicit override like the 500/250 gallery profile) refits rather than reusing
     a stale fit. Every other recipe stays deviation-only so its default keys are
@@ -215,7 +248,7 @@ def tsne_iteration_suffix(
     return "|".join(parts)
 
 
-def _single_lens_weights(sources: tuple[str, ...]) -> dict[str, float]:
+def single_lens_weights(sources: tuple[str, ...]) -> dict[str, float]:
     """Exact weight vector the frontend sends for a per-source lens.
 
     Every source is listed explicitly (0 except the lens's own), matching the
@@ -244,10 +277,10 @@ class ProjectionLens:
 #: weights are what decide whether a prefetched layout is the one the client asks for.
 PROJECTION_LENSES: tuple[ProjectionLens, ...] = (
     ProjectionLens("combined", FROZEN_SOURCES, None),
-    ProjectionLens("maest", ("maest_logits", "maest"), _single_lens_weights(("maest_logits", "maest"))),
-    ProjectionLens("clap", ("clap",), _single_lens_weights(("clap",))),
-    ProjectionLens("rhythm", ("rhythm",), _single_lens_weights(("rhythm",))),
-    ProjectionLens("supervised", ("supervised",), _single_lens_weights(("supervised",))),
+    ProjectionLens("maest", ("maest_logits", "maest"), single_lens_weights(("maest_logits", "maest"))),
+    ProjectionLens("clap", ("clap",), single_lens_weights(("clap",))),
+    ProjectionLens("rhythm", ("rhythm",), single_lens_weights(("rhythm",))),
+    ProjectionLens("supervised", ("supervised",), single_lens_weights(("supervised",))),
 )
 
 #: Lens ids the prefetch job warms, for enqueue/status convenience.
@@ -291,7 +324,12 @@ assert int(FROZEN_FEATURE_MASK.size) == AUDIO_FEATURE_DIM
 
 # The audio-feature blend (``FROZEN_FEATURES_BLEND``) lives in ``backend.tuning``
 # alongside the other tunable thresholds — see that module for the single reference.
-# Former UI slider maxima ("folder contrast" 0–6, "depth emphasis" 1–3).
-FROZEN_FOLDER_BOOST = 6.0
+#: Production folder weighting: the centroid-only hierarchical contrast basis
+#: (no within-folder PC SVD), applied at 40% of the former 6.0 amplitude. Depth 3.0
+#: keeps the deeper-sibling emphasis. The helper defaults stay ``full`` / 3.0 / 1.5
+#: for the frozen evaluation and benchmark paths; these constants are the
+#: production source of truth.
+FROZEN_FOLDER_BOOST = 2.4
 FROZEN_FOLDER_DEPTH_BOOST = 3.0
+FROZEN_FOLDER_BASIS_MODE = "centroids"
 FROZEN_SCALE_FOLDERS = True

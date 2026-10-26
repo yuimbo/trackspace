@@ -114,7 +114,15 @@ function pump(ms = 600): void {
 
 const HTML = `
   <div id="toast-container"></div>
-  <details id="cluster-weights-details"></details>
+  <div id="view-options" class="view-options hidden">
+    <div id="head-confident-fold" class="view-option hidden"></div>
+    <div id="cluster-weights-fold" class="view-option hidden">
+      <details id="cluster-weights-details"></details>
+    </div>
+    <div id="genre-weights-fold" class="view-option hidden"></div>
+    <div id="influences-fold" class="view-option hidden"></div>
+    <div id="tsne-iteration-fold" class="view-option hidden"></div>
+  </div>
 `;
 
 interface Harness {
@@ -158,7 +166,13 @@ function withMaestPending(n: number): typeof STATUS_OK {
 }
 
 /** Route a URL to its response body (default: `{}`). */
-function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
+function makeHarness(
+  routes: (url: string) => unknown = () => ({}),
+  renderProjectionSettings?: (
+    settings: unknown,
+    error?: string,
+  ) => void,
+): Harness {
   const model = new Model();
   const update = vi.fn();
   const scheduleDraw = vi.fn();
@@ -176,6 +190,7 @@ function makeHarness(routes: (url: string) => unknown = () => ({})): Harness {
     status: { update },
     canvas,
     viewMods: viewMods.sink,
+    renderProjectionSettings,
   });
   const fetchSpy = vi.fn((input: RequestInfo | URL) =>
     Promise.resolve(jsonResponse(routes(String(input)))),
@@ -200,8 +215,19 @@ function fetchCalls(fetchSpy: ReturnType<typeof vi.fn>, prefix: string): number 
   return fetchSpy.mock.calls.filter(([u]) => String(u).startsWith(prefix)).length;
 }
 
+const SETTINGS_OK = {
+  ok: true,
+  method: "tsne",
+  dims: 2,
+  recipe: "default",
+  sources: [],
+  weights_editable: true,
+  weights_editable_keys: [],
+};
+
 function projectionRoute(url: string): unknown {
   if (url.startsWith("/api/embeddings/status")) return STATUS_OK;
+  if (url.startsWith("/api/embeddings/projection-settings")) return SETTINGS_OK;
   if (url.startsWith("/api/embeddings/projection")) {
     return { positions: [{ path: "a.mp3", x: 0.2, y: 0.3 }], revision: "rev-1" };
   }
@@ -386,6 +412,139 @@ describe("EmbeddingCoordinator projection fetch", () => {
     coord.setTsneIteration(500, 250);
     model.view3d.on = false;
     expect(model.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
+  });
+
+  it("binds the iteration control to the 50/0 default and accepts 50", () => {
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<select id="tsne-iteration-preset">
+         <option value="default">Default · 50 / 0</option>
+         <option value="fast">Fast · 100 / 100</option>
+         <option value="custom" disabled>Custom</option>
+       </select>
+       <input id="tsne-n-iter" type="number" min="50" />
+       <input id="tsne-early-iter" type="number" min="0" />`,
+    );
+    const { model, coord } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    coord.bindTsneIterationControl();
+
+    const $preset = document.getElementById(
+      "tsne-iteration-preset",
+    ) as HTMLSelectElement;
+    const $nIter = document.getElementById("tsne-n-iter") as HTMLInputElement;
+
+    // A fresh model sends no override: the server uses the recipe's 50/0 budget.
+    expect($preset.value).toBe("default");
+    expect($nIter.value).toBe("");
+
+    // 50 is the production default and is accepted as an explicit override.
+    $nIter.value = "50";
+    $nIter.dispatchEvent(new Event("change"));
+    expect(model.tsneIterationFor()).toEqual({ nIter: 50, early: null });
+    // An explicit budget is remembered as Custom, not mislabelled Default.
+    expect($preset.value).toBe("custom");
+
+    // Below the floor is ignored rather than clamped or sent.
+    $nIter.value = "49";
+    $nIter.dispatchEvent(new Event("change"));
+    expect(model.tsneIterationFor()).toEqual({ nIter: 50, early: null });
+  });
+
+  it("makes Default clear the override after a preset, and rejects invalid fields", () => {
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<select id="tsne-iteration-preset">
+         <option value="default">Default · 50 / 0</option>
+         <option value="fast">Fast · 100 / 100</option>
+         <option value="balanced">Balanced · 250 / 150</option>
+         <option value="gallery">Gallery · 500 / 250</option>
+         <option value="custom" disabled>Custom</option>
+       </select>
+       <input id="tsne-n-iter" type="number" min="50" max="2000" />
+       <input id="tsne-early-iter" type="number" min="0" max="1000" />`,
+    );
+    const { model, coord } = makeHarness(projectionRoute);
+    model.viewMode = "embeddings";
+    coord.bindTsneIterationControl();
+
+    const $preset = document.getElementById(
+      "tsne-iteration-preset",
+    ) as HTMLSelectElement;
+    const $nIter = document.getElementById("tsne-n-iter") as HTMLInputElement;
+    const $early = document.getElementById("tsne-early-iter") as HTMLInputElement;
+
+    $preset.value = "fast";
+    $preset.dispatchEvent(new Event("change"));
+    expect(model.tsneIterationFor()).toEqual({ nIter: 100, early: 100 });
+    expect($preset.value).toBe("fast");
+
+    // ``default`` maps to null, which used to be swallowed by a truthiness guard.
+    $preset.value = "default";
+    $preset.dispatchEvent(new Event("change"));
+    expect(model.tsneIterationFor()).toEqual({ nIter: null, early: null });
+    expect($preset.value).toBe("default");
+    expect($nIter.value).toBe("");
+
+    // Rejected values show the stored budget again instead of the bad text.
+    $preset.value = "fast";
+    $preset.dispatchEvent(new Event("change"));
+    for (const bad of ["49", "2001", "100.5"]) {
+      $nIter.value = bad;
+      $nIter.dispatchEvent(new Event("change"));
+      expect(model.tsneIterationFor()).toEqual({ nIter: 100, early: 100 });
+      expect($nIter.value).toBe("100");
+    }
+    $early.value = "1001";
+    $early.dispatchEvent(new Event("change"));
+    expect(model.tsneIterationFor()).toEqual({ nIter: 100, early: 100 });
+    expect($early.value).toBe("100");
+  });
+
+  it("hides the iteration fold on a tags lens and remembers a custom budget across dims", () => {
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<select id="tsne-iteration-preset">
+         <option value="default">Default · 50 / 0</option>
+         <option value="fast">Fast · 100 / 100</option>
+         <option value="custom" disabled>Custom</option>
+       </select>
+       <input id="tsne-n-iter" type="number" min="50" max="2000" />
+       <input id="tsne-early-iter" type="number" min="0" max="1000" />`,
+    );
+    const { model, coord } = makeHarness(projectionRoute);
+    model.lensId = "tags";
+    coord.syncLensChrome();
+    const $tsneFold = document.getElementById("tsne-iteration-fold")!;
+    const $influences = document.getElementById("influences-fold")!;
+    const $opts = document.getElementById("view-options")!;
+    expect($tsneFold.classList.contains("hidden")).toBe(true);
+    expect($influences.classList.contains("hidden")).toBe(true);
+    expect($opts.classList.contains("hidden")).toBe(true);
+
+    model.lensId = "combined";
+    coord.bindTsneIterationControl();
+    coord.syncLensChrome();
+    expect($tsneFold.classList.contains("hidden")).toBe(false);
+    expect($influences.classList.contains("hidden")).toBe(false);
+
+    const $preset = document.getElementById(
+      "tsne-iteration-preset",
+    ) as HTMLSelectElement;
+    const $nIter = document.getElementById("tsne-n-iter") as HTMLInputElement;
+    coord.setTsneIteration(300, 20);
+    coord.syncLensChrome();
+    expect($preset.value).toBe("custom");
+    expect($nIter.value).toBe("300");
+
+    // 3-D has its own empty budget; switching back restores the 2-D custom one.
+    model.view3d.on = true;
+    coord.syncLensChrome();
+    expect($preset.value).toBe("default");
+    model.view3d.on = false;
+    coord.syncLensChrome();
+    expect($preset.value).toBe("custom");
+    expect($nIter.value).toBe("300");
   });
 
   it("includes externals whenever external roots exist, even when hidden", async () => {
@@ -1137,9 +1296,18 @@ describe("EmbeddingCoordinator 3-D view", () => {
     expect(
       coord.applyApproximateWeights({ ...DEFAULT_CLUSTER_WEIGHTS, maest: 0.6 }),
     ).toBe(true);
-    // Per-axis renormalisation puts each extreme on its frame edge, z included.
-    expect(model.embeddingPositions.get("a.mp3")).toEqual({ x: 0, y: 0, z: 1 });
-    expect(model.embeddingPositions.get("b.mp3")).toEqual({ x: 1, y: 1, z: 0 });
+    // Each axis maps its stepped span back to the base extent independently, so
+    // both points keep their base x/y here; the flat z base still re-bounds z
+    // alone to the unit span.
+    const a = model.embeddingPositions.get("a.mp3")!;
+    const b = model.embeddingPositions.get("b.mp3")!;
+    expect(a.x).toBeCloseTo(0.2, 6);
+    expect(a.y).toBeCloseTo(0.3, 6);
+    expect(b.x).toBeCloseTo(0.7, 6);
+    expect(b.y).toBeCloseTo(0.7, 6);
+    // The base was flat in z, so the step re-bounds z alone to the unit span.
+    expect(a.z).toBeCloseTo(1, 6);
+    expect(b.z).toBeCloseTo(0, 6);
     expect(canvas.scheduleDraw).toHaveBeenCalled();
   });
 
@@ -1791,17 +1959,14 @@ describe("EmbeddingCoordinator scopes", () => {
     expect(model.lensId).toBe("tags");
   });
 
-  it("hides the source-weight sliders for a per-source lens", async () => {
+  it("hides the source-weight editor for a per-source lens", async () => {
     const { model, coord } = makeHarness(projectionRoute);
     vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    const $fold = document.getElementById("cluster-weights-fold")!;
     await coord.switchToLens("clap");
-    expect(
-      document.getElementById("cluster-weights-details")!.hidden,
-    ).toBe(true);
+    expect($fold.classList.contains("hidden")).toBe(true);
     await coord.switchToLens("combined");
-    expect(
-      document.getElementById("cluster-weights-details")!.hidden,
-    ).toBe(false);
+    expect($fold.classList.contains("hidden")).toBe(false);
   });
 });
 
@@ -1823,6 +1988,137 @@ describe("EmbeddingCoordinator position animations", () => {
     coord.cancelAnimation();
     expect(raf.cancelled).toContain(frameId);
     expect(raf.pending.size).toBe(0);
+  });
+});
+
+// ─── Effective projection settings (View options) ────────────
+
+describe("EmbeddingCoordinator projection settings", () => {
+  const settingsCalls = (fetchSpy: ReturnType<typeof vi.fn>) =>
+    fetchSpy.mock.calls.filter(([u]) =>
+      String(u).startsWith("/api/embeddings/projection-settings"),
+    );
+
+  it("fetches the effective settings once per query and refreshes on a budget change", async () => {
+    const render = vi.fn();
+    const { model, coord, fetchSpy } = makeHarness(
+      projectionRoute,
+      render,
+    );
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+
+    await coord.switchToLens("combined");
+    await flush();
+
+    expect(settingsCalls(fetchSpy)).toHaveLength(1);
+    expect(String(settingsCalls(fetchSpy)[0][0])).toContain(
+      "/api/embeddings/projection-settings?",
+    );
+    expect(render).toHaveBeenCalledWith(
+      expect.objectContaining({ recipe: "default" }),
+    );
+
+    // The same view is cached: reopening the panel is free.
+    coord.syncLensChrome();
+    await flush();
+    expect(settingsCalls(fetchSpy)).toHaveLength(1);
+
+    // A budget override is part of the query, so it refreshes.
+    coord.setTsneIteration(100, 100);
+    await flush();
+    expect(settingsCalls(fetchSpy)).toHaveLength(2);
+    expect(String(settingsCalls(fetchSpy)[1][0])).toContain("tsne_n_iter=100");
+  });
+
+  it("keeps an unchanged influences render instead of rebuilding its rows and folds", async () => {
+    const render = vi.fn();
+    const { coord } = makeHarness(projectionRoute, render);
+    await coord.switchToLens("combined");
+    await flush();
+    const renders = render.mock.calls.length;
+    expect(renders).toBeGreaterThan(0);
+
+    // Every later resync resolves the same cached payload, so the open
+    // "Processing (fixed)" fold and its rows must survive untouched.
+    coord.syncLensChrome();
+    coord.syncLensChrome();
+    await flush();
+
+    expect(render.mock.calls.length).toBe(renders);
+  });
+
+  it("keeps a typed iteration draft across an unchanged sync but resyncs on a dimension change", async () => {
+    document.body.insertAdjacentHTML(
+      "beforeend",
+      `<select id="tsne-iteration-preset">
+         <option value="default">Default · 50 / 0</option>
+         <option value="fast">Fast · 100 / 100</option>
+         <option value="custom" disabled>Custom</option>
+       </select>
+       <input id="tsne-n-iter" type="number" min="50" max="2000" />
+       <input id="tsne-early-iter" type="number" min="0" max="1000" />`,
+    );
+    const { model, coord } = makeHarness(projectionRoute);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+    model.lensId = "combined";
+    coord.bindTsneIterationControl();
+
+    // A changed stored budget does resync the control...
+    coord.setTsneIteration(300, 20);
+    coord.syncLensChrome();
+    const $nIter = document.getElementById("tsne-n-iter") as HTMLInputElement;
+    expect($nIter.value).toBe("300");
+
+    // ...but a sync that changes nothing (a queue tick, a lens reopen) must not
+    // rewrite a half-typed budget under the cursor.
+    $nIter.value = "3";
+    coord.syncLensChrome();
+    expect($nIter.value).toBe("3");
+
+    // 3-D keeps its own (empty) budget, so the switch resyncs the control.
+    model.view3d.on = true;
+    coord.syncLensChrome();
+    expect($nIter.value).toBe("");
+    model.view3d.on = false;
+    coord.syncLensChrome();
+    expect($nIter.value).toBe("300");
+  });
+
+  it("surfaces a failed settings fetch inline instead of keeping a stale payload", async () => {
+    const render = vi.fn();
+    const { model, coord } = makeHarness((url) => {
+      if (url.startsWith("/api/embeddings/projection-settings"))
+        throw new Error("settings down");
+      return projectionRoute(url);
+    }, render);
+    vi.spyOn(model, "saveLS").mockImplementation(() => {});
+
+    await coord.switchToLens("combined");
+    await flush();
+
+    expect(render).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining("unavailable"),
+    );
+  });
+
+  it("never calls production settings during the read-only eval gallery", async () => {
+    const render = vi.fn();
+    const { model, coord, fetchSpy } = makeHarness(
+      projectionRoute,
+      render,
+    );
+    model.lensId = "combined";
+    model.evalMode = true;
+
+    coord.syncLensChrome();
+    await flush();
+
+    expect(settingsCalls(fetchSpy)).toHaveLength(0);
+    expect(render).toHaveBeenCalledWith(
+      null,
+      expect.stringContaining("evaluation"),
+    );
   });
 });
 
@@ -1859,5 +2155,26 @@ describe("EmbeddingCoordinator is compute-inert during eval", () => {
     // No projection fetch is issued by the eval apply path.
     expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(0);
     expect(model.embeddingPositions.size).toBe(2);
+  });
+
+  it("applies a 3-D artifact through the shared blend without touching production view3d", async () => {
+    const { model, coord, fetchSpy } = makeHarness(projectionRoute);
+    model.setEvalMode(true);
+    expect(model.view3d.on).toBe(false);
+    const positions = new Map([
+      ["a.mp3", { x: 0.1, y: 0.2, z: 0.3 }],
+      ["b.mp3", { x: 0.8, y: 0.9, z: 0.7 }],
+    ]);
+
+    coord.applyPrecomputedPositions(positions, 3);
+    expect(model.evalDims).toBe(3);
+    expect(model.is3d).toBe(true);
+    expect(model.shows3d).toBe(true);
+    expect(model.view3d.on).toBe(false);
+    // The camera blend runs on the existing shared-frame tween, not a new loop.
+    expect(raf.pending.size).toBe(1);
+    pump(600);
+    expect(model.view3dBlend).toBe(1);
+    expect(fetchCalls(fetchSpy, "/api/embeddings/projection")).toBe(0);
   });
 });

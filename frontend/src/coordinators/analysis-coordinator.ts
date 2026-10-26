@@ -23,10 +23,10 @@ import { phaseLabel } from "../lib/pipeline";
 import {
   stepColorMode,
   type ColorMode,
-  GENRE_FULL_LENS,
   GENRE_FULL_SOURCES,
   GENRE_FULL_WEIGHTS,
 } from "../lib/lenses";
+import type { ProjectionSettings } from "../lib/projection-settings";
 import { api, postJSON } from "../lib/api";
 import { clamp, confirmAction } from "../lib/util";
 import { CoalescedTask, SseSubscription } from "../lib/async";
@@ -43,6 +43,9 @@ export interface AnalysisDeps {
     /** Clickable colour-mode tabs, for centring the head-confident fold-out. */
     colorTabs?: { id: string; x0: number; x1: number }[];
   };
+  /** Resync View options after a colour/lens change (the embedding coordinator
+   *  is the single owner of its folds and panel visibility). */
+  syncViewOptions?(): void;
   /** Refetch the embedding layout after a weight change (optional in tests). */
   refreshProjection?(): Promise<void> | void;
   /** Approximate the layout for a live slider drag (optional in tests). */
@@ -636,9 +639,17 @@ export class AnalysisCoordinator {
       const row = document.createElement("label");
       row.className = "cluster-weight-row";
 
+      // Label + readout sit above the slider so the row reads as a named control
+      // instead of three squeezed columns.
+      const head = document.createElement("span");
+      head.className = "cluster-weight-head";
       const name = document.createElement("span");
       name.className = "cluster-weight-name";
       name.textContent = CLUSTER_WEIGHT_LABELS[source] ?? source;
+      const value = document.createElement("span");
+      value.className = "cluster-weight-value";
+      value.textContent = formatSourceWeight(opts.read(source));
+      head.append(name, value);
 
       const input = document.createElement("input");
       input.type = "range";
@@ -651,21 +662,18 @@ export class AnalysisCoordinator {
         CLUSTER_WEIGHT_DESCRIPTIONS[source] ??
         `Relative influence of the ${source} source`;
 
-      const value = document.createElement("span");
-      value.className = "cluster-weight-value";
-      value.textContent = formatSourceWeight(input.valueAsNumber);
-
+      row.append(head, input);
       if (opts.available && !opts.available(source)) {
-        // Unavailable: the source cannot contribute right now (server stage off,
-        // or no cached vectors yet). Keep its canonical weight — never silently
-        // rewrite it — but disable the slider so a drag cannot imply it works.
+        // Unavailable: the source cannot contribute right now (server stage off).
+        // Keep its canonical weight — never silently rewrite it — but disable the
+        // slider so a drag cannot imply it works.
         input.disabled = true;
-        input.title = `${name.textContent} is unavailable — its stage is off or it has no cached vectors yet`;
+        input.title = `${name.textContent} is unavailable — its stage is off on this server`;
         row.classList.add("unavailable");
         const note = document.createElement("span");
         note.className = "cluster-weight-unavailable";
-        note.textContent = "pending";
-        row.append(name, input, value, note);
+        note.textContent = "unavailable";
+        row.appendChild(note);
       } else {
         input.addEventListener("input", () => {
           value.textContent = formatSourceWeight(input.valueAsNumber);
@@ -673,7 +681,6 @@ export class AnalysisCoordinator {
           // Apply, so dragging never blocks on the expensive path.
           opts.onInput(this._readSliderHost(host, sources, opts));
         });
-        row.append(name, input, value);
       }
       host.appendChild(row);
     }
@@ -709,7 +716,9 @@ export class AnalysisCoordinator {
         `input[data-source="${source}"]`,
       );
       if (input) input.value = String(vector[source] ?? 0);
-      const readout = input?.nextElementSibling;
+      const readout = input?.closest(".cluster-weight-row")?.querySelector(
+        ".cluster-weight-value",
+      );
       if (readout) readout.textContent = formatSourceWeight(vector[source] ?? 0);
     }
   }
@@ -721,6 +730,182 @@ export class AnalysisCoordinator {
       Object.keys(DEFAULT_CLUSTER_WEIGHTS),
       this.deps.model.clusterWeights,
     );
+  }
+
+  /* ── Read-only influences (View options) ───────────────────
+   * The backend's projection-settings payload describes every source and the
+   * fixed processing rules. Editable sources already have a slider in the
+   * Common/Genre editor above, so this list only shows the remaining (fixed or
+   * inactive) ones — never a duplicate second editor. */
+
+  renderProjectionSettings(
+    settings: ProjectionSettings | null,
+    error?: string,
+  ): void {
+    const host = document.getElementById("influence-sources");
+    const fixedHost = document.getElementById("influence-fixed");
+    if (!host || !fixedHost) return;
+    host.replaceChildren();
+    fixedHost.replaceChildren();
+    if (!settings) {
+      if (error) {
+        const note = document.createElement("p");
+        note.className = "influence-empty";
+        note.textContent = error;
+        host.appendChild(note);
+      }
+      return;
+    }
+
+    // Every source with an editable row above is omitted here (its slider owns
+    // it, even when disabled for an unavailable capability). What remains is the
+    // fixed or absent contribution list.
+    const editableKeys = new Set(settings.weights_editable_keys);
+    const rows = settings.sources.filter((s) => !editableKeys.has(s.id));
+    if (rows.length === 0) {
+      const note = document.createElement("p");
+      note.className = "influence-empty";
+      note.textContent = "Every influence is editable above.";
+      host.appendChild(note);
+    }
+    for (const source of rows) {
+      const row = document.createElement("div");
+      row.className = "influence-source";
+      if (!source.available) row.classList.add("unavailable");
+
+      const name = document.createElement("span");
+      name.className = "influence-source-name";
+      name.textContent = CLUSTER_WEIGHT_LABELS[source.id] ?? source.id;
+      name.title =
+        CLUSTER_WEIGHT_DESCRIPTIONS[source.id] ??
+        `Relative influence of the ${source.id} source`;
+
+      const value = document.createElement("span");
+      value.className = "influence-source-weight";
+      value.textContent = formatSourceWeight(source.weight);
+
+      const reason = document.createElement("span");
+      reason.className = "influence-source-reason";
+      reason.textContent = this._influenceReason(source, settings);
+      row.append(name, value, reason);
+      host.appendChild(row);
+    }
+
+    this._renderFixedInfluences(fixedHost, settings);
+  }
+
+  /** Why a non-editable source cannot be adjusted in the active lens. */
+  private _influenceReason(
+    source: ProjectionSettings["sources"][number],
+    settings: ProjectionSettings,
+  ): string {
+    if (!source.available) return "unavailable";
+    if (!source.in_lens) return "not in lens";
+    if (Math.abs(source.weight) < 1e-9) return "inactive";
+    return settings.weights_editable ? "fixed" : "fixed by lens";
+  }
+
+  /** Render the fixed transformation rules as readouts, never fake sliders. */
+  private _renderFixedInfluences(
+    host: HTMLElement,
+    settings: ProjectionSettings,
+  ): void {
+    const details = document.createElement("details");
+    details.className = "influence-processing";
+    const summary = document.createElement("summary");
+    summary.textContent = "Processing (fixed)";
+    details.appendChild(summary);
+
+    const group = (title: string, rows: [string, string][]) => {
+      const heading = document.createElement("div");
+      heading.className = "influence-group-heading";
+      heading.textContent = title;
+      details.appendChild(heading);
+      for (const [label, value] of rows) {
+        const row = document.createElement("div");
+        row.className = "influence-fixed-row";
+        const name = document.createElement("span");
+        name.className = "influence-fixed-name";
+        name.textContent = label;
+        const val = document.createElement("span");
+        val.className = "influence-fixed-value";
+        val.textContent = value;
+        row.append(name, val);
+        details.appendChild(row);
+      }
+    };
+
+    const b = settings.budget;
+    const fb = settings.folder_basis;
+    const cs = settings.coarse_schedule;
+    const af = settings.audio_features;
+    group("Projection", [
+      ["Recipe", settings.recipe],
+      ["Method", settings.method],
+      ["Dimensions", String(settings.dims)],
+    ]);
+    group("Folder basis", [
+      ["Mode", fb.mode],
+      ["Boost", formatSourceWeight(fb.boost)],
+      ["Depth boost", formatSourceWeight(fb.depth_boost)],
+    ]);
+    group("Final fit", [
+      [
+        "Iterations",
+        `${b.tsne_n_iter} (recipe default ${b.default_tsne_n_iter})`,
+      ],
+      [
+        "Early exaggeration",
+        `${b.tsne_early_exaggeration_iter} (recipe default ${b.default_tsne_early_exaggeration_iter})`,
+      ],
+      ["Final exaggeration", formatSourceWeight(b.final_exaggeration)],
+    ]);
+    group("Sample-init hierarchy", [
+      ["Levels", String(cs.fraction_count)],
+      [
+        "Fraction range",
+        `${this._formatFraction(cs.min_fraction)} → ${this._formatFraction(cs.max_fraction)}`,
+      ],
+      ["Iteration budget", String(cs.iteration_budget)],
+      ["Early exaggeration", String(cs.early_exaggeration_iter)],
+      ["Perplexity gamma", formatSourceWeight(cs.perplexity_gamma)],
+      ["Perplexity rule", cs.perplexity_rule],
+    ]);
+    group("Final perplexity", [
+      ["Rule", settings.final_perplexity.rule],
+      [
+        "Resolved",
+        settings.final_perplexity.resolved == null
+          ? "runtime count"
+          : String(settings.final_perplexity.resolved),
+      ],
+    ]);
+    group("Audio features", [
+      ["Blend", formatSourceWeight(af.blend)],
+      ["Mask", this._formatMask(af.mask, af.dim)],
+      ["Dimensions", String(af.dim)],
+    ]);
+    const note = document.createElement("p");
+    note.className = "influence-fixed-note";
+    note.textContent = settings.final_perplexity.note;
+    details.appendChild(note);
+    host.appendChild(details);
+  }
+
+  /** ``1/256`` style for power-of-two fractions, else a compact decimal. */
+  private _formatFraction(v: number): string {
+    if (v > 0 && v < 1) {
+      const inv = 1 / v;
+      if (Math.abs(inv - Math.round(inv)) < 1e-9) return `1/${Math.round(inv)}`;
+    }
+    return formatSourceWeight(v);
+  }
+
+  /** ``6 dims · all on`` for an all-ones mask, else the explicit on/off list. */
+  private _formatMask(mask: number[], dim: number): string {
+    const on = mask.filter((v) => v >= 0.5).length;
+    if (on === mask.length) return `${dim} dims · all on`;
+    return `${on}/${dim} on · ${mask.map((v) => (v >= 0.5 ? "1" : "0")).join("")}`;
   }
 
   /** Read the live slider values into a complete weight map. */
@@ -1123,43 +1308,30 @@ export class AnalysisCoordinator {
     return "No clusters yet — press Rebuild clusters.";
   }
 
-  /** Reflect cluster availability on the panel controls (disabled + explained). */
-  private _syncColorControls(): void {
-    const m = this.deps.model;
-    const available = m.clustersAvailable;
+  /** Reflect cluster availability on the panel's own controls only.
+   *
+   *  This is the whole of a cluster fetch's DOM debt: it may change whether the
+   *  resolution slider can be used, never the lens/colour/dimensionality/budget
+   *  the View options folds derive from. */
+  private _syncClusterControls(): void {
     const $cr = document.getElementById(
       "cluster-resolution-range",
     ) as HTMLInputElement | null;
-    if ($cr) $cr.disabled = !available;
-    // The genre weight preview is a view option shown only for the genre map.
-    const $genre = document.getElementById("genre-weights-fold");
-    if ($genre) {
-      $genre.classList.toggle(
-        "hidden",
-        !(m.genreFullEnabled && m.lens().id === GENRE_FULL_LENS.id),
-      );
-    }
-    // The confident-only gate is a view option: it only exists while the
-    // predicted-folder colour mode is active. The panel shows whenever it has at
-    // least one visible option, so future options need no extra wiring here.
-    const $fold = document.getElementById("head-confident-fold");
-    if ($fold) $fold.classList.toggle("hidden", m.colorMode !== "head");
-    // The t-SNE iteration budget is a view option shown only for a projection lens.
-    const $tsneFold = document.getElementById("tsne-iteration-fold");
-    if ($tsneFold) {
-      $tsneFold.classList.toggle("hidden", m.lens().kind !== "projection");
-    }
-    const $opts = document.getElementById("view-options");
-    if ($opts) {
-      const anyVisible = [...$opts.querySelectorAll(".view-option")].some(
-        (el) => !el.classList.contains("hidden"),
-      );
-      $opts.classList.toggle("hidden", !anyVisible);
-    }
+    if ($cr) $cr.disabled = !this.deps.model.clustersAvailable;
     const $hc = document.getElementById(
       "head-color-confident",
     ) as HTMLInputElement | null;
-    if ($hc) $hc.checked = m.headColorConfident;
+    if ($hc) $hc.checked = this.deps.model.headColorConfident;
+  }
+
+  /** Availability plus the View options folds a *colour* change repaints.
+   *
+   *  Only call this where the colour mode (or the lens) really moved: View
+   *  options is the single owner of its folds and panel visibility, and a full
+   *  resync refetches/rebuilds the influences list. */
+  private _syncColorControls(): void {
+    this._syncClusterControls();
+    this.deps.syncViewOptions?.();
   }
 
   /** Subscribe to queue progress.
@@ -1312,7 +1484,6 @@ export class AnalysisCoordinator {
       this.deps.status.update(m);
       this.deps.scheduleDraw();
       this._syncApplyEnabled();
-      this._syncColorControls();
       // Clustering finished or changed → refresh assignments.
       const rev = st.clusters?.revision ?? null;
       if (rev && rev !== prevRevision) {
@@ -1350,13 +1521,15 @@ export class AnalysisCoordinator {
       if (!d.available) {
         m.clustersAvailable = false;
         // A colouring that can no longer apply must not stay selected.
-        if (m.colorMode === "cluster") m.colorMode = "folder";
+        const fellBack = m.colorMode === "cluster";
+        if (fellBack) m.colorMode = "folder";
         m.clusterAssignments = new Map();
         m.clusterNames = new Map();
         m.clusterSizes = new Map();
         this._renderWeightsNote(null);
         this._renderClusterPanel();
-        this._syncColorControls();
+        if (fellBack) this._syncColorControls();
+        else this._syncClusterControls();
         return;
       }
 
@@ -1373,6 +1546,7 @@ export class AnalysisCoordinator {
       );
       this._renderWeightsNote(d);
       this._renderClusterPanel();
+      this._syncClusterControls();
       this.deps.scheduleDraw();
     } catch {
       /* api() already toasted */
@@ -1420,13 +1594,11 @@ export class AnalysisCoordinator {
     if (!m.clustersAvailable) {
       $meta.textContent = this._clusterUnavailableReason();
       $list.replaceChildren();
-      this._syncColorControls();
       return;
     }
 
     const n = m.clusterNames.size || m.clusterSizes.size;
     $meta.textContent = `${n} clusters at resolution ${m.clusterResolution}`;
-    this._syncColorControls();
 
     const entries = [...m.clusterSizes.entries()].sort((a, b) => b[1] - a[1]);
     $list.replaceChildren();

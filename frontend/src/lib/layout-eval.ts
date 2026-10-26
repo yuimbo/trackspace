@@ -6,6 +6,9 @@
 // blind-name assignment, universe computation and artifact validation follow one
 // rule regardless of UI state.
 
+/** Output dimensionality of one eval artifact. */
+export type EvalDims = 2 | 3;
+
 /** One recipe as listed in the manifest (a completed entry). */
 export interface EvalManifestRecipe {
   id: string;
@@ -13,6 +16,23 @@ export interface EvalManifestRecipe {
   tracks?: number;
   timings?: Record<string, number>;
   alignedTo?: string | null;
+  /** Output dimensionality; legacy manifests omit it and mean 2. */
+  dims: EvalDims;
+  /** Paired-family id (2-D base + 3-D sibling share it); defaults to the id. */
+  group: string;
+}
+
+/** One parsed position: ``z`` is present only on 3-D artifacts. */
+export interface EvalPosition {
+  x: number;
+  y: number;
+  z?: number;
+}
+
+/** Missing dims means the legacy 2-D schema; any other value is unsupported. */
+function parseDims(value: unknown): EvalDims | null {
+  if (value === undefined || value === null) return 2;
+  return value === 2 || value === 3 ? value : null;
 }
 
 /** A parsed, validated manifest of the completed eval recipes. */
@@ -49,7 +69,11 @@ export function parseEvalManifest(raw: unknown): EvalManifest | null {
     if (r.status !== "complete") continue;
     const label = r.label;
     if (typeof label !== "string") continue;
-    const rec: EvalManifestRecipe = { id, label };
+    const dims = parseDims(r.dims);
+    if (dims === null) continue;
+    const group =
+      typeof r.group === "string" && r.group.length > 0 ? r.group : id;
+    const rec: EvalManifestRecipe = { id, label, dims, group };
     if (typeof r.tracks === "number") rec.tracks = r.tracks;
     if (r.timings && typeof r.timings === "object") {
       const timings: Record<string, number> = {};
@@ -90,17 +114,22 @@ export interface EvalArtifact {
   id: string;
   revision: string;
   datasetFingerprint: string;
-  positions: Map<string, { x: number; y: number }>;
+  positions: Map<string, EvalPosition>;
   tracks: number;
   label: string;
   alignedTo: string | null;
   timings: Record<string, number>;
+  /** Output dimensionality; legacy artifacts omit it and mean 2. */
+  dims: EvalDims;
+  /** Paired-family id; defaults to the artifact id. */
+  group: string;
 }
 
 /**
  * Validate + normalise one recipe artifact. Mirrors the backend's own checks:
- * every position must be finite and carry a string path. Returns ``null`` when
- * the artifact is missing/corrupt or its positions are unusable.
+ * every position must be finite and carry a string path, and a 3-D artifact
+ * must carry a finite ``z`` on every position. Returns ``null`` when the
+ * artifact is missing/corrupt or its positions are unusable.
  */
 export function parseEvalArtifact(raw: unknown): EvalArtifact | null {
   if (!raw || typeof raw !== "object") return null;
@@ -108,7 +137,9 @@ export function parseEvalArtifact(raw: unknown): EvalArtifact | null {
   const positions = o.positions;
   if (!Array.isArray(positions)) return null;
   if (typeof o.id !== "string" || typeof o.revision !== "string") return null;
-  const map = new Map<string, { x: number; y: number }>();
+  const dims = parseDims(o.dims);
+  if (dims === null) return null;
+  const map = new Map<string, EvalPosition>();
   for (const pos of positions) {
     if (!pos || typeof pos !== "object") return null;
     const p = pos as Record<string, unknown>;
@@ -117,7 +148,13 @@ export function parseEvalArtifact(raw: unknown): EvalArtifact | null {
     const y = p.y;
     if (typeof x !== "number" || typeof y !== "number") return null;
     if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
-    map.set(p.path, { x, y });
+    const out: EvalPosition = { x, y };
+    if (dims === 3) {
+      const z = p.z;
+      if (typeof z !== "number" || !Number.isFinite(z)) return null;
+      out.z = z;
+    }
+    map.set(p.path, out);
   }
   if (map.size === 0) return null;
   const timings: Record<string, number> = {};
@@ -135,6 +172,8 @@ export function parseEvalArtifact(raw: unknown): EvalArtifact | null {
     label: typeof o.label === "string" ? o.label : o.id,
     alignedTo: typeof o.aligned_to === "string" ? (o.aligned_to as string) : null,
     timings,
+    dims,
+    group: typeof o.group === "string" && o.group.length > 0 ? o.group : o.id,
   };
 }
 

@@ -10,6 +10,7 @@ from backend.embeddings.projection_config import (
     REQUIRED_SOURCES,
     recipe_for,
 )
+from backend.services.projection_request import effective_source_weights
 
 
 def layout_revision_for_projection(
@@ -18,6 +19,7 @@ def layout_revision_for_projection(
     proj: Any | None,
     *,
     cache_versions: Sequence[int],
+    gauge_scope: str | None = None,
 ) -> str | None:
     """Compute layout revision for the projection slice.
 
@@ -26,8 +28,14 @@ def layout_revision_for_projection(
     a re-weighting invalidates position caches. An opt-in recipe id and a non-default
     openTSNE iteration budget are encoded as deviations, so the default recipe's
     revision is byte-identical to before. The ``genre_full`` recipe is the exception:
-    it encodes its *effective* budget absolutely (see the body) so its 100/100
+    it encodes its *effective* budget absolutely (see the body) so its 50/0
     default never aliases the legacy 500/250 fit/layout under the same revision.
+
+    *gauge_scope* is the canonical configured-library scope
+    (``services/lens_layout.gauge_scope_for``). It identifies the reference frame the
+    served coordinates are aligned into, so every caller that can resolve it must
+    pass it — status, the projection route and the prefetch all do, which is what
+    keeps their revisions equal. ``None`` leaves the path-derived fallback in charge.
     """
     sources = getattr(proj, "sources", None) or FROZEN_SOURCES
     required = getattr(proj, "required_sources", None) or REQUIRED_SOURCES
@@ -45,9 +53,9 @@ def layout_revision_for_projection(
     if eff_early is None:
         eff_early = recipe.tsne_early_exaggeration_iter
     # The genre recipe encodes its *effective* budget absolutely: its default moved
-    # from 500/250 to 100/100, and the legacy 500/250 default revision carried no
-    # budget fields, so an absolute encoding is what stops the new 100/100 default
-    # from hashing to (and reading) the legacy fit/layout under the same revision.
+    # from 500/250 to 100/100 and then to 50/0, and the legacy 500/250 default
+    # revision carried no budget fields, so an absolute encoding is what stops the
+    # current default from hashing to (and reading) the legacy fit/layout.
     # Every other recipe encodes only a deviation, keeping the default recipe's
     # revision byte-identical to before.
     is_genre = recipe_id == "genre_full"
@@ -58,11 +66,22 @@ def layout_revision_for_projection(
         else None
     )
 
+    # Encode the weights the gather actually applies, not a raw ``w=`` vector:
+    # a weight for a source outside this lens is not an influence. The default
+    # combined lens at no override stays ``None`` so its revision is byte-identical
+    # to before (and to the pre-weight-cache rows).
+    raw_weights = getattr(proj, "source_weights", None)
+    weights = (
+        None
+        if raw_weights is None and sources == FROZEN_SOURCES
+        else effective_source_weights(proj)
+    )
     return compute_layout_revision(
         eligible_paths=eligible,
         cache_versions=tuple(cache_versions),
-        weights=getattr(proj, "source_weights", None),
+        weights=weights,
         sources=sources,
+        gauge_scope=gauge_scope,
         dims=getattr(proj, "dims", 2),
         recipe_id=recipe_id if recipe_id != "default" else None,
         tsne_n_iter=tsne_n_enc,

@@ -16,16 +16,29 @@ import pickle
 import platform
 import sys
 import threading
+import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 
 from .clap import inference_lock as _inference_lock
 from .linalg_utils import apply_procrustes, procrustes, svd_singular
+from .multilevel_tsne import (
+    fit_multilevel,
+    resolve_fraction_schedule,
+    scale_initialization,
+)
 from .projection_config import (
+    OPENTSNE_COARSE_EARLY_EXAGGERATION_ITER,
+    OPENTSNE_COARSE_ITERATION_BUDGET,
     OPENTSNE_EARLY_EXAGGERATION_ITER,
+    OPENTSNE_FINAL_EXAGGERATION,
+    OPENTSNE_MULTILEVEL_FRACTIONS,
     OPENTSNE_N_ITER,
+    OPENTSNE_PERPLEXITY_GAMMA,
+    OPENTSNE_PERPLEXITY_START_FRACTION,
     PROJECTION_RECIPE_VERSION,
 )
 
@@ -433,25 +446,131 @@ def _fit_tsne(
     *,
     tsne_n_iter: int = OPENTSNE_N_ITER,
     tsne_early_exaggeration_iter: int = OPENTSNE_EARLY_EXAGGERATION_ITER,
+    n_jobs: int = -1,
+    negative_gradient_method: str | None = None,
+    theta: float | None = None,
+    final_exaggeration: float | None = None,
+    on_timings: Callable[[dict[str, float]], None] | None = None,
 ) -> tuple[object, np.ndarray]:
+    """Multilevel sample-init openTSNE fit; returns the final embedding object.
+
+    The coarse chain is the production schedule from ``projection_config``: many
+    small fraction levels split the fixed coarse budget, early exaggeration on the
+    first, each expanding from the previous level's coordinates, then a full-data
+    final fit at the caller's budget. The final fit uses the production perplexity
+    rule ``min(30, max(5, (n−1)/3))`` (30 for n ≥ 91, clamped lower on tiny
+    libraries), and the returned ``TSNEEmbedding`` is fitted on all rows, so
+    ``.transform`` can place new tracks afterwards.
+
+    The keyword knobs after the production budget are a benchmark seam, not a
+    production surface: callers that omit them get the production defaults
+    (``n_jobs=-1``, openTSNE's auto gradient method, backend-default ``theta``,
+    late exaggeration 1.25). ``final_exaggeration`` sets openTSNE's *late*
+    exaggeration on the full-data final fit only; ``None`` means the canonical
+    production value, while an explicit number (e.g. ``1.0`` for the benchmark's
+    control) is used verbatim. Early exaggeration and its iteration count stay at
+    the recipe's values. ``on_timings`` receives the shared ``fit_multilevel``
+    stage timings plus the total fit wall time.
+    """
     from openTSNE import TSNE  # lazy — heavy import
 
-    kwargs: dict = {
-        "n_components": dims,
-        "perplexity": _tsne_perplexity(len(reduced)),
-        "random_state": 42,
-        "n_jobs": -1,
-        "verbose": False,
-        "n_iter": int(tsne_n_iter),
-        "early_exaggeration_iter": int(tsne_early_exaggeration_iter),
-    }
-    if dims == 3:
-        # openTSNE auto-selects negative_gradient_method, but the fft it picks
-        # above 10k points is 2-D only — pin Barnes-Hut for 3-D explicitly.
-        kwargs["negative_gradient_method"] = "bh"
-    tsne = TSNE(**kwargs)
-    embedding = tsne.fit(reduced)
-    return embedding, np.asarray(embedding, dtype=np.float32)
+    if final_exaggeration is None:
+        final_exaggeration = OPENTSNE_FINAL_EXAGGERATION
+
+    if dims == 3 and negative_gradient_method not in (None, "bh"):
+        # openTSNE's FFT approximation is 2-D only.
+        raise ValueError("3-D t-SNE is Barnes-Hut only")
+
+    schedule = resolve_fraction_schedule(
+        OPENTSNE_MULTILEVEL_FRACTIONS,
+        len(reduced),
+        normal_budget=OPENTSNE_COARSE_ITERATION_BUDGET,
+        gamma=OPENTSNE_PERPLEXITY_GAMMA,
+        start_fraction=OPENTSNE_PERPLEXITY_START_FRACTION,
+        early_iter=OPENTSNE_COARSE_EARLY_EXAGGERATION_ITER,
+    )
+
+    def _fit(
+        subset: np.ndarray,
+        n_iter: int,
+        early: int,
+        perplexity: float | None,
+        init: np.ndarray | None,
+        *,
+        late_exaggeration: float | None = None,
+    ) -> object:
+        kwargs: dict = {
+            "n_components": dims,
+            "perplexity": (
+                _tsne_perplexity(len(subset))
+                if perplexity is None
+                else float(perplexity)
+            ),
+            "random_state": 42,
+            "n_jobs": int(n_jobs),
+            "verbose": False,
+            "n_iter": int(n_iter),
+            "early_exaggeration_iter": int(early),
+        }
+        if negative_gradient_method is not None:
+            kwargs["negative_gradient_method"] = negative_gradient_method
+        elif dims == 3:
+            # openTSNE auto-selects negative_gradient_method, but the fft it picks
+            # above 10k points is 2-D only — pin Barnes-Hut for 3-D explicitly.
+            kwargs["negative_gradient_method"] = "bh"
+        if theta is not None:
+            kwargs["theta"] = float(theta)
+        if late_exaggeration is not None:
+            # openTSNE's ``exaggeration`` is the *late* exaggeration. Pin the
+            # early value explicitly so setting it does not also shift the early
+            # phase through openTSNE's ``max(12, exaggeration)`` auto rule.
+            kwargs["exaggeration"] = float(late_exaggeration)
+            kwargs["early_exaggeration"] = 12
+        if init is None and len(subset) <= dims:
+            # A level this small cannot satisfy PCA's ``n_components <= n_samples``
+            # requirement (openTSNE's default init), so start it randomly instead
+            # of letting the whole chain fall back to another backend.
+            kwargs["initialization"] = "random"
+        tsne = TSNE(**kwargs)
+        if init is None:
+            return tsne.fit(subset)
+        return tsne.fit(subset, initialization=scale_initialization(init))
+
+    def fit_level(
+        subset: np.ndarray,
+        normal: int,
+        early: int,
+        perplexity: float | None,
+        init: np.ndarray | None,
+    ) -> np.ndarray:
+        # Explicit array boundary: the shared chain consumes only coordinate
+        # arrays for landmark expansion; the final fit keeps its embedding object.
+        return np.asarray(_fit(subset, normal, early, perplexity, init))
+
+    def fit_final(full: np.ndarray, init: np.ndarray | None) -> object:
+        return _fit(
+            full,
+            tsne_n_iter,
+            tsne_early_exaggeration_iter,
+            None,
+            init,
+            late_exaggeration=final_exaggeration,
+        )
+
+    t_fit = time.perf_counter()
+    embedding, coords, timings = fit_multilevel(
+        reduced,
+        schedule,
+        fit_level=fit_level,
+        fit_final=fit_final,
+        seed=42,
+        n_jobs=n_jobs,
+    )
+    if on_timings is not None:
+        payload = dict(timings)
+        payload["fit"] = time.perf_counter() - t_fit
+        on_timings(payload)
+    return embedding, np.asarray(coords, dtype=np.float32)
 
 
 def _fit_cache_key(

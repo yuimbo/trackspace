@@ -1495,7 +1495,11 @@ export class CanvasView {
         ? [r * shade, g * shade, b * shade]
         : [r, g, b],
       alpha:
-        (faded ? 0.15 : this.model.isExternalTrack(track) ? 0.5 : 1) *
+        (faded
+          ? 0.15
+          : !this.model.evalMode && this.model.isExternalTrack(track)
+            ? 0.5
+            : 1) *
         (1 - GHOST_FADE * ghost),
       // A grey dot contributes shape but almost no colour, so a blob it merges
       // into keeps the hue of its coloured members instead of desaturating.
@@ -1711,8 +1715,14 @@ export class CanvasView {
     if (sel) color = "#ffdd57";
     else color = this.trackColor(track);
 
-    // External-root tracks (shown via the sidebar toggle) read as secondary.
-    const external = !sel && !hov && this.model.isExternalTrack(track);
+    // External-root tracks (shown via the sidebar toggle) read as secondary —
+    // except in eval mode, where the artifact cohort is the whole comparison and
+    // every drawn track must carry equal visual weight.
+    const external =
+      !sel &&
+      !hov &&
+      !this.model.evalMode &&
+      this.model.isExternalTrack(track);
     // While a search is active, tracks it did not match fade into the map so the
     // results stand out. The selected set *is* the result set, so `!sel` covers it.
     const faded =
