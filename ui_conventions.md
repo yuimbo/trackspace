@@ -94,6 +94,16 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
   candidate within the hit radius. Real size: a splat's radius is `POINT_SPLAT_R · scale` and
   the crisp hover/selected disc scales the same way, so nearer dots draw larger in proportion
   to their distance.
+- **Distance fog + depth of field.** The far cap of the cloud is a sphere's opposite pole, not
+  what the orbit view is looking at, so it fades into the background and stops taking hits:
+  `fogAmount(depth, bias)` (`canvas-view.ts`) ramps 0 → 1 between `FOG_START` and `FOG_END`
+  (normalised depth 0.5 → 0.3, 1 = nearest) and the splat alpha drops by up to `FOG_FADE`. At
+  `FOG_BACKGROUND` and beyond a dot is *background*: its splats go to a separate field that is
+  blitted **blurred** (`_blitFog`, `ctx.filter` — the canvas-filter blur used by the scope glass)
+  under the sharp field before it, and it is never hovered, clicked or lassoed. A panned view
+  (`_panBias`) recedes the window by up to `FOG_PAN_BIAS`, so the horizon it panned to stays
+  legible. Scope members are exempt — an opened lens never fogs — and the search-field glow
+  fades with its dot.
 - **Cel sun shading.** The splat shader reads each kernel fragment as a matte sphere cap (normal
   inferred from the fragment's offset from the dot centre, in the camera's +y-up frame) and
   cel-shades it with one orthogonal sun: a single hard terminator, everything on the sun side at

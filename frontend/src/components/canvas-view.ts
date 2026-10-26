@@ -152,6 +152,26 @@ const DEPTH_SHADE_SPAN = 0.55;
 /** A wormhole-ghosted dot fades to this opacity at full influence (ghost = 1). */
 const GHOST_FADE = 0.85;
 /**
+ * Distance fog: the far side of the cloud is a sphere's opposite pole, not
+ * something the orbit view is looking at, so it fades into the background and
+ * stops taking hits. *Fog start* is the depth (1 = nearest) where the fade
+ * begins, *fog end* where a dot is fully fogged; both are receded by up to
+ * `FOG_PAN_BIAS` when the view is panned off the cube centre (`fogAmount`).
+ */
+const FOG_START = 0.5;
+const FOG_END = 0.3;
+/** How much a full pan recedes the fog window, in depth units. */
+const FOG_PAN_BIAS = 0.15;
+/** A fully fogged dot keeps this fraction of its opacity (1 − this = fade). */
+const FOG_FADE = 0.8;
+/**
+ * Fog at/after which a dot is *background*: drawn in the blurred depth-of-field
+ * layer instead of the sharp field, and never hovered, clicked or lassoed.
+ */
+const FOG_BACKGROUND = 0.5;
+/** DoF blur on the background layer, in CSS px (0 = no blur, alpha fade only). */
+const FOG_BLUR_PX = 4;
+/**
  * The sphere scope's wormhole pushes a non-member that projects inside the disc
  * out to this multiple of the sphere's screen radius, ghosting it as it goes.
  * Past this reach nothing moves.
@@ -299,6 +319,23 @@ export function wormhole(
 }
 
 /**
+ * How fogged a dot is at *depth* (0 = fully clear … 1 = fully fogged).
+ *
+ * The window starts behind the sphere's centre plane, so the visible near half and
+ * the horizon band stay crisp while only the far cap fades. *bias* (0..1) recedes
+ * the whole window for a panned view: the user is then looking off-axis at the
+ * horizon they panned to, so more of the far side should stay legible. Pure, so it
+ * is unit-tested directly.
+ */
+export function fogAmount(depth: number, bias = 0): number {
+  const shift = FOG_PAN_BIAS * clamp01(bias);
+  const start = FOG_START - shift;
+  const end = FOG_END - shift;
+  const t = clamp01((start - depth) / (start - end));
+  return t * t * (3 - 2 * t);
+}
+
+/**
  * Read the sphere-scope glass blur radius from a query string's ``glass``
  * parameter: finite and clamped to [0, MAX_GLASS_BLUR], else GLASS_BLUR_PX.
  * ``search`` may be ``"?glass=12"`` or ``"glass=12"``; 0 = no blur, tint only.
@@ -426,6 +463,8 @@ export class CanvasView {
    * scatter falls back to plain 2-D dots.
    */
   points: MetaballLayer;
+  /** This frame's splats for the blurred background (DoF) layer. */
+  private _fogSpecs: PointSpec[] = [];
   /** This frame's splats (all points except the crisp hover/selected ones). */
   private _pointSpecs: PointSpec[] = [];
   /**
@@ -870,6 +909,7 @@ export class CanvasView {
       m.shows3d && m.scope?.shape === "sphere"
         ? this.scopeScreenCircle()
         : null;
+    const fogBias = m.shows3d ? this._panBias() : 0;
     for (const p of field) {
       const t = m.trackByPath(p.path);
       if (!t) continue;
@@ -901,7 +941,10 @@ export class CanvasView {
         radius: FIELD_GLOW_R * (0.55 + 0.45 * w),
         core: 0,
         color: FIELD_GLOW_RGB,
-        alpha: 0.05 + 0.35 * w * w,
+        // A fogged landmark glows just as faintly as its dot.
+        alpha:
+          (0.05 + 0.35 * w * w) *
+          (1 - FOG_FADE * fogAmount(p.depth, fogBias)),
       };
     });
   }
@@ -1307,6 +1350,7 @@ export class CanvasView {
     // tracks on every animation frame is pure GC pressure.
     this._pointSpecs.length = 0;
     this._scopeSpecs.length = 0;
+    this._fogSpecs.length = 0;
     this._crispDots.length = 0;
     this._hitGrid.clear();
     const w = this.$canvas.clientWidth;
@@ -1321,6 +1365,8 @@ export class CanvasView {
       m.shows3d && m.scope?.shape === "sphere"
         ? this.scopeScreenCircle()
         : null;
+    // Distance fog is a 3-D-only cue; the pan bias is one value for the frame.
+    const fogBias = m.shows3d ? this._panBias() : 0;
     tracks.forEach((t, i) => {
       if (!m.isVisible(t)) {
         anyFiltered = true;
@@ -1347,30 +1393,39 @@ export class CanvasView {
         sy > h + CULL_MARGIN
       )
         return;
-      // Heavily ghosted dots are rendered but not hittable or selectable, so
-      // hover, click, lasso and the hover glow ignore them.
-      if (ghost < 0.5) this.positions.push({ idx: i, sx, sy, depth });
+      // The far cap of the cloud is fog: drawn faintly, but it is background, so
+      // hover, click, lasso and the hover glow leave it to the near side. A
+      // scope's members are the lens the user opened, so they never fog.
+      const fog = m.scopePositions.has(t.path)
+        ? 0
+        : fogAmount(depth, fogBias);
+      const reachable = ghost < 0.5 && fog < FOG_BACKGROUND;
+      if (reachable) this.positions.push({ idx: i, sx, sy, depth });
       if (!supported) {
-        this._dot(sx, sy, t, i, scale);
+        this._dot(sx, sy, t, i, scale, 1 - FOG_FADE * fog);
         return;
       }
-      if (ghost < 0.5) {
+      if (reachable) {
         const key = `${Math.round(sx / HIT_CELL)},${Math.round(sy / HIT_CELL)}`;
         const cell = this._hitGrid.get(key);
         if (cell) cell.push({ idx: i, sx, sy, depth });
         else this._hitGrid.set(key, [{ idx: i, sx, sy, depth }]);
       }
       const crisp = m.selected.has(t.path) || this.hoveredIdx === i;
-      if (crisp && ghost < 0.5) {
+      if (crisp && reachable) {
         this._crispDots.push({ sx, sy, idx: i, depth, scale });
       } else {
-        // A heavily ghosted crisp dot merges back into the field as a silhouette.
-        const spec = this._pointSpec(sx, sy, t, depth, scale, ghost);
+        // A ghosted or background-fogged crisp dot merges back into the field as
+        // a silhouette.
+        const spec = this._pointSpec(sx, sy, t, depth, scale, ghost, fog);
         // A sphere scope's members render above its glass, so their splats go
-        // to the second field pass (`_renderBlobs`); everyone else merges with
-        // the outer map.
+        // to the second field pass (`_renderBlobs`); the fogged background is
+        // its own blurred layer under everything sharp; everyone else merges
+        // with the outer map.
         if (wormholeCircle && m.scopePositions.has(t.path)) {
           this._scopeSpecs.push(spec);
+        } else if (fog >= FOG_BACKGROUND) {
+          this._fogSpecs.push(spec);
         } else {
           this._pointSpecs.push(spec);
         }
@@ -1392,7 +1447,8 @@ export class CanvasView {
    * the depth shade: nearer points draw brighter, scaled by the camera blend so
    * the cue fades in with the 2-D↔3-D transition instead of popping at toggle
    * start. Size comes from the perspective `scale` (1 in 2-D), so a nearer
-   * point also draws larger.
+   * point also draws larger. *fog* (0..1) fades the far cap of the cloud into
+   * the background.
    */
   private _pointSpec(
     sx: number,
@@ -1401,6 +1457,7 @@ export class CanvasView {
     depth: number,
     scale: number,
     ghost = 0,
+    fog = 0,
   ): PointSpec {
     const faded =
       this.searchResults !== null && !this.searchResults.has(track.path);
@@ -1421,7 +1478,8 @@ export class CanvasView {
           : !this.model.evalMode && this.model.isExternalTrack(track)
             ? 0.5
             : 1) *
-        (1 - GHOST_FADE * ghost),
+        (1 - GHOST_FADE * ghost) *
+        (1 - FOG_FADE * fog),
       // A grey dot contributes shape but almost no colour, so a blob it merges
       // into keeps the hue of its coloured members instead of desaturating.
       weight: colour === CONFIDENT_MISS_COLOR ? GREY_COLOUR_WEIGHT : 1,
@@ -1451,12 +1509,17 @@ export class CanvasView {
   /**
    * Render the metaball field and blit it over the grid; crisp dots come later.
    *
+   * The fogged background (the cloud's far cap, see `fogAmount`) goes first as its
+   * own depth-of-field layer: the field is rendered on its own, blitted *blurred*
+   * (`_blitFog`), and only then does the sharp field go over it — so near dots
+   * stay crisp while the far side reads as defocused. It needs no depth pre-pass:
+   * it sits entirely under the sharp layer.
+   *
    * With a sphere scope in 3-D the disc is frosted glass: the outer (non-member)
    * field is blitted first, a blurred + tinted circle covers it (`_drawGlass`),
    * then the scope's member field goes over it — the glass softens what sits
-   * behind the disc (the grid/cube and the rim-pushed non-members) while the
-   * members stay sharp on top. Everywhere else the whole field renders in one
-   * pass, exactly as before.
+   * behind the disc (the grid/cube and the pushed-out non-members) while the
+   * members stay sharp on top.
    */
   private _renderBlobs(depthAware: boolean): void {
     if (!this.points.supported) return;
@@ -1466,6 +1529,10 @@ export class CanvasView {
     // The cel light fades with the 2-D↔3-D blend exactly like the depth shade, so
     // the toggle never pops and 2-D keeps its flat colours.
     const shading = this._shading();
+    if (this._fogSpecs.length) {
+      this.points.render(this._fogSpecs, false, shading);
+      this._blitFog(w, h);
+    }
     const circle = this.model.shows3d ? this.scopeScreenCircle() : null;
     if (circle) {
       this.points.render(this._pointSpecs, depthAware, shading);
@@ -1484,6 +1551,41 @@ export class CanvasView {
     return this.model.shows3d
       ? { ...this.model.shading, strength: this.model.view3dBlend }
       : null;
+  }
+
+  /**
+   * Blit the fogged field as the depth-of-field layer. The canvas `filter` gives a
+   * real image-space blur on the GPU; where it is unavailable (Safari, headless
+   * fakes) the layer is simply drawn — the alpha fade alone still sorts it behind
+   * the sharp field.
+   */
+  private _blitFog(w: number, h: number): void {
+    const ctx = this.ctx;
+    const blurred = FOG_BLUR_PX > 0 && typeof ctx.filter === "string";
+    if (blurred) {
+      ctx.save();
+      // Device-pixel sized source drawn under the dpr transform (as `_drawGlass`).
+      ctx.filter = `blur(${FOG_BLUR_PX * (devicePixelRatio || 1)}px)`;
+      ctx.drawImage(this.points.canvas, 0, 0, w, h);
+      ctx.restore();
+      return;
+    }
+    ctx.drawImage(this.points.canvas, 0, 0, w, h);
+  }
+
+  /**
+   * How far the view is panned off the cube centre, 0 (centred) … 1 (the centre
+   * half a viewport away). Distance fog recedes with it: a panned view is an
+   * off-axis look at the horizon, so the far side there should stay legible.
+   */
+  private _panBias(): number {
+    const w = this.$canvas.clientWidth;
+    const h = this.$canvas.clientHeight;
+    if (w < 2 || h < 2) return 0;
+    const [sx, sy] = this.w2s(0.5, 0.5);
+    return clamp01(
+      Math.hypot((sx - w / 2) / (w / 2), (sy - h / 2) / (h / 2)),
+    );
   }
 
   /**
@@ -1643,6 +1745,7 @@ export class CanvasView {
     track: Track,
     idx: number,
     scale = 1,
+    fade = 1,
   ): void {
     const sel = this.model.selected.has(track.path);
     const hov = this.hoveredIdx === idx;
@@ -1668,7 +1771,7 @@ export class CanvasView {
       !sel &&
       !hov &&
       !this.searchResults.has(track.path);
-    ctx.globalAlpha = faded ? 0.15 : external ? 0.5 : 1;
+    ctx.globalAlpha = (faded ? 0.15 : external ? 0.5 : 1) * fade;
 
     ctx.beginPath();
     ctx.arc(sx, sy, r, 0, Math.PI * 2);

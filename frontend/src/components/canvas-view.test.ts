@@ -16,6 +16,7 @@ import {
   CanvasView,
   CONFIDENT_MISS_COLOR,
   depthShade,
+  fogAmount,
   GLASS_BLUR_PX,
   GLASS_TINT,
   GLASS_TINT_FLAT,
@@ -418,6 +419,9 @@ describe("CanvasView 3-D glow compositing", () => {
     ]);
     cv.hoverTarget = { kind: "cluster", id: 2 };
     cv.model.selected.add("a.mp3");
+    // Move b.mp3 to the near half: a fogged dot is background and never occludes
+    // a halo (the DoF layer sits under the sharp field).
+    cv.model.embeddingPositions.set("b.mp3", { x: 0.6, y: 0.5, z: 0.6 });
     cv.draw();
 
     expect(glow.render).toHaveBeenCalledTimes(1);
@@ -429,7 +433,7 @@ describe("CanvasView 3-D glow compositing", () => {
     expect(occluders).toBeDefined();
     const ts = trackScreen(cv);
     const pa = ts({ wx: 0.3, wy: 0.4, wz: 0.8 });
-    const pb = ts({ wx: 0.6, wy: 0.5, wz: 0.2 });
+    const pb = ts({ wx: 0.6, wy: 0.5, wz: 0.6 });
     const crisp = occluders!.find((o) => o.depth === pa.depth)!;
     const splat = occluders!.find((o) => o.depth === pb.depth)!;
     // The crisp dot is a perspective-scaled DOT_R_SEL disc at its own depth; the
@@ -441,13 +445,15 @@ describe("CanvasView 3-D glow compositing", () => {
     expect(splat.depth).toBe(pb.depth);
   });
 
-  it("blits blobs, then glow, then draws the crisp dots on top in 3-D", () => {
+  it("blits the fog layer, the sharp blobs, then the glow in 3-D", () => {
     const { cv, glow, points } = make3dCanvas();
     cv.model.selected.add("a.mp3");
     cv.draw();
-    // The blit order is the composition order: blobs under glow under dots.
+    // b.mp3 is in the fog window, so the composition gains a blurred background
+    // layer first: fog under the sharp field under the glow.
     expect(drawImages[0]).toBe(points.canvas);
-    expect(drawImages[1]).toBe(glow.canvas);
+    expect(drawImages[1]).toBe(points.canvas);
+    expect(drawImages[2]).toBe(glow.canvas);
   });
 
   it("passes no occluders and keeps the DOM stack in 2-D", () => {
@@ -864,6 +870,44 @@ describe("wormhole", () => {
   });
 });
 
+// ─── Distance fog (pure) ─────────────────────────────────────
+
+describe("fogAmount", () => {
+  it("clears the near half and the horizon band", () => {
+    expect(fogAmount(1)).toBe(0);
+    expect(fogAmount(0.55)).toBe(0);
+    expect(fogAmount(0.5)).toBe(0);
+  });
+
+  it("fully fogs the far cap", () => {
+    expect(fogAmount(0.3)).toBe(1);
+    expect(fogAmount(0.05)).toBe(1);
+  });
+
+  it("ramps monotonically between the window edges", () => {
+    const depths = [0.5, 0.47, 0.43, 0.39, 0.35, 0.32, 0.3];
+    for (let i = 1; i < depths.length; i++) {
+      expect(fogAmount(depths[i])).toBeGreaterThan(fogAmount(depths[i - 1]));
+    }
+    expect(fogAmount(0.4)).toBeGreaterThan(0);
+    expect(fogAmount(0.4)).toBeLessThan(1);
+  });
+
+  it("recedes the window when the view is panned off axis", () => {
+    // Same depth, less fog on a panned view — the far side stays legible there.
+    expect(fogAmount(0.4, 1)).toBeLessThan(fogAmount(0.4, 0));
+    expect(fogAmount(0.55, 1)).toBe(0);
+    // The bias is clamped to 0..1.
+    expect(fogAmount(0.35, 5)).toBe(fogAmount(0.35, 1));
+    expect(fogAmount(0.35, -1)).toBe(fogAmount(0.35, 0));
+  });
+
+  it("is continuous at both ends of the window", () => {
+    expect(fogAmount(0.5001)).toBeCloseTo(0, 4);
+    expect(fogAmount(0.2999)).toBeCloseTo(1, 4);
+  });
+});
+
 // ─── Sphere-scope glass blur reader (pure) ───────────────────
 
 describe("readGlassBlur", () => {
@@ -1016,6 +1060,79 @@ describe("CanvasView sphere scope billboard + wormhole", () => {
     expect(memberScreen.sy - centre.sy).toBeCloseTo(0, 5);
   });
 
+  it("fogs the far cap: drawn faintly, never hittable", () => {
+    const m = new Model();
+    m.setAllTracks([
+      makeTrack({ path: "near.mp3" }),
+      makeTrack({ path: "far.mp3" }),
+    ]);
+    m.lensId = "combined";
+    m.view3d.on = true;
+    m.view3dBlend = 1;
+    m.embeddingPositions = new Map([
+      ["near.mp3", { x: 0.5, y: 0.5, z: 1 }],
+      ["far.mp3", { x: 0.5, y: 0.5, z: 0 }],
+    ]);
+    const cv = new CanvasView(m);
+    const glow = { render: vi.fn(), canvas: { style: { visibility: "" } } };
+    const points = { supported: true as const, render: vi.fn(), canvas: {} };
+    (cv as unknown as { glow: typeof glow; points: typeof points }).glow = glow;
+    (cv as unknown as { glow: typeof glow; points: typeof points }).points =
+      points;
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    cv.draw();
+    // Only the near half takes hits; the far pole is background.
+    expect(cv.positions.map((p) => p.idx)).toEqual([0]);
+    // The far dot is drawn as its own blurred depth-of-field layer (no depth
+    // pre-pass: it sits under the sharp field), the near dot in the sharp field.
+    const [fogLayer, sharp] = points.render.mock.calls as [
+      PointSpec[],
+      boolean,
+    ][];
+    expect(fogLayer[0]).toHaveLength(1);
+    expect(fogLayer[1]).toBe(false);
+    expect(sharp[0]).toHaveLength(1);
+    expect(sharp[0][0].alpha).toBeCloseTo(1, 5);
+    // Still drawn, just faded into the fog.
+    expect(fogLayer[0][0].alpha).toBeGreaterThan(0);
+    expect(fogLayer[0][0].alpha).toBeLessThan(0.5);
+  });
+
+  it("never fogs a scope member, even at the back of the cube", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "member.mp3" })]);
+    m.lensId = "combined";
+    m.view3d.on = true;
+    m.view3dBlend = 1;
+    m.embeddingPositions = new Map([["member.mp3", { x: 0.5, y: 0.5, z: 0.1 }]]);
+    // A sphere whose centre sits deep in the cube: its disc would be in the fog
+    // band, but the opened lens must stay fully legible and hittable.
+    m.scope = {
+      shape: "sphere",
+      cx: 0.5,
+      cy: 0.5,
+      cz: 0.1,
+      r: 0.2,
+      lensId: "camelot",
+    };
+    m.scopePositions = new Map([
+      ["member.mp3", { x: 0.6, y: 0.5, billboard: { cx: 0.5, cy: 0.5, cz: 0.1 } }],
+    ]);
+    const cv = new CanvasView(m);
+    const glow = { render: vi.fn(), canvas: { style: { visibility: "" } } };
+    const points = { supported: true as const, render: vi.fn(), canvas: {} };
+    (cv as unknown as { glow: typeof glow; points: typeof points }).glow = glow;
+    (cv as unknown as { glow: typeof glow; points: typeof points }).points =
+      points;
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    cv.draw();
+    expect(cv.positions.map((p) => p.idx)).toEqual([0]);
+    const inner = points.render.mock.calls.at(-1)![0] as PointSpec[];
+    expect(inner[0].alpha).toBeCloseTo(1, 5);
+  });
+
   it("draws a member at the plain 2-D scope position at blend 0", () => {
     const m = new Model();
     m.setAllTracks([makeTrack({ path: "a.mp3" })]);
@@ -1073,8 +1190,9 @@ describe("CanvasView sphere scope billboard + wormhole", () => {
     expect(Math.min(...specs.map((s) => s.alpha))).toBeLessThan(
       Math.max(...specs.map((s) => s.alpha)),
     );
-    // Both were only lightly covered and stay hittable outside the disc.
-    expect(cv.positions).toHaveLength(2);
+    // The near one was only lightly covered, so it stays hittable outside the
+    // disc; the deep one is background fog now (blurred layer, no hits).
+    expect(cv.positions.map((p) => p.idx)).toEqual([0]);
   });
 });
 
@@ -1496,17 +1614,25 @@ describe("CanvasView sphere scope frosted glass", () => {
       (s) => Math.abs(s.x - (400 + 1.7 * 180)) < 1 && Math.abs(s.y - 200) < 1,
     );
     expect(pushed).toBeDefined();
-    expect(pushed!.alpha).toBeCloseTo(0.15, 5);
+    // Fully ghosted, and this point also sits in the fog window, so the two fades
+    // stack: it is a faint silhouette just outside the rim.
+    expect(pushed!.alpha).toBeLessThan(0.15);
 
-    // The same track is present at its raw projection with no scope…
+    // The same track is still drawn at its raw projection with no scope — though
+    // it sits in the fog band, so it stays un-hittable… (the member shares that
+    // screen point but sits at the centre plane, unfogged). It renders in the
+    // blurred fog layer, so search every pass of this frame.
     cv.model.scope = null;
+    points.render.mockClear();
     cv.draw();
-    const pos = cv.positions.find((p) => p.idx === 1);
-    expect(pos).toBeDefined();
-    expect(pos!.sx).toBeCloseTo(400, 3);
-    expect(pos!.sy).toBeCloseTo(200, 3);
+    expect(cv.positions.find((p) => p.idx === 1)).toBeUndefined();
+    const fogged = points.render.mock.calls
+      .flatMap((call) => call[0] as PointSpec[])
+      .find((s) => Math.hypot(s.x - 400, s.y - 200) < 1 && s.alpha < 0.5);
+    expect(fogged).toBeDefined();
 
-    // …and with the sphere scope kept but the 3-D view off.
+    // …and with the sphere scope kept but the 3-D view off it is flat again, so
+    // no fog: it is drawn and hittable at its raw position.
     cv.model.scope = {
       shape: "sphere",
       cx: 0.5,
@@ -1518,47 +1644,55 @@ describe("CanvasView sphere scope frosted glass", () => {
     cv.model.view3d.on = false;
     cv.model.view3dBlend = 0;
     cv.draw();
-    expect(cv.positions.find((p) => p.idx === 1)).toBeDefined();
+    const pos = cv.positions.find((p) => p.idx === 1);
+    expect(pos).toBeDefined();
+    expect(pos!.sx).toBeCloseTo(400, 3);
+    expect(pos!.sy).toBeCloseTo(200, 3);
   });
 
-  it("keeps an outside non-member in the outer pass and routes members to the second", () => {
+  it("routes the fog, the outer field and the members to their own passes", () => {
     const { cv, points } = makeCanvas();
     cv.draw();
-    expect(points.render).toHaveBeenCalledTimes(2);
-    const [outer] = points.render.mock.calls[0] as [PointSpec[], boolean];
-    const [inner] = points.render.mock.calls[1] as [PointSpec[], boolean];
-    // outside.mp3 (616, 200) stays with the outer field; the member's spec goes
-    // to the second pass only.
+    // fog (the deep non-member) → outer field → scope members.
+    expect(points.render).toHaveBeenCalledTimes(3);
+    const [fog] = points.render.mock.calls[0] as [PointSpec[], boolean];
+    const [outer] = points.render.mock.calls[1] as [PointSpec[], boolean];
+    const [inner] = points.render.mock.calls[2] as [PointSpec[], boolean];
+    // inside.mp3's ghost is deep enough to be background fog, so it is the only
+    // splat in the blurred layer; outside.mp3 (616, 200) keeps the outer field
+    // and the member's spec goes to the second pass only.
+    expect(fog).toHaveLength(1);
     expect(outer.find((s) => Math.hypot(s.x - 616, s.y - 200) < 1)).toBeDefined();
     expect(memberAt(outer)).toBeUndefined();
     expect(memberAt(inner)).toBeDefined();
-    // Both visible tracks stay hittable.
+    // The member and the outside non-member stay hittable.
     expect(cv.positions.map((p) => p.idx)).toEqual([0, 2]);
   });
 
-  it("blits outer blobs, draws the frosted glass, then blits the member blobs", () => {
+  it("blits the fog, outer blobs, the frosted glass, then the member blobs", () => {
     const { cv, points, glow } = makeCanvas();
     cv.draw();
-    // The composition order: outer blobs → glass → member blobs → glow.
+    // The composition order: fog → outer blobs → glass → member blobs → glow.
     const blits = log.filter(
       (e): e is Extract<Ev, { type: "drawImage" }> => e.type === "drawImage",
     );
     const glassFill = log.find(
       (e) => e.type === "fill" && e.style === "#1a1a2e",
     ) as Extract<Ev, { type: "fill" }>;
-    expect(blits).toHaveLength(3);
-    expect(log.indexOf(glassFill)).toBeGreaterThan(log.indexOf(blits[0]));
-    expect(log.indexOf(glassFill)).toBeLessThan(log.indexOf(blits[1]));
-    // The member blobs go through the same metaball canvas as the outer field;
-    // the glow blits last, over both.
+    expect(blits).toHaveLength(4);
+    expect(log.indexOf(glassFill)).toBeGreaterThan(log.indexOf(blits[1]));
+    expect(log.indexOf(glassFill)).toBeLessThan(log.indexOf(blits[2]));
+    // Fog, outer field and member blobs all go through the metaball canvas; the
+    // glow blits last, over all of them.
     expect(blits[0].img).toBe(points.canvas);
     expect(blits[1].img).toBe(points.canvas);
-    expect(blits[2].img).toBe(glow.canvas);
+    expect(blits[2].img).toBe(points.canvas);
+    expect(blits[3].img).toBe(glow.canvas);
     // The glass is a clip of the projected circle, tinted with the map
-    // background, between the two metaball blits.
+    // background, between the outer and the member blits.
     const clipIdx = log.findIndex((e) => e.type === "clip");
-    expect(clipIdx).toBeGreaterThan(log.indexOf(blits[0]));
-    expect(clipIdx).toBeLessThan(log.indexOf(blits[1]));
+    expect(clipIdx).toBeGreaterThan(log.indexOf(blits[1]));
+    expect(clipIdx).toBeLessThan(log.indexOf(blits[2]));
     const glassArc = log.find(
       (e) => e.type === "arc" && Math.abs(e.r - 180) < 1,
     ) as Extract<Ev, { type: "arc" }>;
@@ -1616,17 +1750,18 @@ describe("CanvasView sphere scope frosted glass", () => {
     expect(glassFill.alpha).toBe(GLASS_TINT);
   });
 
-  it("renders one pass without a sphere scope, for no scope and for a circle scope", () => {
+  it("draws no glass pass without a sphere scope, for no scope and for a circle scope", () => {
     const { cv, points } = makeCanvas();
     cv.model.scope = null;
     cv.draw();
-    expect(points.render).toHaveBeenCalledTimes(1);
+    // Fog layer + sharp field, and no member pass.
+    expect(points.render).toHaveBeenCalledTimes(2);
     // No glass, so no tint fill anywhere in the frame.
     expect(log.some((e) => e.type === "fill" && e.style === "#1a1a2e")).toBe(
       false,
     );
 
-    // A circle scope keeps the single pass too — the glass is a sphere-only
+    // A circle scope adds no glass pass either — the glass is a sphere-only
     // behaviour, even while the 3-D view is still armed.
     points.render.mockClear();
     log.length = 0;
@@ -1638,6 +1773,8 @@ describe("CanvasView sphere scope frosted glass", () => {
       lensId: "camelot",
     };
     cv.draw();
+    // One pass: a circle scope hides the only fogged track (its outer position
+    // is inside the region), so there is no DoF layer and no member pass.
     expect(points.render).toHaveBeenCalledTimes(1);
     expect(log.some((e) => e.type === "fill" && e.style === "#1a1a2e")).toBe(
       false,
