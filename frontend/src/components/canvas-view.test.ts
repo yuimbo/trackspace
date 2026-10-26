@@ -21,7 +21,6 @@ import {
   GLASS_TINT_FLAT,
   nearestInBlob,
   readGlassBlur,
-  rimPush,
   tabAt,
   wormhole,
   type DotPosition,
@@ -433,9 +432,10 @@ describe("CanvasView 3-D glow compositing", () => {
     const pb = ts({ wx: 0.6, wy: 0.5, wz: 0.2 });
     const crisp = occluders!.find((o) => o.depth === pa.depth)!;
     const splat = occluders!.find((o) => o.depth === pb.depth)!;
-    // The crisp dot is a DOT_R_SEL disc at its own depth; the field splat keeps
-    // its perspective-scaled radius, so the occlusion footprint matches the blob.
-    expect(crisp.radius).toBe(6);
+    // The crisp dot is a perspective-scaled DOT_R_SEL disc at its own depth; the
+    // field splat keeps its own perspective-scaled radius, so both occlusion
+    // footprints match what is drawn.
+    expect(crisp.radius).toBeCloseTo(6 * pa.scale, 5);
     expect(crisp.depth).toBe(pa.depth);
     expect(splat.radius).toBeCloseTo(POINT_SPLAT_R * pb.scale, 5);
     expect(splat.depth).toBe(pb.depth);
@@ -810,140 +810,57 @@ describe("CanvasView sphere scope", () => {
 
 describe("wormhole", () => {
   const circle = { cx: 400, cy: 200, r: 100 };
-  const centreDepth = 0.525;
-  const depthReach = 0.05;
-  // Deep enough in front of the centre plane that s saturates at 1.
-  const frontDepth = centreDepth + 2 * depthReach;
 
-  it("leaves points at or behind the centre plane untouched", () => {
-    const at = wormhole(
-      { sx: 420, sy: 200, depth: centreDepth },
-      circle,
-      centreDepth,
-      depthReach,
-    );
-    expect(at).toEqual({ sx: 420, sy: 200, ghost: 0 });
-    const behind = wormhole(
-      { sx: 420, sy: 200, depth: centreDepth - 0.2 },
-      circle,
-      centreDepth,
-      depthReach,
-    );
-    expect(behind).toEqual({ sx: 420, sy: 200, ghost: 0 });
+  it("leaves points at or beyond the circle untouched", () => {
+    expect(wormhole({ sx: 500, sy: 200 }, circle)).toEqual({
+      sx: 500,
+      sy: 200,
+      ghost: 0,
+    });
+    expect(wormhole({ sx: 600, sy: 200 }, circle)).toEqual({
+      sx: 600,
+      sy: 200,
+      ghost: 0,
+    });
   });
 
-  it("pushes a fully-influenced point at the circle centre out to the rim", () => {
-    const res = wormhole(
-      { sx: 400, sy: 200, depth: frontDepth },
-      circle,
-      centreDepth,
-      depthReach,
-    );
-    // d < 1e-3 picks the fixed +x direction, so the result lands exactly r right.
-    expect(res.sx).toBeCloseTo(400 + 100, 5);
+  it("throws the circle centre out to the reach radius, fully ghosted", () => {
+    const res = wormhole({ sx: 400, sy: 200 }, circle);
+    // d < 1e-3 picks the fixed +x direction, so the result lands exactly Rinf right.
+    expect(res.sx).toBeCloseTo(400 + 170, 5);
     expect(res.sy).toBeCloseTo(200, 5);
     expect(res.ghost).toBeCloseTo(1, 5);
   });
 
-  it("leaves points at or beyond the reach radius untouched", () => {
-    const Rinf = 100 * 1.7;
-    const atRinf = wormhole(
-      { sx: 400 + Rinf, sy: 200, depth: frontDepth },
-      circle,
-      centreDepth,
-      depthReach,
-    );
-    expect(atRinf).toEqual({ sx: 400 + Rinf, sy: 200, ghost: 0 });
-    const beyond = wormhole(
-      { sx: 600, sy: 200, depth: frontDepth },
-      circle,
-      centreDepth,
-      depthReach,
-    );
-    expect(beyond).toEqual({ sx: 600, sy: 200, ghost: 0 });
+  it("pushes deeper points farther out and ghosts them harder", () => {
+    const at = (d: number) => wormhole({ sx: 400 + d, sy: 200 }, circle);
+    const dist = (d: number) => Math.hypot(at(d).sx - 400, at(d).sy - 200);
+    // Every point leaves the disc: the raw distance never survives.
+    for (const d of [0, 25, 50, 99.9]) expect(dist(d)).toBeGreaterThanOrEqual(100);
+    for (const d of [25, 50, 99.9]) expect(dist(d)).toBeLessThan(dist(d - 25));
+    expect(at(0).ghost).toBeGreaterThan(at(60).ghost);
+    expect(at(60).ghost).toBeGreaterThan(at(99.9).ghost);
   });
 
-  it("displaces monotonically and continuously out to the reach radius", () => {
-    const distAt = (d: number) => {
-      const res = wormhole(
-        { sx: 400 + d, sy: 200, depth: frontDepth },
-        circle,
-        centreDepth,
-        depthReach,
-      );
-      return Math.hypot(res.sx - 400, res.sy - 200);
-    };
-    expect(distAt(0)).toBeCloseTo(100, 5);
-    const ds = [0, 20, 60, 100, 120, 169.999, 170];
-    for (let i = 1; i < ds.length; i++) {
-      expect(distAt(ds[i])).toBeGreaterThan(distAt(ds[i - 1]));
-    }
-    expect(distAt(170)).toBeCloseTo(170, 5);
-    // Continuous at the reach edge: the last inside point lands ~on the rim.
-    expect(Math.abs(distAt(169.999) - 170)).toBeLessThan(0.01);
+  it("is continuous at the rim", () => {
+    const justInside = wormhole({ sx: 400 + 99.999, sy: 200 }, circle);
+    expect(Math.hypot(justInside.sx - 400, justInside.sy - 200)).toBeCloseTo(
+      100,
+      2,
+    );
+    expect(justInside.ghost).toBeLessThan(0.001);
   });
 
   it("displaces radially outward along the ray from the centre", () => {
     // A point at 45° inside the circle is pushed further out on the same ray.
-    const res = wormhole(
-      { sx: 420, sy: 220, depth: frontDepth },
-      circle,
-      centreDepth,
-      depthReach,
-    );
+    const res = wormhole({ sx: 420, sy: 220 }, circle);
     const dx = res.sx - 400;
     const dy = res.sy - 200;
     expect(dx).toBeGreaterThan(20);
     expect(dy).toBeGreaterThan(20);
     expect(dx / 20).toBeCloseTo(dy / 20, 5);
     expect(Math.hypot(dx, dy)).toBeGreaterThan(Math.hypot(20, 20));
-  });
-});
-
-// ─── Sphere-scope glass rim push (pure) ──────────────────────
-
-describe("rimPush", () => {
-  const circle = { cx: 400, cy: 200, r: 100 };
-
-  it("maps inside points onto the inner rim band", () => {
-    // The centre point goes to the fixed +x direction at (1 − RIM_BAND)·r.
-    const centre = rimPush({ sx: 400, sy: 200 }, circle);
-    expect(centre).toEqual({ sx: 400 + 82, sy: 200 });
-    for (const d of [10, 50, 90, 99.9]) {
-      const p = rimPush({ sx: 400 + d, sy: 200 }, circle);
-      const dd = Math.hypot(p.sx - 400, p.sy - 200);
-      expect(dd).toBeGreaterThanOrEqual(0.82 * 100);
-      expect(dd).toBeLessThanOrEqual(0.964 * 100);
-    }
-  });
-
-  it("is monotone in the raw distance", () => {
-    const distAt = (d: number) => {
-      const res = rimPush({ sx: 400 + d, sy: 200 }, circle);
-      return Math.hypot(res.sx - 400, res.sy - 200);
-    };
-    expect(distAt(0)).toBeCloseTo(82, 5);
-    const ds = [0, 10, 50, 90, 99.9];
-    for (let i = 1; i < ds.length; i++) {
-      expect(distAt(ds[i])).toBeGreaterThan(distAt(ds[i - 1]));
-    }
-    // The band endpoints: [0.82r, 0.964r] across the inside of the circle.
-    expect(distAt(99.9)).toBeCloseTo(100 * (0.82 + 0.18 * 0.8 * 0.999), 5);
-  });
-
-  it("pushes radially outward along the ray from the centre", () => {
-    const res = rimPush({ sx: 420, sy: 220 }, circle);
-    const dx = res.sx - 400;
-    const dy = res.sy - 200;
-    expect(dx).toBeGreaterThan(20);
-    expect(dy).toBeGreaterThan(20);
-    expect(dx / 20).toBeCloseTo(dy / 20, 5);
-    expect(Math.hypot(dx, dy)).toBeGreaterThan(Math.hypot(20, 20));
-  });
-
-  it("leaves points at or beyond the circle unchanged", () => {
-    expect(rimPush({ sx: 500, sy: 200 }, circle)).toEqual({ sx: 500, sy: 200 });
-    expect(rimPush({ sx: 600, sy: 200 }, circle)).toEqual({ sx: 600, sy: 200 });
+    expect(res.ghost).toBeGreaterThan(0);
   });
 });
 
@@ -1133,30 +1050,31 @@ describe("CanvasView sphere scope billboard + wormhole", () => {
     expect(s.depth).toBeCloseTo(0.05 + 0.95 * 0.5, 8);
   });
 
-  it("ghosts a nearer non-member out of the circle and glasses one behind the disc", () => {
+  it("pushes every non-member out of the disc, ghosting the deeper one harder", () => {
     const { cv, points } = make3dCanvas();
-    // front.mp3 projects inside the sphere's circle and is nearer the camera
-    // than its centre; behind.mp3 is inside the circle but behind the plane.
     cv.draw();
-    const [specs] = points.render.mock.calls[0] as [PointSpec[], boolean];
-    const ghostSpec = specs.find((s) => s.alpha < 0.5)!;
-    // Faded to 1 − GHOST_FADE, sunk to the depth floor, pushed out of the circle.
-    expect(ghostSpec.alpha).toBeCloseTo(0.15, 5);
-    expect(ghostSpec.depth).toBeCloseTo(0.05, 5);
-    expect(Math.hypot(ghostSpec.x - 400, ghostSpec.y - 200)).toBeGreaterThan(
-      0.25 * 720,
-    );
-    // The behind-track projects inside the circle behind the disc: it is glassed
-    // onto the inner rim band of the outer pass — visible under the glass at
-    // full colour, but not hittable or selectable.
-    const all = points.render.mock.calls.flatMap(
+    const circle = cv.scopeScreenCircle()!;
+    const specs = points.render.mock.calls.flatMap(
       (call) => call[0] as PointSpec[],
     );
-    const glassed = all.find((s) => s.alpha === 1)!;
-    const rimDist = Math.hypot(glassed.x - 400, glassed.y - 200);
-    expect(rimDist).toBeGreaterThan(0.82 * 0.25 * 720);
-    expect(rimDist).toBeLessThan(0.964 * 0.25 * 720);
-    expect(cv.positions.map((p) => p.idx)).toEqual([]);
+    expect(specs).toHaveLength(2);
+    // Nothing foreign survives inside the outline: every splat clears the rim,
+    // however deep the point sat in the disc.
+    for (const s of specs) {
+      expect(
+        Math.hypot(s.x - circle.cx, s.y - circle.cy),
+      ).toBeGreaterThanOrEqual(circle.r - 1e-6);
+      // Pushed points fade with how much of the disc covered them.
+      expect(s.alpha).toBeGreaterThan(0);
+      expect(s.alpha).toBeLessThan(1);
+    }
+    // front.mp3 projects nearer the disc centre than behind.mp3, so it is the
+    // ghosted-harder of the two.
+    expect(Math.min(...specs.map((s) => s.alpha))).toBeLessThan(
+      Math.max(...specs.map((s) => s.alpha)),
+    );
+    // Both were only lightly covered and stay hittable outside the disc.
+    expect(cv.positions).toHaveLength(2);
   });
 });
 
@@ -1564,25 +1482,21 @@ describe("CanvasView sphere scope frosted glass", () => {
   const memberAt = (specs: PointSpec[]) =>
     specs.find((s) => Math.hypot(s.x - 436, s.y - 216) < 1);
 
-  it("glasses a non-member inside the sphere's circle onto the rim and keeps it unhittable", () => {
+  it("pushes a covered non-member clear of the disc, ghosted and unhittable", () => {
     const { cv, points } = makeCanvas();
     cv.draw();
-    // inside.mp3 projects at the circle centre behind the sphere: it is pushed
-    // to the inner rim band of the outer pass — visible under the glass — but
-    // never hittable or selectable.
+    // inside.mp3 projects at the circle centre: it is thrown out to the reach
+    // radius, fully ghosted — never inside the outline, never hittable.
     expect(cv.positions.find((p) => p.idx === 1)).toBeUndefined();
     const all = points.render.mock.calls.flatMap(
       (call) => call[0] as PointSpec[],
     );
-    const rim = all.find((s) => {
-      const d = Math.hypot(s.x - 400, s.y - 200);
-      return d >= 0.82 * 180 && d <= 0.964 * 180;
-    });
-    expect(rim).toBeDefined();
-    // At the exact centre the fixed +x direction puts it at (1 − RIM_BAND)·r.
-    expect(rim!.x).toBeCloseTo(400 + 0.82 * 180, 3);
-    expect(rim!.y).toBeCloseTo(200, 3);
-    expect(rim!.alpha).toBe(1);
+    // At the exact centre the fixed +x direction puts it on the +x reach radius.
+    const pushed = all.find(
+      (s) => Math.abs(s.x - (400 + 1.7 * 180)) < 1 && Math.abs(s.y - 200) < 1,
+    );
+    expect(pushed).toBeDefined();
+    expect(pushed!.alpha).toBeCloseTo(0.15, 5);
 
     // The same track is present at its raw projection with no scope…
     cv.model.scope = null;
@@ -1730,7 +1644,7 @@ describe("CanvasView sphere scope frosted glass", () => {
     );
   });
 
-  it("drops a non-member's search-field glow inside the circle and keeps a member's", () => {
+  it("moves a non-member's search-field glow out of the disc and keeps a member's", () => {
     const { cv } = makeCanvas();
     cv.searchField = [
       { path: "member.mp3", score: 0.5 },
@@ -1740,10 +1654,14 @@ describe("CanvasView sphere scope frosted glass", () => {
     cv.searchActive = true;
     cv.draw();
     const pts = cv.collectSearchGlowPoints();
-    // inside.mp3 projects at the circle centre (behind the glass): its glow is
-    // dropped; the member and outside landmarks keep theirs.
-    expect(pts).toHaveLength(2);
+    // inside.mp3 projects at the circle centre: its glow follows the dot out to
+    // the reach radius instead of bleeding under the glass; the member and the
+    // outside landmark keep theirs.
+    expect(pts).toHaveLength(3);
     expect(pts.find((p) => Math.hypot(p.x - 400, p.y - 200) < 1)).toBeUndefined();
+    expect(
+      pts.find((p) => Math.hypot(p.x - (400 + 1.7 * 180), p.y - 200) < 1),
+    ).toBeDefined();
     expect(pts.find((p) => Math.hypot(p.x - 436, p.y - 216) < 1)).toBeDefined();
     expect(pts.find((p) => Math.hypot(p.x - 616, p.y - 200) < 1)).toBeDefined();
   });

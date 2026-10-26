@@ -24,6 +24,12 @@
 // slab behind that front surface, so depth layers stay separate gooey blobs instead
 // of blending into one another.
 //
+// The same 3-D frame also lights the field: `render(..., shade)` reads each kernel
+// fragment as a matte sphere cap and cel-shades it with one fixed orthogonal sun —
+// a hard terminator, full light on the sun side, a flat shadow crescent behind it —
+// so a dot gains a clear orientation hint and a merged blob keeps one continuous
+// light.
+//
 // The 2-D canvas stays the single source of truth for *where* things are: this
 // module is handed the same screen positions the scatter would have drawn, and the
 // caller blits the result between the grid and the overlays. Hit testing stays
@@ -74,6 +80,48 @@ const OUTLINE_ALPHA = 0.35;
 export const DEPTH_MASK = 0.4;
 /** Occlusion slab behind the front surface, in normalised depth units. */
 const DEPTH_SLAB = 0.06;
+/** Half-width of the cel terminator's antialias ramp, in lambert units. */
+const SHADOW_RAMP = 0.03;
+
+/**
+ * Cel-shading knobs, in view-frame terms (the frame the sphere normal is built in:
+ * +x right, +y up, +z toward the viewer).
+ */
+export interface ShadingTune {
+  /** Sun azimuth in degrees: 0 = from the right, 90 = from above. */
+  azimuth: number;
+  /** Sun elevation above the screen plane in degrees (90 = head-on). */
+  elevation: number;
+  /** Lambert below this terminator is shadow; higher = larger shadow. */
+  shadowEdge: number;
+  /** Shadow brightness as a fraction of the lit colour (lower = darker). */
+  shadowTone: number;
+}
+
+/** A frame's complete shading state: the tunables plus the 2-D↔3-D mix. */
+export interface Shading extends ShadingTune {
+  /** 0..1: 0 = flat 2-D colours, 1 = full cel shading. */
+  strength: number;
+}
+
+/** Shipped cel-shading defaults: the tuned sun, terminator and shadow tone. */
+export const DEFAULT_SHADING: ShadingTune = {
+  azimuth: 120,
+  elevation: 60,
+  shadowEdge: 0.6,
+  shadowTone: 0.6,
+};
+
+/** Unit sun direction for an azimuth/elevation pair, in view-frame terms. */
+export function sunDirection(
+  azimuthDeg: number,
+  elevationDeg: number,
+): [number, number, number] {
+  const az = (azimuthDeg * Math.PI) / 180;
+  const el = (elevationDeg * Math.PI) / 180;
+  const flat = Math.cos(el);
+  return [Math.cos(az) * flat, Math.sin(az) * flat, Math.sin(el)];
+}
 
 const FLOATS_PER_VERTEX = 11;
 const VERTICES_PER_POINT = 6;
@@ -112,6 +160,17 @@ void main() {
 // kernel is damped behind the front surface from the depth pre-pass (`u_front`):
 // a point only contributes within a thin slab behind the nearest solid kernel at
 // that pixel, so depth layers never blend into each other.
+//
+// `u_shade` (0 = flat, 1 = full) adds the 3-D orientation hint: the kernel is read
+// as a matte sphere cap, its normal inferred from the fragment's offset from the
+// splat centre, lit by one fixed orthogonal sun. The light is cel-shaded: one hard
+// terminator, everything on the sun side at full brightness, only the small
+// crescent facing away dropped to a flat shadow tone. Because the composite divides
+// the summed colour by the summed weight, this is a kernel-weighted average of
+// shaded colour — so a merged blob keeps one continuous light across the whole blob
+// instead of per-dot spheres. Sun direction, terminator and shadow tone are uniforms
+// (`u_sun`, `u_shadowEdge`, `u_shadowTone`) so the View-options shading sliders tune
+// them live; `DEFAULT_SHADING` holds the shipped values.
 const SPLAT_FRAG_SRC = `#version 300 es
 precision highp float;
 precision highp sampler2D;
@@ -124,6 +183,10 @@ uniform float u_core;
 uniform sampler2D u_front;
 uniform float u_slab;
 uniform float u_depthAware;
+uniform float u_shade;
+uniform vec3 u_sun;
+uniform float u_shadowEdge;
+uniform float u_shadowTone;
 out vec4 outColor;
 void main() {
   float d = length(v_local) / v_radius;
@@ -132,7 +195,16 @@ void main() {
     float front = texelFetch(u_front, ivec2(gl_FragCoord.xy), 0).r;
     w *= 1.0 - smoothstep(0.0, u_slab, front - v_depth);
   }
-  outColor = vec4(v_color.rgb * w * v_color.a * v_weight, w);
+  // Sphere-cap normal in the view frame (+y up, +z toward the viewer): the core
+  // faces the viewer, the falloff tilts to edge-on. v_local is screen pixels
+  // (y down), so its y is flipped to match the camera's up axis.
+  vec2 nxy = vec2(v_local.x, -v_local.y) / v_radius;
+  vec3 n = vec3(nxy, sqrt(max(1.0 - d * d, 0.0)));
+  float lambert = max(dot(n, u_sun), 0.0);
+  // A narrow ramp keeps the cel edge crisp without aliasing it.
+  float lit = smoothstep(u_shadowEdge - ${SHADOW_RAMP}, u_shadowEdge + ${SHADOW_RAMP}, lambert);
+  float light = mix(1.0, mix(u_shadowTone, 1.0, lit), u_shade);
+  outColor = vec4(v_color.rgb * light * w * v_color.a * v_weight, w);
 }`;
 
 // Front-depth pre-pass: the same kernel, MAX-blended into a second target so each
@@ -242,6 +314,10 @@ export class MetaballLayer {
   private splatFrontLoc: WebGLUniformLocation | null = null;
   private splatSlabLoc: WebGLUniformLocation | null = null;
   private splatDepthAwareLoc: WebGLUniformLocation | null = null;
+  private splatShadeLoc: WebGLUniformLocation | null = null;
+  private splatSunLoc: WebGLUniformLocation | null = null;
+  private splatShadowEdgeLoc: WebGLUniformLocation | null = null;
+  private splatShadowToneLoc: WebGLUniformLocation | null = null;
   private depthResolutionLoc: WebGLUniformLocation | null = null;
   private depthCoreLoc: WebGLUniformLocation | null = null;
   private fieldLoc: WebGLUniformLocation | null = null;
@@ -336,6 +412,10 @@ export class MetaballLayer {
     this.splatFrontLoc = gl.getUniformLocation(splat, "u_front");
     this.splatSlabLoc = gl.getUniformLocation(splat, "u_slab");
     this.splatDepthAwareLoc = gl.getUniformLocation(splat, "u_depthAware");
+    this.splatShadeLoc = gl.getUniformLocation(splat, "u_shade");
+    this.splatSunLoc = gl.getUniformLocation(splat, "u_sun");
+    this.splatShadowEdgeLoc = gl.getUniformLocation(splat, "u_shadowEdge");
+    this.splatShadowToneLoc = gl.getUniformLocation(splat, "u_shadowTone");
     this.depthResolutionLoc = gl.getUniformLocation(depth, "u_resolution");
     this.depthCoreLoc = gl.getUniformLocation(depth, "u_core");
     this.fieldLoc = gl.getUniformLocation(composite, "u_field");
@@ -420,9 +500,14 @@ export class MetaballLayer {
    *
    * With `depthAware`, the grey/colour split is ignored — every point is splatted
    * in one pass and depth alone decides ordering, via a front-depth pre-pass that
-   * occludes points behind the nearest solid kernel at each pixel.
+   * occludes points behind the nearest solid kernel at each pixel. *shading*
+   * supplies the 3-D cel light; ``null`` keeps the flat 2-D colours exactly.
    */
-  render(points: readonly PointSpec[], depthAware = false): void {
+  render(
+    points: readonly PointSpec[],
+    depthAware = false,
+    shading: Shading | null = null,
+  ): void {
     const gl = this.gl;
     // A frame may draw before the first `sync`; the target has no storage yet, so
     // skip it rather than clear an incomplete framebuffer.
@@ -432,7 +517,7 @@ export class MetaballLayer {
         this._clearFrame();
         return;
       }
-      this._pass(points, true, true);
+      this._pass(points, true, true, shading);
       return;
     }
     const grey: PointSpec[] = [];
@@ -444,8 +529,8 @@ export class MetaballLayer {
     }
     const first = grey.length ? grey : colour;
     const second = grey.length ? colour : null;
-    this._pass(first, true, false);
-    if (second) this._pass(second, false, false);
+    this._pass(first, true, false, shading);
+    if (second) this._pass(second, false, false, shading);
   }
 
   /** Clear the visible canvas so a frame with no splats is not stale. */
@@ -464,6 +549,7 @@ export class MetaballLayer {
     points: readonly PointSpec[],
     clearCanvas: boolean,
     depthAware = false,
+    shading: Shading | null = null,
   ): void {
     const gl = this.gl!;
     const dpr = devicePixelRatio || 1;
@@ -526,6 +612,7 @@ export class MetaballLayer {
     gl.uniform1f(this.splatCoreLoc, CORE);
     gl.uniform1f(this.splatSlabLoc, DEPTH_SLAB);
     gl.uniform1f(this.splatDepthAwareLoc, depthAware ? 1 : 0);
+    this._setShadingUniforms(shading);
     // Always point `u_front` at the depth target on unit 1: WebGL validates sampler
     // bindings even when the shader branch is skipped, and the default unit 0 holds the
     // field texture this pass is rendering into (a feedback loop that drops the draw).
@@ -560,6 +647,30 @@ export class MetaballLayer {
     gl.uniform1f(this.outlineWidthLoc, OUTLINE_PX);
     gl.uniform1f(this.outlineAlphaLoc, OUTLINE_ALPHA);
     gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+
+  /**
+   * Upload this pass's cel-shading uniforms. A null state (2-D) sets strength 0, so
+   * the shader's light term is exactly 1 and the dot keeps its flat colour; the sun
+   * and tone are still written so no stale value from a previous frame survives.
+   */
+  private _setShadingUniforms(shading: Shading | null): void {
+    const gl = this.gl!;
+    const s = shading;
+    gl.uniform1f(this.splatShadeLoc, s ? Math.max(0, Math.min(1, s.strength)) : 0);
+    const [x, y, z] = sunDirection(
+      s ? s.azimuth : DEFAULT_SHADING.azimuth,
+      s ? s.elevation : DEFAULT_SHADING.elevation,
+    );
+    gl.uniform3f(this.splatSunLoc, x, y, z);
+    gl.uniform1f(
+      this.splatShadowEdgeLoc,
+      s ? s.shadowEdge : DEFAULT_SHADING.shadowEdge,
+    );
+    gl.uniform1f(
+      this.splatShadowToneLoc,
+      s ? s.shadowTone : DEFAULT_SHADING.shadowTone,
+    );
   }
 
   private _pointAttrib(

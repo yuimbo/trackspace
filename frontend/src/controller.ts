@@ -389,6 +389,8 @@ export class Controller {
       applyPreviewGain: (gain) => {
         this.$audio.volume = gain;
       },
+      setPerspective: (persp) => this.canvas.setPerspective(persp),
+      scheduleDraw: () => this.canvas.scheduleDraw(),
     });
 
     this._wireModel();

@@ -68,10 +68,12 @@ collapse tween runs). Toggle: the `3D` tab beside the lens tabs, or the **3** ke
 the eval gallery, which switches the current group to its precomputed 3-D sibling).
 
 - **Camera.** `lib/camera3d.ts` rotates the unit cube about its centre and applies a slight
-  perspective (`?persp=0.28` default, `0` = orthographic; read once at load). The rotated x/y
-  go through the existing `w2s`, so pan/zoom are unchanged; `depth` (0.05–1, 1 = nearest) and
-  the perspective `scale` (point radius) are the only new values. Every world→screen consumer
-  of track positions goes through `CanvasView._trackScreen`.
+  perspective (`model.view3d.persp`, default 0.6 = the ceiling, `0` = orthographic; persisted,
+  `?persp=` overrides it for one session). The View-options slider that tunes it live is parked
+  (commented out in `index.html`) now the tuned value ships. The rotated x/y go through the
+  existing `w2s`, so pan/zoom are unchanged; `depth` (0.05–1, 1 = nearest) and the perspective
+  `scale` (point radius) are the only new values. Every world→screen consumer of track positions
+  goes through `CanvasView._trackScreen`.
 - **Transition.** `model.view3dBlend` (0 = head-on orthographic, 1 = full 3-D, not persisted)
   scales yaw, pitch, perspective and the depth shading; `EmbeddingCoordinator._tweenBlend`
   animates it on its own rAF handle (it moves a camera parameter, not a dot, so it may run
@@ -86,10 +88,22 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
   consistent orientation.
 - **Controls.** Alt+drag or middle-drag orbits; Alt+Shift+drag and trackpad scroll pan; wheel
   zooms. In 2-D, Alt/middle-drag still pan. Orbit persists on mouse-up, not per move.
-- **Depth-aware metaballs.** `MetaballLayer.render(points, true)` MAX-blends each pixel's front
-  depth, then splats only points within a thin slab behind it, so depth layers stay separate
-  blobs. Far points are also darkened (`depthShade`). Hit testing picks the front-most
-  candidate within the hit radius.
+- **Depth-aware metaballs.** `MetaballLayer.render(points, true, shade)` MAX-blends each pixel's
+  front depth, then splats only points within a thin slab behind it, so depth layers stay
+  separate blobs. Far points are also darkened (`depthShade`). Hit testing picks the front-most
+  candidate within the hit radius. Real size: a splat's radius is `POINT_SPLAT_R · scale` and
+  the crisp hover/selected disc scales the same way, so nearer dots draw larger in proportion
+  to their distance.
+- **Cel sun shading.** The splat shader reads each kernel fragment as a matte sphere cap (normal
+  inferred from the fragment's offset from the dot centre, in the camera's +y-up frame) and
+  cel-shades it with one orthogonal sun: a single hard terminator, everything on the sun side at
+  full brightness, only the crescent facing away dropped to a flat shadow tone. Because the
+  composite divides summed colour by summed weight, a merged blob keeps one continuous light; at
+  blend 0 the term is exactly 1, so 2-D colours are unchanged. Sun azimuth/elevation, terminator
+  position (`shadowEdge`) and shadow darkness (`shadowTone`) are uniforms fed from
+  `model.shading`; the shipped values are `DEFAULT_SHADING` in `lib/point-layer.ts` (sun 120°,
+  tilt 60°, shadow 60 %, tone 60 %). The View-options tuning sliders are parked — commented out in
+  `index.html` but still bound in `OptionsPanelBinder`, which no-ops without the elements.
 - **Depth-aware glow.** `GlowLayer.render(points, occluders)` depth-tests each halo against the
   scatter points and crisp dots, so a halo is hidden by blobs at its depth or nearer and shows
   over deeper ones. In 3-D the glow canvas is hidden and blitted into the scatter canvas right
@@ -103,21 +117,23 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
   - **Contents are the flat 2-D scope view**, never a nested 3-D map: the scope lens is always
     fetched with `dims=2` (shared cache with 2-D), and the members are drawn *billboarded* —
     a flat disc facing the camera at the sphere's projected centre, not rotating with the orbit.
-  - **Wormhole.** Non-members nearer the camera than the sphere's centre and near its screen
-    circle are pushed radially out to the rim band and faded to ghost silhouettes
-    (`wormhole()` in `canvas-view.ts`: `WORMHOLE_REACH`, `GHOST_FADE`). A ghost sinks to the
-    lowest depth so it cannot occlude the contents, and is neither hoverable nor selectable.
+    The layout fills that disc (FG-squircle, see below), so the contents reach the rim.
+  - **Solid sphere.** Anything that is not a member and projects inside the circle is pushed
+    radially OUT past the rim and ghosted by how much of the disc covered it
+    (`wormhole()` in `canvas-view.ts`: `WORMHOLE_REACH`, `GHOST_FADE`); nothing foreign ever
+    sits inside the outline, whatever the orbit. A ghost sinks to the lowest depth so it cannot
+    occlude the contents, is neither hoverable nor selectable, and its search-field glow follows
+    it out.
   - **Frames.** A scope member's position carries its own frame (`MapPos.billboard`: the sphere
     centre it is laid out around), and a move between two frames (scope open/close/lens switch,
     2-D↔3-D conversion) is stored as `{…, from, mix}` and blended in *view* space by
     `CanvasView._viewFrame` — never lerped in world coordinates, which would glide toward an
     unrelated cube point before snapping.
-  - **Frosted glass.** The scope disc is a pane of glass over the rest of the map: non-members
-    that project inside its circle are pushed to the inner rim band (`rimPush()`, not hoverable
-    or selectable) and stay visible *behind* the glass, which blurs and tints the grid, cube and
-    outer blobs (`_drawGlass`: clip + `ctx.filter` blur self-copy + background tint). The
-    scope's members render sharp on top. Blur radius is `?glass=<css px>` (default 7, `0` =
-    tint only); without `ctx.filter` support (Safari) the tint alone is used, stronger.
+  - **Frosted glass.** The scope disc is a pane of glass over the rest of the map: it blurs and
+    tints the grid, cube and outer blobs (`_drawGlass`: clip + `ctx.filter` blur self-copy +
+    background tint). The scope's members render sharp on top. Blur radius is `?glass=<css px>`
+    (default 7, `0` = tint only); without `ctx.filter` support (Safari) the tint alone is used,
+    stronger.
 - **Weight sliders** work live in 3-D: the landmark Jacobian is dimension-agnostic and the
   frontend approximates z like x/y; a Jacobian fetched for the other dimensionality is never
   applied (`_jacobianKey` carries `dims`).
@@ -610,10 +626,10 @@ so a cluster can be read in a different space without leaving the map.
   stretched by the non-square viewport — so the outline always encloses exactly the scoped
   tracks and never an out-of-scope one.
 - The in-scope positions are the scope lens's layout min-max normalised and mapped into the
-  region: a circle's inscribed square, or a box's full extent (so a wide or tall box is
-  used). A deterministic scope lens is instant, a projection scope lens reuses its cached
-  global layout. The tab bar lists the built-ins
-  except the tag lens.
+  region: a circle and a sphere fill their **disc** (the FG-squircle mapping bends the square
+  onto the disc, so the layout reaches the rim on every ray), a box fills its full extent (so a
+  wide or tall box is used). A deterministic scope lens is instant, a projection scope lens
+  reuses its cached global layout. The tab bar lists the built-ins except the tag lens.
 - While a scope is open, in-scope dots behave like embedding-mode dots: tag
   drag/transform is disabled. Switching the outer lens drops the scope.
 

@@ -29,23 +29,28 @@ export const ORBIT_RAD_PER_PX = 0.008;
 export const MAX_PITCH = Math.PI / 2 - 0.01;
 
 /**
- * Default perspective strength for the 3-D view; the user can tune it live with
- * ``?persp=0.15`` (see ``readPerspective``).
+ * Default perspective strength for the 3-D view (its ceiling): the tuned look.
+ * The View-options slider that used to tune it is currently commented out in
+ * ``index.html``; ``?persp=0.15`` still overrides it for one session (see
+ * ``readPerspective``).
  */
-export const DEFAULT_PERSPECTIVE = 0.28;
+export const DEFAULT_PERSPECTIVE = 0.6;
 /** Perspective is clamped to this ceiling so the near face cannot blow up. */
 export const MAX_PERSPECTIVE = 0.6;
 
 /**
  * Read a perspective strength from a query string's ``persp`` parameter: finite
- * and clamped to [0, MAX_PERSPECTIVE], else DEFAULT_PERSPECTIVE. ``search`` may
- * be ``"?persp=0.15"`` or ``"persp=0.15"``.
+ * and clamped to [0, MAX_PERSPECTIVE], else *fallback* (the user's persisted
+ * setting). ``search`` may be ``"?persp=0.15"`` or ``"persp=0.15"``.
  */
-export function readPerspective(search: string): number {
+export function readPerspective(
+  search: string,
+  fallback = DEFAULT_PERSPECTIVE,
+): number {
   const m = /(?:^|[?&])persp=([^&]+)/.exec(search);
-  if (!m) return DEFAULT_PERSPECTIVE;
+  if (!m) return fallback;
   const v = Number(m[1]);
-  if (!Number.isFinite(v)) return DEFAULT_PERSPECTIVE;
+  if (!Number.isFinite(v)) return fallback;
   return Math.max(0, Math.min(MAX_PERSPECTIVE, v));
 }
 

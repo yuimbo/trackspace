@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { packPointVertices, type PointSpec } from "./point-layer";
+import {
+  DEFAULT_SHADING,
+  packPointVertices,
+  sunDirection,
+  type PointSpec,
+} from "./point-layer";
 
 describe("packPointVertices", () => {
   const point: PointSpec = {
@@ -68,5 +73,48 @@ describe("packPointVertices", () => {
 
   it("packs no vertices for no points", () => {
     expect(packPointVertices([]).length).toBe(0);
+  });
+});
+
+describe("cel-shading sun", () => {
+  it("returns a unit vector for any azimuth/elevation", () => {
+    for (const [az, el] of [
+      [0, 0],
+      [128, 55],
+      [270, 90],
+      [360, 30],
+    ]) {
+      const [x, y, z] = sunDirection(az, el);
+      expect(Math.hypot(x, y, z)).toBeCloseTo(1, 10);
+    }
+  });
+
+  it("maps the axes in view-frame terms (0° right, 90° up, elevation = z)", () => {
+    const [rx, ry, rz] = sunDirection(0, 0);
+    expect([rx, ry, rz]).toEqual([1, 0, 0]);
+    const [ux, uy] = sunDirection(90, 0);
+    expect(ux).toBeCloseTo(0, 10);
+    expect(uy).toBeCloseTo(1, 10);
+    const [, , hz] = sunDirection(0, 90);
+    expect(hz).toBeCloseTo(1, 10);
+  });
+
+  it("puts the default sun up and to the left, in front of the screen", () => {
+    const [x, y, z] = sunDirection(
+      DEFAULT_SHADING.azimuth,
+      DEFAULT_SHADING.elevation,
+    );
+    expect(x).toBeLessThan(0);
+    expect(y).toBeGreaterThan(0);
+    expect(z).toBeGreaterThan(0.7);
+  });
+
+  it("ships the tuned defaults", () => {
+    expect(DEFAULT_SHADING).toEqual({
+      azimuth: 120,
+      elevation: 60,
+      shadowEdge: 0.6,
+      shadowTone: 0.6,
+    });
   });
 });

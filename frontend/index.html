@@ -153,6 +153,44 @@
         <div id="influence-fixed" class="influence-fixed"></div>
       </details>
     </div>
+    <!--
+      3-D camera + lighting tuning, parked while the tuned values ship as defaults
+      (`DEFAULT_PERSPECTIVE` in `lib/camera3d.ts`, `DEFAULT_SHADING` in
+      `lib/point-layer.ts`). Uncomment this block to re-expose the sliders: the
+      OptionsPanelBinder wiring and the `syncLensChrome` fold gates are still live
+      and no-op without these elements.
+
+    <div id="perspective-fold" class="view-option hidden">
+      <label title="3-D perspective: how strongly nearer dots grow. 0 = orthographic">
+        Perspective
+        <input type="range" id="view-perspective" min="0" max="0.6" step="0.01" aria-label="3-D perspective strength" />
+        <span id="view-perspective-value" class="option-value"></span>
+      </label>
+    </div>
+    <div id="shading-fold" class="view-option hidden">
+      <div class="view-options-heading" aria-hidden="true">Cel shading</div>
+      <label title="Sun azimuth around the dot: 0° = from the right, 90° = from above">
+        Sun
+        <input type="range" id="shade-sun-az" min="0" max="360" step="1" aria-label="Sun azimuth" />
+        <span id="shade-sun-az-value" class="option-value"></span>
+      </label>
+      <label title="Sun height above the screen plane: 0° = grazing, 90° = head-on">
+        Tilt
+        <input type="range" id="shade-sun-el" min="0" max="90" step="1" aria-label="Sun elevation" />
+        <span id="shade-sun-el-value" class="option-value"></span>
+      </label>
+      <label title="Where the light turns to shadow: higher = larger shadow">
+        Shadow
+        <input type="range" id="shade-shadow-edge" min="0" max="1" step="0.01" aria-label="Shadow edge" />
+        <span id="shade-shadow-edge-value" class="option-value"></span>
+      </label>
+      <label title="Shadow brightness: lower = darker shadow">
+        Tone
+        <input type="range" id="shade-shadow-tone" min="0" max="1" step="0.01" aria-label="Shadow tone" />
+        <span id="shade-shadow-tone-value" class="option-value"></span>
+      </label>
+    </div>
+    -->
   </div>
 
   <footer id="statusbar">

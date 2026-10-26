@@ -912,6 +912,11 @@ body { display: flex; }
 .view-option-inline input[type="number"] {
   width: 58px;
 }
+#perspective-fold input[type="range"],
+#shading-fold input[type="range"] {
+  width: 84px;
+  margin: 0;
+}
 .view-option label {
   display: flex;
   align-items: center;

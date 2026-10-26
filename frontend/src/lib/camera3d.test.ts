@@ -209,6 +209,12 @@ describe("camera3d readPerspective", () => {
     expect(readPerspective("?persp=abc")).toBe(DEFAULT_PERSPECTIVE);
     expect(readPerspective("?persp=")).toBe(DEFAULT_PERSPECTIVE);
   });
+
+  it("prefers the supplied fallback (the persisted setting) when absent or junk", () => {
+    expect(readPerspective("", 0.12)).toBe(0.12);
+    expect(readPerspective("?persp=abc", 0.12)).toBe(0.12);
+    expect(readPerspective("?persp=0.3", 0.12)).toBeCloseTo(0.3, 10);
+  });
 });
 
 describe("camera3d orbitDrag", () => {

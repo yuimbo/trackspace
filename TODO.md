@@ -155,6 +155,16 @@ The rationale is in `audio_pipeline.md` → *Composite vector construction*.
 
 ### Frontend
 
+- [ ] **Decide the fate of the parked 3-D tuning sliders.** The perspective and cel-shading
+      sliders are commented out in `index.html` now the tuned values ship as defaults
+      (`DEFAULT_PERSPECTIVE` 0.6, `DEFAULT_SHADING` 120°/60°/0.6/0.6). Either delete the
+      dead path (`#perspective-fold` / `#shading-fold` markup comment,
+      `OptionsPanelBinder._bindShading` / `_writeShading` / `_renderPerspective` and their
+      tests, the `setPerspective` / `scheduleDraw` deps, `model.shading`,
+      `CanvasView.setPerspective`) or re-expose it behind a dev flag — keeping both wired
+      but unreachable is the worst of the two.
+      Files: `frontend/index.html`, `frontend/src/coordinators/options-panel.ts`,
+      `frontend/src/model.ts`, `frontend/src/components/canvas-view.ts`.
 - [ ] **Lens presets are unreachable.** The lens `<select>` and the Save/Delete
       preset buttons were removed from the view panel, so `Model.addLensPreset` /
       `applyLensPreset` / `deleteLensPreset` and `localStorage` persistence are

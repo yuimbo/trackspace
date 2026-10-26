@@ -616,10 +616,9 @@ export class EmbeddingCoordinator {
     m.saveLS();
     this.deps.status.update(m);
     this.deps.canvas.scheduleDraw();
-    void this.refreshProjectionSettings();
-    // The iteration control is keyed by dimensionality too: re-read it so the
-    // 2-D↔3-D toggle shows the other view's own stored budget.
-    this._resyncTsneControl?.();
+    // The view-options folds depend on the dimensionality (iteration budget,
+    // perspective strength), and the settings fetch is part of the same sync.
+    this.syncLensChrome();
     if (m.lens().kind === "projection") {
       // Hold the blend target until the toggled layout is in hand: the camera
       // tween and the position lerp then start together (see `_applyPositions`),
@@ -1608,6 +1607,12 @@ export class EmbeddingCoordinator {
     // The confident gate only exists while predicted-folder colouring is active.
     const confident = document.getElementById("head-confident-fold");
     if (confident) confident.classList.toggle("hidden", m.colorMode !== "head");
+    // The perspective and shading controls only matter while the orbit view is
+    // actually 3-D.
+    const persp = document.getElementById("perspective-fold");
+    if (persp) persp.classList.toggle("hidden", !m.is3d);
+    const shading = document.getElementById("shading-fold");
+    if (shading) shading.classList.toggle("hidden", !m.is3d);
     void this.refreshProjectionSettings();
     this._syncViewOptionsVisibility();
     // The iteration control reflects the active dimensionality's per-dimension
@@ -1885,14 +1890,16 @@ export class EmbeddingCoordinator {
   /**
    * Normalise a scope lens's subset and map it into the region.
    *
-   * A circle gets the lens square inscribed in it (no dot escapes the outline); a
-   * box fills the box, so a wide or tall region uses its whole extent. A sphere's
+   * A box fills the box, so a wide or tall region uses its whole extent. A
+   * circle and a sphere both fill their **disc**: the square-normalised layout is
+   * bent onto the disc with the FG-squircle mapping, which stretches each axis to
+   * the rim while keeping relative positions — a dot at an extreme of the map
+   * lands on the outline instead of stopping at the inscribed square. A sphere's
    * contents are a flat map too: the sphere is the 3-D membership volume, but its
-   * tracks are laid out in the same inscribed square as the circle of its radius,
-   * centred on the sphere's (cx, cy). Every scope maps to {x, y} with no z; a
-   * sphere's positions additionally carry the sphere centre as their `billboard`
-   * anchor, so the canvas can draw them facing the camera without reading the
-   * (possibly already-closed) scope.
+   * tracks are laid out in its radius around (cx, cy). Every scope maps to
+   * {x, y} with no z; a sphere's positions additionally carry the sphere centre
+   * as their `billboard` anchor, so the canvas can draw them facing the camera
+   * without reading the (possibly already-closed) scope.
    */
   private _mapIntoScope(
     raw: Map<string, MapPos>,
@@ -1912,13 +1919,26 @@ export class EmbeddingCoordinator {
     const rx = maxX - minX || 1;
     const ry = maxY - minY || 1;
     const { hw, hh } = scopeHalfExtents(scope);
-    const sideX = scope.shape === "box" ? hw * 2 : hw * Math.SQRT2;
-    const sideY = scope.shape === "box" ? hh * 2 : hh * Math.SQRT2;
+    const box = scope.shape === "box";
     const bb = scope.shape === "sphere" ? { cx: scope.cx, cy: scope.cy, cz: scope.cz ?? 0.5 } : undefined;
     const out = new Map<string, MapPos>();
     for (const [path, p] of raw) {
-      const x = scope.cx + ((p.x - minX) / rx - 0.5) * sideX;
-      const y = scope.cy + ((p.y - minY) / ry - 0.5) * sideY;
+      // Unit-square coordinates, then either the box extents or the disc.
+      const u = ((p.x - minX) / rx - 0.5) * 2;
+      const v = ((p.y - minY) / ry - 0.5) * 2;
+      let x: number;
+      let y: number;
+      if (box) {
+        x = scope.cx + u * hw;
+        y = scope.cy + v * hh;
+      } else {
+        // FG-squircle: the unit square maps onto the unit disc (corners included),
+        // so the layout reaches the outline on every ray.
+        const bendX = Math.sqrt(1 - (v * v) / 2);
+        const bendY = Math.sqrt(1 - (u * u) / 2);
+        x = scope.cx + u * bendX * hw;
+        y = scope.cy + v * bendY * hh;
+      }
       out.set(path, bb ? { x, y, billboard: bb } : { x, y });
     }
     return out;

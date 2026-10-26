@@ -1518,10 +1518,15 @@ describe("EmbeddingCoordinator scopes", () => {
     expect(model.scopePositions.has("near.mp3")).toBe(true);
     expect(model.scopePositions.has("far.mp3")).toBe(true);
     expect(model.scopePositions.has("outside.mp3")).toBe(false);
-    // Mapped into the circle's inscribed square, so inside the radius.
+    // Mapped onto the circle's disc: reaches the rim, never escapes it.
+    let reach = 0;
     for (const p of model.scopePositions.values()) {
-      expect(Math.hypot(p.x - 0.5, p.y - 0.5)).toBeLessThanOrEqual(0.1);
+      const d = Math.hypot(p.x - 0.5, p.y - 0.5);
+      expect(d).toBeLessThanOrEqual(0.1 + 1e-9);
+      reach = Math.max(reach, d);
     }
+    // The layout fills the region: an extreme of the map lands on the outline.
+    expect(reach).toBeCloseTo(0.1, 9);
   });
 
   it("closes the scope and clears its positions", async () => {
@@ -1699,7 +1704,7 @@ describe("EmbeddingCoordinator scopes", () => {
     }
     // The same raw layout under a circle with the same centre and radius maps
     // identically — the sphere is the 3-D membership volume, but its contents
-    // are the flat inscribed square, and scopePositions carry no z.
+    // are the flat disc layout, and scopePositions carry no z.
     await coord.openScope(
       { shape: "circle", cx: 0.5, cy: 0.5, r: 0.2, lensId: "" },
       "clap",

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Model, type HoverTarget, type Track } from "../model";
-import { ORBIT_RAD_PER_PX } from "../lib/camera3d";
+import { DEFAULT_PERSPECTIVE, ORBIT_RAD_PER_PX } from "../lib/camera3d";
 import { setEvalReadOnly } from "../lib/eval-readonly";
 import type { CanvasView } from "../components";
 import {
@@ -786,7 +786,12 @@ describe("CanvasInteractionController 3-D orbit", () => {
 
     expect(model.vp.ox).toBeCloseTo(vpBefore.ox - 100 / 1000, 5);
     expect(model.vp.oy).toBeCloseTo(vpBefore.oy - 20 / 1000, 5);
-    expect(model.view3d).toEqual({ on: false, yaw: 0.6, pitch: 0.35 });
+    expect(model.view3d).toEqual({
+      on: false,
+      yaw: 0.6,
+      pitch: 0.35,
+      persp: DEFAULT_PERSPECTIVE,
+    });
   });
 
   it("toggles 3-D from the on-canvas view tab without starting a gesture", () => {

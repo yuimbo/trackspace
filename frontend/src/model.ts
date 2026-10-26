@@ -26,7 +26,16 @@ import {
   type BloomRangeKey,
 } from "./lib/bloom";
 import { clusterColor, dirTagColors, keyColor, tempoColor } from "./lib/colors";
-import { MAX_PITCH, type Orbit } from "./lib/camera3d";
+import {
+  DEFAULT_PERSPECTIVE,
+  MAX_PERSPECTIVE,
+  MAX_PITCH,
+  type Orbit,
+} from "./lib/camera3d";
+import {
+  DEFAULT_SHADING,
+  type ShadingTune,
+} from "./lib/point-layer";
 import { displayFolderPath } from "./lib/path-presenter";
 import type { EvalDims } from "./lib/layout-eval";
 import { clamp01 } from "./lib/util";
@@ -440,9 +449,11 @@ export interface MapPos {
 /**
  * Client-side 3-D orbit view option (persisted). ``on`` arms the mode; the
  * projection and deterministic lenses stay 2-D regardless — see ``is3d``.
+ * ``persp`` is the perspective strength (0 = orthographic), tunable live.
  */
 export interface View3D extends Orbit {
   on: boolean;
+  persp: number;
 }
 
 /** A region on the canvas whose tracks are re-laid-out by another lens. */
@@ -592,7 +603,12 @@ export class Model extends EventBus {
    * Client-side 3-D orbit view option; persisted. Only a projection lens with
    * this on is actually 3-D — see ``is3d``.
    */
-  view3d: View3D = { on: false, yaw: 0.6, pitch: 0.35 };
+  view3d: View3D = {
+    on: false,
+    yaw: 0.6,
+    pitch: 0.35,
+    persp: DEFAULT_PERSPECTIVE,
+  };
   /**
    * Camera blend 0..1 for the 2-D↔3-D transition: 0 = head-on orthographic,
    * 1 = the full orbit + perspective. Transient, never persisted: ``loadLS``
@@ -601,6 +617,12 @@ export class Model extends EventBus {
    * rotated view until it lands back on head-on.
    */
   view3dBlend = 0;
+  /**
+   * 3-D cel-shading state fed to the splat shader; starts at the shipped
+   * ``DEFAULT_SHADING``. Transient: the View-options tuning sliders are parked
+   * (commented out in ``index.html``), so nothing writes it in normal use.
+   */
+  shading: ShadingTune = { ...DEFAULT_SHADING };
   _knownTags: string[] = [];
 
   /**
@@ -2043,10 +2065,20 @@ export class Model extends EventBus {
         // A stored orbit is accepted only when it is fully valid: `on` must be
         // exactly true and both angles finite numbers. Anything else (missing
         // key, legacy shape, bad values) keeps the defaults — 3-D must never
-        // come on by accident.
+        // come on by accident. `persp` is sanitised on its own, so a bad value
+        // cannot reject an otherwise valid orbit.
         const v3 = (d as { view3d?: unknown }).view3d;
         if (v3 && typeof v3 === "object") {
-          const r = v3 as { on?: unknown; yaw?: unknown; pitch?: unknown };
+          const r = v3 as {
+            on?: unknown;
+            yaw?: unknown;
+            pitch?: unknown;
+            persp?: unknown;
+          };
+          const persp =
+            typeof r.persp === "number" && Number.isFinite(r.persp)
+              ? Math.max(0, Math.min(MAX_PERSPECTIVE, r.persp))
+              : DEFAULT_PERSPECTIVE;
           if (
             r.on === true &&
             typeof r.yaw === "number" &&
@@ -2058,7 +2090,10 @@ export class Model extends EventBus {
               on: true,
               yaw: r.yaw,
               pitch: Math.max(-MAX_PITCH, Math.min(MAX_PITCH, r.pitch)),
+              persp,
             };
+          } else {
+            this.view3d.persp = persp;
           }
         }
         const ti = (d as { tsneIteration?: unknown }).tsneIteration;

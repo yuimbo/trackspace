@@ -38,6 +38,7 @@ import {
   MetaballLayer,
   POINT_SPLAT_R,
   type PointSpec,
+  type Shading,
 } from "../lib/point-layer";
 import {
   buildTooltip,
@@ -151,17 +152,11 @@ const DEPTH_SHADE_SPAN = 0.55;
 /** A wormhole-ghosted dot fades to this opacity at full influence (ghost = 1). */
 const GHOST_FADE = 0.85;
 /**
- * A sphere scope's wormhole pushes in-front non-members out to this multiple of
- * the sphere's screen radius, ghosting them as they clear the disc. Inside the
- * circle the frosted glass takes over (`rimPush`); past this reach nothing moves.
+ * The sphere scope's wormhole pushes a non-member that projects inside the disc
+ * out to this multiple of the sphere's screen radius, ghosting it as it goes.
+ * Past this reach nothing moves.
  */
 const WORMHOLE_REACH = 1.7;
-/**
- * Width of the inner rim band a glassed point is pushed onto, as a fraction of
- * the sphere's screen radius. `rimPush` maps the inside of the circle onto
- * [(1 − RIM_BAND)·r, (1 − RIM_BAND + RIM_BAND·0.8)·r].
- */
-const RIM_BAND = 0.18;
 /**
  * Frosted-glass tint over the sphere scope at full blur: the disc softens the
  * grid and the outer blobs, and this tint dims what the blur leaves.
@@ -176,20 +171,6 @@ export const GLASS_TINT_FLAT = 0.8;
 export const GLASS_BLUR_PX = 7;
 /** The glass blur is clamped to this ceiling (CSS px). */
 export const MAX_GLASS_BLUR = 24;
-
-/**
- * A cube-unit depth difference → normalised depth units, the scale `_trackScreen`
- * maps raw rotated depth to (a cube-unit Δ lands at (1 - DEPTH_FLOOR)·Δ/√3 there).
- */
-function depthUnits(delta: number): number {
-  return ((1 - DEPTH_FLOOR) * delta) / Math.sqrt(3);
-}
-
-/** GLSL-style smoothstep: 0 below *edge0*, 1 above *edge1*, smooth in between. */
-function smoothstep(edge0: number, edge1: number, x: number): number {
-  const t = clamp01((x - edge0) / (edge1 - edge0));
-  return t * t * (3 - 2 * t);
-}
 
 /** The 8 corners of the unit cube, (x, y, z) each 0 or 1. */
 const CUBE_CORNERS: readonly (readonly [number, number, number])[] = [
@@ -285,72 +266,36 @@ export function depthShade(depth: number, blend = 1): number {
 }
 
 /**
- * The sphere-scope wormhole: displace a NON-member that is nearer the camera
- * than the sphere's centre and whose screen position falls near the sphere's
- * projected circle radially OUT of the circle, fading it into a ghost. The
- * influence ramps up (with *depthReach*) the nearer the point is, and fades out
- * (with *Rinf = WORMHOLE_REACH·r*) the farther it is from the circle's centre,
- * so the rim band stays continuous with the untouched outside. Pure, so it is
- * unit-tested directly.
+ * Clear the open sphere scope's disc of non-members: displace a point that
+ * projects inside the circle radially OUT of it, ghosting it as it goes, so the
+ * disc only ever holds the scope's own contents.
  *
- * *depth* and *centreDepth* are the normalised 0.05–1 depths `_trackScreen`
- * returns; the displacement itself is done in screen px on the projected circle.
+ * Inside (`d < r`) maps monotonically onto `(r, WORMHOLE_REACH·r]`, keeping each
+ * point's angular order around the rim instead of collapsing them onto one
+ * radius: a point barely inside moves just clear of the rim, one the scope covers
+ * completely is thrown out to the reach radius. The ghost ramps 0 at the rim → 1
+ * at the centre, so a hidden point arrives as a faint silhouette. Points at or
+ * beyond the circle are returned unchanged. Pure, so it is unit-tested directly.
  */
 export function wormhole(
-  p: { sx: number; sy: number; depth: number },
-  circle: { cx: number; cy: number; r: number },
-  centreDepth: number,
-  depthReach: number,
-): { sx: number; sy: number; ghost: number } {
-  // A degenerate reach/circle cannot displace anything; skip before smoothstep
-  // divides by zero.
-  if (depthReach <= 0 || circle.r <= 0) {
-    return { sx: p.sx, sy: p.sy, ghost: 0 };
-  }
-  // 0 at/behind the centre plane, 1 once the point is depthReach nearer.
-  const s = smoothstep(0, depthReach, p.depth - centreDepth);
-  if (s === 0) return { sx: p.sx, sy: p.sy, ghost: 0 };
-  const Rinf = circle.r * WORMHOLE_REACH;
-  const dx = p.sx - circle.cx;
-  const dy = p.sy - circle.cy;
-  const d = Math.hypot(dx, dy);
-  // 1 inside the circle, fading to 0 at Rinf, so everything past it is untouched.
-  const f = 1 - smoothstep(circle.r, Rinf, d);
-  const w = s * f;
-  if (w === 0) return { sx: p.sx, sy: p.sy, ghost: 0 };
-  // Monotone: maps [0, Rinf] onto [r, Rinf] — inside points push to the rim band.
-  const dOut = circle.r + (Rinf - circle.r) * (d / Rinf);
-  // Away from the centre (fixed +x for a point exactly at it, so it is deterministic).
-  const [ux, uy] = d < 1e-3 ? [1, 0] : [dx / d, dy / d];
-  return {
-    sx: p.sx + (circle.cx + ux * dOut - p.sx) * w,
-    sy: p.sy + (circle.cy + uy * dOut - p.sy) * w,
-    ghost: w,
-  };
-}
-
-/**
- * Push a non-member that still projects inside a sphere scope's circle onto the
- * inner rim band, so it stays visible under the frosted glass instead of being
- * hidden outright. Monotone: maps the inside (`d < r`) onto
- * [(1 − RIM_BAND)·r, (1 − RIM_BAND + RIM_BAND·0.8)·r] — near the rim, clear of
- * the circle's centre — along the ray away from the centre (fixed +x for a
- * point exactly at it, so the result is deterministic). Points at or beyond the
- * circle are returned unchanged. Pure, so it is unit-tested directly.
- */
-export function rimPush(
   p: { sx: number; sy: number },
   circle: { cx: number; cy: number; r: number },
-): { sx: number; sy: number } {
+): { sx: number; sy: number; ghost: number } {
+  if (circle.r <= 0) return { sx: p.sx, sy: p.sy, ghost: 0 };
   const dx = p.sx - circle.cx;
   const dy = p.sy - circle.cy;
   const d = Math.hypot(dx, dy);
-  if (d >= circle.r) return { sx: p.sx, sy: p.sy };
-  const dOut =
-    circle.r * (1 - RIM_BAND) + circle.r * RIM_BAND * 0.8 * (d / circle.r);
+  if (d >= circle.r) return { sx: p.sx, sy: p.sy, ghost: 0 };
+  const Rinf = circle.r * WORMHOLE_REACH;
+  // Reverse the order: the deeper inside, the farther out (continuous at the rim).
+  const dOut = Rinf - (Rinf - circle.r) * (d / circle.r);
   // Away from the centre (fixed +x for a point exactly at it, so deterministic).
   const [ux, uy] = d < 1e-3 ? [1, 0] : [dx / d, dy / d];
-  return { sx: circle.cx + ux * dOut, sy: circle.cy + uy * dOut };
+  return {
+    sx: circle.cx + ux * dOut,
+    sy: circle.cy + uy * dOut,
+    ghost: 1 - d / circle.r,
+  };
 }
 
 /**
@@ -456,10 +401,8 @@ export class CanvasView {
   _rafId = 0;
   /** Bottom of the top tabbers this frame, so status pills dock below the bloom chip. */
   private _topTabsBottom = TOP_TABS_BOTTOM;
-  /** Perspective strength for the 3-D view; tunable live via ``?persp=…``. */
-  private persp = readPerspective(
-    typeof location !== "undefined" ? location.search : "",
-  );
+  /** Perspective strength for the 3-D view; mirror of ``model.view3d.persp``. */
+  private persp: number;
   /** Sphere-scope glass blur radius in CSS px; tunable live via ``?glass=…``. */
   private glassBlur = readGlassBlur(
     typeof location !== "undefined" ? location.search : "",
@@ -491,7 +434,13 @@ export class CanvasView {
    */
   private _scopeSpecs: PointSpec[] = [];
   /** Hover/selected dots, excluded from the merge so they read as single tracks. */
-  private _crispDots: { sx: number; sy: number; idx: number; depth: number }[] = [];
+  private _crispDots: {
+    sx: number;
+    sy: number;
+    idx: number;
+    depth: number;
+    scale: number;
+  }[] = [];
   /** Reused occluder list for the 3-D glow pass (see `_glowOccluders`). */
   private _occluders: GlowOccluder[] = [];
   /** Cached map background colour for the sphere-scope glass tint. */
@@ -501,6 +450,11 @@ export class CanvasView {
 
   constructor(model: Model) {
     this.model = model;
+    // `?persp=` overrides the persisted setting for this session only.
+    this.persp = readPerspective(
+      typeof location !== "undefined" ? location.search : "",
+      model.view3d.persp,
+    );
     this.$canvas = document.getElementById("viewport") as HTMLCanvasElement;
     this.ctx = this.$canvas.getContext("2d")!;
     this.glow = new GlowLayer(
@@ -549,6 +503,15 @@ export class CanvasView {
       (sx - PAD) / (vp.zoom * iw) + vp.ox,
       (h - PAD - sy) / (vp.zoom * ih) + vp.oy,
     ];
+  }
+
+  /**
+   * Set the 3-D perspective strength (status-bar slider). Clamping lives in the
+   * model; the canvas just uses the value on the next frame.
+   */
+  setPerspective(persp: number): void {
+    this.persp = persp;
+    this.scheduleDraw();
   }
 
   /**
@@ -901,16 +864,28 @@ export class CanvasView {
     let lo = Infinity,
       hi = -Infinity;
     const placed: { x: number; y: number; score: number; depth: number }[] = [];
+    // The same cleared disc the scatter draws: a non-member's landmark glow
+    // follows its wormholed position, so nothing bleeds under the glass.
+    const circle =
+      m.shows3d && m.scope?.shape === "sphere"
+        ? this.scopeScreenCircle()
+        : null;
     for (const p of field) {
       const t = m.trackByPath(p.path);
       if (!t) continue;
       const pos = this._resolveTrackWPos(t);
       if (!pos) continue;
       const { sx, sy, depth } = this._trackScreen(pos);
-      // A non-member that projects inside the circle is glassed behind the
-      // scope's disc, so its landmark glow must not bleed through the glass.
-      if (this._behindScope(p.path, sx, sy)) continue;
-      placed.push({ x: sx, y: sy, score: p.score, depth });
+      const shift =
+        circle && !m.scopePositions.has(p.path)
+          ? wormhole({ sx, sy }, circle)
+          : null;
+      placed.push({
+        x: shift ? shift.sx : sx,
+        y: shift ? shift.sy : sy,
+        score: p.score,
+        depth,
+      });
       if (p.score < lo) lo = p.score;
       if (p.score > hi) hi = p.score;
     }
@@ -973,7 +948,8 @@ export class CanvasView {
    * map field plus the sphere scope's member field) plus the crisp
    * hover/selected dots, each with the depth a halo must sit behind.
    * Point-splat radii are already perspective-scaled, so the occlusion
-   * footprint matches the blob on screen; crisp dots get a `DOT_R_SEL` disc.
+   * footprint matches the blob on screen; crisp dots get a perspective-scaled
+   * `DOT_R_SEL` disc.
    */
   private _glowOccluders(): GlowOccluder[] {
     const occ = this._occluders;
@@ -985,7 +961,12 @@ export class CanvasView {
       occ.push({ x: p.x, y: p.y, radius: p.radius, depth: p.depth ?? 0.5 });
     }
     for (const c of this._crispDots) {
-      occ.push({ x: c.sx, y: c.sy, radius: DOT_R_SEL, depth: c.depth });
+      occ.push({
+        x: c.sx,
+        y: c.sy,
+        radius: DOT_R_SEL * c.scale,
+        depth: c.depth,
+      });
     }
     return occ;
   }
@@ -1319,31 +1300,6 @@ export class CanvasView {
     return this._tagPos(t);
   }
 
-  /**
-   * A non-member whose (post-wormhole) screen position lies inside the open
-   * sphere scope's circle is glassed: `_drawScatter` pushes it to the inner rim
-   * band under the frosted-glass disc, where it is visible but not hit, and its
-   * search glow is dropped. Members (`scopePositions`) are the scope's own
-   * contents and are never glassed. *circle* is the already-projected sphere
-   * circle when the caller has one (the scatter loop's wormhole context); when
-   * omitted it is recomputed, and the rule is a no-op unless a 3-D sphere scope
-   * is shown.
-   */
-  private _behindScope(
-    path: string,
-    sx: number,
-    sy: number,
-    circle?: { cx: number; cy: number; r: number } | null,
-  ): boolean {
-    if (this.model.scopePositions.has(path)) return false;
-    const c =
-      circle ??
-      (this.model.shows3d && this.model.scope?.shape === "sphere"
-        ? this.scopeScreenCircle()
-        : null);
-    return c !== null && Math.hypot(sx - c.cx, sy - c.cy) < c.r;
-  }
-
   private _drawScatter(tracks: Track[]): void {
     const m = this.model;
     const supported = this.points.supported;
@@ -1356,32 +1312,15 @@ export class CanvasView {
     const w = this.$canvas.clientWidth;
     const h = this.$canvas.clientHeight;
     let anyFiltered = false;
-    // Sphere scope in 3-D: the disc is a frosted-glass backdrop for its members,
-    // so a non-member in front of the sphere is wormholed radially out of the
-    // projected circle, ghosting as it goes; one that still projects inside the
-    // circle lies behind the glass and is pushed to the inner rim band
-    // (`rimPush`) — visible under the glass, but not hittable. Members
-    // (`scopePositions`) are never displaced or glassed.
-    let wormholeCtx: {
-      circle: { cx: number; cy: number; r: number };
-      centreDepth: number;
-      depthReach: number;
-    } | null = null;
-    if (m.shows3d && m.scope?.shape === "sphere") {
-      const circle = this.scopeScreenCircle();
-      if (circle) {
-        const cz = m.scope.cz ?? 0.5;
-        wormholeCtx = {
-          circle,
-          centreDepth: this._trackScreen({
-            wx: m.scope.cx,
-            wy: m.scope.cy,
-            wz: cz,
-          }).depth,
-          depthReach: depthUnits(0.25 * m.scope.r),
-        };
-      }
-    }
+    // Sphere scope in 3-D: the disc is a frosted-glass backdrop for its members
+    // only, so every non-member that projects inside it is wormholed radially
+    // out past the rim, ghosting as it goes — the sphere reads as solid whatever
+    // the orbit, and nothing foreign ever sits inside the outline. Members
+    // (`scopePositions`) are never displaced.
+    const wormholeCircle =
+      m.shows3d && m.scope?.shape === "sphere"
+        ? this.scopeScreenCircle()
+        : null;
     tracks.forEach((t, i) => {
       if (!m.isVisible(t)) {
         anyFiltered = true;
@@ -1393,28 +1332,11 @@ export class CanvasView {
       let sx = rawSx;
       let sy = rawSy;
       let ghost = 0;
-      if (wormholeCtx && !m.scopePositions.has(t.path)) {
-        const w = wormhole(
-          { sx, sy, depth },
-          wormholeCtx.circle,
-          wormholeCtx.centreDepth,
-          wormholeCtx.depthReach,
-        );
-        sx = w.sx;
-        sy = w.sy;
-        ghost = w.ghost;
-      }
-      // A non-member that still projects inside the circle lies behind the
-      // frosted glass: push it onto the inner rim band so it stays visible
-      // (blurred by the disc) instead of vanishing, and draw it at full
-      // colour — but, like a heavy ghost, never hittable or selectable.
-      let glassed = false;
-      if (wormholeCtx && this._behindScope(t.path, sx, sy, wormholeCtx.circle)) {
-        const rim = rimPush({ sx, sy }, wormholeCtx.circle);
-        sx = rim.sx;
-        sy = rim.sy;
-        glassed = true;
-        ghost = 0;
+      if (wormholeCircle && !m.scopePositions.has(t.path)) {
+        const pushed = wormhole({ sx, sy }, wormholeCircle);
+        sx = pushed.sx;
+        sy = pushed.sy;
+        ghost = pushed.ghost;
       }
       // An off-screen dot cannot be seen or hit, so skip it entirely; while
       // zoomed in this is most of the library.
@@ -1426,29 +1348,28 @@ export class CanvasView {
       )
         return;
       // Heavily ghosted dots are rendered but not hittable or selectable, so
-      // hover, click, lasso and the hover glow ignore them. Glassed points are
-      // not hittable either, even though they draw at full colour.
-      if (!glassed && ghost < 0.5) this.positions.push({ idx: i, sx, sy, depth });
+      // hover, click, lasso and the hover glow ignore them.
+      if (ghost < 0.5) this.positions.push({ idx: i, sx, sy, depth });
       if (!supported) {
-        this._dot(sx, sy, t, i);
+        this._dot(sx, sy, t, i, scale);
         return;
       }
-      if (!glassed && ghost < 0.5) {
+      if (ghost < 0.5) {
         const key = `${Math.round(sx / HIT_CELL)},${Math.round(sy / HIT_CELL)}`;
         const cell = this._hitGrid.get(key);
         if (cell) cell.push({ idx: i, sx, sy, depth });
         else this._hitGrid.set(key, [{ idx: i, sx, sy, depth }]);
       }
       const crisp = m.selected.has(t.path) || this.hoveredIdx === i;
-      if (crisp && !glassed && ghost < 0.5) {
-        this._crispDots.push({ sx, sy, idx: i, depth });
+      if (crisp && ghost < 0.5) {
+        this._crispDots.push({ sx, sy, idx: i, depth, scale });
       } else {
         // A heavily ghosted crisp dot merges back into the field as a silhouette.
         const spec = this._pointSpec(sx, sy, t, depth, scale, ghost);
         // A sphere scope's members render above its glass, so their splats go
-        // to the second field pass (`_renderBlobs`); everyone else — glassed
-        // points included — merges with the outer map.
-        if (wormholeCtx && m.scopePositions.has(t.path)) {
+        // to the second field pass (`_renderBlobs`); everyone else merges with
+        // the outer map.
+        if (wormholeCircle && m.scopePositions.has(t.path)) {
           this._scopeSpecs.push(spec);
         } else {
           this._pointSpecs.push(spec);
@@ -1542,17 +1463,27 @@ export class CanvasView {
     const w = this.$canvas.clientWidth,
       h = this.$canvas.clientHeight;
     const ctx = this.ctx;
+    // The cel light fades with the 2-D↔3-D blend exactly like the depth shade, so
+    // the toggle never pops and 2-D keeps its flat colours.
+    const shading = this._shading();
     const circle = this.model.shows3d ? this.scopeScreenCircle() : null;
     if (circle) {
-      this.points.render(this._pointSpecs, depthAware);
+      this.points.render(this._pointSpecs, depthAware, shading);
       ctx.drawImage(this.points.canvas, 0, 0, w, h);
       this._drawGlass(circle, w, h);
-      this.points.render(this._scopeSpecs, depthAware);
+      this.points.render(this._scopeSpecs, depthAware, shading);
       ctx.drawImage(this.points.canvas, 0, 0, w, h);
       return;
     }
-    this.points.render(this._pointSpecs, depthAware);
+    this.points.render(this._pointSpecs, depthAware, shading);
     ctx.drawImage(this.points.canvas, 0, 0, w, h);
+  }
+
+  /** This frame's cel-shading state, or null when the view is flat (2-D). */
+  private _shading(): Shading | null {
+    return this.model.shows3d
+      ? { ...this.model.shading, strength: this.model.view3dBlend }
+      : null;
   }
 
   /**
@@ -1608,7 +1539,8 @@ export class CanvasView {
   /** The crisp hover/selected dots on top of the merged field. */
   private _drawCrispDots(tracks: Track[]): void {
     if (!this.points.supported) return;
-    for (const c of this._crispDots) this._dot(c.sx, c.sy, tracks[c.idx], c.idx);
+    for (const c of this._crispDots)
+      this._dot(c.sx, c.sy, tracks[c.idx], c.idx, c.scale);
   }
 
   /* ── Hover glow pass (navigation targets + selection bloom) ── */
@@ -1705,10 +1637,16 @@ export class CanvasView {
 
   /* ── Single dot ─────────────────────────────────────────── */
 
-  private _dot(sx: number, sy: number, track: Track, idx: number): void {
+  private _dot(
+    sx: number,
+    sy: number,
+    track: Track,
+    idx: number,
+    scale = 1,
+  ): void {
     const sel = this.model.selected.has(track.path);
     const hov = this.hoveredIdx === idx;
-    const r = sel ? DOT_R_SEL : hov ? DOT_R + 1.5 : DOT_R;
+    const r = (sel ? DOT_R_SEL : hov ? DOT_R + 1.5 : DOT_R) * scale;
     const ctx = this.ctx;
 
     let color: string;

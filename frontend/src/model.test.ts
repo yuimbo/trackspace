@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { Model, type Track } from "./model";
-import { MAX_PITCH } from "./lib/camera3d";
+import {
+  DEFAULT_PERSPECTIVE,
+  MAX_PERSPECTIVE,
+  MAX_PITCH,
+} from "./lib/camera3d";
 
 function track(path: string, folder: string): Track {
   return { path, filename: path, folder, tags: {}, artist: "", title: "" };
@@ -806,21 +810,31 @@ describe("Model eval-mode persistence", () => {
 describe("Model 3-D orbit view", () => {
   beforeEach(() => localStorage.clear());
 
-  it("defaults to off", () => {
-    expect(new Model().view3d).toEqual({ on: false, yaw: 0.6, pitch: 0.35 });
+  it("defaults to off, with the default perspective strength", () => {
+    expect(new Model().view3d).toEqual({
+      on: false,
+      yaw: 0.6,
+      pitch: 0.35,
+      persp: DEFAULT_PERSPECTIVE,
+    });
   });
 
-  it("persists the orbit", () => {
+  it("persists the orbit and the perspective strength", () => {
     const m = new Model();
-    m.view3d = { on: true, yaw: 1.2, pitch: 0.4 };
+    m.view3d = { on: true, yaw: 1.2, pitch: 0.4, persp: 0.2 };
     m.saveLS();
     const m2 = new Model();
     m2.loadLS();
-    expect(m2.view3d).toEqual({ on: true, yaw: 1.2, pitch: 0.4 });
+    expect(m2.view3d).toEqual({ on: true, yaw: 1.2, pitch: 0.4, persp: 0.2 });
   });
 
   it("falls back to defaults for garbage persisted input", () => {
-    const defaults = { on: false, yaw: 0.6, pitch: 0.35 };
+    const defaults = {
+      on: false,
+      yaw: 0.6,
+      pitch: 0.35,
+      persp: DEFAULT_PERSPECTIVE,
+    };
     for (const stored of [
       { view3d: "bogus" },
       { view3d: { on: "yes", yaw: 1.2, pitch: 0.4 } },
@@ -835,6 +849,34 @@ describe("Model 3-D orbit view", () => {
     }
   });
 
+  it("keeps a stored perspective with a legacy orbit, sanitised", () => {
+    // A pre-slider orbit has no `persp`: the default fills it in. A junk or
+    // out-of-range value is clamped without rejecting the orbit itself.
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: true, yaw: 0.4, pitch: 0.2 } }),
+    );
+    const legacy = new Model();
+    legacy.loadLS();
+    expect(legacy.view3d.persp).toBe(DEFAULT_PERSPECTIVE);
+
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: false, yaw: 0.4, pitch: 0.2, persp: 99 } }),
+    );
+    const clamped = new Model();
+    clamped.loadLS();
+    expect(clamped.view3d.persp).toBe(MAX_PERSPECTIVE);
+
+    localStorage.setItem(
+      "trackspace",
+      JSON.stringify({ view3d: { on: false, yaw: 0.4, pitch: 0.2, persp: "x" } }),
+    );
+    const junk = new Model();
+    junk.loadLS();
+    expect(junk.view3d.persp).toBe(DEFAULT_PERSPECTIVE);
+  });
+
   it("clamps a persisted pitch to ±MAX_PITCH", () => {
     localStorage.setItem(
       "trackspace",
@@ -842,7 +884,12 @@ describe("Model 3-D orbit view", () => {
     );
     const m = new Model();
     m.loadLS();
-    expect(m.view3d).toEqual({ on: true, yaw: 0.4, pitch: MAX_PITCH });
+    expect(m.view3d).toEqual({
+      on: true,
+      yaw: 0.4,
+      pitch: MAX_PITCH,
+      persp: DEFAULT_PERSPECTIVE,
+    });
 
     localStorage.setItem(
       "trackspace",
@@ -850,13 +897,18 @@ describe("Model 3-D orbit view", () => {
     );
     const m2 = new Model();
     m2.loadLS();
-    expect(m2.view3d).toEqual({ on: true, yaw: 0.4, pitch: -MAX_PITCH });
+    expect(m2.view3d).toEqual({
+      on: true,
+      yaw: 0.4,
+      pitch: -MAX_PITCH,
+      persp: DEFAULT_PERSPECTIVE,
+    });
   });
 
   it("is3d only for a projection lens with the view on, outside eval mode", () => {
     const m = new Model();
     expect(m.is3d).toBe(false);
-    m.view3d = { on: true, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: true, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     // Tags lens: no z axis.
     m.lensId = "tags";
     expect(m.is3d).toBe(false);
@@ -873,7 +925,7 @@ describe("Model 3-D orbit view", () => {
     m.setEvalMode(false);
     expect(m.is3d).toBe(true);
     // Toggle off.
-    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     expect(m.is3d).toBe(false);
   });
 
@@ -884,11 +936,11 @@ describe("Model 3-D orbit view", () => {
     expect(m.is3d).toBe(false);
     expect(m.shows3d).toBe(false);
     // Armed (mid-entry or full): both render 3-D.
-    m.view3d = { on: true, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: true, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     expect(m.is3d).toBe(true);
     expect(m.shows3d).toBe(true);
     // Turned off but still blending back: the collapse tween keeps rendering 3-D.
-    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     m.view3dBlend = 0.5;
     expect(m.is3d).toBe(false);
     expect(m.shows3d).toBe(true);
@@ -910,7 +962,7 @@ describe("Model 3-D orbit view", () => {
 
   it("eval dims drive is3d/shows3d and reset when eval ends", () => {
     const m = new Model();
-    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     m.setEvalMode(true);
     expect(m.evalDims).toBe(2);
     expect(m.is3d).toBe(false);
@@ -958,7 +1010,7 @@ describe("Model 3-D orbit view", () => {
 
   it("does not persist the blend (it is transient)", () => {
     const m = new Model();
-    m.view3d = { on: true, yaw: 1.2, pitch: 0.4 };
+    m.view3d = { on: true, yaw: 1.2, pitch: 0.4, persp: DEFAULT_PERSPECTIVE };
     m.view3dBlend = 0.3; // mid-tween
     m.saveLS();
     const m2 = new Model();
@@ -975,7 +1027,7 @@ describe("Model per-dimensionality t-SNE iteration budget", () => {
     const m = new Model();
     m.genreFullEnabled = true;
     m.lensId = "genre_full";
-    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     m.setTsneIterationForActiveView(250, 150);
     m.view3d.on = true;
     m.setTsneIterationForActiveView(500, 250);
@@ -986,7 +1038,7 @@ describe("Model per-dimensionality t-SNE iteration budget", () => {
     m2.genreFullEnabled = true;
     m2.lensId = "genre_full";
     // 2-D and 3-D keep their own budgets.
-    m2.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m2.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     expect(m2.tsneIterationFor()).toEqual({ nIter: 250, early: 150 });
     m2.view3d.on = true;
     expect(m2.tsneIterationFor()).toEqual({ nIter: 500, early: 250 });
@@ -1040,7 +1092,7 @@ describe("Model per-dimensionality t-SNE iteration budget", () => {
     m.genreFullEnabled = true;
     m.lensId = "clap";
     // The active dimension prefers the active saved lens (clap), not genre.
-    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     expect(m.tsneIterationFor()).toEqual({ nIter: 200, early: 100 });
     // The other dimension picks the genre entry deterministically.
     m.view3d.on = true;
@@ -1064,7 +1116,7 @@ describe("Model per-dimensionality t-SNE iteration budget", () => {
     );
     const m = new Model();
     m.loadLS();
-    m.view3d = { on: false, yaw: 0.6, pitch: 0.35 };
+    m.view3d = { on: false, yaw: 0.6, pitch: 0.35, persp: DEFAULT_PERSPECTIVE };
     expect(m.tsneIterationFor()).toEqual({ nIter: 200, early: 100 });
     m.view3d.on = true;
     expect(m.tsneIterationFor()).toEqual({ nIter: 300, early: 150 });
