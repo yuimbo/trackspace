@@ -445,6 +445,44 @@ describe("CanvasView 3-D glow compositing", () => {
     expect(splat.depth).toBe(pb.depth);
   });
 
+  it("still haloes a background dot, faded with its fog", () => {
+    const { cv } = make3dCanvas();
+    cv.model.clusterAssignments = new Map([
+      ["a.mp3", 2],
+      ["b.mp3", 2],
+    ]);
+    cv.hoverTarget = { kind: "cluster", id: 2 };
+    cv.draw();
+    // b.mp3 is background fog, so only a.mp3 is hittable…
+    expect(cv.positions.map((p) => p.idx)).toEqual([0]);
+    // …but the halo covers the whole target, the background dot faded with its
+    // fog: one halo at full strength, one dimmer, both visible.
+    const pts = cv.collectHoverGlowPoints(cv.model.tracks);
+    expect(pts).toHaveLength(2);
+    const alphas = pts.map((p) => p.alpha);
+    expect(Math.min(...alphas)).toBeGreaterThan(0);
+    expect(Math.min(...alphas)).toBeLessThan(Math.max(...alphas));
+  });
+
+  it("keeps a far selected dot crisp and yellow (selection fog immunity)", () => {
+    const { cv, points } = make3dCanvas();
+    cv.model.selected.add("b.mp3");
+    cv.draw();
+    // A selection is active colouring, not depth context: no DoF layer, and the
+    // far dot stays hittable rather than becoming background.
+    expect(points.render).toHaveBeenCalledTimes(1);
+    expect(cv.positions.map((p) => p.idx)).toEqual([0, 1]);
+    // It is drawn as a crisp (yellow) dot, not a fogged/blurred splat.
+    const crisp = (
+      cv as unknown as { _crispDots: { idx: number }[] }
+    )._crispDots;
+    expect(crisp.map((c) => c.idx)).toEqual([1]);
+    const splats = points.render.mock.calls.flatMap(
+      (call) => call[0] as PointSpec[],
+    );
+    expect(splats).toHaveLength(1); // only the unselected near dot
+  });
+
   it("blits the fog layer, the sharp blobs, then the glow in 3-D", () => {
     const { cv, glow, points } = make3dCanvas();
     cv.model.selected.add("a.mp3");
@@ -688,6 +726,133 @@ describe("CanvasView scope positions", () => {
     expect(box!.w).toBeCloseTo(2 * 0.2 * iw, 3);
     expect(box!.h).toBeCloseTo(2 * 0.1 * ih, 3);
     expect(ellipses.some((e) => e.rx > 1)).toBe(false);
+  });
+});
+
+// ─── Glow dot sizing (hover) ──────────────────────────────────
+
+describe("CanvasView glow dot", () => {
+  let arcs: { x: number; y: number; r: number; alpha: number }[];
+  let origGetContext: typeof HTMLCanvasElement.prototype.getContext;
+
+  beforeEach(() => {
+    vi.stubGlobal("devicePixelRatio", 1);
+    document.body.innerHTML =
+      '<canvas id="viewport"></canvas><div id="tooltip" class="hidden"></div><div id="coords-panel" class="hidden"></div>';
+    const fake = makeFakeCtx();
+    arcs = fake.arcs;
+    origGetContext = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = (() =>
+      fake.ctx) as unknown as typeof HTMLCanvasElement.prototype.getContext;
+  });
+
+  afterEach(() => {
+    HTMLCanvasElement.prototype.getContext = origGetContext;
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("grows a glowing dot by 1.5 screen px, not scaled by perspective", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    m.lensId = "combined";
+    m.view3d.on = true;
+    m.view3dBlend = 1;
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.3, y: 0.4, z: 0.8 }]]);
+    const cv = new CanvasView(m);
+    const points = { supported: true as const, render: vi.fn(), canvas: {} };
+    (cv as unknown as { points: unknown }).points = points;
+    (cv as unknown as { glow: unknown }).glow = {
+      render: vi.fn(),
+      canvas: { style: { visibility: "" } },
+    };
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    const { sx, sy, scale } = (
+      cv as unknown as {
+        _trackScreen(p: { wx: number; wy: number; wz?: number }): {
+          sx: number;
+          sy: number;
+          scale: number;
+        };
+      }
+    )._trackScreen({ wx: 0.3, wy: 0.4, wz: 0.8 });
+
+    cv.hoveredIdx = 0;
+    cv.draw();
+    const dot = arcs.find((a) => Math.hypot(a.x - sx, a.y - sy) < 1)!;
+    // DOT_R is 4: the growth lands on top of the perspective-scaled radius.
+    expect(dot.r).toBeCloseTo(4 * scale + 1.5, 5);
+    expect(dot.r).not.toBeCloseTo((4 + 1.5) * scale, 5);
+    // The ring is the dot's own colour at half brightness (50 % toward black).
+    (
+      cv as unknown as {
+        _dot(
+          x: number,
+          y: number,
+          track: Track,
+          idx: number,
+          scale: number,
+        ): void;
+      }
+    )._dot(sx, sy, m.trackByPath("a.mp3")!, 0, scale);
+    const [r, g, b] = parseColor(cv.trackColor(m.trackByPath("a.mp3")!));
+    const hex = (v: number): string =>
+      Math.round(v * 127.5)
+        .toString(16)
+        .padStart(2, "0");
+    expect((cv.ctx as unknown as { strokeStyle: string }).strokeStyle).toBe(
+      `#${hex(r)}${hex(g)}${hex(b)}`,
+    );
+  });
+
+  it("leaves a selected dot exactly as it was, even while hovered", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "a.mp3" })]);
+    m.lensId = "combined";
+    m.view3d.on = true;
+    m.view3dBlend = 1;
+    m.embeddingPositions = new Map([["a.mp3", { x: 0.3, y: 0.4, z: 0.8 }]]);
+    const cv = new CanvasView(m);
+    const points = { supported: true as const, render: vi.fn(), canvas: {} };
+    (cv as unknown as { points: unknown }).points = points;
+    (cv as unknown as { glow: unknown }).glow = {
+      render: vi.fn(),
+      canvas: { style: { visibility: "" } },
+    };
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    const { sx, sy, scale } = (
+      cv as unknown as {
+        _trackScreen(p: { wx: number; wy: number; wz?: number }): {
+          sx: number;
+          sy: number;
+          scale: number;
+        };
+      }
+    )._trackScreen({ wx: 0.3, wy: 0.4, wz: 0.8 });
+
+    cv.model.selected.add("a.mp3");
+    cv.hoveredIdx = 0;
+    cv.draw();
+    const dot = arcs.find((a) => Math.hypot(a.x - sx, a.y - sy) < 1)!;
+    // Selection wins over glow: DOT_R_SEL at its own scale, no growth.
+    expect(dot.r).toBeCloseTo(6 * scale, 5);
+    // …and the white ring is unchanged (drawn directly, so it is the last stroke).
+    (
+      cv as unknown as {
+        _dot(
+          x: number,
+          y: number,
+          track: Track,
+          idx: number,
+          scale: number,
+        ): void;
+      }
+    )._dot(sx, sy, m.trackByPath("a.mp3")!, 0, scale);
+    expect((cv.ctx as unknown as { strokeStyle: string }).strokeStyle).toBe(
+      "#ffffffaa",
+    );
   });
 });
 

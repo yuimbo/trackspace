@@ -213,10 +213,20 @@ const TARGET_GLOW_COLOR = "#8e9bff";
 /** Search-field glow: accent RGB (matches `TARGET_GLOW_COLOR`) and splat radius in px. */
 const FIELD_GLOW_RGB: [number, number, number] = [142 / 255, 155 / 255, 1];
 const FIELD_GLOW_R = 64;
-/** Hover halo: a dot-sized disc plus a soft edge, sized to match the old blur pass. */
-const HOVER_GLOW_R = DOT_R + 20;
+/** Hover halo: a small flat core plus a soft edge. */
+const HOVER_GLOW_R = (DOT_R + 20) * 0.4;
 const HOVER_GLOW_CORE = 0.42;
 const HOVER_GLOW_ALPHA = 0.64;
+/** A glowing dot draws this much larger, in screen px (not perspective-scaled). */
+const GLOW_DOT_GROW = 1.5;
+/** The selection yellow: the crisp dot fill and a far selected dot's splat. */
+const SELECTED_COLOR = "#ffdd57";
+/**
+ * A selection is the user's active working set, not depth context, so it takes
+ * only this fraction of the distance fog: it stays sharp, near-full strength and
+ * clickable even at the back of the cloud.
+ */
+const SELECTION_FOG_SCALE = 0.25;
 /** Selection-bloom cursor ring when no dot is hovered (no class colour to borrow). */
 const CURSOR_COLOR = "rgba(255,190,90,0.95)";
 
@@ -465,6 +475,17 @@ export class CanvasView {
   points: MetaballLayer;
   /** This frame's splats for the blurred background (DoF) layer. */
   private _fogSpecs: PointSpec[] = [];
+  /**
+   * This frame's background (fogged) dots in screen space, so the glow pass can
+   * still halo them — faded like the dots themselves.
+   */
+  private _backgroundDots: {
+    idx: number;
+    sx: number;
+    sy: number;
+    depth: number;
+    fog: number;
+  }[] = [];
   /** This frame's splats (all points except the crisp hover/selected ones). */
   private _pointSpecs: PointSpec[] = [];
   /**
@@ -949,15 +970,22 @@ export class CanvasView {
     });
   }
 
-  /** Glow points for the hovered navigation target / selection-bloom family. */
+  /** Glow points for the hovered navigation target / selection-bloom family.
+   *
+   * Covers the background (fogged) group too: a far dot that a navigator points
+   * at keeps its halo, faded in step with its dot so it stays behind the fog.
+   */
   collectHoverGlowPoints(tracks: Track[]): GlowPoint[] {
     if (this.hoverTarget === null && this.hoveredBloomTrack === null) {
       return [];
     }
     const points: GlowPoint[] = [];
-    for (const pos of this.positions) {
+    const halo = (
+      pos: { idx: number; sx: number; sy: number; depth: number },
+      fade: number,
+    ): void => {
       const track = tracks[pos.idx];
-      if (!this._inHoverGlow(track)) continue;
+      if (!track || !this._inHoverGlow(track)) return;
       points.push({
         x: pos.sx,
         y: pos.sy,
@@ -965,9 +993,12 @@ export class CanvasView {
         radius: HOVER_GLOW_R,
         core: HOVER_GLOW_CORE,
         color: parseColor(this._hoverGlowColor(track)),
-        alpha: HOVER_GLOW_ALPHA,
+        alpha: HOVER_GLOW_ALPHA * fade,
       });
-    }
+    };
+    for (const pos of this.positions) halo(pos, 1);
+    for (const pos of this._backgroundDots)
+      halo(pos, 1 - FOG_FADE * pos.fog);
     return points;
   }
 
@@ -1351,6 +1382,7 @@ export class CanvasView {
     this._pointSpecs.length = 0;
     this._scopeSpecs.length = 0;
     this._fogSpecs.length = 0;
+    this._backgroundDots.length = 0;
     this._crispDots.length = 0;
     this._hitGrid.clear();
     const w = this.$canvas.clientWidth;
@@ -1395,12 +1427,18 @@ export class CanvasView {
         return;
       // The far cap of the cloud is fog: drawn faintly, but it is background, so
       // hover, click, lasso and the hover glow leave it to the near side. A
-      // scope's members are the lens the user opened, so they never fog.
+      // scope's members are the lens the user opened, so they never fog, and a
+      // selection keeps most of its strength (`SELECTION_FOG_SCALE`) so the
+      // active colouring never washes out.
+      const selected = m.selected.has(t.path);
       const fog = m.scopePositions.has(t.path)
         ? 0
-        : fogAmount(depth, fogBias);
+        : fogAmount(depth, fogBias) * (selected ? SELECTION_FOG_SCALE : 1);
       const reachable = ghost < 0.5 && fog < FOG_BACKGROUND;
       if (reachable) this.positions.push({ idx: i, sx, sy, depth });
+      // A background dot still carries its halo: the glow pass reads this list.
+      else if (ghost < 0.5)
+        this._backgroundDots.push({ idx: i, sx, sy, depth, fog });
       if (!supported) {
         this._dot(sx, sy, t, i, scale, 1 - FOG_FADE * fog);
         return;
@@ -1461,7 +1499,12 @@ export class CanvasView {
   ): PointSpec {
     const faded =
       this.searchResults !== null && !this.searchResults.has(track.path);
-    const colour = this.trackColor(track);
+    // A selected dot that is not drawn crisp (it is ghosted, i.e. pushed out of a
+    // sphere scope) still reads as selected: it keeps the selection yellow
+    // instead of the track's own colour.
+    const colour = this.model.selected.has(track.path)
+      ? SELECTED_COLOR
+      : this.trackColor(track);
     const shows3d = this.model.shows3d;
     const [r, g, b] = parseColor(colour);
     const shade = depthShade(depth, this.model.view3dBlend);
@@ -1749,11 +1792,16 @@ export class CanvasView {
   ): void {
     const sel = this.model.selected.has(track.path);
     const hov = this.hoveredIdx === idx;
-    const r = (sel ? DOT_R_SEL : hov ? DOT_R + 1.5 : DOT_R) * scale;
+    // Glow mode: a NON-selected dot carrying a halo — the hovered dot, or a bloom
+    // family member drawn crisp. It grows in *screen* px so the small halo and the
+    // dot stay one unit at any perspective scale. Selection keeps its own look
+    // (yellow fill, white ring, no growth), so the two states never mix.
+    const glowing = !sel && (hov || this._inHoverGlow(track));
+    const r = (sel ? DOT_R_SEL : DOT_R) * scale + (glowing ? GLOW_DOT_GROW : 0);
     const ctx = this.ctx;
 
     let color: string;
-    if (sel) color = "#ffdd57";
+    if (sel) color = SELECTED_COLOR;
     else color = this.trackColor(track);
 
     // External-root tracks (shown via the sidebar toggle) read as secondary —
@@ -1780,13 +1828,25 @@ export class CanvasView {
 
     ctx.globalAlpha = 1;
 
-    // Selected and hovered dots get a white outline, so a track stays legible
-    // against a merged blob without changing its own colour.
-    if (sel || hov) {
-      ctx.strokeStyle = "#ffffffaa";
+    // Selected dots keep the white outline they always had, so a track stays
+    // legible against a merged blob. A glowing (non-selected) dot rings itself in
+    // a milder version of its own colour — half-way to black — so the halo reads
+    // as part of the dot without a bright badge over it.
+    if (glowing || sel) {
+      ctx.strokeStyle = glowing ? this._glowRingColor(track) : "#ffffffaa";
       ctx.lineWidth = 1.5;
       ctx.stroke();
     }
+  }
+
+  /** A glowing dot's ring: its own colour mixed 50 % toward black. */
+  private _glowRingColor(track: Track): string {
+    const hex = (v: number): string =>
+      Math.round(v * 127.5)
+        .toString(16)
+        .padStart(2, "0");
+    const [r, g, b] = parseColor(this.trackColor(track));
+    return `#${hex(r)}${hex(g)}${hex(b)}`;
   }
 
   /* ── Transform bounding box ─────────────────────────────── */

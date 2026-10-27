@@ -102,8 +102,9 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
   blitted **blurred** (`_blitFog`, `ctx.filter` — the canvas-filter blur used by the scope glass)
   under the sharp field before it, and it is never hovered, clicked or lassoed. A panned view
   (`_panBias`) recedes the window by up to `FOG_PAN_BIAS`, so the horizon it panned to stays
-  legible. Scope members are exempt — an opened lens never fogs — and the search-field glow
-  fades with its dot.
+  legible. Scope members are exempt — an opened lens never fogs — a selection takes only
+  `SELECTION_FOG_SCALE` of the fog (so the active yellow stays crisp, hittable and unblurred),
+  and the search-field glow fades with its dot.
 - **Cel sun shading.** The splat shader reads each kernel fragment as a matte sphere cap (normal
   inferred from the fragment's offset from the dot centre, in the camera's +y-up frame) and
   cel-shades it with one orthogonal sun: a single hard terminator, everything on the sun side at
@@ -117,7 +118,12 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
 - **Depth-aware glow.** `GlowLayer.render(points, occluders)` depth-tests each halo against the
   scatter points and crisp dots, so a halo is hidden by blobs at its depth or nearer and shows
   over deeper ones. In 3-D the glow canvas is hidden and blitted into the scatter canvas right
-  after the blobs (below the crisp dots); in 2-D it stays a DOM layer under the scatter.
+  after the blobs (below the crisp dots); in 2-D it stays a DOM layer under the scatter. The halo
+  is compact (`HOVER_GLOW_R` is 0.4× the old radius) and covers the background (fogged) group too,
+  faded in step with each dot's fog. A glowing **non-selected** dot grows by `GLOW_DOT_GROW`
+  **screen** px (halo and dot stay one unit at any perspective scale) and rings itself in its own
+  colour mixed 50 % toward black (`_glowRingColor`); selection is untouched (yellow,
+  `DOT_R_SEL`, white ring) so the two states never mix.
 - **Scopes are spheres** (`Scope.shape === "sphere"`, centre `cx,cy,cz`, radius `r`), the one
   shape whose members do not change under orbit; membership is tested in cube coordinates
   (`scopeContains(..., wz)`) and the outline is a projected circle. X+scroll opens one at the
