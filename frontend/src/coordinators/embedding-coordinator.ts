@@ -1899,7 +1899,9 @@ export class EmbeddingCoordinator {
    * tracks are laid out in its radius around (cx, cy). Every scope maps to
    * {x, y} with no z; a sphere's positions additionally carry the sphere centre
    * as their `billboard` anchor, so the canvas can draw them facing the camera
-   * without reading the (possibly already-closed) scope.
+   * without reading the (possibly already-closed) scope. The layout is pure world
+   * geometry: the sphere's screen-space safe zone from the rim is the canvas's
+   * job (`SCOPE_SAFE_ZONE_PX`).
    */
   private _mapIntoScope(
     raw: Map<string, MapPos>,

@@ -37,6 +37,7 @@ import { GlowLayer, type GlowOccluder, type GlowPoint } from "../lib/glow-layer"
 import {
   MetaballLayer,
   POINT_SPLAT_R,
+  sunDirection,
   type PointSpec,
   type Shading,
 } from "../lib/point-layer";
@@ -172,11 +173,19 @@ const FOG_BACKGROUND = 0.5;
 /** DoF blur on the background layer, in CSS px (0 = no blur, alpha fade only). */
 const FOG_BLUR_PX = 4;
 /**
- * The sphere scope's wormhole pushes a non-member that projects inside the disc
- * out to this multiple of the sphere's screen radius, ghosting it as it goes.
- * Past this reach nothing moves.
+ * How far outside the rim the sphere scope's wormhole may park a non-member that
+ * projects inside the disc, as a fraction of the sphere's screen radius. The
+ * whole covered interior is squeezed into that thin band so the pushed dots hug
+ * the rim instead of spraying into a wide halo; nothing is moved farther.
  */
-const WORMHOLE_REACH = 1.7;
+export const WORMHOLE_BAND = 0.18;
+/**
+ * Screen px a sphere scope's members keep clear of the rim. The crowding this
+ * guards against is splat-sized and the wormhole parks the pushed-out
+ * non-members just outside the rim, so the clearance is a fixed px distance, not
+ * a fraction of the radius: it stays the same visible gap at any zoom.
+ */
+export const SCOPE_SAFE_ZONE_PX = 10;
 /**
  * Frosted-glass tint over the sphere scope at full blur: the disc softens the
  * grid and the outer blobs, and this tint dims what the blur leaves.
@@ -191,6 +200,16 @@ export const GLASS_TINT_FLAT = 0.8;
 export const GLASS_BLUR_PX = 7;
 /** The glass blur is clamped to this ceiling (CSS px). */
 export const MAX_GLASS_BLUR = 24;
+/**
+ * Sphere cues painted on the scope's glass, both deliberately faint so they hint
+ * at a curved pane without competing with the contents: a specular glint where
+ * the dome's normal faces the cel sun (core alpha, reach as a fraction of the
+ * radius), and a fake environment reflection (sky above, ground below).
+ */
+const GLINT_ALPHA = 0.12;
+const GLINT_R = 0.75;
+const SKY_ALPHA = 0.05;
+const GROUND_ALPHA = 0.09;
 
 /** The 8 corners of the unit cube, (x, y, z) each 0 or 1. */
 const CUBE_CORNERS: readonly (readonly [number, number, number])[] = [
@@ -300,12 +319,14 @@ export function depthShade(depth: number, blend = 1): number {
  * projects inside the circle radially OUT of it, ghosting it as it goes, so the
  * disc only ever holds the scope's own contents.
  *
- * Inside (`d < r`) maps monotonically onto `(r, WORMHOLE_REACH·r]`, keeping each
- * point's angular order around the rim instead of collapsing them onto one
+ * Inside (`d < r`) maps monotonically onto `(r, r + WORMHOLE_BAND·r]`, keeping
+ * each point's angular order around the rim instead of collapsing them onto one
  * radius: a point barely inside moves just clear of the rim, one the scope covers
- * completely is thrown out to the reach radius. The ghost ramps 0 at the rim → 1
- * at the centre, so a hidden point arrives as a faint silhouette. Points at or
- * beyond the circle are returned unchanged. Pure, so it is unit-tested directly.
+ * completely is squeezed to the outer edge of the band. The band is thin, so the
+ * displaced dots stay pinned to the rim rather than ringing the scope. The ghost
+ * ramps 0 at the rim → 1 at the centre, so a hidden point arrives as a faint
+ * silhouette. Points at or beyond the circle are returned unchanged. Pure, so it
+ * is unit-tested directly.
  */
 export function wormhole(
   p: { sx: number; sy: number },
@@ -316,9 +337,9 @@ export function wormhole(
   const dy = p.sy - circle.cy;
   const d = Math.hypot(dx, dy);
   if (d >= circle.r) return { sx: p.sx, sy: p.sy, ghost: 0 };
-  const Rinf = circle.r * WORMHOLE_REACH;
+  const band = circle.r * WORMHOLE_BAND;
   // Reverse the order: the deeper inside, the farther out (continuous at the rim).
-  const dOut = Rinf - (Rinf - circle.r) * (d / circle.r);
+  const dOut = circle.r + band * (1 - d / circle.r);
   // Away from the centre (fixed +x for a point exactly at it, so deterministic).
   const [ux, uy] = d < 1e-3 ? [1, 0] : [dx / d, dy / d];
   return {
@@ -597,7 +618,9 @@ export class CanvasView {
    * layout) is drawn as a disc facing the camera: it takes the anchor's
    * projection and lays the member's world offset out at the anchor's
    * perspective scale, so a member at world offset ``r`` lands on the sphere's
-   * projected circle edge and the disc never rotates with the orbit. The anchor
+   * projected circle edge and the disc never rotates with the orbit. The offset
+   * is then pulled ``SCOPE_SAFE_ZONE_PX`` screen px toward the anchor, so the
+   * contents stop just short of the rim instead of crowding it. The anchor
    * rides on the position itself, so it survives the scope closing. In 2-D the
    * flag is ignored — the flat position is drawn as-is.
    *
@@ -622,9 +645,23 @@ export class CanvasView {
         wy: pos.billboard.cy,
         wz: pos.billboard.cz,
       });
+      const dx = (pos.wx - pos.billboard.cx) * c.scale;
+      const dy = (pos.wy - pos.billboard.cy) * c.scale;
+      // The offset in screen px, so the safe zone is measured in px like the
+      // splats it protects. Scaling the view offset by `k` scales its screen
+      // image by `k`, so the disc shrinks by exactly the safe zone. It eases in
+      // with the 2-D↔3-D blend (like the depth shade), so a flat map at blend 0
+      // keeps its exact positions and the toggle has no pop.
+      const zoom = this.model.vp.zoom;
+      const safe = SCOPE_SAFE_ZONE_PX * clamp01(this.model.view3dBlend);
+      const dPx = Math.hypot(
+        dx * zoom * Math.max(1e-6, this.$canvas.clientWidth - 2 * PAD),
+        dy * zoom * Math.max(1e-6, this.$canvas.clientHeight - 2 * PAD),
+      );
+      const k = dPx > safe ? 1 - safe / dPx : 0;
       frame = {
-        rx: c.rx + (pos.wx - pos.billboard.cx) * c.scale,
-        ry: c.ry + (pos.wy - pos.billboard.cy) * c.scale,
+        rx: c.rx + dx * k,
+        ry: c.ry + dy * k,
         d: c.d,
         scale: c.scale,
       };
@@ -1638,6 +1675,10 @@ export class CanvasView {
    * alone — at higher alpha — must do the hiding where the canvas `filter` is
    * unavailable (Safari, and headless fakes). The scope's member splats render
    * after and stay sharp.
+   *
+   * The pane then gets its two curvature cues: a specular glint toward the cel
+   * sun (the same light the points are shaded by) and a faint sky-over-ground
+   * gradient standing in for a reflection of the environment.
    */
   private _drawGlass(
     circle: { cx: number; cy: number; r: number },
@@ -1659,6 +1700,28 @@ export class CanvasView {
     }
     ctx.globalAlpha = blurred ? GLASS_TINT : GLASS_TINT_FLAT;
     ctx.fillStyle = this.mapBackground();
+    ctx.fill();
+    // Fake reflection first, glint on top: sky brightens the upper half, the
+    // ground darkens the lower, and the highlight lands where the dome's normal
+    // faces the sun (view +y is up, canvas +y is down).
+    ctx.globalAlpha = 1;
+    const { cx, cy, r } = circle;
+    const sky = ctx.createLinearGradient(0, cy - r, 0, cy + r);
+    sky.addColorStop(0, `rgba(255,255,255,${SKY_ALPHA})`);
+    sky.addColorStop(0.5, "rgba(255,255,255,0)");
+    sky.addColorStop(1, `rgba(0,0,0,${GROUND_ALPHA})`);
+    ctx.fillStyle = sky;
+    ctx.fill();
+    const [lx, ly] = sunDirection(
+      this.model.shading.azimuth,
+      this.model.shading.elevation,
+    );
+    const gx = cx + lx * r * 0.5;
+    const gy = cy - ly * r * 0.5;
+    const glint = ctx.createRadialGradient(gx, gy, 0, gx, gy, r * GLINT_R);
+    glint.addColorStop(0, `rgba(255,255,255,${GLINT_ALPHA})`);
+    glint.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = glint;
     ctx.fill();
     ctx.restore();
   }
@@ -2362,13 +2425,6 @@ export class CanvasView {
           ctx.fill();
           ctx.stroke();
           ctx.setLineDash([]);
-          // A faint inner ring makes the disc read as a sphere.
-          ctx.save();
-          ctx.globalAlpha = 0.35;
-          ctx.beginPath();
-          ctx.arc(circle.cx, circle.cy, circle.r * 0.5, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.restore();
           // The lens tabs sit just outside the region, above unless it is near the top.
           const above = circle.cy - circle.r - 16 > 26;
           const tabCy = above ? circle.cy - circle.r - 16 : circle.cy + circle.r + 16;

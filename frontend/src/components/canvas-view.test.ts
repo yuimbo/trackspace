@@ -23,6 +23,8 @@ import {
   nearestInBlob,
   readGlassBlur,
   tabAt,
+  SCOPE_SAFE_ZONE_PX,
+  WORMHOLE_BAND,
   wormhole,
   type DotPosition,
 } from "./canvas-view";
@@ -58,6 +60,9 @@ function makeFakeCtx(): {
   let currentAlpha = 1;
   const target: Record<string, unknown> = {
     measureText: () => ({ width: 10 }),
+    // Gradients are opaque paint sources; the glass just fills with them.
+    createRadialGradient: () => ({ addColorStop: () => undefined }),
+    createLinearGradient: () => ({ addColorStop: () => undefined }),
     ellipse: (x: number, y: number, rx: number, ry: number) => {
       ellipses.push({ x, y, rx, ry });
     },
@@ -88,6 +93,27 @@ function makeFakeCtx(): {
     rects,
     arcs,
   };
+}
+
+/** Project a position through the canvas's own screen transform (drawing path). */
+function trackScreen(cv: CanvasView) {
+  return (
+    cv as unknown as {
+      _trackScreen(pos: {
+        wx: number;
+        wy: number;
+        wz?: number;
+        billboard?: { cx: number; cy: number; cz: number };
+        from?: {
+          wx: number;
+          wy: number;
+          wz?: number;
+          billboard?: { cx: number; cy: number; cz: number };
+        };
+        mix?: number;
+      }): { sx: number; sy: number; depth: number; scale: number };
+    }
+  )._trackScreen.bind(cv);
 }
 
 describe("CanvasView cluster hover glow", () => {
@@ -397,16 +423,6 @@ describe("CanvasView 3-D glow compositing", () => {
     (cv as unknown as { glow: typeof glow; points: typeof points }).glow = glow;
     (cv as unknown as { glow: typeof glow; points: typeof points }).points = points;
     return { cv, glow, points };
-  }
-
-  function trackScreen(cv: CanvasView) {
-    return (cv as unknown as {
-      _trackScreen(pos: {
-        wx: number;
-        wy: number;
-        wz?: number;
-      }): { sx: number; sy: number; depth: number; scale: number };
-    })._trackScreen.bind(cv);
   }
 
   it("occludes the 3-D glow with the blobs and the crisp dots", () => {
@@ -879,16 +895,6 @@ describe("CanvasView sphere scope", () => {
     vi.restoreAllMocks();
   });
 
-  function trackScreen(cv: CanvasView) {
-    return (cv as unknown as {
-      _trackScreen(pos: {
-        wx: number;
-        wy: number;
-        wz?: number;
-      }): { sx: number; sy: number; depth: number; scale: number };
-    })._trackScreen.bind(cv);
-  }
-
   it("returns the scope position's z for an in-scope track", () => {
     const m = new Model();
     m.setAllTracks([makeTrack({ path: "a.mp3" })]);
@@ -940,7 +946,7 @@ describe("CanvasView sphere scope", () => {
     expect(cv.worldPosForTrack(m.trackByPath("b.mp3")!)).toBeNull();
   });
 
-  it("draws a sphere scope as a screen circle with a faint inner ring", () => {
+  it("draws a sphere scope as a single screen circle", () => {
     const m = new Model();
     m.setAllTracks([makeTrack({ path: "a.mp3" })]);
     m.lensId = "combined";
@@ -962,18 +968,16 @@ describe("CanvasView sphere scope", () => {
 
     cv.draw();
 
-    // The sphere's screen circle: the outer ring at the projected radius plus
-    // the faint inner ring at half radius.
+    // One outline at the projected radius — the spheriness cue lives on the
+    // glass (glint + reflection), not in a second ring.
     const ring = arcs.filter((a) => a.r > 10);
-    expect(ring).toHaveLength(2);
+    expect(ring).toHaveLength(1);
     const c = trackScreen(cv)({ wx: 0.5, wy: 0.5, wz: 0.5 });
-    const [outer, inner] = ring;
+    const [outer] = ring;
     // 0.1 world radius at the centre plane and zoom 1 → 0.1 * 720 px.
     expect(outer.r).toBeCloseTo(0.1 * 720, 3);
     expect(outer.x).toBeCloseTo(c.sx, 3);
     expect(outer.y).toBeCloseTo(c.sy, 3);
-    expect(inner.r).toBeCloseTo(outer.r * 0.5, 3);
-    expect(inner.alpha).toBeCloseTo(0.35, 5);
   });
 });
 
@@ -981,6 +985,7 @@ describe("CanvasView sphere scope", () => {
 
 describe("wormhole", () => {
   const circle = { cx: 400, cy: 200, r: 100 };
+  const outer = 100 * (1 + WORMHOLE_BAND);
 
   it("leaves points at or beyond the circle untouched", () => {
     expect(wormhole({ sx: 500, sy: 200 }, circle)).toEqual({
@@ -995,19 +1000,21 @@ describe("wormhole", () => {
     });
   });
 
-  it("throws the circle centre out to the reach radius, fully ghosted", () => {
+  it("squeezes the disc centre to the outer edge of the rim band, fully ghosted", () => {
     const res = wormhole({ sx: 400, sy: 200 }, circle);
-    // d < 1e-3 picks the fixed +x direction, so the result lands exactly Rinf right.
-    expect(res.sx).toBeCloseTo(400 + 170, 5);
+    // d < 1e-3 picks the fixed +x direction, so the result lands exactly on +x.
+    expect(res.sx).toBeCloseTo(400 + outer, 5);
     expect(res.sy).toBeCloseTo(200, 5);
     expect(res.ghost).toBeCloseTo(1, 5);
   });
 
-  it("pushes deeper points farther out and ghosts them harder", () => {
+  it("keeps every covered point in a thin band hugging the rim", () => {
     const at = (d: number) => wormhole({ sx: 400 + d, sy: 200 }, circle);
     const dist = (d: number) => Math.hypot(at(d).sx - 400, at(d).sy - 200);
-    // Every point leaves the disc: the raw distance never survives.
+    // Every point leaves the disc: the raw distance never survives…
     for (const d of [0, 25, 50, 99.9]) expect(dist(d)).toBeGreaterThanOrEqual(100);
+    // …and none is sprayed beyond the band, so the pushed dots stay on the rim.
+    for (const d of [0, 25, 50, 99.9]) expect(dist(d)).toBeLessThanOrEqual(outer);
     for (const d of [25, 50, 99.9]) expect(dist(d)).toBeLessThan(dist(d - 25));
     expect(at(0).ghost).toBeGreaterThan(at(60).ghost);
     expect(at(60).ghost).toBeGreaterThan(at(99.9).ghost);
@@ -1115,17 +1122,6 @@ describe("CanvasView sphere scope billboard + wormhole", () => {
     vi.restoreAllMocks();
   });
 
-  function trackScreen(cv: CanvasView) {
-    return (cv as unknown as {
-      _trackScreen(pos: {
-        wx: number;
-        wy: number;
-        wz?: number;
-        billboard?: { cx: number; cy: number; cz: number };
-      }): { sx: number; sy: number; depth: number; scale: number };
-    })._trackScreen.bind(cv);
-  }
-
   /** A 3-D canvas whose WebGL layers are fakes that record their render calls. */
   function make3dCanvas(): {
     cv: CanvasView;
@@ -1200,20 +1196,27 @@ describe("CanvasView sphere scope billboard + wormhole", () => {
     const other = m.trackByPath("other.mp3")!;
 
     // Default camera: the member resolves to the sphere centre + flat offset at
-    // the centre's perspective scale (the centre is the cube centre → scale 1).
-    expect(cv.worldPosForTrack(member)).toEqual({ wx: 0.6, wy: 0.5 });
+    // the centre's perspective scale (the centre is the cube centre → scale 1),
+    // pulled SCOPE_SAFE_ZONE_PX toward the centre — 10 px at zoom 1 → 10/720.
+    const inset = SCOPE_SAFE_ZONE_PX / 720;
+    const pinned = cv.worldPosForTrack(member)!;
+    expect(pinned.wx).toBeCloseTo(0.6 - inset, 9);
+    expect(pinned.wy).toBeCloseTo(0.5, 9);
     const otherBefore = cv.worldPosForTrack(other);
-    expect(otherBefore).not.toEqual({ wx: 0.6, wy: 0.5 });
+    expect(otherBefore!.wx).not.toBeCloseTo(0.6 - inset, 9);
 
     // Orbiting leaves the member pinned to the sphere; the non-member moves.
     m.view3d.yaw = 1.2;
     m.view3d.pitch = 0.1;
-    expect(cv.worldPosForTrack(member)).toEqual({ wx: 0.6, wy: 0.5 });
+    const pinnedAfter = cv.worldPosForTrack(member)!;
+    expect(pinnedAfter.wx).toBeCloseTo(0.6 - inset, 9);
+    expect(pinnedAfter.wy).toBeCloseTo(0.5, 9);
     const otherAfter = cv.worldPosForTrack(other);
     expect(otherAfter).not.toEqual(otherBefore);
 
     // On screen the member sits at the projected centre + (x − cx, y − cy)·scale
-    // (scale 1 here), i.e. fixed on the billboarded disc, at both orbits.
+    // (scale 1 here), pulled SCOPE_SAFE_ZONE_PX toward the centre, i.e. fixed on
+    // the billboarded disc, at both orbits.
     const ts = trackScreen(cv);
     const centre = ts({ wx: 0.5, wy: 0.5, wz: 0.5 });
     const memberScreen = ts({
@@ -1221,8 +1224,55 @@ describe("CanvasView sphere scope billboard + wormhole", () => {
       wy: 0.5,
       billboard: { cx: 0.5, cy: 0.5, cz: 0.5 },
     });
-    expect(memberScreen.sx - centre.sx).toBeCloseTo(0.1 * 720, 5);
+    expect(memberScreen.sx - centre.sx).toBeCloseTo(
+      0.1 * 720 - SCOPE_SAFE_ZONE_PX,
+      5,
+    );
     expect(memberScreen.sy - centre.sy).toBeCloseTo(0, 5);
+  });
+
+  it("keeps scope members a fixed px inside the rim at any zoom", () => {
+    const m = new Model();
+    m.setAllTracks([makeTrack({ path: "member.mp3" })]);
+    m.lensId = "combined";
+    m.view3d.on = true;
+    m.view3dBlend = 1;
+    m.embeddingPositions = new Map([["member.mp3", { x: 0.5, y: 0.5 }]]);
+    m.scope = {
+      shape: "sphere",
+      cx: 0.5,
+      cy: 0.5,
+      cz: 0.5,
+      r: 0.2,
+      lensId: "camelot",
+    };
+    // The layout's extreme: on the rim, 0.2 world units from the sphere centre.
+    m.scopePositions = new Map([
+      [
+        "member.mp3",
+        { x: 0.7, y: 0.5, billboard: { cx: 0.5, cy: 0.5, cz: 0.5 } },
+      ],
+    ]);
+    const cv = new CanvasView(m);
+    Object.defineProperty(cv.$canvas, "clientWidth", { value: 800 });
+    Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
+    const ts = trackScreen(cv);
+    // 0.2 world radius at the centre plane → 0.2·720 px at zoom 1; the member
+    // laid out on that rim keeps the same px clearance at every zoom, because
+    // the safe zone is a screen distance, not a fraction of the radius.
+    for (const zoom of [1, 2, 0.5]) {
+      m.vp.zoom = zoom;
+      const c = ts({ wx: 0.5, wy: 0.5, wz: 0.5 });
+      const at = ts({
+        wx: 0.7,
+        wy: 0.5,
+        billboard: { cx: 0.5, cy: 0.5, cz: 0.5 },
+      });
+      expect(Math.hypot(at.sx - c.sx, at.sy - c.sy)).toBeCloseTo(
+        0.2 * 720 * zoom - SCOPE_SAFE_ZONE_PX,
+        5,
+      );
+    }
   });
 
   it("fogs the far cap: drawn faintly, never hittable", () => {
@@ -1383,24 +1433,6 @@ describe("CanvasView cross-frame scope animation blend", () => {
 
   const BB = { cx: 0.5, cy: 0.5, cz: 0.5 };
 
-  function trackScreen(cv: CanvasView) {
-    return (cv as unknown as {
-      _trackScreen(pos: {
-        wx: number;
-        wy: number;
-        wz?: number;
-        billboard?: { cx: number; cy: number; cz: number };
-        from?: {
-          wx: number;
-          wy: number;
-          wz?: number;
-          billboard?: { cx: number; cy: number; cz: number };
-        };
-        mix?: number;
-      }): { sx: number; sy: number; depth: number; scale: number };
-    })._trackScreen.bind(cv);
-  }
-
   function viewFrame(cv: CanvasView) {
     return (cv as unknown as {
       _viewFrame(pos: {
@@ -1493,10 +1525,10 @@ describe("CanvasView cross-frame scope animation blend", () => {
     });
     expect(throughOverlay.sx).toBe(settled.sx);
     expect(throughOverlay.sy).toBe(settled.sy);
-    expect(cv.worldPosForTrack(m.trackByPath("a.mp3")!)).toEqual({
-      wx: 0.6,
-      wy: 0.5,
-    });
+    // The settled billboard point, minus the safe zone (10 px at zoom 1).
+    const settledPos = cv.worldPosForTrack(m.trackByPath("a.mp3")!)!;
+    expect(settledPos.wx).toBeCloseTo(0.6 - SCOPE_SAFE_ZONE_PX / 720, 9);
+    expect(settledPos.wy).toBeCloseTo(0.5, 9);
     // At mix 1 the entry is exactly the outer cube projection (head-on camera,
     // and the outer sits on the centre depth plane → scale 1).
     cv.animPositions = new Map([
@@ -1649,12 +1681,19 @@ describe("CanvasView sphere scope frosted glass", () => {
   } {
     const log: Ev[] = [];
     let currentAlpha = 1;
+    // Gradients stringify to their kind, so the fill log names the paint source.
+    const gradient = (kind: string) => ({
+      addColorStop: () => undefined,
+      toString: () => kind,
+    });
     const target: Record<string, unknown> = {
       measureText: () => ({ width: 10 }),
       ...(filter !== undefined ? { filter } : {}),
       drawImage: (img: unknown) => {
         log.push({ type: "drawImage", img });
       },
+      createRadialGradient: () => gradient("radial"),
+      createLinearGradient: () => gradient("linear"),
       fill: () => {
         log.push({
           type: "fill",
@@ -1760,10 +1799,17 @@ describe("CanvasView sphere scope frosted glass", () => {
     return { cv, points, glow };
   }
 
-  // Screen geometry: member billboards to (436, 216), inside sits at the
-  // circle centre (400, 200), outside at (616, 200) — 216 px from the centre.
-  const memberAt = (specs: PointSpec[]) =>
-    specs.find((s) => Math.hypot(s.x - 436, s.y - 216) < 1);
+  // Screen geometry: the member billboards a hair inside (436, 216) — pulled
+  // SCOPE_SAFE_ZONE_PX toward the disc centre — inside.mp3 sits at the circle
+  // centre (400, 200), outside.mp3 at (616, 200).
+  const memberAt = (cv: CanvasView, specs: PointSpec[]) => {
+    const p = trackScreen(cv)({
+      wx: 0.55,
+      wy: 0.45,
+      billboard: { cx: 0.5, cy: 0.5, cz: 0.5 },
+    });
+    return specs.find((s) => Math.hypot(s.x - p.sx, s.y - p.sy) < 1);
+  };
 
   it("pushes a covered non-member clear of the disc, ghosted and unhittable", () => {
     const { cv, points } = makeCanvas();
@@ -1774,9 +1820,11 @@ describe("CanvasView sphere scope frosted glass", () => {
     const all = points.render.mock.calls.flatMap(
       (call) => call[0] as PointSpec[],
     );
-    // At the exact centre the fixed +x direction puts it on the +x reach radius.
+    // At the exact centre the fixed +x direction puts it on the +x rim band.
     const pushed = all.find(
-      (s) => Math.abs(s.x - (400 + 1.7 * 180)) < 1 && Math.abs(s.y - 200) < 1,
+      (s) =>
+        Math.abs(s.x - 400 - 180 * (1 + WORMHOLE_BAND)) < 1 &&
+        Math.abs(s.y - 200) < 1,
     );
     expect(pushed).toBeDefined();
     // Fully ghosted, and this point also sits in the fog window, so the two fades
@@ -1828,8 +1876,8 @@ describe("CanvasView sphere scope frosted glass", () => {
     // and the member's spec goes to the second pass only.
     expect(fog).toHaveLength(1);
     expect(outer.find((s) => Math.hypot(s.x - 616, s.y - 200) < 1)).toBeDefined();
-    expect(memberAt(outer)).toBeUndefined();
-    expect(memberAt(inner)).toBeDefined();
+    expect(memberAt(cv, outer)).toBeUndefined();
+    expect(memberAt(cv, inner)).toBeDefined();
     // The member and the outside non-member stay hittable.
     expect(cv.positions.map((p) => p.idx)).toEqual([0, 2]);
   });
@@ -1869,6 +1917,23 @@ describe("CanvasView sphere scope frosted glass", () => {
     expect(
       log.some((e) => e.type === "drawImage" && e.img === cv.$canvas),
     ).toBe(false);
+  });
+
+  it("paints the spheriness cues on the glass: reflection, then the sun glint", () => {
+    const { cv } = makeCanvas();
+    cv.draw();
+    const fills = log.filter(
+      (e): e is Extract<Ev, { type: "fill" }> => e.type === "fill",
+    );
+    const tintAt = fills.findIndex((f) => f.style === "#1a1a2e");
+    const skyAt = fills.findIndex((f) => f.style === "linear");
+    const glintAt = fills.findIndex((f) => f.style === "radial");
+    expect(tintAt).toBeGreaterThan(-1);
+    // Both cues go over the tint, the reflection first so the glint reads on top,
+    // and each paints once.
+    expect(skyAt).toBeGreaterThan(tintAt);
+    expect(glintAt).toBeGreaterThan(skyAt);
+    expect(fills.filter((f) => f.style === "radial")).toHaveLength(1);
   });
 
   it("self-copies the canvas under the clip and blurs it when ctx.filter is a string", () => {
@@ -1957,14 +2022,16 @@ describe("CanvasView sphere scope frosted glass", () => {
     cv.draw();
     const pts = cv.collectSearchGlowPoints();
     // inside.mp3 projects at the circle centre: its glow follows the dot out to
-    // the reach radius instead of bleeding under the glass; the member and the
+    // the rim band instead of bleeding under the glass; the member and the
     // outside landmark keep theirs.
     expect(pts).toHaveLength(3);
     expect(pts.find((p) => Math.hypot(p.x - 400, p.y - 200) < 1)).toBeUndefined();
     expect(
-      pts.find((p) => Math.hypot(p.x - (400 + 1.7 * 180), p.y - 200) < 1),
+      pts.find(
+        (p) => Math.hypot(p.x - 400 - 180 * (1 + WORMHOLE_BAND), p.y - 200) < 1,
+      ),
     ).toBeDefined();
-    expect(pts.find((p) => Math.hypot(p.x - 436, p.y - 216) < 1)).toBeDefined();
+    expect(memberAt(cv, pts)).toBeDefined();
     expect(pts.find((p) => Math.hypot(p.x - 616, p.y - 200) < 1)).toBeDefined();
   });
 
@@ -2030,16 +2097,6 @@ describe("CanvasView scope picking", () => {
     Object.defineProperty(cv.$canvas, "clientHeight", { value: 400 });
     cv.draw();
     return cv;
-  }
-
-  function trackScreen(cv: CanvasView) {
-    return (cv as unknown as {
-      _trackScreen(pos: {
-        wx: number;
-        wy: number;
-        wz?: number;
-      }): { sx: number; sy: number; depth: number; scale: number };
-    })._trackScreen.bind(cv);
   }
 
   it("snaps to the nearest on-screen dot within 20 px and returns its cube position", () => {
@@ -2911,15 +2968,6 @@ describe("CanvasView 3-D perspective projection", () => {
   });
 
   /** Cast through the private `_trackScreen` so the projection is unit-tested. */
-  function trackScreen(cv: CanvasView) {
-    return (cv as unknown as {
-      _trackScreen(pos: {
-        wx: number;
-        wy: number;
-        wz?: number;
-      }): { sx: number; sy: number; depth: number; scale: number };
-    })._trackScreen.bind(cv);
-  }
 
   it("scales a near point up and a far point down under perspective", () => {
     vi.stubGlobal("location", { search: "?persp=0.28" });

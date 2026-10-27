@@ -133,11 +133,12 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
   - **Contents are the flat 2-D scope view**, never a nested 3-D map: the scope lens is always
     fetched with `dims=2` (shared cache with 2-D), and the members are drawn *billboarded* —
     a flat disc facing the camera at the sphere's projected centre, not rotating with the orbit.
-    The layout fills that disc (FG-squircle, see below), so the contents reach the rim.
+    The layout fills that disc (FG-squircle, see below); on screen the members are then pulled
+    `SCOPE_SAFE_ZONE_PX` (10 px) toward the centre, so they stop just short of the rim.
   - **Solid sphere.** Anything that is not a member and projects inside the circle is pushed
-    radially OUT past the rim and ghosted by how much of the disc covered it
-    (`wormhole()` in `canvas-view.ts`: `WORMHOLE_REACH`, `GHOST_FADE`); nothing foreign ever
-    sits inside the outline, whatever the orbit. A ghost sinks to the lowest depth so it cannot
+    radially OUT of it, into a thin band hugging the rim, and ghosted by how much of the disc
+    covered it (`wormhole()` in `canvas-view.ts`: `WORMHOLE_BAND`, `GHOST_FADE`); nothing foreign
+    ever sits inside the outline, whatever the orbit. A ghost sinks to the lowest depth so it cannot
     occlude the contents, is neither hoverable nor selectable, and its search-field glow follows
     it out.
   - **Frames.** A scope member's position carries its own frame (`MapPos.billboard`: the sphere
@@ -149,7 +150,9 @@ the eval gallery, which switches the current group to its precomputed 3-D siblin
     tints the grid, cube and outer blobs (`_drawGlass`: clip + `ctx.filter` blur self-copy +
     background tint). The scope's members render sharp on top. Blur radius is `?glass=<css px>`
     (default 7, `0` = tint only); without `ctx.filter` support (Safari) the tint alone is used,
-    stronger.
+    stronger. Two faint curvature cues sit on the pane so it reads as a sphere rather than a flat
+    lasso: a specular glint toward the cel sun (`sunDirection`, so it follows the shading sliders)
+    and a sky-over-ground gradient standing in for an environment reflection.
 - **Weight sliders** work live in 3-D: the landmark Jacobian is dimension-agnostic and the
   frontend approximates z like x/y; a Jacobian fetched for the other dimensionality is never
   applied (`_jacobianKey` carries `dims`).
